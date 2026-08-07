@@ -4,6 +4,7 @@ import argparse
 import os
 import subprocess
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .approval import materialize_execution_copy, verify_approval_bundle
@@ -22,6 +23,10 @@ from .process_utils import (
 )
 from .resources import BoundedStreamCapture, WorkspaceExecutionLock, enforce_data_quota
 from .util import canonical_json, utc_now_iso
+
+
+class ApprovalExecutionExpired(RuntimeError):
+    pass
 
 
 def run_operation(operation_id: str) -> int:
@@ -170,6 +175,9 @@ def run_operation(operation_id: str) -> int:
         except (ValueError, FileNotFoundError):
             pass
         child_env["WINDOWS_LOCAL_MCP_JOB_NONCE"] = nonce
+        _ensure_approval_execution_fresh(
+            audit.get_operation(operation_id, include_events=False)
+        )
         child = subprocess.Popen(
             argv,
             cwd=cwd,
@@ -212,6 +220,11 @@ def run_operation(operation_id: str) -> int:
             exit_code = None
             status = "timed_out"
             error = f"maximum runtime exceeded: {max_runtime} seconds"
+    except ApprovalExecutionExpired as exc:
+        exit_code = None
+        status = "expired"
+        error = str(exc)
+        audit.add_event(operation_id, "approval_expired_before_child_start", {})
     except Exception as exc:  # noqa: BLE001 - every child failure must become a terminal job
         if child_identity is not None:
             terminate_process_tree(child_identity)
@@ -250,19 +263,36 @@ def run_operation(operation_id: str) -> int:
         "pre_git_path": pre_git,
         "post_git_path": post_git,
     }
-    audit.update_operation(
-        operation_id,
-        status=status,
-        finished_at=utc_now_iso(),
-        exit_code=exit_code,
-        post_git_path=post_git,
-        result_json=canonical_json(result),
-        error=error,
-        duration_ms=duration_ms,
-    )
+    update_fields: dict[str, object] = {
+        "status": status,
+        "finished_at": utc_now_iso(),
+        "exit_code": exit_code,
+        "post_git_path": post_git,
+        "result_json": canonical_json(result),
+        "error": error,
+        "duration_ms": duration_ms,
+    }
+    if status == "expired" and operation["tier"] == "host_approval":
+        update_fields["approval_status"] = "expired"
+    audit.update_operation(operation_id, **update_fields)
     audit.add_event(operation_id, "worker_finished", {"status": status, "exit_code": exit_code})
     execution_lock.__exit__(None, None, None)
     return 0 if status == "succeeded" else 1
+
+
+def _ensure_approval_execution_fresh(operation: dict[str, object]) -> None:
+    if operation.get("tier") != "host_approval":
+        return
+    if operation.get("approval_status") != "approved" or not operation.get("claimed_at"):
+        raise RuntimeError("approval execution grant is not active")
+    expires_value = operation.get("approval_expires_at")
+    if not expires_value:
+        raise ApprovalExecutionExpired("approval execution grant has no expiration")
+    expires_at = datetime.fromisoformat(str(expires_value))
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
+    if expires_at <= datetime.now(UTC):
+        raise ApprovalExecutionExpired("approval execution grant expired before child start")
 
 
 def _verify_adb_target(normalized: dict[str, object], emulator_only: bool) -> None:
