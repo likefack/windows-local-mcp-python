@@ -73,6 +73,7 @@ def test_worker_environment_keeps_only_required_internal_values() -> None:
         "LOCAL_MCP_CONFIG": r"C:\config.toml",
         "LOCAL_MCP_ROOT": r"C:\workspace",
         "LOCAL_MCP_TRANSPORT": "streamable-http",
+        "LOCAL_MCP_HOST": "127.0.0.1",
         "PRIVATE_TOKEN": "secret",
     }
 
@@ -80,6 +81,7 @@ def test_worker_environment_keeps_only_required_internal_values() -> None:
 
     assert worker["LOCAL_MCP_CONFIG"] == source["LOCAL_MCP_CONFIG"]
     assert worker["LOCAL_MCP_ROOT"] == source["LOCAL_MCP_ROOT"]
-    assert "LOCAL_MCP_TRANSPORT" not in worker
+    assert worker["LOCAL_MCP_TRANSPORT"] == source["LOCAL_MCP_TRANSPORT"]
+    assert "LOCAL_MCP_HOST" not in worker
     assert "PRIVATE_TOKEN" not in worker
     assert worker["WINDOWS_LOCAL_MCP_JOB_NONCE"] == "nonce-2"
