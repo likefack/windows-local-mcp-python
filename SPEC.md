@@ -15,7 +15,7 @@ Security objectives:
 
 ## 2. Capability switches
 
-`filesystem_enabled`, `git_enabled`, `flutter_enabled`, `dart_enabled`, `adb_enabled`, and `powershell_enabled` are independent. Disabled optional tools are not resolved at startup. `workspace_root` is mandatory; there is no current-directory fallback.
+`filesystem_enabled`, `git_enabled`, `flutter_enabled`, `dart_enabled`, `adb_enabled`, and `powershell_enabled` are independent. A disabled capability is disabled in both the automatic and approval paths; approval does not override an explicit `false`. Disabled optional tools are not resolved at startup. `workspace_root` is mandatory; there is no current-directory fallback.
 
 Dangerous configuration combinations fail startup validation:
 
@@ -38,12 +38,14 @@ All MCP file paths pass through `Workspace`.
 
 `write_file` additionally:
 
-1. takes a cross-process workspace execution lock and canonical-target thread lock;
+1. takes a cross-process workspace mutation lock and canonical-target thread lock;
 2. re-resolves target and reads/checks expected SHA inside the locks;
 3. enforces old/new/diff/backup/data quotas before replacement;
 4. writes and fsyncs a same-directory temporary file;
 5. revalidates parent `(device,inode)` and target full identity immediately before `os.replace`;
 6. verifies resulting SHA.
+
+Ordinary file reads do not take the workspace mutation lock.
 
 ## 4. Automatic command tier
 
@@ -56,6 +58,7 @@ Automatic subcommands: `status`, `diff`, `log`, `show`, restricted `rev-parse`, 
 - Force no pager; diff/show force `--no-ext-diff --no-textconv`.
 - Disallow `-C`, `--git-dir`, `--work-tree`, `--output`, config injection, pager/external helpers, and unknown flags.
 - Pathspec is accepted only after `--` and resolved inside workspace.
+- Git repository/config override environment variables are removed before Git subprocesses run.
 - `git_info` returns branch, HEAD, status, working diff, staged diff, recent log, and changed files through bounded subprocess capture.
 
 ### Flutter and Dart
@@ -75,6 +78,18 @@ ADB is separately disabled by default. Automatic forms are exact:
 - `adb -s SERIAL exec-out screencap -p`
 
 Targeted calls require serial validation. `adb_emulator_only=true` requires an `emulator-*` serial and a successful `adb emu avd name` preflight. Optional `adb_allowed_serials` further narrows targets. General shell and state changes require approval.
+
+### Execution lock policy
+
+The workspace mutation lock is no longer held for every command for the full child-process lifetime.
+
+- Safe Git reads, safe ADB reads, `flutter analyze`, `dart analyze`, and non-writing `dart format` execute without the workspace mutation lock.
+- Approved code-loading commands in immutable `staged-cwd` snapshot mode, including test/build-style execution, run without the workspace mutation lock because they execute from `data_dir`, not the original workspace.
+- A writing `dart format`, an approved command marked `workspace_write=true`, and approved commands that still execute against the original workspace keep the exclusive workspace mutation lock through verification and child execution.
+- Snapshot/manifest creation may still take the workspace lock briefly so the captured input set is coherent.
+- Old approval rows that do not contain explicit snapshot metadata fail conservatively and keep the lock.
+
+This permits long-running isolated tests/builds and read-only analysis to overlap with unrelated workspace activity without weakening the write boundary.
 
 ## 5. Approval and immutable execution
 
@@ -113,7 +128,7 @@ Code-loading commands that do not need to mutate the source run from an immutabl
 - file-based Dart/Flutter package dependencies outside `cwd` are copied and `package_config.json` is rewritten;
 - non-file or non-enumerable dependencies fail closed.
 
-The immutable copy is verified after local approval. The worker then creates a separate writable disposable run copy, so build artifacts cannot mutate the approved input copy. Unrelated workspace changes outside the approved `cwd` do not invalidate snapshot execution.
+The immutable copy is verified after local approval. The worker then creates a separate writable disposable run copy, so build artifacts cannot mutate the approved input copy. Unrelated workspace changes outside the approved `cwd` do not invalidate snapshot execution. Snapshot-backed child execution does not hold the workspace mutation lock.
 
 Installed OS/toolchains are the trusted computing base. Their primary executable is content-bound. Complete OS DLL/toolchain virtualization is not provided.
 
@@ -129,6 +144,7 @@ Git host operations additionally bind Git state obtained through Git. Direct `.g
 - Separately approved compatibility grants have `approval_expires_at`.
 - Local approve-and-run performs approval and `claimed_at` assignment in one transaction.
 - Claim predicates require the correct status, future expiry, and `claimed_at IS NULL`.
+- The worker rechecks `approval_expires_at` immediately before `subprocess.Popen()`; an expired grant never starts the child process.
 
 ## 6. Process lifecycle
 
@@ -151,7 +167,7 @@ Retention deletes only known artifact roots and skips artifacts whose operation 
 
 ## 8. Audit
 
-All important MCP boundary actions create operations/events, including rejection before normalization, job poll/stop, approval poll/claim, audit access, timeout, stale identity, and startup reconciliation. Secret-like fields are redacted; file content is represented by byte count and SHA. stdout/stderr and full file content are never copied into unbounded audit fields.
+All important MCP boundary actions create operations/events, including rejection before normalization, job poll/stop, approval poll/claim, audit access, timeout, stale identity, lock selection, and startup reconciliation. Secret-like fields are redacted; file content is represented by byte count and SHA. stdout/stderr and full file content are never copied into unbounded audit fields.
 
 ## 9. data_dir protection
 
