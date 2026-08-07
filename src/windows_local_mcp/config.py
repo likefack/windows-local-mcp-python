@@ -10,6 +10,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from .git_env import strip_git_ambient_environment
+
 
 class Settings(BaseModel):
     """Validated, fail-closed configuration for one MCP instance/workspace."""
@@ -228,6 +230,10 @@ def _default_data_dir() -> Path:
 
 
 def load_settings() -> Settings:
+    # Every production entrypoint calls load_settings(). Scrub Git repository/config overrides
+    # before any Git probe, snapshot, approval-state capture, or child process can inherit them.
+    strip_git_ambient_environment(os.environ)
+
     config_path_value = os.environ.get("LOCAL_MCP_CONFIG", "").strip()
     payload: dict[str, object] = {}
 
