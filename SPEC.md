@@ -53,6 +53,14 @@ Ordinary file reads do not take a mutation lock.
 
 Automatic execution uses complete subcommand grammars, not a first-token allowlist. Unknown flags, positional forms, config/output paths, or unsafe ambiguity are rejected and can be resubmitted through approval.
 
+The MCP surface is split after the deny-by-default grammar succeeds:
+
+- `execute_readonly`: safe Git reads, `flutter analyze`, `dart analyze`, and non-writing `dart format`.
+- `execute_workspace_write`: automatic commands intentionally modifying workspace source; currently writing `dart format`.
+- `adb_read`: only the fixed read-only ADB grammar.
+
+The split is presentation and host-policy metadata, not a second authorization system. All three call the same `CommandPolicy.normalize_safe()` and the same queue/executor path. A command routed to the wrong surface is rejected and directed to the matching tool.
+
 ### Git
 
 Automatic subcommands: `status`, `diff`, `log`, `show`, restricted `rev-parse`, and `ls-files`.
@@ -106,7 +114,7 @@ request_host_command
   -> ChatGPT poll_approval / poll_job
 ```
 
-`execute_approved` remains compatibility-only. It cannot claim an already consumed grant.
+`request_host_command` only stages local approval state and immutable inputs; it does not launch the requested process. Dangerous execution starts only from the local approval UI after the human approves it. There is no model-facing `execute_approved` tool, which avoids a second destructive/open-world MCP call after local approval.
 
 The approval hash covers normalized command, cwd, network flag, reason, risk, and manifest digest. The manifest covers:
 
@@ -186,10 +194,15 @@ Authenticated multi-principal HTTP is not implemented. Setting `http_multi_princ
 
 ## 11. MCP annotations
 
-- pure local reads: read-only, non-destructive, closed-world
-- file writes: non-read-only, destructive, closed-world
-- safe command multiplexer: non-read-only, potentially destructive/open-world because ADB is a possible configured backend
-- approval/general host action: non-read-only, destructive, open-world
-- polls: read-only
+Annotations describe the real action performed by each model-facing call:
 
-Annotations are host hints and never replace server-side enforcement.
+- pure local reads and `execute_readonly`: read-only, non-destructive, closed-world;
+- `adb_read`: read-only, non-destructive, closed-world;
+- `write_file` and `execute_workspace_write`: non-read-only, destructive, closed-world;
+- `request_host_command`: non-read-only, non-destructive, closed-world because it only creates an approval request and cannot launch the host command;
+- polls: read-only;
+- process-stop controls remain explicitly mutating/destructive where appropriate.
+
+The generic `execute`, `start_command`, and `execute_approved` surfaces are not exposed to MCP clients. This prevents one broad annotation from making read-only Git/analyze calls appear destructive and prevents a second model-facing dangerous execution step after local approval.
+
+Annotations are host hints and never replace server-side enforcement. The ChatGPT/MCP host may still apply its own confirmation policy.
