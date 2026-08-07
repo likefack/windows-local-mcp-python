@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from .config import Settings
 from .paths import Workspace
+from .tool_safety import ensure_external_tool_executable
 from .util import canonical_json, sha256_text
 
 
@@ -74,6 +75,21 @@ class CommandPolicy:
                 return str(Path(resolved).resolve())
         raise FileNotFoundError(f"executable was not found on PATH: {', '.join(candidates)}")
 
+    def _resolve_safe_executable(self, candidates: Sequence[str]) -> str:
+        executable = self._resolve_executable(candidates)
+        return ensure_external_tool_executable(
+            executable,
+            workspace_root=self.workspace.root,
+            data_dir=self.settings.data_dir,
+        )
+
+    def _require_workspace_git_root(self) -> None:
+        """Prevent automatic Git from discovering and reading a repository above workspace_root."""
+        if not (self.workspace.root / ".git").exists():
+            raise PermissionError(
+                "automatic Git requires workspace_root itself to be a Git worktree root"
+            )
+
     @staticmethod
     def _program_key(program: str) -> str:
         key = Path(program).name.casefold()
@@ -91,26 +107,27 @@ class CommandPolicy:
 
         if key == "git":
             self._require_enabled("git", self.settings.git_enabled)
+            self._require_workspace_git_root()
             normalized_args = self._normalize_git(args)
-            executable = self._resolve_executable(("git.exe", "git"))
+            executable = self._resolve_safe_executable(("git.exe", "git"))
             return self._result(executable, normalized_args, cwd_path, "git")
 
         if key == "flutter":
             self._require_enabled("flutter", self.settings.flutter_enabled)
             normalized_args = self._normalize_flutter(args)
-            executable = self._resolve_executable(("flutter.bat", "flutter.cmd", "flutter"))
+            executable = self._resolve_safe_executable(("flutter.bat", "flutter.cmd", "flutter"))
             return self._result(executable, normalized_args, cwd_path, "flutter")
 
         if key == "dart":
             self._require_enabled("dart", self.settings.dart_enabled)
             normalized_args = self._normalize_dart(args)
-            executable = self._resolve_executable(("dart.exe", "dart"))
+            executable = self._resolve_safe_executable(("dart.exe", "dart"))
             return self._result(executable, normalized_args, cwd_path, "dart")
 
         if key == "adb":
             self._require_enabled("adb", self.settings.adb_enabled)
             normalized_args = self._normalize_adb(args)
-            executable = self._resolve_executable(("adb.exe", "adb"))
+            executable = self._resolve_safe_executable(("adb.exe", "adb"))
             return self._result(executable, normalized_args, cwd_path, "adb")
 
         raise PermissionError(
@@ -206,6 +223,7 @@ class CommandPolicy:
         elif subcommand == "log":
             allowed = self.GIT_COMMON_FLAGS | {"--all", "--branches", "--tags"}
             normalized = self._git_revisions_flags_paths(tail, allowed, allow_count=True)
+            normalized = ["--no-ext-diff", "--no-textconv", *normalized]
         elif subcommand == "show":
             normalized = self._git_revisions_flags_paths(tail, self.GIT_COMMON_FLAGS)
             normalized = ["--no-ext-diff", "--no-textconv", *normalized]
@@ -259,7 +277,12 @@ class CommandPolicy:
             head, paths = values, []
         normalized_head: list[str] = []
         for value in head:
-            if value in allowed or (allow_count and self.SAFE_LOG_COUNT.fullmatch(value)) or self.SAFE_REVISION.fullmatch(value) and not value.startswith("-"):
+            if (
+                value in allowed
+                or (allow_count and self.SAFE_LOG_COUNT.fullmatch(value))
+                or self.SAFE_REVISION.fullmatch(value)
+                and not value.startswith("-")
+            ):
                 normalized_head.append(value)
             else:
                 raise PermissionError("Git revision or option is not in the safe grammar")
@@ -270,7 +293,13 @@ class CommandPolicy:
     def _normalize_flutter(self, args: list[str]) -> list[str]:
         if args[0].casefold() != "analyze":
             raise PermissionError(f"flutter {args[0]} loads or executes code and requires approval")
-        allowed_flags = {"--fatal-infos", "--fatal-warnings", "--no-fatal-infos", "--no-fatal-warnings", "--no-pub"}
+        allowed_flags = {
+            "--fatal-infos",
+            "--fatal-warnings",
+            "--no-fatal-infos",
+            "--no-fatal-warnings",
+            "--no-pub",
+        }
         flags: list[str] = []
         paths: list[str] = []
         for value in args[1:]:
