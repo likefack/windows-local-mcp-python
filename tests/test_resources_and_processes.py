@@ -1,13 +1,18 @@
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 from windows_local_mcp.audit import AuditStore
 from windows_local_mcp.config import Settings
 from windows_local_mcp.executor import Executor
 from windows_local_mcp.process_utils import ProcessIdentity, terminate_process_tree
-from windows_local_mcp.resources import BoundedStreamCapture, enforce_data_quota
+from windows_local_mcp.resources import (
+    BoundedStreamCapture,
+    WorkspaceExecutionLock,
+    enforce_data_quota,
+)
 
 
 def make_settings(tmp_path: Path) -> Settings:
@@ -85,3 +90,49 @@ def test_data_dir_quota_rejects_additional_artifacts(tmp_path: Path) -> None:
         assert "quota exceeded" in str(error)
     else:
         raise AssertionError("data_dir quota must reject additional bytes")
+
+
+def test_target_write_lock_allows_different_targets_and_blocks_conflicts(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    target_a = settings.workspace_root / "a.txt"
+    target_b = settings.workspace_root / "b.txt"
+    counter = 0
+    while WorkspaceExecutionLock._target_slot(target_a) == WorkspaceExecutionLock._target_slot(
+        target_b
+    ):
+        counter += 1
+        target_b = settings.workspace_root / f"b-{counter}.txt"
+
+    def attempt(lock: WorkspaceExecutionLock, result: list[str]) -> None:
+        try:
+            with lock:
+                result.append("acquired")
+        except TimeoutError:
+            result.append("timeout")
+
+    with WorkspaceExecutionLock(settings, target=target_a):
+        # A different canonical target maps to a different slot and can proceed immediately.
+        with WorkspaceExecutionLock(settings, target=target_b, timeout=0.5):
+            pass
+
+        same_target_result: list[str] = []
+        same_target_thread = threading.Thread(
+            target=attempt,
+            args=(WorkspaceExecutionLock(settings, target=target_a, timeout=0.2), same_target_result),
+        )
+        same_target_thread.start()
+        same_target_thread.join(timeout=2)
+        assert same_target_result == ["timeout"]
+
+        workspace_result: list[str] = []
+        workspace_thread = threading.Thread(
+            target=attempt,
+            args=(WorkspaceExecutionLock(settings, timeout=0.2), workspace_result),
+        )
+        workspace_thread.start()
+        workspace_thread.join(timeout=2)
+        assert workspace_result == ["timeout"]
+
+    # Once the target write finishes, a workspace-wide writer can acquire every slot.
+    with WorkspaceExecutionLock(settings, timeout=0.5):
+        pass
