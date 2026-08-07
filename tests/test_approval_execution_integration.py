@@ -9,6 +9,7 @@ from windows_local_mcp.config import Settings
 from windows_local_mcp.executor import Executor
 from windows_local_mcp.paths import Workspace
 from windows_local_mcp.policy import NormalizedCommand
+from windows_local_mcp.resources import WorkspaceExecutionLock
 
 
 def _write_config(workspace: Path, data: Path, config: Path) -> None:
@@ -50,7 +51,7 @@ def _prepare_operation(
         display_command=[sys.executable, "main.py"],
         program_key="python",
     )
-    _, _, digest = prepare_approval_bundle(
+    _, manifest, digest = prepare_approval_bundle(
         settings=settings,
         workspace=Workspace(settings),
         operation_id=operation_id,
@@ -66,6 +67,8 @@ def _prepare_operation(
         request={
             "normalized_command": command.model_dump(),
             "approval_manifest_digest": digest,
+            "approval_manifest_summary": {"mode": manifest["mode"]},
+            "workspace_write": False,
             "max_runtime_seconds": 30,
         },
         approval_status="pending",
@@ -101,6 +104,40 @@ def test_local_approval_launches_immutable_snapshot_once(
     assert store.get_operation("approval-execution-integration")["claimed_at"] is not None
     assert os.path.exists(result["stdout_path"])
     assert settings.data_dir == data.resolve()
+
+
+def test_snapshot_execution_does_not_wait_for_workspace_write_lock(
+    tmp_path: Path, monkeypatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    data = tmp_path / "data"
+    config = tmp_path / "config.toml"
+    _write_config(workspace, data, config)
+    monkeypatch.setenv("LOCAL_MCP_CONFIG", str(config))
+    monkeypatch.delenv("LOCAL_MCP_ROOT", raising=False)
+
+    settings, store, executor = _prepare_operation(
+        workspace=workspace,
+        data=data,
+        operation_id="snapshot-with-workspace-lock-held",
+        script_text="print('SNAPSHOT RUNS INDEPENDENTLY')",
+    )
+    store.approve_and_claim("snapshot-with-workspace-lock-held", approver="integration-test")
+
+    # Simulate an unrelated workspace write that holds the exclusive mutation lock.
+    # Snapshot-backed execution works only from data_dir, so it must not wait for this lock.
+    with WorkspaceExecutionLock(settings):
+        result = executor.launch("snapshot-with-workspace-lock-held", 5)
+
+    assert result["status"] == "succeeded"
+    assert "SNAPSHOT RUNS INDEPENDENTLY" in result["stdout_preview"]
+    operation = store.get_operation("snapshot-with-workspace-lock-held")
+    assert any(
+        event["event_type"] == "workspace_lock_selected"
+        and event["payload"].get("mode") == "none"
+        for event in operation["events"]
+    )
 
 
 def test_expired_claim_is_rejected_immediately_before_child_start(
