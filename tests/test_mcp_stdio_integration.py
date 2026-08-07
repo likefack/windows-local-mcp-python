@@ -119,7 +119,7 @@ def test_real_stdio_tools_list_and_file_round_trip(tmp_path: Path) -> None:
             approval = await session.call_tool(
                 "request_host_command",
                 {
-                    "command": ["git", "status", "--short"],
+                    "command": [sys.executable, "-c", "print('approval request only')"],
                     "reason": "verify request-only MCP behavior",
                     "risk_summary": "test request must not launch a child process",
                 },
