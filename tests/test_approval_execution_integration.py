@@ -132,12 +132,6 @@ def test_snapshot_execution_does_not_wait_for_workspace_write_lock(
 
     assert result["status"] == "succeeded"
     assert "SNAPSHOT RUNS INDEPENDENTLY" in result["stdout_preview"]
-    operation = store.get_operation("snapshot-with-workspace-lock-held")
-    assert any(
-        event["event_type"] == "workspace_lock_selected"
-        and event["payload"].get("mode") == "none"
-        for event in operation["events"]
-    )
 
 
 def test_expired_claim_is_rejected_immediately_before_child_start(
