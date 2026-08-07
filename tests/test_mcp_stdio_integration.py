@@ -63,6 +63,7 @@ def test_real_stdio_tools_list_and_file_round_trip(tmp_path: Path) -> None:
                 "adb_read",
                 "request_host_command",
                 "poll_approval",
+                "audit_get",
             } <= tools.keys()
             assert {"execute", "start_command", "execute_approved"}.isdisjoint(tools.keys())
 
@@ -114,5 +115,28 @@ def test_real_stdio_tools_list_and_file_round_trip(tmp_path: Path) -> None:
                 {"program": "git", "args": ["status", "--short"]},
             )
             assert wrong_surface.is_error
+
+            approval = await session.call_tool(
+                "request_host_command",
+                {
+                    "command": ["git", "status", "--short"],
+                    "reason": "verify request-only MCP behavior",
+                    "risk_summary": "test request must not launch a child process",
+                },
+            )
+            assert not approval.is_error
+            assert approval.structured_content is not None
+            assert approval.structured_content["status"] == "pending"
+            approval_id = approval.structured_content["approval_id"]
+
+            approval_record = await session.call_tool(
+                "audit_get", {"operation_id": approval_id}
+            )
+            assert not approval_record.is_error
+            assert approval_record.structured_content is not None
+            assert approval_record.structured_content["status"] == "pending_approval"
+            assert approval_record.structured_content["approval_status"] == "pending"
+            assert approval_record.structured_content["worker_pid"] is None
+            assert approval_record.structured_content["child_pid"] is None
 
     anyio.run(exercise)
