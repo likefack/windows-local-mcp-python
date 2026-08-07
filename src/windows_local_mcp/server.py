@@ -13,8 +13,14 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver import Image
 from mcp.types import ToolAnnotations
 
-from .approval import prepare_approval_bundle, verify_approval_bundle
+from .approval import prepare_approval_bundle
 from .audit import AuditStore
+from .command_traits import (
+    SafeExecutionKind,
+    classify_safe_execution,
+    dart_format_writes,
+    recommended_tool,
+)
 from .config import Settings, load_settings
 from .executor import Executor
 from .git_snapshot import capture_git_snapshot
@@ -29,11 +35,8 @@ READ_ONLY = ToolAnnotations(
 LOCAL_WRITE = ToolAnnotations(
     readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False
 )
-HOST_ACTION = ToolAnnotations(
-    readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True
-)
-SAFE_EXECUTION = ToolAnnotations(
-    readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True
+APPROVAL_REQUEST = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False
 )
 CONTROL = ToolAnnotations(
     readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False
@@ -55,9 +58,11 @@ mcp = MCPServer(
     "Windows Local MCP",
     version="0.3.0",
     instructions=(
-        "Operate inside the configured workspace. Use execute only for its validated low-risk "
-        "grammars. Test/build/general shell/destructive ADB require request_host_command and "
-        "local approval. After local approval, poll_approval or poll_job; do not execute twice."
+        "Operate inside the configured workspace. Use execute_readonly for safe Git/analyze "
+        "operations, execute_workspace_write for constrained automatic source formatting, and "
+        "adb_read for fixed read-only emulator operations. Test/build/general shell/destructive "
+        "ADB require request_host_command and local approval. request_host_command only stages "
+        "the request; local approval performs the dangerous execution once. Poll the result."
     ),
     log_level="INFO",
 )
@@ -146,6 +151,11 @@ def session_info() -> dict[str, Any]:
         },
         "adb_emulator_only": runtime.settings.adb_emulator_only,
         "approval_flow": "request -> local approve-and-run -> poll",
+        "automatic_tools": {
+            "read_only": "execute_readonly",
+            "workspace_write": "execute_workspace_write",
+            "adb_read": "adb_read",
+        },
         "transport": "stdio by default; optional loopback-only streamable-http",
     }
     result["operation_id"] = _log_simple(tool_name="session_info", request={}, result=result)
@@ -415,11 +425,7 @@ def _queue_command(
     if normalized_model.program_key in {"flutter", "dart"}:
         dart_writes = (
             normalized_model.program_key == "dart"
-            and normalized_model.args[0] == "format"
-            and not any(
-                value in {"--show", "--output=show", "--output=none"}
-                for value in normalized_model.args
-            )
+            and dart_format_writes(normalized_model.args)
         )
         with WorkspaceExecutionLock(runtime.settings):
             _, _, execution_manifest_digest = prepare_approval_bundle(
@@ -446,20 +452,26 @@ def _queue_command(
     return runtime.executor.launch(operation_id, timeout)
 
 
-@mcp.tool(annotations=SAFE_EXECUTION)
-def execute(
+def _run_automatic_tool(
+    *,
+    tool_name: str,
+    expected_kind: SafeExecutionKind,
     program: str,
     args: list[str],
-    cwd: str = ".",
-    foreground_timeout_seconds: int | None = None,
-    max_runtime_seconds: int | None = None,
+    cwd: str,
+    foreground_timeout_seconds: int | None,
+    max_runtime_seconds: int | None,
 ) -> dict[str, Any]:
-    """Execute only a fully validated low-risk command grammar."""
     request = {"program": program, "args": args, "cwd": cwd}
     try:
         normalized = runtime.policy.normalize_safe(program=program, args=args, cwd=cwd)
+        actual_kind = classify_safe_execution(normalized)
+        if actual_kind != expected_kind:
+            raise PermissionError(
+                f"command belongs to {recommended_tool(actual_kind)}, not {tool_name}"
+            )
         return _queue_command(
-            tool_name="execute",
+            tool_name=tool_name,
             tier="safe_command",
             normalized_command=normalized.model_dump(),
             safe_request=request,
@@ -475,36 +487,67 @@ def execute(
             ),
         )
     except Exception as error:
-        _audit_rejection("execute", request, error)
+        _audit_rejection(tool_name, request, error)
         raise
 
 
-@mcp.tool(annotations=SAFE_EXECUTION)
-def start_command(
+@mcp.tool(annotations=READ_ONLY)
+def execute_readonly(
     program: str,
     args: list[str],
     cwd: str = ".",
+    foreground_timeout_seconds: int | None = None,
     max_runtime_seconds: int | None = None,
 ) -> dict[str, Any]:
-    """Start a validated low-risk command as a bounded background job."""
-    request = {"program": program, "args": args, "cwd": cwd}
-    try:
-        normalized = runtime.policy.normalize_safe(program=program, args=args, cwd=cwd)
-        return _queue_command(
-            tool_name="start_command",
-            tier="safe_command",
-            normalized_command=normalized.model_dump(),
-            safe_request=request,
-            foreground_timeout_seconds=0,
-            max_runtime_seconds=(
-                runtime.settings.default_max_runtime_seconds
-                if max_runtime_seconds is None
-                else max_runtime_seconds
-            ),
-        )
-    except Exception as error:
-        _audit_rejection("start_command", request, error)
-        raise
+    """Run validated read-only Git/Flutter/Dart commands; use timeout 0 for a background job."""
+    return _run_automatic_tool(
+        tool_name="execute_readonly",
+        expected_kind=SafeExecutionKind.READ_ONLY,
+        program=program,
+        args=args,
+        cwd=cwd,
+        foreground_timeout_seconds=foreground_timeout_seconds,
+        max_runtime_seconds=max_runtime_seconds,
+    )
+
+
+@mcp.tool(annotations=LOCAL_WRITE)
+def execute_workspace_write(
+    program: str,
+    args: list[str],
+    cwd: str = ".",
+    foreground_timeout_seconds: int | None = None,
+    max_runtime_seconds: int | None = None,
+) -> dict[str, Any]:
+    """Run only validated automatic commands that intentionally modify workspace source files."""
+    return _run_automatic_tool(
+        tool_name="execute_workspace_write",
+        expected_kind=SafeExecutionKind.WORKSPACE_WRITE,
+        program=program,
+        args=args,
+        cwd=cwd,
+        foreground_timeout_seconds=foreground_timeout_seconds,
+        max_runtime_seconds=max_runtime_seconds,
+    )
+
+
+@mcp.tool(annotations=READ_ONLY)
+def adb_read(
+    args: list[str],
+    cwd: str = ".",
+    foreground_timeout_seconds: int | None = None,
+    max_runtime_seconds: int | None = None,
+) -> dict[str, Any]:
+    """Run only the fixed read-only ADB grammar against an allowed emulator target."""
+    return _run_automatic_tool(
+        tool_name="adb_read",
+        expected_kind=SafeExecutionKind.ADB_READ,
+        program="adb",
+        args=args,
+        cwd=cwd,
+        foreground_timeout_seconds=foreground_timeout_seconds,
+        max_runtime_seconds=max_runtime_seconds,
+    )
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -555,7 +598,7 @@ def poll_job(job_id: str) -> dict[str, Any]:
 
 @mcp.tool(annotations=READ_ONLY)
 def get_adb_screenshot(job_id: str) -> Image:
-    """Return the bounded PNG produced by an approved safe emulator screenshot job."""
+    """Return the bounded PNG produced by a successful safe emulator screenshot job."""
     request = {"job_id": job_id}
     try:
         operation = runtime.audit.get_operation(job_id, include_events=False)
@@ -595,7 +638,7 @@ def stop_job(job_id: str) -> dict[str, Any]:
         raise
 
 
-@mcp.tool(annotations=HOST_ACTION)
+@mcp.tool(annotations=APPROVAL_REQUEST)
 def request_host_command(
     command: list[str],
     cwd: str = ".",
@@ -605,7 +648,7 @@ def request_host_command(
     workspace_write: bool = False,
     max_runtime_seconds: int | None = None,
 ) -> dict[str, Any]:
-    """Stage an immutable, expiring host-command request for local approve-and-run."""
+    """Stage an immutable approval request; this tool never launches the requested host command."""
     request_input = {
         "command": command,
         "cwd": cwd,
@@ -675,7 +718,7 @@ def request_host_command(
             "status": "pending",
             "request_hash": request_hash,
             "expires_at": request_expires_at,
-            "message": "A local user may approve and launch it once; poll_approval for the result.",
+            "message": "Local approval may execute it once; poll_approval for status/result.",
         }
     except Exception as error:
         _audit_rejection("request_host_command", request_input, error)
@@ -706,43 +749,6 @@ def poll_approval(approval_id: str) -> dict[str, Any]:
         return result
     except Exception as error:
         _audit_rejection("poll_approval", {"approval_id": approval_id}, error)
-        raise
-
-
-@mcp.tool(annotations=HOST_ACTION)
-def execute_approved(
-    approval_id: str, foreground_timeout_seconds: int | None = None
-) -> dict[str, Any]:
-    """Compatibility path; normal local approval already launches exactly once."""
-    request = {"approval_id": approval_id}
-    try:
-        operation = runtime.audit.get_operation(approval_id, include_events=False)
-        if operation["status"] in {"queued", "running", "succeeded", "failed", "timed_out"}:
-            return runtime.executor.poll(approval_id)
-        normalized = NormalizedCommand.model_validate(operation["request"]["normalized_command"])
-        manifest_digest = operation["request"]["approval_manifest_digest"]
-        expected_hash = approval_hash(
-            normalized=normalized,
-            reason=operation["request"].get("reason", ""),
-            risk_summary=operation["request"].get("risk_summary", ""),
-            manifest_digest=manifest_digest,
-        )
-        if expected_hash != operation.get("request_hash"):
-            raise RuntimeError("approved request hash mismatch")
-        verify_approval_bundle(
-            settings=runtime.settings,
-            operation_id=approval_id,
-            expected_digest=manifest_digest,
-        )
-        runtime.audit.claim_approved(approval_id)
-        return runtime.executor.launch(
-            approval_id,
-            runtime.settings.default_foreground_timeout_seconds
-            if foreground_timeout_seconds is None
-            else foreground_timeout_seconds,
-        )
-    except Exception as error:
-        _audit_rejection("execute_approved", request, error)
         raise
 
 
