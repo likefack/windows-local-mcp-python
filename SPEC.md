@@ -1,79 +1,176 @@
-# Windows Local MCP 仕様
+# Windows Local MCP Security Specification
 
-## 1. 目的
+## 1. Scope and trust model
 
-ChatGPTなどのMCPホストが、Windows上の現在のローカル作業ツリーを直接読み、変更し、検証できるようにする。
+One server process represents exactly one explicitly configured `workspace_root`. The MCP client controls tool arguments and may modify ordinary workspace files. The Windows account, installed OS/toolchains, `data_dir`, and the local approver are trusted. The process must not run as Administrator.
 
-GitHub上の別コピーを編集する方式と異なり、未コミット変更を含む実際の作業状態を対象にする。
+Security objectives:
 
-## 2. 非目的
+1. No direct workspace escape through file paths or automatic command operands.
+2. No arbitrary host/device code execution in the automatic tier.
+3. Approval binds every MCP-influenceable behavior input and is fresh, atomic, one-shot.
+4. Audit/output/storage remain bounded and outside the workspace.
+5. Process cancellation never trusts a recyclable PID alone.
+6. Low-risk development operations remain automatic.
 
-- Decision Deck本体の機能をこのリポジトリへ実装しない
-- ChatGPTの内部メモリを直接更新しない
-- Windows全体を無制限に操作させない
-- OSレベルの完全なサンドボックスを提供したと主張しない
+## 2. Capability switches
 
-## 3. 権限モデル
+`filesystem_enabled`, `git_enabled`, `flutter_enabled`, `dart_enabled`, `adb_enabled`, and `powershell_enabled` are independent. Disabled optional tools are not resolved at startup. `workspace_root` is mandatory; there is no current-directory fallback.
 
-### Tier 0: 読み取り
+Dangerous configuration combinations fail startup validation:
 
-`session_info`、`list_directory`、`read_file`、`get_image`、`audit_list`、`audit_get`
+- lexical or resolved overlap between `workspace_root` and `data_dir`
+- workspace/data root reparse points
+- non-loopback unauthenticated HTTP
+- multi-principal HTTP without authenticated ownership enforcement
+- PowerShell safe-script configuration while PowerShell is disabled
 
-### Tier 1: 制限付き自動実行
+## 3. Filesystem broker
 
-`write_file`、`execute`、`start_command`、`poll_job`、`stop_job`
+All MCP file paths pass through `Workspace`.
 
-`execute` は許可リストに登録されたプログラムとサブコマンドだけを実行する。
+- Reject absolute, drive-qualified, UNC, ADS, reserved device, trailing-dot/space, and NUL paths.
+- Resolve every existing component and reject workspace escape.
+- Reject symlink, junction, mount/reparse components.
+- Reject regular files with `st_nlink > 1`.
+- Apply protected-name, read-denied, and write-denied policy separately.
+- Keep `.git` directly unreadable/unwritable; obtain state only through Git subprocesses.
 
-### Tier 2: 人間承認
+`write_file` additionally:
 
-`request_host_command`、`poll_approval`、`execute_approved`
+1. takes a cross-process workspace execution lock and canonical-target thread lock;
+2. re-resolves target and reads/checks expected SHA inside the locks;
+3. enforces old/new/diff/backup/data quotas before replacement;
+4. writes and fsyncs a same-directory temporary file;
+5. revalidates parent `(device,inode)` and target full identity immediately before `os.replace`;
+6. verifies resulting SHA.
 
-任意PowerShell、ネットワークアクセス、削除、プロセス操作などはこの経路へ送る。
+## 4. Automatic command tier
 
-承認対象は正規化JSONからSHA-256を作り、承認後の差し替えを拒否する。
+Automatic execution uses complete subcommand grammars, not a first-token allowlist. Unknown flags, positional forms, config/output paths, or unsafe ambiguity are rejected and can be resubmitted through approval.
 
-## 4. executeの設計
+### Git
 
-`execute` は自由なシェルではない。次を共通化する。
+Automatic subcommands: `status`, `diff`, `log`, `show`, restricted `rev-parse`, and `ls-files`.
 
-- 実行ファイルの解決
-- 作業ディレクトリ制限
-- 入力検証
-- プロセス起動
-- stdout / stderr回収
-- タイムアウト
-- バックグラウンド化
-- 停止
-- Git状態取得
-- 監査ログ
+- Force no pager; diff/show force `--no-ext-diff --no-textconv`.
+- Disallow `-C`, `--git-dir`, `--work-tree`, `--output`, config injection, pager/external helpers, and unknown flags.
+- Pathspec is accepted only after `--` and resolved inside workspace.
+- `git_info` returns branch, HEAD, status, working diff, staged diff, recent log, and changed files through bounded subprocess capture.
 
-push、deploy、delete、外部送信、本番DB変更などは専用ツール化すべきである。
+### Flutter and Dart
 
-## 5. ジョブ管理
+- `flutter analyze` only; force `--no-pub` and validate every explicit path.
+- `dart analyze` and constrained `dart format` only.
+- `flutter test/build/run` and `dart test/run/compile` are never automatic.
+- analyze is executed from a fixed snapshot; format that writes uses full source manifest plus the execution lock.
 
-コマンドは専用workerプロセスで実行する。
+### ADB
 
-- 受付時点でSQLiteへ `queued`
-- worker開始時に `running`
-- 30秒以内に終了すれば同期結果
-- 30秒を超えれば `job_id`
-- 終了時に `succeeded` または `failed`
-- 最大実行時間超過時に `timed_out`
-- stop_jobで `cancelled`
+ADB is separately disabled by default. Automatic forms are exact:
 
-## 6. 監査ログ
+- `adb devices [-l]`
+- `adb -s SERIAL get-state`
+- fixed read-only `getprop`, `wm`, and `dumpsys` forms
+- `adb -s SERIAL exec-out screencap -p`
 
-操作要求を受信した時点でDBへ記録する。
+Targeted calls require serial validation. `adb_emulator_only=true` requires an `emulator-*` serial and a successful `adb emu avd name` preflight. Optional `adb_allowed_serials` further narrows targets. General shell and state changes require approval.
 
-ファイル編集は変更前後SHA、unified diff、バックアップを保存する。
+## 5. Approval and immutable execution
 
-コマンドはargv、cwd、stdout、stderr、終了コード、実行前後のGit状態を保存する。
+Preferred flow:
 
-## 7. セキュリティ上の限界
+```text
+request_host_command
+  -> pending immutable manifest with request TTL
+  -> local UI verifies and atomically approve+claims
+  -> MCP worker runs fixed content once
+  -> ChatGPT poll_approval / poll_job
+```
 
-- Windowsのネットワーク隔離は未実装
-- 管理者権限で起動しない
-- 作業フォルダに秘密鍵や本番資格情報を置かない
-- PowerShellの任意実行は必ず承認経路
-- 監査DB自体への悪意あるローカル改ざんは防げない
+`execute_approved` remains compatibility-only. It cannot claim an already consumed grant.
+
+The approval hash covers normalized command, cwd, network flag, reason, risk, and manifest digest. The manifest covers:
+
+- main executable bytes and filesystem identity;
+- complete argv;
+- effective Settings digest;
+- relevant environment digest;
+- every regular file in the MCP-influenceable execution scope;
+- external regular-file operands where complete binding is possible;
+- Dart/Flutter package closure resolved from `package_config.json`;
+- Git HEAD/status/working diff/staged diff for Git host operations.
+
+### Snapshot mode
+
+Code-loading commands that do not need to mutate the source run from an immutable copy of their `cwd`. Paths outside `cwd` are not reachable through the original workspace because:
+
+- standalone workspace paths are rewritten to the copy;
+- embedded workspace paths and external code-loader paths are rejected;
+- symlink/junction/reparse/hardlink entries are rejected;
+- MCP configuration variables and language/module injection variables are removed from the child environment;
+- HOME/USERPROFILE/APPDATA/LOCALAPPDATA/TEMP/PUB_CACHE point to an operation-local runtime directory;
+- file-based Dart/Flutter package dependencies outside `cwd` are copied and `package_config.json` is rewritten;
+- non-file or non-enumerable dependencies fail closed.
+
+The immutable copy is verified after local approval. The worker then creates a separate writable disposable run copy, so build artifacts cannot mutate the approved input copy. Unrelated workspace changes outside the approved `cwd` do not invalidate snapshot execution.
+
+Installed OS/toolchains are the trusted computing base. Their primary executable is content-bound. Complete OS DLL/toolchain virtualization is not provided.
+
+### Source-write mode
+
+Commands intended to mutate the original workspace require `workspace_write=true`. The complete workspace (excluding direct `.git` bytes) is manifested, all source files are revalidated, and execution occurs while holding the same cross-process lock used by `write_file`. Any workspace addition, deletion, or content change after request invalidates approval.
+
+Git host operations additionally bind Git state obtained through Git. Direct `.git` MCP access remains prohibited.
+
+### Expiry and one-shot semantics
+
+- Pending request expiry is stored in `request_expires_at` and enforced by SQL predicates.
+- Separately approved compatibility grants have `approval_expires_at`.
+- Local approve-and-run performs approval and `claimed_at` assignment in one transaction.
+- Claim predicates require the correct status, future expiry, and `claimed_at IS NULL`.
+
+## 6. Process lifecycle
+
+Executor creates a random nonce inherited by worker and child. Durable identity contains PID, process creation time, executable path, and nonce. `stop_job` terminates only if all identity fields still match. A mismatch marks the job `interrupted` without killing a process. Server startup reconciles stale queued/running rows the same way.
+
+On Windows, processes use a new process group and no window. On other platforms they use a new session. This is lifecycle control, not an OS sandbox.
+
+## 7. Resource limits and retention
+
+- file read/write/image/directory entry limits;
+- pre-replacement backup and streamed diff limits;
+- command count/argument/reason limits;
+- approval file-count/byte limits;
+- stdout/stderr pipes drained by bounded head/tail collectors;
+- bounded Git snapshots;
+- total `data_dir` quota;
+- age and terminal-operation-count retention.
+
+Retention deletes only known artifact roots and skips artifacts whose operation is nonterminal.
+
+## 8. Audit
+
+All important MCP boundary actions create operations/events, including rejection before normalization, job poll/stop, approval poll/claim, audit access, timeout, stale identity, and startup reconciliation. Secret-like fields are redacted; file content is represented by byte count and SHA. stdout/stderr and full file content are never copied into unbounded audit fields.
+
+## 9. data_dir protection
+
+`data_dir` is resolved independently and must not lexically or effectively overlap workspace. Both roots must not be reparse points. On Windows, `protect_data_dir_acl=true` removes inherited ACLs and grants Full Control only to the current token SID and SYSTEM.
+
+ACL cannot distinguish two processes running as the same Windows user. MCP filesystem tools still cannot reach `data_dir` because it is outside workspace, and artifact paths are validated before special retrieval such as ADB screenshots.
+
+## 10. Transport and ownership
+
+Default transport is stdio. Streamable HTTP is disabled unless `http_enabled=true`, and only loopback hosts are accepted.
+
+Authenticated multi-principal HTTP is not implemented. Setting `http_multi_principal_enabled=true` fails startup. Therefore no supported configuration exposes globally shared job/approval/audit identifiers to distinct authenticated principals. A future implementation must persist `principal_id` on every operation and include it in every create/get/list/poll/claim/execute/cancel/audit SQL predicate.
+
+## 11. MCP annotations
+
+- pure local reads: read-only, non-destructive, closed-world
+- file writes: non-read-only, destructive, closed-world
+- safe command multiplexer: non-read-only, potentially destructive/open-world because ADB is a possible configured backend
+- approval/general host action: non-read-only, destructive, open-world
+- polls: read-only
+
+Annotations are host hints and never replace server-side enforcement.

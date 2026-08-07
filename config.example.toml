@@ -1,16 +1,49 @@
-workspace_root = "C:\\dev\\decision-deck"
+# Required. Copy this file to config.toml and set one concrete project directory.
+# Run one MCP instance per workspace/profile rather than granting a broad parent directory.
+workspace_root = "C:\\path\\to\\your-project"
 
-# 省略時は %LOCALAPPDATA%\WindowsLocalMCP
+# Empty uses %LOCALAPPDATA%\WindowsLocalMCP. It must not overlap workspace_root.
 data_dir = ""
 
+# Capability switches. Disabled tools are not resolved at startup.
+filesystem_enabled = true
+git_enabled = true
+flutter_enabled = false
+dart_enabled = false
+adb_enabled = false
+powershell_enabled = false
+
+# ADB is a separate target boundary. The safe default accepts emulator-* serials only.
+adb_emulator_only = true
+adb_allowed_serials = []
+
+# File and artifact limits.
 max_text_file_bytes = 2097152
+max_write_bytes = 2097152
+max_diff_bytes = 4194304
+max_backup_bytes = 16777216
 max_image_bytes = 10485760
+max_output_bytes_per_stream = 16777216
+max_data_dir_bytes = 536870912
 max_directory_entries = 3000
-approval_ttl_seconds = 1800
+output_preview_characters = 12000
+max_command_arguments = 64
+max_command_argument_characters = 1024
+max_reason_characters = 4000
+max_audit_record_bytes = 131072
+retention_days = 14
+retention_max_operations = 2000
+
+# Approval requests expire before review; an approved grant has a shorter one-shot TTL.
+approval_request_ttl_seconds = 1800
+approval_execution_ttl_seconds = 60
+approval_manifest_max_files = 10000
+approval_manifest_max_bytes = 268435456
 default_foreground_timeout_seconds = 30
 default_max_runtime_seconds = 1800
-output_preview_characters = 12000
+default_approver = "local-user"
 
+# Protected file names are denied for direct read and write.
 blocked_file_names = [
   ".env",
   ".env.local",
@@ -21,7 +54,8 @@ blocked_file_names = [
   "service-account.json",
 ]
 
-excluded_directories = [
+# Hidden means omitted from directory listings, not automatically unreadable.
+hidden_directories = [
   ".git",
   ".dart_tool",
   "build",
@@ -30,11 +64,25 @@ excluded_directories = [
   "__pycache__",
 ]
 
-# 通常のexecuteで許可するPowerShellスクリプト。
-# 任意の -Command は許可されません。
-safe_powershell_scripts = [
-  # "scripts\\doctor.ps1",
-  # "scripts\\verify-android.ps1",
+# Direct .git access stays denied; Git state is available through git_info/safe Git commands.
+read_denied_directories = [".git"]
+
+# Generated/dependency trees are read-compatible but not directly writable by default.
+write_denied_directories = [
+  ".git",
+  ".dart_tool",
+  "build",
+  "node_modules",
+  ".venv",
+  "__pycache__",
 ]
 
-default_approver = "local-user"
+# Streamable HTTP is off by default. When enabled, only loopback hosts are accepted.
+http_enabled = false
+http_host = "127.0.0.1"
+http_port = 8000
+# This release deliberately rejects true: authenticated principal ownership is not implemented.
+http_multi_principal_enabled = false
+
+# On Windows, remove inherited ACLs and grant the current user and SYSTEM full control.
+protect_data_dir_acl = true

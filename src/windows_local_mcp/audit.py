@@ -4,11 +4,12 @@ import json
 import sqlite3
 import threading
 import uuid
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from .config import Settings
+from .resources import prune_artifacts
 from .util import canonical_json, utc_now_iso
-
 
 TERMINAL_STATUSES = {
     "succeeded",
@@ -17,6 +18,7 @@ TERMINAL_STATUSES = {
     "timed_out",
     "rejected",
     "expired",
+    "interrupted",
 }
 
 
@@ -26,6 +28,8 @@ class AuditStore:
         self.db_path = settings.data_dir / "audit.db"
         self._lock = threading.RLock()
         self._init_db()
+        self._prune_database()
+        prune_artifacts(settings, protected_ids=self._protected_operation_ids())
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path, timeout=30)
@@ -54,10 +58,18 @@ class AuditStore:
                     approval_by TEXT,
                     approval_note TEXT,
                     approved_at TEXT,
+                    request_expires_at TEXT,
+                    approval_expires_at TEXT,
+                    claimed_at TEXT,
                     started_at TEXT,
                     finished_at TEXT,
                     worker_pid INTEGER,
+                    worker_create_time REAL,
+                    worker_executable TEXT,
                     child_pid INTEGER,
+                    child_create_time REAL,
+                    child_executable TEXT,
+                    process_nonce TEXT,
                     exit_code INTEGER,
                     stdout_path TEXT,
                     stderr_path TEXT,
@@ -90,6 +102,50 @@ class AuditStore:
                     ON events(operation_id, id);
                 """
             )
+            existing = {
+                row["name"] for row in db.execute("PRAGMA table_info(operations)").fetchall()
+            }
+            migrations = {
+                "request_expires_at": "TEXT",
+                "approval_expires_at": "TEXT",
+                "claimed_at": "TEXT",
+                "worker_create_time": "REAL",
+                "worker_executable": "TEXT",
+                "child_create_time": "REAL",
+                "child_executable": "TEXT",
+                "process_nonce": "TEXT",
+            }
+            for name, sql_type in migrations.items():
+                if name not in existing:
+                    db.execute(f"ALTER TABLE operations ADD COLUMN {name} {sql_type}")
+
+    def _prune_database(self) -> None:
+        with self._lock, self._connect() as db:
+            keep = self.settings.retention_max_operations
+            stale_rows = db.execute(
+                """
+                SELECT id FROM operations
+                WHERE status IN ('succeeded','failed','cancelled','timed_out','rejected','expired','interrupted')
+                ORDER BY created_at DESC LIMIT -1 OFFSET ?
+                """,
+                (keep,),
+            ).fetchall()
+            stale = [row["id"] for row in stale_rows]
+            if stale:
+                placeholders = ",".join("?" for _ in stale)
+                db.execute(f"DELETE FROM events WHERE operation_id IN ({placeholders})", stale)
+                db.execute(f"DELETE FROM operations WHERE id IN ({placeholders})", stale)
+
+    def _protected_operation_ids(self) -> set[str]:
+        with self._connect() as db:
+            rows = db.execute(
+                """
+                SELECT id FROM operations
+                WHERE status NOT IN ('succeeded','failed','cancelled','timed_out',
+                                     'rejected','expired','interrupted')
+                """
+            ).fetchall()
+        return {str(row["id"]) for row in rows}
 
     def create_operation(
         self,
@@ -102,16 +158,22 @@ class AuditStore:
         request_hash: str | None = None,
         approval_status: str | None = None,
         session_id: str | None = None,
+        operation_id: str | None = None,
+        request_expires_at: str | None = None,
     ) -> str:
-        operation_id = str(uuid.uuid4())
+        operation_id = operation_id or str(uuid.uuid4())
         now = utc_now_iso()
+        request_json = canonical_json(request)
+        if len(request_json.encode("utf-8")) > self.settings.max_audit_record_bytes:
+            raise ValueError("audit request exceeds max_audit_record_bytes")
         with self._lock, self._connect() as db:
             db.execute(
                 """
                 INSERT INTO operations (
                     id, created_at, updated_at, session_id, tool_name, tier,
-                    status, cwd, request_json, request_hash, approval_status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    status, cwd, request_json, request_hash, approval_status,
+                    request_expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     operation_id,
@@ -122,9 +184,10 @@ class AuditStore:
                     tier,
                     status,
                     cwd,
-                    canonical_json(request),
+                    request_json,
                     request_hash,
                     approval_status,
+                    request_expires_at,
                 ),
             )
             db.execute(
@@ -139,16 +202,16 @@ class AuditStore:
     def update_operation(self, operation_id: str, **fields: Any) -> None:
         if not fields:
             return
+        result_json = fields.get("result_json")
+        if isinstance(result_json, str) and len(result_json.encode("utf-8")) > self.settings.max_audit_record_bytes:
+            raise ValueError("audit result exceeds max_audit_record_bytes")
         fields["updated_at"] = utc_now_iso()
         assignments = ", ".join(f"{key} = ?" for key in fields)
         values = list(fields.values()) + [operation_id]
         with self._lock, self._connect() as db:
-            cursor = db.execute(
-                f"UPDATE operations SET {assignments} WHERE id = ?",
-                values,
-            )
+            cursor = db.execute(f"UPDATE operations SET {assignments} WHERE id = ?", values)
             if cursor.rowcount != 1:
-                raise KeyError(f"操作が見つかりません: {operation_id}")
+                raise KeyError(f"operation not found: {operation_id}")
 
     def add_event(
         self,
@@ -156,28 +219,23 @@ class AuditStore:
         event_type: str,
         payload: dict[str, Any] | None = None,
     ) -> None:
+        payload_json = canonical_json(payload or {})
+        if len(payload_json.encode("utf-8")) > self.settings.max_audit_record_bytes:
+            payload_json = canonical_json({"truncated": True, "original_bytes": len(payload_json.encode("utf-8"))})
         with self._lock, self._connect() as db:
             db.execute(
                 """
                 INSERT INTO events(operation_id, occurred_at, event_type, payload_json)
                 VALUES (?, ?, ?, ?)
                 """,
-                (
-                    operation_id,
-                    utc_now_iso(),
-                    event_type,
-                    canonical_json(payload or {}),
-                ),
+                (operation_id, utc_now_iso(), event_type, payload_json),
             )
 
     def get_operation(self, operation_id: str, *, include_events: bool = True) -> dict[str, Any]:
         with self._connect() as db:
-            row = db.execute(
-                "SELECT * FROM operations WHERE id = ?",
-                (operation_id,),
-            ).fetchone()
+            row = db.execute("SELECT * FROM operations WHERE id = ?", (operation_id,)).fetchone()
             if row is None:
-                raise KeyError(f"操作が見つかりません: {operation_id}")
+                raise KeyError(f"operation not found: {operation_id}")
             result = dict(row)
             result["request"] = json.loads(result.pop("request_json"))
             if result.get("result_json"):
@@ -223,25 +281,39 @@ class AuditStore:
             rows = db.execute(
                 f"""
                 SELECT id, created_at, updated_at, tool_name, tier, status, cwd,
-                       approval_status, approval_by, approved_at, exit_code,
-                       duration_ms, error
-                FROM operations
-                {where}
-                ORDER BY created_at DESC
-                LIMIT ?
+                       approval_status, approval_by, approved_at, request_expires_at,
+                       approval_expires_at, claimed_at, exit_code, duration_ms, error
+                FROM operations {where}
+                ORDER BY created_at DESC LIMIT ?
                 """,
                 values,
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def list_pending_approvals(self, limit: int = 100) -> list[dict[str, Any]]:
+    def list_active_operations(self) -> list[dict[str, Any]]:
         with self._connect() as db:
             rows = db.execute(
                 """
                 SELECT * FROM operations
-                WHERE approval_status = 'pending'
+                WHERE status IN ('queued', 'running')
                 ORDER BY created_at ASC
-                LIMIT ?
+                """
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["request"] = json.loads(item.pop("request_json"))
+            result.append(item)
+        return result
+
+    def list_pending_approvals(self, limit: int = 100) -> list[dict[str, Any]]:
+        self.expire_pending()
+        with self._connect() as db:
+            rows = db.execute(
+                """
+                SELECT * FROM operations
+                WHERE approval_status = 'pending' AND status = 'pending_approval'
+                ORDER BY created_at ASC LIMIT ?
                 """,
                 (max(1, min(limit, 500)),),
             ).fetchall()
@@ -252,6 +324,33 @@ class AuditStore:
             result.append(item)
         return result
 
+    def expire_pending(self) -> int:
+        now = utc_now_iso()
+        with self._lock, self._connect() as db:
+            rows = db.execute(
+                """
+                SELECT id FROM operations
+                WHERE approval_status = 'pending' AND request_expires_at <= ?
+                """,
+                (now,),
+            ).fetchall()
+            ids = [row["id"] for row in rows]
+            db.execute(
+                """
+                UPDATE operations SET approval_status='expired', status='expired',
+                    updated_at=?, finished_at=?, error='approval request expired'
+                WHERE approval_status='pending' AND request_expires_at <= ?
+                """,
+                (now, now, now),
+            )
+            for operation_id in ids:
+                db.execute(
+                    """INSERT INTO events(operation_id, occurred_at, event_type, payload_json)
+                    VALUES (?, ?, 'expired', '{}')""",
+                    (operation_id, now),
+                )
+        return len(ids)
+
     def decide_approval(
         self,
         operation_id: str,
@@ -260,40 +359,78 @@ class AuditStore:
         approver: str,
         note: str = "",
     ) -> dict[str, Any]:
-        now = utc_now_iso()
+        now = datetime.now(UTC)
+        now_iso = now.isoformat()
+        approval_expires = (now + timedelta(seconds=self.settings.approval_execution_ttl_seconds)).isoformat()
         new_approval = "approved" if approved else "rejected"
         new_status = "approved" if approved else "rejected"
         with self._lock, self._connect() as db:
             cursor = db.execute(
                 """
-                UPDATE operations
-                SET approval_status = ?, status = ?, approval_by = ?,
-                    approval_note = ?, approved_at = ?, updated_at = ?
-                WHERE id = ? AND approval_status = 'pending'
+                UPDATE operations SET approval_status=?, status=?, approval_by=?,
+                    approval_note=?, approved_at=?, approval_expires_at=?, updated_at=?,
+                    finished_at=CASE WHEN ?='rejected' THEN ? ELSE finished_at END
+                WHERE id=? AND approval_status='pending' AND status='pending_approval'
+                    AND request_expires_at > ?
                 """,
                 (
                     new_approval,
                     new_status,
                     approver,
                     note,
-                    now,
-                    now,
+                    now_iso,
+                    approval_expires if approved else None,
+                    now_iso,
+                    new_approval,
+                    now_iso,
                     operation_id,
+                    now_iso,
                 ),
             )
             if cursor.rowcount != 1:
-                raise RuntimeError("承認待ちではないか、すでに別の決定が行われています")
+                self._expire_one_locked(db, operation_id, now_iso)
+                db.commit()
+                raise RuntimeError("approval is not pending or has expired")
             db.execute(
-                """
-                INSERT INTO events(operation_id, occurred_at, event_type, payload_json)
-                VALUES (?, ?, ?, ?)
-                """,
+                """INSERT INTO events(operation_id, occurred_at, event_type, payload_json)
+                VALUES (?, ?, ?, ?)""",
                 (
                     operation_id,
-                    now,
+                    now_iso,
                     new_approval,
                     canonical_json({"approver": approver, "note": note}),
                 ),
+            )
+        return self.get_operation(operation_id)
+
+    def approve_and_claim(
+        self, operation_id: str, *, approver: str, note: str = ""
+    ) -> dict[str, Any]:
+        """Atomically approve a fresh request and consume its one execution grant."""
+        now_value = datetime.now(UTC)
+        now = now_value.isoformat()
+        grant_expires = (
+            now_value + timedelta(seconds=self.settings.approval_execution_ttl_seconds)
+        ).isoformat()
+        with self._lock, self._connect() as db:
+            cursor = db.execute(
+                """
+                UPDATE operations SET approval_status='approved', status='queued',
+                    approval_by=?, approval_note=?, approved_at=?, approval_expires_at=?,
+                    claimed_at=?, updated_at=?
+                WHERE id=? AND approval_status='pending' AND status='pending_approval'
+                    AND request_expires_at > ?
+                """,
+                (approver, note, now, grant_expires, now, now, operation_id, now),
+            )
+            if cursor.rowcount != 1:
+                self._expire_one_locked(db, operation_id, now)
+                db.commit()
+                raise RuntimeError("approval is not pending or has expired")
+            db.execute(
+                """INSERT INTO events(operation_id, occurred_at, event_type, payload_json)
+                VALUES (?, ?, 'approved_and_claimed', ?)""",
+                (operation_id, now, canonical_json({"approver": approver, "note": note})),
             )
         return self.get_operation(operation_id)
 
@@ -302,19 +439,38 @@ class AuditStore:
         with self._lock, self._connect() as db:
             cursor = db.execute(
                 """
-                UPDATE operations
-                SET status = 'queued', updated_at = ?
-                WHERE id = ? AND approval_status = 'approved' AND status = 'approved'
+                UPDATE operations SET status='queued', claimed_at=?, updated_at=?
+                WHERE id=? AND approval_status='approved' AND status='approved'
+                    AND approval_expires_at > ? AND claimed_at IS NULL
                 """,
-                (now, operation_id),
+                (now, now, operation_id, now),
             )
             if cursor.rowcount != 1:
-                raise RuntimeError("未承認、拒否済み、期限切れ、またはすでに実行済みです")
+                db.execute(
+                    """
+                    UPDATE operations SET approval_status='expired', status='expired',
+                        finished_at=?, updated_at=?, error='approval execution grant expired'
+                    WHERE id=? AND approval_status='approved' AND status='approved'
+                        AND approval_expires_at <= ?
+                    """,
+                    (now, now, operation_id, now),
+                )
+                db.commit()
+                raise RuntimeError("approval is expired, already claimed, or not approved")
             db.execute(
-                """
-                INSERT INTO events(operation_id, occurred_at, event_type, payload_json)
-                VALUES (?, ?, 'execution_claimed', '{}')
-                """,
+                """INSERT INTO events(operation_id, occurred_at, event_type, payload_json)
+                VALUES (?, ?, 'execution_claimed', '{}')""",
                 (operation_id, now),
             )
         return self.get_operation(operation_id)
+
+    @staticmethod
+    def _expire_one_locked(db: sqlite3.Connection, operation_id: str, now: str) -> None:
+        db.execute(
+            """
+            UPDATE operations SET approval_status='expired', status='expired',
+                finished_at=?, updated_at=?, error='approval request expired'
+            WHERE id=? AND approval_status='pending' AND request_expires_at <= ?
+            """,
+            (now, now, operation_id, now),
+        )

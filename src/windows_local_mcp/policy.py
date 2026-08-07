@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import re
 import shutil
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
+from typing import ClassVar
 
 from pydantic import BaseModel
 
@@ -21,25 +23,48 @@ class NormalizedCommand(BaseModel):
 
 
 class CommandPolicy:
-    GIT_ALLOWED = {"status", "diff", "log", "show", "rev-parse", "ls-files", "grep"}
-    FLUTTER_ALLOWED = {"analyze", "test", "build", "doctor", "devices"}
-    DART_ALLOWED = {"analyze", "format", "test"}
-    ADB_ALLOWED = {"devices", "get-state", "shell", "exec-out"}
-    ADB_SHELL_ALLOWED = {"input", "am", "pm", "wm", "dumpsys", "screencap"}
+    """Deny-by-default grammars for commands that may run without approval."""
+
+    GIT_SUBCOMMANDS: ClassVar[set[str]] = {
+        "status",
+        "diff",
+        "log",
+        "show",
+        "rev-parse",
+        "ls-files",
+    }
+    GIT_COMMON_FLAGS: ClassVar[set[str]] = {
+        "--no-color",
+        "--color=never",
+        "--stat",
+        "--name-only",
+        "--name-status",
+        "--oneline",
+        "--decorate",
+        "--no-decorate",
+        "--patch",
+        "-p",
+    }
+    SAFE_REVISION = re.compile(r"[A-Za-z0-9._/@~^{}+-]+")
+    SAFE_FORMAT_LINE_LENGTH = re.compile(r"--line-length=(?:[1-9][0-9]{0,3})")
+    SAFE_LOG_COUNT = re.compile(r"-(?:[1-9]|[1-9][0-9]|1[0-9]{2}|200)")
+    ADB_PROPERTIES: ClassVar[set[str]] = {
+        "ro.build.version.release",
+        "ro.build.version.sdk",
+        "ro.product.manufacturer",
+        "ro.product.model",
+        "ro.kernel.qemu",
+    }
 
     def __init__(self, settings: Settings, workspace: Workspace) -> None:
         self.settings = settings
         self.workspace = workspace
-        self.safe_scripts = {
-            self.workspace.resolve_existing(item, allow_directory=False)
-            for item in settings.safe_powershell_scripts
-        }
 
     @staticmethod
     def _reject_nul(values: Sequence[str]) -> None:
         for value in values:
             if "\x00" in value:
-                raise ValueError("NUL文字を含む引数を拒否しました")
+                raise ValueError("NUL is not allowed in command arguments")
 
     @staticmethod
     def _resolve_executable(candidates: Sequence[str]) -> str:
@@ -47,53 +72,49 @@ class CommandPolicy:
             resolved = shutil.which(candidate)
             if resolved:
                 return str(Path(resolved).resolve())
-        raise FileNotFoundError(f"実行ファイルがPATHに見つかりません: {', '.join(candidates)}")
+        raise FileNotFoundError(f"executable was not found on PATH: {', '.join(candidates)}")
 
-    def normalize_safe(
-        self,
-        *,
-        program: str,
-        args: list[str],
-        cwd: str,
-    ) -> NormalizedCommand:
-        if not args:
-            raise ValueError("サブコマンドまたは引数が必要です")
-        self._reject_nul([program, *args])
-        cwd_path = self.workspace.resolve_directory(cwd)
-        key = program.casefold()
+    @staticmethod
+    def _program_key(program: str) -> str:
+        key = Path(program).name.casefold()
         for suffix in (".exe", ".bat", ".cmd"):
-            if key.endswith(suffix):
-                key = key[: -len(suffix)]
+            key = key.removesuffix(suffix)
+        return key
+
+    def normalize_safe(self, *, program: str, args: list[str], cwd: str) -> NormalizedCommand:
+        if not args:
+            raise ValueError("a subcommand or arguments are required")
+        self._reject_nul([program, *args])
+        self._check_argument_limits(args)
+        cwd_path = self.workspace.resolve_directory(cwd, access="read")
+        key = self._program_key(program)
 
         if key == "git":
-            if args[0].casefold() not in self.GIT_ALLOWED:
-                raise PermissionError(f"git {args[0]} は通常実行で許可されていません")
+            self._require_enabled("git", self.settings.git_enabled)
+            normalized_args = self._normalize_git(args)
             executable = self._resolve_executable(("git.exe", "git"))
-            return self._result(executable, args, cwd_path, "git")
+            return self._result(executable, normalized_args, cwd_path, "git")
 
         if key == "flutter":
-            if args[0].casefold() not in self.FLUTTER_ALLOWED:
-                raise PermissionError(f"flutter {args[0]} は通常実行で許可されていません")
+            self._require_enabled("flutter", self.settings.flutter_enabled)
+            normalized_args = self._normalize_flutter(args)
             executable = self._resolve_executable(("flutter.bat", "flutter.cmd", "flutter"))
-            return self._result(executable, args, cwd_path, "flutter")
+            return self._result(executable, normalized_args, cwd_path, "flutter")
 
         if key == "dart":
-            if args[0].casefold() not in self.DART_ALLOWED:
-                raise PermissionError(f"dart {args[0]} は通常実行で許可されていません")
+            self._require_enabled("dart", self.settings.dart_enabled)
+            normalized_args = self._normalize_dart(args)
             executable = self._resolve_executable(("dart.exe", "dart"))
-            return self._result(executable, args, cwd_path, "dart")
+            return self._result(executable, normalized_args, cwd_path, "dart")
 
         if key == "adb":
-            self._validate_adb(args)
+            self._require_enabled("adb", self.settings.adb_enabled)
+            normalized_args = self._normalize_adb(args)
             executable = self._resolve_executable(("adb.exe", "adb"))
-            return self._result(executable, args, cwd_path, "adb")
-
-        if key in {"powershell", "powershell_script", "pwsh"}:
-            return self._normalize_safe_powershell(args, cwd_path)
+            return self._result(executable, normalized_args, cwd_path, "adb")
 
         raise PermissionError(
-            f"{program} は通常実行の許可リストにありません。"
-            "request_host_commandを使用してください"
+            f"{program} is not eligible for automatic execution; use request_host_command"
         )
 
     def normalize_host(
@@ -104,67 +125,237 @@ class CommandPolicy:
         network_expected: bool,
     ) -> NormalizedCommand:
         if not command:
-            raise ValueError("commandは1要素以上必要です")
+            raise ValueError("command must contain an executable")
         self._reject_nul(command)
-        cwd_path = self.workspace.resolve_directory(cwd)
+        self._check_argument_limits(command)
+        cwd_path = self.workspace.resolve_directory(cwd, access="read")
         executable = shutil.which(command[0])
         if executable is None:
             candidate = Path(command[0]).expanduser()
-            if candidate.exists():
+            if candidate.exists() and candidate.is_file():
                 executable = str(candidate.resolve())
             else:
-                raise FileNotFoundError(f"実行ファイルが見つかりません: {command[0]}")
+                raise FileNotFoundError(f"executable was not found: {command[0]}")
+        key = self._program_key(executable)
+        if key in {"powershell", "pwsh"} and not self.settings.powershell_enabled:
+            raise PermissionError("PowerShell capability is disabled")
         return NormalizedCommand(
             executable=str(Path(executable).resolve()),
             args=list(command[1:]),
             cwd=str(cwd_path),
             display_command=list(command),
-            program_key=Path(executable).stem.casefold(),
+            program_key=key,
             network_expected=network_expected,
         )
 
-    def _validate_adb(self, args: list[str]) -> None:
-        first = args[0].casefold()
-        if first not in self.ADB_ALLOWED:
-            raise PermissionError(f"adb {args[0]} は通常実行で許可されていません")
-        if first == "exec-out":
-            if [part.casefold() for part in args[1:]] != ["screencap", "-p"]:
-                raise PermissionError("adb exec-outは screencap -p のみ許可しています")
-        if first == "shell":
-            if len(args) < 2 or args[1].casefold() not in self.ADB_SHELL_ALLOWED:
-                raise PermissionError(
-                    "adb shellは input/am/pm/wm/dumpsys/screencap のみ許可しています"
-                )
+    @staticmethod
+    def _require_enabled(name: str, enabled: bool) -> None:
+        if not enabled:
+            raise PermissionError(f"{name} capability is disabled")
 
-    def _normalize_safe_powershell(
+    def _check_argument_limits(self, values: list[str]) -> None:
+        if len(values) > self.settings.max_command_arguments:
+            raise ValueError("command exceeds max_command_arguments")
+        if any(
+            len(value) > self.settings.max_command_argument_characters for value in values
+        ):
+            raise ValueError("command argument exceeds max_command_argument_characters")
+
+    def _normalize_git(self, args: list[str]) -> list[str]:
+        subcommand = args[0].casefold()
+        if subcommand not in self.GIT_SUBCOMMANDS:
+            raise PermissionError(f"git {args[0]} requires human approval")
+        tail = list(args[1:])
+
+        if subcommand == "status":
+            allowed = {
+                "--short",
+                "-s",
+                "--branch",
+                "-b",
+                "--porcelain",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--untracked-files=normal",
+                "--untracked-files=no",
+            }
+            normalized = self._flags_and_pathspec(tail, allowed)
+        elif subcommand == "diff":
+            allowed = self.GIT_COMMON_FLAGS | {
+                "--cached",
+                "--staged",
+                "--check",
+                "--quiet",
+                "--exit-code",
+                "--binary",
+                "--no-renames",
+            }
+            normalized = self._git_revisions_flags_paths(tail, allowed)
+            normalized = ["--no-ext-diff", "--no-textconv", *normalized]
+        elif subcommand == "log":
+            allowed = self.GIT_COMMON_FLAGS | {"--all", "--branches", "--tags"}
+            normalized = self._git_revisions_flags_paths(tail, allowed, allow_count=True)
+        elif subcommand == "show":
+            normalized = self._git_revisions_flags_paths(tail, self.GIT_COMMON_FLAGS)
+            normalized = ["--no-ext-diff", "--no-textconv", *normalized]
+        elif subcommand == "rev-parse":
+            permitted = {
+                ("HEAD",),
+                ("--short", "HEAD"),
+                ("--abbrev-ref", "HEAD"),
+                ("--show-toplevel",),
+                ("--is-inside-work-tree",),
+            }
+            if tuple(tail) not in permitted:
+                raise PermissionError("git rev-parse arguments are not in the safe grammar")
+            normalized = tail
+        else:  # ls-files
+            allowed = {
+                "--cached",
+                "--modified",
+                "--deleted",
+                "--others",
+                "--exclude-standard",
+                "--stage",
+            }
+            normalized = self._flags_and_pathspec(tail, allowed)
+
+        return ["--no-pager", subcommand, *normalized]
+
+    def _flags_and_pathspec(self, values: list[str], allowed: set[str]) -> list[str]:
+        if "--" in values:
+            split = values.index("--")
+            flags, paths = values[:split], values[split + 1 :]
+        else:
+            flags, paths = values, []
+        if any(flag not in allowed for flag in flags):
+            raise PermissionError("Git option is not in the safe grammar")
+        if paths:
+            return [*flags, "--", *self._normalize_read_paths(paths)]
+        return flags
+
+    def _git_revisions_flags_paths(
         self,
-        args: list[str],
-        cwd_path: Path,
-    ) -> NormalizedCommand:
-        folded = [item.casefold() for item in args]
-        if "-command" in folded or "-c" in folded or "-encodedcommand" in folded:
-            raise PermissionError("任意PowerShellコードは承認付き経路を使用してください")
+        values: list[str],
+        allowed: set[str],
+        *,
+        allow_count: bool = False,
+    ) -> list[str]:
+        if "--" in values:
+            split = values.index("--")
+            head, paths = values[:split], values[split + 1 :]
+        else:
+            head, paths = values, []
+        normalized_head: list[str] = []
+        for value in head:
+            if value in allowed or (allow_count and self.SAFE_LOG_COUNT.fullmatch(value)) or self.SAFE_REVISION.fullmatch(value) and not value.startswith("-"):
+                normalized_head.append(value)
+            else:
+                raise PermissionError("Git revision or option is not in the safe grammar")
+        if paths:
+            return [*normalized_head, "--", *self._normalize_read_paths(paths)]
+        return normalized_head
 
-        try:
-            file_index = folded.index("-file")
-        except ValueError as error:
-            raise PermissionError(
-                "通常PowerShellは -File で明示済みスクリプトを呼ぶ場合だけ許可します"
-            ) from error
+    def _normalize_flutter(self, args: list[str]) -> list[str]:
+        if args[0].casefold() != "analyze":
+            raise PermissionError(f"flutter {args[0]} loads or executes code and requires approval")
+        allowed_flags = {"--fatal-infos", "--fatal-warnings", "--no-fatal-infos", "--no-fatal-warnings", "--no-pub"}
+        flags: list[str] = []
+        paths: list[str] = []
+        for value in args[1:]:
+            if value.startswith("-"):
+                if value not in allowed_flags:
+                    raise PermissionError("Flutter option is not in the safe grammar")
+                flags.append(value)
+            else:
+                paths.append(value)
+        if "--no-pub" not in flags:
+            flags.insert(0, "--no-pub")
+        return ["analyze", *flags, *self._normalize_read_paths(paths)]
 
-        if file_index + 1 >= len(args):
-            raise ValueError("-Fileの後にスクリプトパスが必要です")
+    def _normalize_dart(self, args: list[str]) -> list[str]:
+        subcommand = args[0].casefold()
+        if subcommand == "test":
+            raise PermissionError("dart test loads project code and requires human approval")
+        if subcommand == "analyze":
+            flags: list[str] = []
+            paths: list[str] = []
+            for value in args[1:]:
+                if value in {"--fatal-infos", "--fatal-warnings"}:
+                    flags.append(value)
+                elif value.startswith("-"):
+                    raise PermissionError("Dart analyze option is not in the safe grammar")
+                else:
+                    paths.append(value)
+            if len(paths) > 1:
+                raise PermissionError("dart analyze accepts at most one validated path")
+            return ["analyze", *flags, *self._normalize_read_paths(paths)]
+        if subcommand == "format":
+            flags: list[str] = []
+            paths: list[str] = []
+            output_mode = "write"
+            for value in args[1:]:
+                if value in {"--set-exit-if-changed", "--show", "--output=show"}:
+                    flags.append(value)
+                    if value in {"--show", "--output=show"}:
+                        output_mode = "show"
+                elif value == "--output=none":
+                    flags.append(value)
+                    output_mode = "none"
+                elif self.SAFE_FORMAT_LINE_LENGTH.fullmatch(value):
+                    flags.append(value)
+                elif value.startswith("-"):
+                    raise PermissionError("Dart format option is not in the safe grammar")
+                else:
+                    paths.append(value)
+            if not paths:
+                paths = ["."]
+            access = "write" if output_mode == "write" else "read"
+            normalized_paths = [
+                str(self.workspace.resolve_existing(path, access=access)) for path in paths
+            ]
+            return ["format", *flags, *normalized_paths]
+        raise PermissionError(f"dart {args[0]} is not eligible for automatic execution")
 
-        script = self.workspace.resolve_existing(args[file_index + 1], allow_directory=False)
-        if script not in self.safe_scripts:
-            raise PermissionError(
-                f"安全スクリプトとして登録されていません: {self.workspace.relative(script)}"
+    def _normalize_adb(self, args: list[str]) -> list[str]:
+        if args in (["devices"], ["devices", "-l"]):
+            return list(args)
+        if len(args) < 3 or args[0] != "-s":
+            raise PermissionError("targeted ADB operations require '-s SERIAL'")
+        serial = args[1]
+        self._validate_adb_serial(serial)
+        operation = args[2:]
+        allowed = (
+            operation == ["get-state"]
+            or operation == ["shell", "wm", "size"]
+            or operation == ["shell", "wm", "density"]
+            or operation == ["shell", "dumpsys", "battery"]
+            or operation == ["shell", "dumpsys", "display"]
+            or operation == ["shell", "dumpsys", "window"]
+            or operation == ["shell", "dumpsys", "activity", "activities"]
+            or operation == ["exec-out", "screencap", "-p"]
+            or (
+                len(operation) == 3
+                and operation[:2] == ["shell", "getprop"]
+                and operation[2] in self.ADB_PROPERTIES
             )
+        )
+        if not allowed:
+            raise PermissionError("ADB operation is not in the fixed read-only grammar")
+        return ["-s", serial, *operation]
 
-        normalized_args = list(args)
-        normalized_args[file_index + 1] = str(script)
-        executable = self._resolve_executable(("powershell.exe", "pwsh.exe", "pwsh"))
-        return self._result(executable, normalized_args, cwd_path, "powershell_script")
+    def _validate_adb_serial(self, serial: str) -> None:
+        allowed = self.settings.adb_allowed_serials
+        if allowed and serial not in allowed:
+            raise PermissionError(f"ADB serial is not allowlisted: {serial}")
+        if self.settings.adb_emulator_only and not serial.casefold().startswith("emulator-"):
+            raise PermissionError("physical or nonstandard ADB targets are disabled")
+
+    def _normalize_read_paths(self, paths: list[str]) -> list[str]:
+        return [
+            str(self.workspace.resolve_existing(path, access="read"))
+            for path in paths
+        ]
 
     @staticmethod
     def _result(
@@ -188,6 +379,7 @@ def approval_hash(
     normalized: NormalizedCommand,
     reason: str,
     risk_summary: str,
+    manifest_digest: str,
 ) -> str:
     payload = {
         "executable": normalized.executable,
@@ -196,5 +388,6 @@ def approval_hash(
         "network_expected": normalized.network_expected,
         "reason": reason,
         "risk_summary": risk_summary,
+        "manifest_digest": manifest_digest,
     }
     return sha256_text(canonical_json(payload))

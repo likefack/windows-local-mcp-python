@@ -1,0 +1,96 @@
+{
+  "documentType": "codex-security.scan-manifest",
+  "scan": {
+    "artifacts": [
+      {
+        "mediaType": "application/json",
+        "path": "findings.json",
+        "sha256": "26f80c455ece357aa7be019382767a2e959eb310350af180399f1a0a09660920"
+      },
+      {
+        "mediaType": "application/json",
+        "path": "coverage.json",
+        "sha256": "46e5222d05e6e67cc2c8631ab1a17c22b836c8c4bfd51a0cdd1342f9491dc529"
+      }
+    ],
+    "completedAt": "2026-08-07T07:30:24.769533Z",
+    "coverageRef": "coverage.json",
+    "findingsRef": "findings.json",
+    "id": "7c843e64-4a08-4ef5-8da6-f37d96b633e0",
+    "producer": {
+      "name": "codex-security-plugin",
+      "version": "0.1.18"
+    },
+    "scope": {
+      "artifactsReviewed": [
+        "README.md",
+        "SPEC.md",
+        "VERIFICATION.md",
+        "config.example.toml",
+        "pyproject.toml",
+        "run-server.ps1",
+        "run-approvals.ps1",
+        "src/windows_local_mcp/",
+        "tests/"
+      ],
+      "excludePaths": [],
+      "includePaths": [
+        "."
+      ],
+      "limitations": [
+        "AST parsing succeeded for 16 Python files; pytest/ruff/MCP runtime could not run because dependencies are not installed.",
+        "No live Git exploit, Flutter, Dart, ADB, PowerShell, MCP Inspector, or Secure MCP Tunnel execution was performed."
+      ],
+      "runtimeStatus": "Dependencies absent; repository unchanged and worktree clean.",
+      "summary": "All 26 current repository files were statically reviewed.",
+      "validationMode": "Parent validation plus independent baseline and two focused investigations."
+    },
+    "sealedAt": "2026-08-07T07:30:24.769533Z",
+    "startedAt": "2026-08-07T07:00:00.188008Z",
+    "status": "completed",
+    "target": {
+      "displayName": "windows-local-mcp-python",
+      "kind": "git_revision",
+      "revision": "f9074999ac43edb593400d47c33a52560080f3a5",
+      "targetId": "target_sha256_5977c329cc2487c89c4e2272409dc3e2dbb1ab275b38ee589a9ef68fb8320387"
+    },
+    "threatModel": {
+      "assets": [
+        "Host-user files and credentials",
+        "Files outside workspace_root",
+        "Host process authority",
+        "Android targets",
+        "Approval and audit integrity"
+      ],
+      "assumptions": [
+        "Not Administrator",
+        "Default data_dir outside workspace",
+        "Secure MCP Tunnel external and unverified",
+        "OS/network sandbox absent as documented"
+      ],
+      "attackerCapabilities": [
+        "Choose MCP arguments",
+        "Read/write allowed workspace files",
+        "Invoke Tier-1 commands",
+        "Manage job and approval IDs"
+      ],
+      "securityObjectives": [
+        "No unapproved external filesystem access",
+        "No arbitrary host/device execution in Tier 1",
+        "Fresh approval binds effective code",
+        "Authenticated owner-scoped access",
+        "Bounded resources and trustworthy audit"
+      ],
+      "summary": "An MCP client controls tool arguments and workspace content; the Windows process runs as the local user. Boundaries are workspace containment, Tier-1 policy, human approval, transport authentication, and audit storage.",
+      "trustBoundaries": [
+        "MCP client to handlers",
+        "Workspace content to subprocesses",
+        "Tier 1 to approval",
+        "Approval to later effective code",
+        "Transport to Windows account",
+        "Workspace to data_dir"
+      ]
+    }
+  },
+  "schemaVersion": "1.0"
+}

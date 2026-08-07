@@ -1,24 +1,32 @@
 param(
-    [Parameter(Mandatory = $true)]
-    [string]$Root,
+    [Parameter(Mandatory = $false)]
+    [string]$Root = "",
 
     [Parameter(Mandatory = $false)]
     [string]$Config = ""
 )
 
 $ErrorActionPreference = "Stop"
+$RepoRoot = $PSScriptRoot
+$Python = Join-Path $RepoRoot ".venv\Scripts\python.exe"
 
-if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
-    throw "作業フォルダが存在しません: $Root"
+if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) {
+    throw "Repository virtual environment not found. Run: py -m venv .venv; .\.venv\Scripts\python.exe -m pip install -e `".[dev]`""
 }
 
-$env:LOCAL_MCP_ROOT = (Resolve-Path -LiteralPath $Root).Path
+if ($Root -ne "") {
+    if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
+        throw "workspace_root does not exist: $Root"
+    }
+    $env:LOCAL_MCP_ROOT = (Resolve-Path -LiteralPath $Root).Path
+}
 
 if ($Config -ne "") {
     if (-not (Test-Path -LiteralPath $Config -PathType Leaf)) {
-        throw "設定ファイルが存在しません: $Config"
+        throw "Config file does not exist: $Config"
     }
     $env:LOCAL_MCP_CONFIG = (Resolve-Path -LiteralPath $Config).Path
 }
 
-python -m windows_local_mcp.cli server
+& $Python -m windows_local_mcp.cli server
+exit $LASTEXITCODE

@@ -1,0 +1,88 @@
+{
+  "completeness": "partial",
+  "deferred": [
+    {
+      "id": "windows_integration",
+      "paths": [
+        "VERIFICATION.md"
+      ],
+      "reason": "Dependencies and toolchains are absent; live Windows PowerShell Flutter Dart ADB and process tests were not run."
+    },
+    {
+      "id": "secure_tunnel_integration",
+      "paths": [
+        "README.md",
+        "VERIFICATION.md"
+      ],
+      "reason": "No tunnel configuration exists and Secure MCP Tunnel is explicitly untested."
+    }
+  ],
+  "documentType": "codex-security.coverage",
+  "excludePaths": [],
+  "explicitExclusions": [],
+  "includePaths": [
+    "."
+  ],
+  "inventoryStrategy": "repository",
+  "mode": "repository",
+  "openQuestions": [
+    {
+      "question": "Does the deployed Secure MCP Tunnel enforce the intended authenticated boundary and clean stdio lifecycle?"
+    },
+    {
+      "question": "Which exact MCP SDK 2.x and adb versions will be deployed and pass integration tests?"
+    }
+  ],
+  "scanId": "7c843e64-4a08-4ef5-8da6-f37d96b633e0",
+  "schemaVersion": "1.0",
+  "surfaces": [
+    {
+      "disposition": "reported",
+      "id": "filesystem_paths",
+      "label": "Workspace paths and file tools",
+      "receiptRefs": []
+    },
+    {
+      "disposition": "reported",
+      "id": "command_policy",
+      "label": "Git Flutter Dart ADB and PowerShell policy",
+      "receiptRefs": []
+    },
+    {
+      "disposition": "reported",
+      "id": "approval_flow",
+      "label": "Approval request hash decision claim and execution",
+      "receiptRefs": []
+    },
+    {
+      "disposition": "reported",
+      "id": "jobs",
+      "label": "Worker lifecycle output timeout polling and cancellation",
+      "receiptRefs": []
+    },
+    {
+      "disposition": "reported",
+      "id": "audit",
+      "label": "SQLite audit events artifacts and access",
+      "receiptRefs": []
+    },
+    {
+      "disposition": "needs_follow_up",
+      "id": "mcp_transport",
+      "label": "stdio optional HTTP SDK CLI and launch scripts",
+      "receiptRefs": []
+    },
+    {
+      "disposition": "reported",
+      "id": "configuration",
+      "label": "Settings data paths executable discovery and defaults",
+      "receiptRefs": []
+    },
+    {
+      "disposition": "needs_follow_up",
+      "id": "documentation_tests",
+      "label": "README SPEC VERIFICATION packaging and tests",
+      "receiptRefs": []
+    }
+  ]
+}

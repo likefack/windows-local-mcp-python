@@ -7,7 +7,11 @@ from windows_local_mcp.config import Settings
 def test_operation_round_trip(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
-    settings = Settings(workspace_root=root, data_dir=tmp_path / "data")
+    settings = Settings(
+        workspace_root=root,
+        data_dir=tmp_path / "data",
+        protect_data_dir_acl=False,
+    )
     settings.ensure_directories()
     store = AuditStore(settings)
 
