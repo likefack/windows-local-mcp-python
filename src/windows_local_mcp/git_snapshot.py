@@ -8,6 +8,7 @@ from pathlib import Path
 from .config import Settings
 from .git_env import sanitized_git_environment
 from .resources import BoundedStreamCapture, enforce_data_quota
+from .tool_safety import ensure_external_tool_executable
 
 
 def capture_git_snapshot(
@@ -18,13 +19,22 @@ def capture_git_snapshot(
 ) -> str | None:
     if not settings.git_enabled:
         return None
-    git = shutil.which("git.exe") or shutil.which("git")
-    if not git:
+    discovered_git = shutil.which("git.exe") or shutil.which("git")
+    if not discovered_git:
         return None
-    root = settings.workspace_root
+    try:
+        git = ensure_external_tool_executable(
+            discovered_git,
+            workspace_root=settings.workspace_root,
+            data_dir=settings.data_dir,
+        )
+    except (FileNotFoundError, PermissionError):
+        return None
+
+    root = settings.workspace_root.resolve(strict=True)
     git_env = sanitized_git_environment()
     probe = subprocess.run(
-        [git, "-C", str(root), "rev-parse", "--is-inside-work-tree"],
+        [git, "-C", str(root), "rev-parse", "--show-toplevel"],
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -34,7 +44,15 @@ def capture_git_snapshot(
         check=False,
         env=git_env,
     )
-    if probe.returncode != 0 or probe.stdout.strip() != "true":
+    if probe.returncode != 0:
+        return None
+    try:
+        discovered_root = Path(probe.stdout.strip()).resolve(strict=True)
+    except (FileNotFoundError, OSError):
+        return None
+    if discovered_root != root:
+        # Do not let a workspace nested inside a larger repository expose parent-repository
+        # state through automatic snapshots or git_info.
         return None
 
     commands = [
@@ -49,10 +67,33 @@ def capture_git_snapshot(
             "staged",
             [git, "-C", str(root), "diff", "--cached", "--binary", "--no-ext-diff", "--no-textconv"],
         ),
-        ("recent", [git, "-C", str(root), "--no-pager", "log", "-10", "--oneline", "--decorate"]),
+        (
+            "recent",
+            [
+                git,
+                "-C",
+                str(root),
+                "--no-pager",
+                "log",
+                "-10",
+                "--oneline",
+                "--decorate",
+                "--no-ext-diff",
+                "--no-textconv",
+            ],
+        ),
         (
             "changed-files",
-            [git, "-C", str(root), "diff", "--name-status", "--no-ext-diff", "HEAD"],
+            [
+                git,
+                "-C",
+                str(root),
+                "diff",
+                "--name-status",
+                "--no-ext-diff",
+                "--no-textconv",
+                "HEAD",
+            ],
         ),
     ]
     per_stream_limit = max(4096, settings.max_diff_bytes // len(commands) // 2)
