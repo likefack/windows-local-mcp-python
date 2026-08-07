@@ -10,7 +10,8 @@ from pathlib import Path
 from .approval import materialize_execution_copy, verify_approval_bundle
 from .audit import AuditStore
 from .child_env import build_command_environment
-from .config import Settings, load_settings
+from .command_traits import dart_format_writes
+from .config import load_settings
 from .git_snapshot import capture_git_snapshot
 from .paths import Workspace
 from .policy import CommandPolicy
@@ -35,55 +36,12 @@ def run_operation(operation_id: str) -> int:
     operation = audit.get_operation(operation_id, include_events=False)
     request = operation["request"]
     normalized = request["normalized_command"]
-    use_workspace_lock = _requires_workspace_execution_lock(operation, request, normalized)
-    audit.add_event(
-        operation_id,
-        "workspace_lock_selected",
-        {"mode": "exclusive" if use_workspace_lock else "none"},
-    )
-
-    execution_lock = WorkspaceExecutionLock(settings) if use_workspace_lock else None
-    if execution_lock is not None:
-        try:
-            execution_lock.__enter__()
-        except TimeoutError as error:
-            audit.update_operation(
-                operation_id,
-                status="failed",
-                finished_at=utc_now_iso(),
-                error=f"workspace execution lock timed out: {error}",
-            )
-            audit.add_event(operation_id, "workspace_lock_timeout", {})
-            return 1
-    try:
-        return _run_operation(
-            operation_id=operation_id,
-            settings=settings,
-            audit=audit,
-            operation=operation,
-            request=request,
-            normalized=normalized,
-        )
-    finally:
-        if execution_lock is not None:
-            execution_lock.__exit__(None, None, None)
-
-
-def _run_operation(
-    *,
-    operation_id: str,
-    settings: Settings,
-    audit: AuditStore,
-    operation: dict[str, object],
-    request: dict[str, object],
-    normalized: dict[str, object],
-) -> int:
     try:
         if operation["tier"] == "host_approval":
             verified = verify_approval_bundle(
                 settings=settings,
                 operation_id=operation_id,
-                expected_digest=str(request["approval_manifest_digest"]),
+                expected_digest=request["approval_manifest_digest"],
             )
             verified = materialize_execution_copy(
                 settings=settings, operation_id=operation_id, normalized=verified
@@ -131,9 +89,9 @@ def _run_operation(
         )
         return 1
 
-    executable = str(normalized["executable"])
-    args = list(normalized["args"])  # type: ignore[arg-type]
-    cwd = str(normalized["cwd"])
+    executable = normalized["executable"]
+    args = list(normalized["args"])
+    cwd = normalized["cwd"]
     max_runtime = int(request["max_runtime_seconds"])
     nonce = str(operation.get("process_nonce") or os.environ.get("WINDOWS_LOCAL_MCP_JOB_NONCE", ""))
     if not nonce:
@@ -163,9 +121,27 @@ def _run_operation(
     child_identity: ProcessIdentity | None = None
     stdout_capture: BoundedStreamCapture | None = None
     stderr_capture: BoundedStreamCapture | None = None
+    status = "failed"
+    exit_code: int | None = None
+    error: str | None = None
+    workspace_lock: WorkspaceExecutionLock | None = None
 
     try:
+        if _requires_workspace_execution_lock(operation, request, normalized):
+            workspace_lock = WorkspaceExecutionLock(settings)
+            try:
+                workspace_lock.__enter__()
+            except TimeoutError as lock_error:
+                audit.add_event(
+                    operation_id,
+                    "workspace_lock_timeout",
+                    {"error": str(lock_error)[:1000]},
+                )
+                raise
         _verify_adb_target(normalized, settings.adb_emulator_only)
+        if operation["tier"] == "host_approval":
+            refreshed = audit.get_operation(operation_id, include_events=False)
+            _ensure_approval_execution_fresh(refreshed)
         child_env = build_command_environment(
             os.environ,
             extra_names=settings.child_environment_allowlist,
@@ -192,9 +168,6 @@ def _run_operation(
             )
         except (ValueError, FileNotFoundError):
             pass
-        _ensure_approval_execution_fresh(
-            audit.get_operation(operation_id, include_events=False)
-        )
         child = subprocess.Popen(
             argv,
             cwd=cwd,
@@ -238,10 +211,18 @@ def _run_operation(
             status = "timed_out"
             error = f"maximum runtime exceeded: {max_runtime} seconds"
     except ApprovalExecutionExpired as exc:
+        if child_identity is not None:
+            terminate_process_tree(child_identity)
+        elif child is not None:
+            child.terminate()
         exit_code = None
         status = "expired"
         error = str(exc)
-        audit.add_event(operation_id, "approval_expired_before_child_start", {})
+        audit.add_event(
+            operation_id,
+            "approval_expired_before_child_start",
+            {"error": error[:1000]},
+        )
     except Exception as exc:  # noqa: BLE001 - every child failure must become a terminal job
         if child_identity is not None:
             terminate_process_tree(child_identity)
@@ -255,6 +236,8 @@ def _run_operation(
             stdout_capture.join()
         if stderr_capture is not None:
             stderr_capture.join()
+        if workspace_lock is not None:
+            workspace_lock.__exit__(None, None, None)
 
     duration_ms = int((time.monotonic() - started) * 1000)
     post_git = capture_git_snapshot(settings=settings, operation_id=operation_id, stage="after")
@@ -309,20 +292,15 @@ def _requires_workspace_execution_lock(
         args = list(normalized.get("args") or [])
         if not args or args[0] != "format":
             return False
-        return not any(
-            value in {"--show", "--output=show", "--output=none"}
-            for value in args
-        )
+        return dart_format_writes(args)
 
     if tier == "host_approval":
         if bool(request.get("workspace_write")):
             return True
         summary = request.get("approval_manifest_summary")
-        if isinstance(summary, dict) and summary.get("mode") == "staged-cwd":
-            return False
         # Old audit rows or non-snapshot host commands remain conservative. They may execute
         # against the real workspace, so keep the exclusive lock unless isolation is explicit.
-        return True
+        return not (isinstance(summary, dict) and summary.get("mode") == "staged-cwd")
 
     return True
 
@@ -345,7 +323,7 @@ def _ensure_approval_execution_fresh(operation: dict[str, object]) -> None:
 def _verify_adb_target(normalized: dict[str, object], emulator_only: bool) -> None:
     if normalized.get("program_key") != "adb" or not emulator_only:
         return
-    args = list(normalized["args"])  # type: ignore[arg-type]
+    args = list(normalized["args"])
     if len(args) < 2 or args[0] != "-s":
         return
     serial = args[1]
