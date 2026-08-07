@@ -42,7 +42,7 @@ def test_sanitized_git_environment_removes_ambient_overrides(name: str) -> None:
     assert sanitized["PATH"] == environment["PATH"]
 
 
-def test_load_settings_strips_git_overrides_from_process_environment(
+def test_load_settings_strips_unapproved_process_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -66,7 +66,7 @@ def test_load_settings_strips_git_overrides_from_process_environment(
     monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
     monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.worktree")
     monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(tmp_path / "outside"))
-    monkeypatch.setenv("GIT_AUTHOR_NAME", "kept-author")
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "unlisted-author")
 
     settings = load_settings()
 
@@ -76,7 +76,8 @@ def test_load_settings_strips_git_overrides_from_process_environment(
     assert "GIT_CONFIG_COUNT" not in os.environ
     assert "GIT_CONFIG_KEY_0" not in os.environ
     assert "GIT_CONFIG_VALUE_0" not in os.environ
-    assert os.environ["GIT_AUTHOR_NAME"] == "kept-author"
+    assert "GIT_AUTHOR_NAME" not in os.environ
+    assert os.environ["LOCAL_MCP_CONFIG"] == str(config)
 
 
 def test_git_snapshot_ignores_hostile_repository_environment(
