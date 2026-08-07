@@ -10,7 +10,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from .child_env import normalize_extra_environment_names
+from .child_env import normalize_extra_environment_names, sanitize_process_environment
 from .git_env import strip_git_ambient_environment
 
 
@@ -266,5 +266,11 @@ def load_settings() -> Settings:
         payload["data_dir"] = str(_default_data_dir())
 
     settings = Settings.model_validate(payload)
+    # After the config is resolved, discard unrelated ambient values from the MCP process itself.
+    # Internal Git probes and approval-state subprocesses then inherit the same minimal baseline.
+    sanitize_process_environment(
+        os.environ,
+        extra_names=settings.child_environment_allowlist,
+    )
     settings.ensure_directories()
     return settings
