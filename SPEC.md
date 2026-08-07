@@ -38,14 +38,16 @@ All MCP file paths pass through `Workspace`.
 
 `write_file` additionally:
 
-1. takes a cross-process workspace mutation lock and canonical-target thread lock;
+1. takes a target-scoped cross-process mutation slot plus the canonical-target thread lock;
 2. re-resolves target and reads/checks expected SHA inside the locks;
 3. enforces old/new/diff/backup/data quotas before replacement;
 4. writes and fsyncs a same-directory temporary file;
 5. revalidates parent `(device,inode)` and target full identity immediately before `os.replace`;
 6. verifies resulting SHA.
 
-Ordinary file reads do not take the workspace mutation lock.
+Target slots are selected from the canonical target path. Different slots can proceed concurrently; the same target always maps to the same slot, while a hash collision only causes extra serialization. A workspace-wide writer acquires every slot, so it still excludes all target writes.
+
+Ordinary file reads do not take a mutation lock.
 
 ## 4. Automatic command tier
 
@@ -81,15 +83,16 @@ Targeted calls require serial validation. `adb_emulator_only=true` requires an `
 
 ### Execution lock policy
 
-The workspace mutation lock is no longer held for every command for the full child-process lifetime.
+The workspace-wide mutation lock is no longer held for every command for the full child-process lifetime.
 
-- Safe Git reads, safe ADB reads, `flutter analyze`, `dart analyze`, and non-writing `dart format` execute without the workspace mutation lock.
-- Approved code-loading commands in immutable `staged-cwd` snapshot mode, including test/build-style execution, run without the workspace mutation lock because they execute from `data_dir`, not the original workspace.
-- A writing `dart format`, an approved command marked `workspace_write=true`, and approved commands that still execute against the original workspace keep the exclusive workspace mutation lock through verification and child execution.
-- Snapshot/manifest creation may still take the workspace lock briefly so the captured input set is coherent.
-- Old approval rows that do not contain explicit snapshot metadata fail conservatively and keep the lock.
+- Safe Git reads, safe ADB reads, `flutter analyze`, `dart analyze`, and non-writing `dart format` execute without the workspace-wide mutation lock.
+- Approved code-loading commands in immutable `staged-cwd` snapshot mode, including test/build-style execution, run without the workspace-wide mutation lock because they execute from `data_dir`, not the original workspace.
+- A writing `dart format`, an approved command marked `workspace_write=true`, and approved commands that still execute against the original workspace keep the exclusive workspace-wide mutation lock through verification and child execution.
+- Snapshot/manifest creation may still take the workspace-wide lock briefly so the captured input set is coherent.
+- `write_file` uses one target slot rather than all slots, so unrelated file writes can proceed concurrently while still conflicting with workspace-wide writers.
+- Old approval rows that do not contain explicit snapshot metadata fail conservatively and keep the workspace-wide lock.
 
-This permits long-running isolated tests/builds and read-only analysis to overlap with unrelated workspace activity without weakening the write boundary.
+This permits long-running isolated tests/builds, read-only analysis, and unrelated target writes to overlap without weakening the source-write boundary.
 
 ## 5. Approval and immutable execution
 
@@ -128,13 +131,13 @@ Code-loading commands that do not need to mutate the source run from an immutabl
 - file-based Dart/Flutter package dependencies outside `cwd` are copied and `package_config.json` is rewritten;
 - non-file or non-enumerable dependencies fail closed.
 
-The immutable copy is verified after local approval. The worker then creates a separate writable disposable run copy, so build artifacts cannot mutate the approved input copy. Unrelated workspace changes outside the approved `cwd` do not invalidate snapshot execution. Snapshot-backed child execution does not hold the workspace mutation lock.
+The immutable copy is verified after local approval. The worker then creates a separate writable disposable run copy, so build artifacts cannot mutate the approved input copy. Unrelated workspace changes outside the approved `cwd` do not invalidate snapshot execution. Snapshot-backed child execution does not hold the workspace-wide mutation lock.
 
 Installed OS/toolchains are the trusted computing base. Their primary executable is content-bound. Complete OS DLL/toolchain virtualization is not provided.
 
 ### Source-write mode
 
-Commands intended to mutate the original workspace require `workspace_write=true`. The complete workspace (excluding direct `.git` bytes) is manifested, all source files are revalidated, and execution occurs while holding the same cross-process lock used by `write_file`. Any workspace addition, deletion, or content change after request invalidates approval.
+Commands intended to mutate the original workspace require `workspace_write=true`. The complete workspace (excluding direct `.git` bytes) is manifested, all source files are revalidated, and execution occurs while holding the workspace-wide form of the same mutation-lock family used by target writes. Any workspace addition, deletion, or content change after request invalidates approval.
 
 Git host operations additionally bind Git state obtained through Git. Direct `.git` MCP access remains prohibited.
 
