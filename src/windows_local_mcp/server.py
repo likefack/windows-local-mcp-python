@@ -253,7 +253,9 @@ def write_file(
         if len(content_bytes) > runtime.settings.max_write_bytes:
             raise ValueError("write exceeds max_write_bytes")
         target = runtime.workspace.resolve_for_write(path)
-        with WorkspaceExecutionLock(runtime.settings), runtime.workspace.lock_target(target):
+        with WorkspaceExecutionLock(
+            runtime.settings, target=target
+        ), runtime.workspace.lock_target(target):
             target = runtime.workspace.resolve_for_write(path)
             parent_identity = runtime.workspace.identity(target.parent)
             if parent_identity is None:
