@@ -49,7 +49,11 @@ def prepare_approval_bundle(
     stage_root.mkdir(parents=True)
 
     executable = Path(normalized.executable)
-    executable_record = _file_record(executable, max_bytes=settings.approval_manifest_max_bytes)
+    executable_record = _file_record(
+        executable,
+        max_bytes=settings.approval_manifest_max_bytes,
+        allow_hardlinks=True,
+    )
     manifest: dict[str, Any] = {
         "version": 1,
         "operation_id": operation_id,
@@ -159,7 +163,9 @@ def verify_approval_bundle(
 
     executable_record = manifest["executable"]
     if _file_record(
-        Path(executable_record["path"]), max_bytes=settings.approval_manifest_max_bytes
+        Path(executable_record["path"]),
+        max_bytes=settings.approval_manifest_max_bytes,
+        allow_hardlinks=True,
     ) != executable_record:
         raise RuntimeError("approved executable changed after approval was requested")
     for record in manifest.get("inputs", []):
@@ -428,11 +434,16 @@ def _is_inside(candidate: Path, parent: Path) -> bool:
         return False
 
 
-def _file_record(path: Path, *, max_bytes: int | None = None) -> dict[str, Any]:
+def _file_record(
+    path: Path,
+    *,
+    max_bytes: int | None = None,
+    allow_hardlinks: bool = False,
+) -> dict[str, Any]:
     if path.is_symlink() or not path.is_file():
         raise PermissionError(f"approval input must be a regular non-reparse file: {path}")
     info = path.stat()
-    if info.st_nlink > 1:
+    if not allow_hardlinks and info.st_nlink > 1:
         raise PermissionError(f"approval input with multiple hard links is denied: {path}")
     if max_bytes is not None and info.st_size > max_bytes:
         raise ValueError(f"approval input exceeds byte limit: {path}")
