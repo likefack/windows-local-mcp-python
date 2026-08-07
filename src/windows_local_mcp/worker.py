@@ -32,20 +32,55 @@ class ApprovalExecutionExpired(RuntimeError):
 def run_operation(operation_id: str) -> int:
     settings = load_settings()
     audit = AuditStore(settings)
-    execution_lock = WorkspaceExecutionLock(settings)
-    execution_lock.__enter__()
     operation = audit.get_operation(operation_id, include_events=False)
     request = operation["request"]
     normalized = request["normalized_command"]
+    use_workspace_lock = _requires_workspace_execution_lock(operation, request, normalized)
+    audit.add_event(
+        operation_id,
+        "workspace_lock_selected",
+        {"mode": "exclusive" if use_workspace_lock else "none"},
+    )
+
+    execution_lock = WorkspaceExecutionLock(settings) if use_workspace_lock else None
+    if execution_lock is not None:
+        execution_lock.__enter__()
+    try:
+        return _run_operation(
+            operation_id=operation_id,
+            settings=settings,
+            audit=audit,
+            operation=operation,
+            request=request,
+            normalized=normalized,
+        )
+    finally:
+        if execution_lock is not None:
+            execution_lock.__exit__(None, None, None)
+
+
+def _run_operation(
+    *,
+    operation_id: str,
+    settings: object,
+    audit: AuditStore,
+    operation: dict[str, object],
+    request: dict[str, object],
+    normalized: dict[str, object],
+) -> int:
+    # settings is the validated Settings instance returned by load_settings(). Keeping this helper
+    # separate makes the lock lifetime explicit: only workspace-mutating execution wraps this call.
     try:
         if operation["tier"] == "host_approval":
             verified = verify_approval_bundle(
-                settings=settings,
+                settings=settings,  # type: ignore[arg-type]
                 operation_id=operation_id,
-                expected_digest=request["approval_manifest_digest"],
+                expected_digest=str(request["approval_manifest_digest"]),
             )
             verified = materialize_execution_copy(
-                settings=settings, operation_id=operation_id, normalized=verified
+                settings=settings,  # type: ignore[arg-type]
+                operation_id=operation_id,
+                normalized=verified,
             )
             normalized = verified.model_dump()
             audit.add_event(operation_id, "approval_bundle_verified", {})
@@ -53,7 +88,7 @@ def run_operation(operation_id: str) -> int:
             safe_request = request.get("safe_request")
             if not isinstance(safe_request, dict):
                 raise RuntimeError("safe command is missing its original validated request")
-            policy = CommandPolicy(settings, Workspace(settings))
+            policy = CommandPolicy(settings, Workspace(settings))  # type: ignore[arg-type]
             fresh = policy.normalize_safe(
                 program=str(safe_request["program"]),
                 args=list(safe_request["args"]),
@@ -64,12 +99,14 @@ def run_operation(operation_id: str) -> int:
             execution_manifest_digest = request.get("execution_manifest_digest")
             if execution_manifest_digest:
                 verified = verify_approval_bundle(
-                    settings=settings,
+                    settings=settings,  # type: ignore[arg-type]
                     operation_id=operation_id,
                     expected_digest=str(execution_manifest_digest),
                 )
                 verified = materialize_execution_copy(
-                    settings=settings, operation_id=operation_id, normalized=verified
+                    settings=settings,  # type: ignore[arg-type]
+                    operation_id=operation_id,
+                    normalized=verified,
                 )
                 normalized = verified.model_dump()
                 audit.add_event(operation_id, "safe_execution_bundle_verified", {})
@@ -88,20 +125,22 @@ def run_operation(operation_id: str) -> int:
             "pre_execution_verification_failed",
             {"error": f"{type(error).__name__}: {error}"[:1000]},
         )
-        execution_lock.__exit__(None, None, None)
         return 1
 
-    executable = normalized["executable"]
-    args = list(normalized["args"])
-    cwd = normalized["cwd"]
+    executable = str(normalized["executable"])
+    args = list(normalized["args"])  # type: ignore[arg-type]
+    cwd = str(normalized["cwd"])
     max_runtime = int(request["max_runtime_seconds"])
     nonce = str(operation.get("process_nonce") or os.environ.get("WINDOWS_LOCAL_MCP_JOB_NONCE", ""))
     if not nonce:
         raise RuntimeError("worker process nonce is missing")
 
-    stdout_path = settings.data_dir / "outputs" / f"{operation_id}.stdout.log"
-    stderr_path = settings.data_dir / "outputs" / f"{operation_id}.stderr.log"
-    enforce_data_quota(settings, incoming_bytes=2 * settings.max_output_bytes_per_stream)
+    stdout_path = settings.data_dir / "outputs" / f"{operation_id}.stdout.log"  # type: ignore[attr-defined]
+    stderr_path = settings.data_dir / "outputs" / f"{operation_id}.stderr.log"  # type: ignore[attr-defined]
+    enforce_data_quota(
+        settings,  # type: ignore[arg-type]
+        incoming_bytes=2 * settings.max_output_bytes_per_stream,  # type: ignore[attr-defined]
+    )
 
     audit.update_operation(
         operation_id,
@@ -113,7 +152,9 @@ def run_operation(operation_id: str) -> int:
     )
     audit.add_event(operation_id, "worker_started", {"worker_pid": os.getpid()})
 
-    pre_git = capture_git_snapshot(settings=settings, operation_id=operation_id, stage="before")
+    pre_git = capture_git_snapshot(
+        settings=settings, operation_id=operation_id, stage="before"  # type: ignore[arg-type]
+    )
     if pre_git:
         audit.update_operation(operation_id, pre_git_path=pre_git)
 
@@ -125,7 +166,7 @@ def run_operation(operation_id: str) -> int:
     stderr_capture: BoundedStreamCapture | None = None
 
     try:
-        _verify_adb_target(normalized, settings.adb_emulator_only)
+        _verify_adb_target(normalized, settings.adb_emulator_only)  # type: ignore[attr-defined]
         child_env = os.environ.copy()
         for internal_name in (
             "LOCAL_MCP_CONFIG",
@@ -154,7 +195,7 @@ def run_operation(operation_id: str) -> int:
             child_env.pop(injection_name, None)
         if normalized.get("program_key") == "git":
             child_env = sanitized_git_environment(child_env)
-        runtime_root = settings.data_dir / "outputs" / f"{operation_id}-runtime"
+        runtime_root = settings.data_dir / "outputs" / f"{operation_id}-runtime"  # type: ignore[attr-defined]
         try:
             Path(cwd).resolve(strict=True).relative_to(runtime_root.resolve(strict=True))
             isolated_home = runtime_root / "home"
@@ -204,10 +245,10 @@ def run_operation(operation_id: str) -> int:
             {"child_pid": child.pid, "argv": argv, "identity_verified": True},
         )
         stdout_capture = BoundedStreamCapture(
-            child.stdout, stdout_path, settings.max_output_bytes_per_stream
+            child.stdout, stdout_path, settings.max_output_bytes_per_stream  # type: ignore[attr-defined]
         )
         stderr_capture = BoundedStreamCapture(
-            child.stderr, stderr_path, settings.max_output_bytes_per_stream
+            child.stderr, stderr_path, settings.max_output_bytes_per_stream  # type: ignore[attr-defined]
         )
         stdout_capture.start()
         stderr_capture.start()
@@ -240,12 +281,18 @@ def run_operation(operation_id: str) -> int:
             stderr_capture.join()
 
     duration_ms = int((time.monotonic() - started) * 1000)
-    post_git = capture_git_snapshot(settings=settings, operation_id=operation_id, stage="after")
+    post_git = capture_git_snapshot(
+        settings=settings, operation_id=operation_id, stage="after"  # type: ignore[arg-type]
+    )
     stdout_preview = (
-        stdout_capture.preview(settings.output_preview_characters) if stdout_capture else ""
+        stdout_capture.preview(settings.output_preview_characters)  # type: ignore[attr-defined]
+        if stdout_capture
+        else ""
     )
     stderr_preview = (
-        stderr_capture.preview(settings.output_preview_characters) if stderr_capture else ""
+        stderr_capture.preview(settings.output_preview_characters)  # type: ignore[attr-defined]
+        if stderr_capture
+        else ""
     )
     result = {
         "operation_id": operation_id,
@@ -276,8 +323,38 @@ def run_operation(operation_id: str) -> int:
         update_fields["approval_status"] = "expired"
     audit.update_operation(operation_id, **update_fields)
     audit.add_event(operation_id, "worker_finished", {"status": status, "exit_code": exit_code})
-    execution_lock.__exit__(None, None, None)
     return 0 if status == "succeeded" else 1
+
+
+def _requires_workspace_execution_lock(
+    operation: dict[str, object],
+    request: dict[str, object],
+    normalized: dict[str, object],
+) -> bool:
+    """Return whether execution can mutate the original workspace and needs exclusivity."""
+    tier = operation.get("tier")
+    if tier == "safe_command":
+        if normalized.get("program_key") != "dart":
+            return False
+        args = list(normalized.get("args") or [])
+        if not args or args[0] != "format":
+            return False
+        return not any(
+            value in {"--show", "--output=show", "--output=none"}
+            for value in args
+        )
+
+    if tier == "host_approval":
+        if bool(request.get("workspace_write")):
+            return True
+        summary = request.get("approval_manifest_summary")
+        if isinstance(summary, dict) and summary.get("mode") == "staged-cwd":
+            return False
+        # Old audit rows or non-snapshot host commands remain conservative. They may execute
+        # against the real workspace, so keep the exclusive lock unless isolation is explicit.
+        return True
+
+    return True
 
 
 def _ensure_approval_execution_fresh(operation: dict[str, object]) -> None:
