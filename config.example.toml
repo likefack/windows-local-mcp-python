@@ -5,7 +5,7 @@ workspace_root = "C:\\path\\to\\your-project"
 # Empty uses %LOCALAPPDATA%\WindowsLocalMCP. It must not overlap workspace_root.
 data_dir = ""
 
-# Capability switches. Disabled tools are not resolved at startup.
+# Capability switches. false blocks both automatic execution and direct request_host_command use.
 filesystem_enabled = true
 git_enabled = true
 flutter_enabled = false
