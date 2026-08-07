@@ -17,6 +17,7 @@ _BASE_ALLOWED_NAMES = frozenset(
         "APPDATA",
         "COMSPEC",
         "FLUTTER_ROOT",
+        "HOME",
         "HOMEDRIVE",
         "HOMEPATH",
         "JAVA_HOME",
@@ -33,6 +34,7 @@ _BASE_ALLOWED_NAMES = frozenset(
         "PROGRAMFILES",
         "PROGRAMFILES(X86)",
         "PROGRAMW6432",
+        "PUB_CACHE",
         "PYTHONIOENCODING",
         "PYTHONUTF8",
         "SYSTEMDRIVE",
@@ -74,7 +76,11 @@ _FORBIDDEN_EXPLICIT_NAMES = frozenset(
     }
 )
 
-_WORKER_INTERNAL_NAMES = frozenset({"LOCAL_MCP_CONFIG", "LOCAL_MCP_ROOT"})
+# The worker needs these only to locate the same MCP configuration and to keep approval
+# environment binding stable. They are deliberately not copied to the final host command.
+_WORKER_INTERNAL_NAMES = frozenset(
+    {"LOCAL_MCP_CONFIG", "LOCAL_MCP_ROOT", "LOCAL_MCP_TRANSPORT"}
+)
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_()]*$")
 
 
