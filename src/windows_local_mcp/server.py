@@ -6,6 +6,7 @@ import shutil
 import tempfile
 import uuid
 from datetime import UTC, datetime, timedelta
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -124,9 +125,7 @@ def _audit_rejection(tool_name: str, request: dict[str, Any], error: Exception) 
         request=_safe_request(request),
     )
     message = f"{type(error).__name__}: {error}"
-    runtime.audit.update_operation(
-        operation_id, finished_at=utc_now_iso(), error=message
-    )
+    runtime.audit.update_operation(operation_id, finished_at=utc_now_iso(), error=message)
     runtime.audit.add_event(operation_id, "rejected", {"error": message[:1000]})
 
 
@@ -169,8 +168,9 @@ def list_directory(path: str = ".") -> dict[str, Any]:
     try:
         _require_filesystem()
         directory = runtime.workspace.resolve_directory(path)
-        entries = list(directory.iterdir())
-        if len(entries) > runtime.settings.max_directory_entries:
+        limit = runtime.settings.max_directory_entries
+        entries = list(islice(directory.iterdir(), limit + 1))
+        if len(entries) > limit:
             raise ValueError("directory entry limit exceeded")
         result = {
             "path": runtime.workspace.relative(directory),
@@ -305,9 +305,7 @@ def write_file(
                 relative=runtime.workspace.relative(target),
                 destination=diff_path,
             )
-            enforce_data_quota(
-                runtime.settings, incoming_bytes=diff_bytes + len(previous_bytes)
-            )
+            enforce_data_quota(runtime.settings, incoming_bytes=diff_bytes + len(previous_bytes))
             backup_path: str | None = None
             if target.exists():
                 backup_dir = runtime.settings.data_dir / "backups" / operation_id
@@ -423,9 +421,8 @@ def _queue_command(
     normalized_model = NormalizedCommand.model_validate(normalized_command)
     execution_manifest_digest: str | None = None
     if normalized_model.program_key in {"flutter", "dart"}:
-        dart_writes = (
-            normalized_model.program_key == "dart"
-            and dart_format_writes(normalized_model.args)
+        dart_writes = normalized_model.program_key == "dart" and dart_format_writes(
+            normalized_model.args
         )
         with WorkspaceExecutionLock(runtime.settings):
             _, _, execution_manifest_digest = prepare_approval_bundle(
