@@ -116,3 +116,36 @@ def test_git_snapshot_ignores_hostile_repository_environment(
     content = Path(snapshot).read_text(encoding="utf-8")
     assert "===== status exit=0 =====" in content
     assert "===== branch exit=0 =====" in content
+
+
+def test_git_snapshot_does_not_climb_to_parent_repository(tmp_path: Path) -> None:
+    git = shutil.which("git.exe") or shutil.which("git")
+    if git is None:
+        pytest.skip("Git is not installed")
+
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    subprocess.run(
+        [git, "init", str(parent)],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        check=True,
+        shell=False,
+    )
+    workspace = parent / "nested-workspace"
+    workspace.mkdir()
+    settings = Settings(
+        workspace_root=workspace,
+        data_dir=tmp_path / "data",
+        protect_data_dir_acl=False,
+        git_enabled=True,
+    )
+    settings.ensure_directories()
+
+    snapshot = capture_git_snapshot(
+        settings=settings,
+        operation_id="nested-parent",
+        stage="test",
+    )
+
+    assert snapshot is None
