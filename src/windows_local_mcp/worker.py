@@ -9,8 +9,8 @@ from pathlib import Path
 
 from .approval import materialize_execution_copy, verify_approval_bundle
 from .audit import AuditStore
+from .child_env import build_command_environment
 from .config import Settings, load_settings
-from .git_env import sanitized_git_environment
 from .git_snapshot import capture_git_snapshot
 from .paths import Workspace
 from .policy import CommandPolicy
@@ -166,34 +166,12 @@ def _run_operation(
 
     try:
         _verify_adb_target(normalized, settings.adb_emulator_only)
-        child_env = os.environ.copy()
-        for internal_name in (
-            "LOCAL_MCP_CONFIG",
-            "LOCAL_MCP_ROOT",
-            "LOCAL_MCP_TRANSPORT",
-            "LOCAL_MCP_HOST",
-            "LOCAL_MCP_PORT",
-        ):
-            child_env.pop(internal_name, None)
-        for injection_name in (
-            "PYTHONPATH",
-            "PYTHONHOME",
-            "NODE_PATH",
-            "NODE_OPTIONS",
-            "PSModulePath",
-            "JAVA_TOOL_OPTIONS",
-            "JDK_JAVA_OPTIONS",
-            "_JAVA_OPTIONS",
-            "GRADLE_OPTS",
-            "DART_VM_OPTIONS",
-            "FLUTTER_TOOL_ARGS",
-            "RUBYLIB",
-            "PERL5LIB",
-            "CLASSPATH",
-        ):
-            child_env.pop(injection_name, None)
-        if normalized.get("program_key") == "git":
-            child_env = sanitized_git_environment(child_env)
+        child_env = build_command_environment(
+            os.environ,
+            extra_names=settings.child_environment_allowlist,
+            nonce=nonce,
+            git_command=normalized.get("program_key") == "git",
+        )
         runtime_root = settings.data_dir / "outputs" / f"{operation_id}-runtime"
         try:
             Path(cwd).resolve(strict=True).relative_to(runtime_root.resolve(strict=True))
@@ -214,7 +192,6 @@ def _run_operation(
             )
         except (ValueError, FileNotFoundError):
             pass
-        child_env["WINDOWS_LOCAL_MCP_JOB_NONCE"] = nonce
         _ensure_approval_execution_fresh(
             audit.get_operation(operation_id, include_events=False)
         )
