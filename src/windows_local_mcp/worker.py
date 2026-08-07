@@ -9,6 +9,7 @@ from pathlib import Path
 from .approval import materialize_execution_copy, verify_approval_bundle
 from .audit import AuditStore
 from .config import load_settings
+from .git_env import sanitized_git_environment
 from .git_snapshot import capture_git_snapshot
 from .paths import Workspace
 from .policy import CommandPolicy
@@ -146,6 +147,8 @@ def run_operation(operation_id: str) -> int:
             "CLASSPATH",
         ):
             child_env.pop(injection_name, None)
+        if normalized.get("program_key") == "git":
+            child_env = sanitized_git_environment(child_env)
         runtime_root = settings.data_dir / "outputs" / f"{operation_id}-runtime"
         try:
             Path(cwd).resolve(strict=True).relative_to(runtime_root.resolve(strict=True))
