@@ -9,7 +9,7 @@ from pathlib import Path
 
 from .approval import materialize_execution_copy, verify_approval_bundle
 from .audit import AuditStore
-from .config import load_settings
+from .config import Settings, load_settings
 from .git_env import sanitized_git_environment
 from .git_snapshot import capture_git_snapshot
 from .paths import Workspace
@@ -44,7 +44,17 @@ def run_operation(operation_id: str) -> int:
 
     execution_lock = WorkspaceExecutionLock(settings) if use_workspace_lock else None
     if execution_lock is not None:
-        execution_lock.__enter__()
+        try:
+            execution_lock.__enter__()
+        except TimeoutError as error:
+            audit.update_operation(
+                operation_id,
+                status="failed",
+                finished_at=utc_now_iso(),
+                error=f"workspace execution lock timed out: {error}",
+            )
+            audit.add_event(operation_id, "workspace_lock_timeout", {})
+            return 1
     try:
         return _run_operation(
             operation_id=operation_id,
@@ -62,25 +72,21 @@ def run_operation(operation_id: str) -> int:
 def _run_operation(
     *,
     operation_id: str,
-    settings: object,
+    settings: Settings,
     audit: AuditStore,
     operation: dict[str, object],
     request: dict[str, object],
     normalized: dict[str, object],
 ) -> int:
-    # settings is the validated Settings instance returned by load_settings(). Keeping this helper
-    # separate makes the lock lifetime explicit: only workspace-mutating execution wraps this call.
     try:
         if operation["tier"] == "host_approval":
             verified = verify_approval_bundle(
-                settings=settings,  # type: ignore[arg-type]
+                settings=settings,
                 operation_id=operation_id,
                 expected_digest=str(request["approval_manifest_digest"]),
             )
             verified = materialize_execution_copy(
-                settings=settings,  # type: ignore[arg-type]
-                operation_id=operation_id,
-                normalized=verified,
+                settings=settings, operation_id=operation_id, normalized=verified
             )
             normalized = verified.model_dump()
             audit.add_event(operation_id, "approval_bundle_verified", {})
@@ -88,7 +94,7 @@ def _run_operation(
             safe_request = request.get("safe_request")
             if not isinstance(safe_request, dict):
                 raise RuntimeError("safe command is missing its original validated request")
-            policy = CommandPolicy(settings, Workspace(settings))  # type: ignore[arg-type]
+            policy = CommandPolicy(settings, Workspace(settings))
             fresh = policy.normalize_safe(
                 program=str(safe_request["program"]),
                 args=list(safe_request["args"]),
@@ -99,14 +105,12 @@ def _run_operation(
             execution_manifest_digest = request.get("execution_manifest_digest")
             if execution_manifest_digest:
                 verified = verify_approval_bundle(
-                    settings=settings,  # type: ignore[arg-type]
+                    settings=settings,
                     operation_id=operation_id,
                     expected_digest=str(execution_manifest_digest),
                 )
                 verified = materialize_execution_copy(
-                    settings=settings,  # type: ignore[arg-type]
-                    operation_id=operation_id,
-                    normalized=verified,
+                    settings=settings, operation_id=operation_id, normalized=verified
                 )
                 normalized = verified.model_dump()
                 audit.add_event(operation_id, "safe_execution_bundle_verified", {})
@@ -135,12 +139,9 @@ def _run_operation(
     if not nonce:
         raise RuntimeError("worker process nonce is missing")
 
-    stdout_path = settings.data_dir / "outputs" / f"{operation_id}.stdout.log"  # type: ignore[attr-defined]
-    stderr_path = settings.data_dir / "outputs" / f"{operation_id}.stderr.log"  # type: ignore[attr-defined]
-    enforce_data_quota(
-        settings,  # type: ignore[arg-type]
-        incoming_bytes=2 * settings.max_output_bytes_per_stream,  # type: ignore[attr-defined]
-    )
+    stdout_path = settings.data_dir / "outputs" / f"{operation_id}.stdout.log"
+    stderr_path = settings.data_dir / "outputs" / f"{operation_id}.stderr.log"
+    enforce_data_quota(settings, incoming_bytes=2 * settings.max_output_bytes_per_stream)
 
     audit.update_operation(
         operation_id,
@@ -152,9 +153,7 @@ def _run_operation(
     )
     audit.add_event(operation_id, "worker_started", {"worker_pid": os.getpid()})
 
-    pre_git = capture_git_snapshot(
-        settings=settings, operation_id=operation_id, stage="before"  # type: ignore[arg-type]
-    )
+    pre_git = capture_git_snapshot(settings=settings, operation_id=operation_id, stage="before")
     if pre_git:
         audit.update_operation(operation_id, pre_git_path=pre_git)
 
@@ -166,7 +165,7 @@ def _run_operation(
     stderr_capture: BoundedStreamCapture | None = None
 
     try:
-        _verify_adb_target(normalized, settings.adb_emulator_only)  # type: ignore[attr-defined]
+        _verify_adb_target(normalized, settings.adb_emulator_only)
         child_env = os.environ.copy()
         for internal_name in (
             "LOCAL_MCP_CONFIG",
@@ -195,7 +194,7 @@ def _run_operation(
             child_env.pop(injection_name, None)
         if normalized.get("program_key") == "git":
             child_env = sanitized_git_environment(child_env)
-        runtime_root = settings.data_dir / "outputs" / f"{operation_id}-runtime"  # type: ignore[attr-defined]
+        runtime_root = settings.data_dir / "outputs" / f"{operation_id}-runtime"
         try:
             Path(cwd).resolve(strict=True).relative_to(runtime_root.resolve(strict=True))
             isolated_home = runtime_root / "home"
@@ -245,10 +244,10 @@ def _run_operation(
             {"child_pid": child.pid, "argv": argv, "identity_verified": True},
         )
         stdout_capture = BoundedStreamCapture(
-            child.stdout, stdout_path, settings.max_output_bytes_per_stream  # type: ignore[attr-defined]
+            child.stdout, stdout_path, settings.max_output_bytes_per_stream
         )
         stderr_capture = BoundedStreamCapture(
-            child.stderr, stderr_path, settings.max_output_bytes_per_stream  # type: ignore[attr-defined]
+            child.stderr, stderr_path, settings.max_output_bytes_per_stream
         )
         stdout_capture.start()
         stderr_capture.start()
@@ -281,18 +280,12 @@ def _run_operation(
             stderr_capture.join()
 
     duration_ms = int((time.monotonic() - started) * 1000)
-    post_git = capture_git_snapshot(
-        settings=settings, operation_id=operation_id, stage="after"  # type: ignore[arg-type]
-    )
+    post_git = capture_git_snapshot(settings=settings, operation_id=operation_id, stage="after")
     stdout_preview = (
-        stdout_capture.preview(settings.output_preview_characters)  # type: ignore[attr-defined]
-        if stdout_capture
-        else ""
+        stdout_capture.preview(settings.output_preview_characters) if stdout_capture else ""
     )
     stderr_preview = (
-        stderr_capture.preview(settings.output_preview_characters)  # type: ignore[attr-defined]
-        if stderr_capture
-        else ""
+        stderr_capture.preview(settings.output_preview_characters) if stderr_capture else ""
     )
     result = {
         "operation_id": operation_id,
