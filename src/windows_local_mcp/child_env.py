@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping, MutableMapping
 import os
 import re
-from collections.abc import Iterable, Mapping, MutableMapping
 
 from .git_env import is_git_ambient_override, sanitized_git_environment
 
