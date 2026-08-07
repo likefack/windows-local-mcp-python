@@ -137,8 +137,7 @@ class CommandPolicy:
             else:
                 raise FileNotFoundError(f"executable was not found: {command[0]}")
         key = self._program_key(executable)
-        if key in {"powershell", "pwsh"} and not self.settings.powershell_enabled:
-            raise PermissionError("PowerShell capability is disabled")
+        self._require_host_capability(key)
         return NormalizedCommand(
             executable=str(Path(executable).resolve()),
             args=list(command[1:]),
@@ -147,6 +146,18 @@ class CommandPolicy:
             program_key=key,
             network_expected=network_expected,
         )
+
+    def _require_host_capability(self, key: str) -> None:
+        if key == "git":
+            self._require_enabled("git", self.settings.git_enabled)
+        elif key == "flutter":
+            self._require_enabled("flutter", self.settings.flutter_enabled)
+        elif key == "dart":
+            self._require_enabled("dart", self.settings.dart_enabled)
+        elif key == "adb":
+            self._require_enabled("adb", self.settings.adb_enabled)
+        elif key in {"powershell", "pwsh"}:
+            self._require_enabled("PowerShell", self.settings.powershell_enabled)
 
     @staticmethod
     def _require_enabled(name: str, enabled: bool) -> None:
