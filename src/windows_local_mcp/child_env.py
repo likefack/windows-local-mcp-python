@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, MutableMapping
 
 from .git_env import is_git_ambient_override, sanitized_git_environment
 
@@ -76,9 +76,9 @@ _FORBIDDEN_EXPLICIT_NAMES = frozenset(
     }
 )
 
-# The worker needs these only to locate the same MCP configuration and to keep approval
-# environment binding stable. They are deliberately not copied to the final host command.
-_WORKER_INTERNAL_NAMES = frozenset(
+# The server/worker needs these only to locate the same MCP configuration and transport.
+# They are deliberately not copied to the final host command.
+_INTERNAL_NAMES = frozenset(
     {"LOCAL_MCP_CONFIG", "LOCAL_MCP_ROOT", "LOCAL_MCP_TRANSPORT"}
 )
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_()]*$")
@@ -129,7 +129,7 @@ def build_worker_environment(
     source = os.environ if source is None else source
     result = build_allowlisted_environment(source, extra_names=extra_names)
     for key, value in source.items():
-        if key.upper() in _WORKER_INTERNAL_NAMES:
+        if key.upper() in _INTERNAL_NAMES:
             result[key] = value
     result["WINDOWS_LOCAL_MCP_JOB_NONCE"] = nonce
     return result
@@ -148,3 +148,19 @@ def build_command_environment(
         result = sanitized_git_environment(result)
     result["WINDOWS_LOCAL_MCP_JOB_NONCE"] = nonce
     return result
+
+
+def sanitize_process_environment(
+    environment: MutableMapping[str, str] | None = None,
+    *,
+    extra_names: Iterable[str] = (),
+) -> None:
+    """Reduce the MCP process environment so internal subprocesses inherit the same safe base."""
+    target = os.environ if environment is None else environment
+    original = dict(target)
+    filtered = build_allowlisted_environment(original, extra_names=extra_names)
+    for key, value in original.items():
+        if key.upper() in _INTERNAL_NAMES or key.upper() == "WINDOWS_LOCAL_MCP_JOB_NONCE":
+            filtered[key] = value
+    target.clear()
+    target.update(filtered)
