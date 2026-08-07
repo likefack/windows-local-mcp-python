@@ -1,0 +1,40 @@
+workspace_root = "C:\\dev\\decision-deck"
+
+# 省略時は %LOCALAPPDATA%\WindowsLocalMCP
+data_dir = ""
+
+max_text_file_bytes = 2097152
+max_image_bytes = 10485760
+max_directory_entries = 3000
+approval_ttl_seconds = 1800
+default_foreground_timeout_seconds = 30
+default_max_runtime_seconds = 1800
+output_preview_characters = 12000
+
+blocked_file_names = [
+  ".env",
+  ".env.local",
+  ".env.production",
+  "id_rsa",
+  "id_ed25519",
+  "credentials.json",
+  "service-account.json",
+]
+
+excluded_directories = [
+  ".git",
+  ".dart_tool",
+  "build",
+  "node_modules",
+  ".venv",
+  "__pycache__",
+]
+
+# 通常のexecuteで許可するPowerShellスクリプト。
+# 任意の -Command は許可されません。
+safe_powershell_scripts = [
+  # "scripts\\doctor.ps1",
+  # "scripts\\verify-android.ps1",
+]
+
+default_approver = "local-user"

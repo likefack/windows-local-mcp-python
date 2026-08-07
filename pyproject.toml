@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "windows-local-mcp"
+version = "0.2.0"
+description = "A Windows-native local workspace MCP server with approvals and durable audit logs."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+  "mcp>=2,<3",
+  "pydantic>=2.8,<3",
+  "psutil>=6,<8",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<9", "ruff>=0.12,<1"]
+
+[project.scripts]
+windows-local-mcp = "windows_local_mcp.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/windows_local_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
