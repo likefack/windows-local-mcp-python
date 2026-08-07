@@ -6,6 +6,7 @@ import uuid
 from pathlib import Path
 
 from .config import Settings
+from .git_env import sanitized_git_environment
 from .resources import BoundedStreamCapture, enforce_data_quota
 
 
@@ -21,6 +22,7 @@ def capture_git_snapshot(
     if not git:
         return None
     root = settings.workspace_root
+    git_env = sanitized_git_environment()
     probe = subprocess.run(
         [git, "-C", str(root), "rev-parse", "--is-inside-work-tree"],
         capture_output=True,
@@ -30,6 +32,7 @@ def capture_git_snapshot(
         timeout=15,
         shell=False,
         check=False,
+        env=git_env,
     )
     if probe.returncode != 0 or probe.stdout.strip() != "true":
         return None
@@ -68,6 +71,7 @@ def capture_git_snapshot(
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     shell=False,
+                    env=git_env,
                 )
                 if process.stdout is None or process.stderr is None:
                     raise RuntimeError("failed to capture Git snapshot output")
