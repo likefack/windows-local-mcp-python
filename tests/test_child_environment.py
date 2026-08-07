@@ -6,6 +6,7 @@ from windows_local_mcp.child_env import (
     build_allowlisted_environment,
     build_command_environment,
     build_worker_environment,
+    sanitize_process_environment,
 )
 from windows_local_mcp.config import Settings
 
@@ -85,3 +86,27 @@ def test_worker_environment_keeps_only_required_internal_values() -> None:
     assert "LOCAL_MCP_HOST" not in worker
     assert "PRIVATE_TOKEN" not in worker
     assert worker["WINDOWS_LOCAL_MCP_JOB_NONCE"] == "nonce-2"
+
+
+def test_process_environment_is_reduced_in_place() -> None:
+    environment = {
+        "PATH": "base",
+        "SYSTEMROOT": r"C:\Windows",
+        "MY_BUILD_FLAG": "enabled",
+        "PRIVATE_TOKEN": "secret",
+        "LOCAL_MCP_CONFIG": r"C:\config.toml",
+        "LOCAL_MCP_TRANSPORT": "stdio",
+        "GIT_DIR": r"C:\outside\.git",
+    }
+
+    sanitize_process_environment(
+        environment,
+        extra_names=["MY_BUILD_FLAG"],
+    )
+
+    assert environment["PATH"] == "base"
+    assert environment["MY_BUILD_FLAG"] == "enabled"
+    assert environment["LOCAL_MCP_CONFIG"] == r"C:\config.toml"
+    assert environment["LOCAL_MCP_TRANSPORT"] == "stdio"
+    assert "PRIVATE_TOKEN" not in environment
+    assert "GIT_DIR" not in environment
