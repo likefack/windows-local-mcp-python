@@ -17,6 +17,12 @@ powershell_enabled = false
 adb_emulator_only = true
 adb_allowed_serials = []
 
+# Child processes receive a small built-in Windows/toolchain allowlist instead of the whole
+# parent environment. Add only project-specific variable names that are genuinely required.
+# Known injection/redirection variables such as PYTHONPATH, NODE_OPTIONS, GIT_DIR and
+# LOCAL_MCP_* are rejected even if listed here.
+child_environment_allowlist = []
+
 # File and artifact limits.
 max_text_file_bytes = 2097152
 max_write_bytes = 2097152
