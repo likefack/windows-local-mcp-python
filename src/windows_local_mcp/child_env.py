@@ -6,7 +6,6 @@ from collections.abc import Iterable, Mapping, MutableMapping
 
 from .git_env import is_git_ambient_override, sanitized_git_environment
 
-
 # Minimal Windows/toolchain environment that ordinary subprocesses commonly need.
 # Arbitrary project-specific values are not inherited unless explicitly allowlisted in config.
 _BASE_ALLOWED_NAMES = frozenset(
