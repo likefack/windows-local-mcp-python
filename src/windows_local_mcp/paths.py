@@ -37,12 +37,8 @@ class Workspace:
         self.root = settings.workspace_root.resolve(strict=True)
         self._blocked = {name.casefold() for name in settings.blocked_file_names}
         self._hidden = {name.casefold() for name in settings.hidden_directories}
-        self._read_denied = {
-            name.casefold() for name in settings.read_denied_directories
-        }
-        self._write_denied = {
-            name.casefold() for name in settings.write_denied_directories
-        }
+        self._read_denied = {name.casefold() for name in settings.read_denied_directories}
+        self._write_denied = {name.casefold() for name in settings.write_denied_directories}
         self._locks_guard = threading.Lock()
         self._target_locks: dict[str, threading.RLock] = {}
         self._reject_reparse_chain(self.root)
@@ -154,6 +150,25 @@ class Workspace:
                 raise IsADirectoryError(f"write target is not a regular file: {target}")
             self._reject_hardlink(target)
         return target
+
+    def ensure_directory_for_write(self, user_path: str) -> Path:
+        """Create a workspace directory chain while rechecking every Windows path component."""
+        self._validate_windows_syntax(user_path)
+        lexical = self.root / user_path
+        self._check_inside(lexical.resolve(strict=False))
+        self._check_access(lexical, access="write")
+        current = self.root
+        for part in lexical.relative_to(self.root).parts:
+            current /= part
+            if current.exists():
+                self._reject_reparse_chain(current)
+                if not current.is_dir():
+                    raise NotADirectoryError(f"write parent is not a directory: {current}")
+            else:
+                current.mkdir()
+                self._reject_reparse_chain(current)
+            self._check_inside(current.resolve(strict=True))
+        return current.resolve(strict=True)
 
     def relative(self, path: Path) -> str:
         resolved = path.resolve(strict=False)

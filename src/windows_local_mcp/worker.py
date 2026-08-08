@@ -13,6 +13,7 @@ from .child_env import build_command_environment
 from .command_traits import dart_format_writes
 from .config import load_settings
 from .git_snapshot import capture_git_snapshot
+from .network_isolation import apply_safe_network_environment, safe_network_policy
 from .paths import Workspace
 from .policy import CommandPolicy
 from .process_utils import (
@@ -24,6 +25,7 @@ from .process_utils import (
 )
 from .resources import BoundedStreamCapture, WorkspaceExecutionLock, enforce_data_quota
 from .util import canonical_json, utc_now_iso
+from .workspace_history import capture_workspace_state, compare_workspace_states
 
 
 class ApprovalExecutionExpired(RuntimeError):
@@ -111,9 +113,42 @@ def run_operation(operation_id: str) -> int:
     )
     audit.add_event(operation_id, "worker_started", {"worker_pid": os.getpid()})
 
+    workspace_lock: WorkspaceExecutionLock | None = None
+    tracks_workspace = _requires_workspace_execution_lock(operation, request, normalized)
+    if tracks_workspace:
+        workspace_lock = WorkspaceExecutionLock(settings)
+        try:
+            workspace_lock.__enter__()
+        except TimeoutError as lock_error:
+            audit.update_operation(
+                operation_id, status="failed", finished_at=utc_now_iso(), error=str(lock_error)
+            )
+            audit.add_event(
+                operation_id, "workspace_lock_timeout", {"error": str(lock_error)[:1000]}
+            )
+            return 1
+
     pre_git = capture_git_snapshot(settings=settings, operation_id=operation_id, stage="before")
     if pre_git:
         audit.update_operation(operation_id, pre_git_path=pre_git)
+    pre_workspace = None
+    if tracks_workspace:
+        try:
+            pre_workspace = capture_workspace_state(settings, operation_id, "before")
+            audit.update_operation(operation_id, pre_workspace_path=pre_workspace.manifest_path)
+        except Exception as snapshot_error:  # noqa: BLE001 - persist checkpoint failures
+            audit.update_operation(
+                operation_id,
+                status="failed",
+                finished_at=utc_now_iso(),
+                error=f"workspace checkpoint failed: {type(snapshot_error).__name__}: {snapshot_error}",
+            )
+            audit.add_event(
+                operation_id, "workspace_checkpoint_failed", {"error": str(snapshot_error)[:1000]}
+            )
+            if workspace_lock is not None:
+                workspace_lock.__exit__(None, None, None)
+            return 1
 
     argv = build_process_argv(executable, args)
     started = time.monotonic()
@@ -124,20 +159,8 @@ def run_operation(operation_id: str) -> int:
     status = "failed"
     exit_code: int | None = None
     error: str | None = None
-    workspace_lock: WorkspaceExecutionLock | None = None
 
     try:
-        if _requires_workspace_execution_lock(operation, request, normalized):
-            workspace_lock = WorkspaceExecutionLock(settings)
-            try:
-                workspace_lock.__enter__()
-            except TimeoutError as lock_error:
-                audit.add_event(
-                    operation_id,
-                    "workspace_lock_timeout",
-                    {"error": str(lock_error)[:1000]},
-                )
-                raise
         _verify_adb_target(normalized, settings.adb_emulator_only)
         if operation["tier"] == "host_approval":
             refreshed = audit.get_operation(operation_id, include_events=False)
@@ -148,6 +171,23 @@ def run_operation(operation_id: str) -> int:
             nonce=nonce,
             git_command=normalized.get("program_key") == "git",
         )
+        if operation["tier"] == "safe_command":
+            network_policy = safe_network_policy(str(normalized.get("program_key", "")))
+            apply_safe_network_environment(child_env, str(normalized.get("program_key", "")))
+            audit.update_operation(
+                operation_id, network_policy_json=canonical_json(network_policy.as_dict())
+            )
+            audit.add_event(operation_id, "network_policy_applied", network_policy.as_dict())
+        else:
+            network_policy = {
+                "name": "approved-host-network",
+                "internet": "allowed" if normalized.get("network_expected") else "not-requested",
+                "lan": "allowed" if normalized.get("network_expected") else "not-requested",
+                "loopback": "allowed",
+                "enforcement": "human-approval",
+            }
+            audit.update_operation(operation_id, network_policy_json=canonical_json(network_policy))
+            audit.add_event(operation_id, "network_policy_applied", network_policy)
         runtime_root = settings.data_dir / "outputs" / f"{operation_id}-runtime"
         try:
             Path(cwd).resolve(strict=True).relative_to(runtime_root.resolve(strict=True))
@@ -236,11 +276,45 @@ def run_operation(operation_id: str) -> int:
             stdout_capture.join()
         if stderr_capture is not None:
             stderr_capture.join()
-        if workspace_lock is not None:
-            workspace_lock.__exit__(None, None, None)
 
     duration_ms = int((time.monotonic() - started) * 1000)
     post_git = capture_git_snapshot(settings=settings, operation_id=operation_id, stage="after")
+    workspace_change: dict[str, object] = {
+        "changed_files": [],
+        "added_lines": 0,
+        "removed_lines": 0,
+        "diff_path": None,
+        "rollback_state": "not_applicable",
+    }
+    post_workspace = None
+    if pre_workspace is not None:
+        try:
+            post_workspace = capture_workspace_state(settings, operation_id, "after")
+            workspace_change = compare_workspace_states(
+                settings, pre_workspace.manifest_path, post_workspace.manifest_path, operation_id
+            )
+            workspace_change["rollback_state"] = (
+                "complete" if workspace_change["changed_files"] else "not_applicable"
+            )
+            if operation["tier"] == "host_approval":
+                # Approved host commands retain the user's OS token and can affect protected
+                # workspace entries (for example .git) that MCP checkpoints intentionally omit.
+                workspace_change["rollback_state"] = "partial"
+            if _has_irreversible_effect(normalized):
+                workspace_change["rollback_state"] = (
+                    "partial" if workspace_change["changed_files"] else "unavailable"
+                )
+        except Exception as snapshot_error:  # noqa: BLE001 - result remains safely partial
+            workspace_change = {
+                "changed_files": [],
+                "added_lines": 0,
+                "removed_lines": 0,
+                "diff_path": None,
+                "rollback_state": "partial",
+                "snapshot_error": f"{type(snapshot_error).__name__}: {snapshot_error}",
+            }
+    if workspace_lock is not None:
+        workspace_lock.__exit__(None, None, None)
     stdout_preview = (
         stdout_capture.preview(settings.output_preview_characters) if stdout_capture else ""
     )
@@ -262,6 +336,7 @@ def run_operation(operation_id: str) -> int:
         "stderr_path": str(stderr_path),
         "pre_git_path": pre_git,
         "post_git_path": post_git,
+        **workspace_change,
     }
     update_fields: dict[str, object] = {
         "status": status,
@@ -271,6 +346,10 @@ def run_operation(operation_id: str) -> int:
         "result_json": canonical_json(result),
         "error": error,
         "duration_ms": duration_ms,
+        "diff_path": workspace_change.get("diff_path"),
+        "pre_workspace_path": pre_workspace.manifest_path if pre_workspace else None,
+        "post_workspace_path": post_workspace.manifest_path if post_workspace else None,
+        "rollback_state": workspace_change.get("rollback_state"),
     }
     if status == "expired" and operation["tier"] == "host_approval":
         update_fields["approval_status"] = "expired"
@@ -303,6 +382,18 @@ def _requires_workspace_execution_lock(
         return not (isinstance(summary, dict) and summary.get("mode") == "staged-cwd")
 
     return True
+
+
+def _has_irreversible_effect(normalized: dict[str, object]) -> bool:
+    if bool(normalized.get("network_expected")):
+        return True
+    key = normalized.get("program_key")
+    args = [str(value).casefold() for value in list(normalized.get("args") or [])]
+    if key == "git" and args and args[0] in {"commit", "push", "fetch", "pull"}:
+        return True
+    return key == "adb" and any(
+        value in {"install", "uninstall", "push", "shell", "emu"} for value in args
+    )
 
 
 def _ensure_approval_execution_fresh(operation: dict[str, object]) -> None:

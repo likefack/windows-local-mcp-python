@@ -79,7 +79,11 @@ class AuditStore:
                     backup_path TEXT,
                     result_json TEXT,
                     error TEXT,
-                    duration_ms INTEGER
+                    duration_ms INTEGER,
+                    pre_workspace_path TEXT,
+                    post_workspace_path TEXT,
+                    rollback_state TEXT,
+                    network_policy_json TEXT
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_operations_created
@@ -114,6 +118,10 @@ class AuditStore:
                 "child_create_time": "REAL",
                 "child_executable": "TEXT",
                 "process_nonce": "TEXT",
+                "pre_workspace_path": "TEXT",
+                "post_workspace_path": "TEXT",
+                "rollback_state": "TEXT",
+                "network_policy_json": "TEXT",
             }
             for name, sql_type in migrations.items():
                 if name not in existing:
@@ -203,7 +211,10 @@ class AuditStore:
         if not fields:
             return
         result_json = fields.get("result_json")
-        if isinstance(result_json, str) and len(result_json.encode("utf-8")) > self.settings.max_audit_record_bytes:
+        if (
+            isinstance(result_json, str)
+            and len(result_json.encode("utf-8")) > self.settings.max_audit_record_bytes
+        ):
             raise ValueError("audit result exceeds max_audit_record_bytes")
         fields["updated_at"] = utc_now_iso()
         assignments = ", ".join(f"{key} = ?" for key in fields)
@@ -221,7 +232,9 @@ class AuditStore:
     ) -> None:
         payload_json = canonical_json(payload or {})
         if len(payload_json.encode("utf-8")) > self.settings.max_audit_record_bytes:
-            payload_json = canonical_json({"truncated": True, "original_bytes": len(payload_json.encode("utf-8"))})
+            payload_json = canonical_json(
+                {"truncated": True, "original_bytes": len(payload_json.encode("utf-8"))}
+            )
         with self._lock, self._connect() as db:
             db.execute(
                 """
@@ -240,6 +253,8 @@ class AuditStore:
             result["request"] = json.loads(result.pop("request_json"))
             if result.get("result_json"):
                 result["result"] = json.loads(result["result_json"])
+            if result.get("network_policy_json"):
+                result["network_policy"] = json.loads(result["network_policy_json"])
             if include_events:
                 event_rows = db.execute(
                     """
@@ -289,6 +304,19 @@ class AuditStore:
                 values,
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def latest_workspace_checkpoint(self) -> dict[str, Any] | None:
+        with self._connect() as db:
+            row = db.execute(
+                """SELECT * FROM operations WHERE post_workspace_path IS NOT NULL
+                   AND finished_at IS NOT NULL
+                   ORDER BY finished_at DESC, created_at DESC LIMIT 1"""
+            ).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        item["request"] = json.loads(item.pop("request_json"))
+        return item
 
     def list_active_operations(self) -> list[dict[str, Any]]:
         with self._connect() as db:
@@ -361,7 +389,9 @@ class AuditStore:
     ) -> dict[str, Any]:
         now = datetime.now(UTC)
         now_iso = now.isoformat()
-        approval_expires = (now + timedelta(seconds=self.settings.approval_execution_ttl_seconds)).isoformat()
+        approval_expires = (
+            now + timedelta(seconds=self.settings.approval_execution_ttl_seconds)
+        ).isoformat()
         new_approval = "approved" if approved else "rejected"
         new_status = "approved" if approved else "rejected"
         with self._lock, self._connect() as db:

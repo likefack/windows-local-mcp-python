@@ -224,7 +224,14 @@ def prune_artifacts(settings: Settings, *, protected_ids: set[str] | None = None
     """Apply age and size retention only to known artifact directories."""
     artifact_roots = [
         settings.data_dir / name
-        for name in ("outputs", "diffs", "backups", "git-snapshots", "approval-staging")
+        for name in (
+            "outputs",
+            "diffs",
+            "backups",
+            "git-snapshots",
+            "approval-staging",
+            "workspace-history",
+        )
     ]
     protected_ids = protected_ids or set()
     cutoff = datetime.now(UTC) - timedelta(days=settings.retention_days)

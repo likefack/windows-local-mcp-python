@@ -10,10 +10,22 @@ from .audit import TERMINAL_STATUSES, AuditStore
 from .config import Settings, load_settings
 from .executor import Executor
 from .policy import NormalizedCommand, approval_hash
-from .util import utc_now_iso
+from .resources import WorkspaceExecutionLock
+from .risk import command_risk_facts
+from .util import canonical_json, sha256_text, utc_now_iso
+from .workspace_history import (
+    capture_workspace_state,
+    compare_workspace_states,
+    restore_workspace_state,
+)
 
 _READ_ACTIVITY_TOOLS = {"list_directory", "read_file", "get_image", "git_info"}
-_COMMAND_ACTIVITY_TOOLS = {"execute_readonly", "execute_workspace_write", "adb_read", "request_host_command"}
+_COMMAND_ACTIVITY_TOOLS = {
+    "execute_readonly",
+    "execute_workspace_write",
+    "adb_read",
+    "request_host_command",
+}
 
 
 def _show(item: dict[str, object]) -> None:
@@ -24,8 +36,34 @@ def _show(item: dict[str, object]) -> None:
     print(f"Tool        : {item['tool_name']}")
     print(f"CWD         : {item['cwd']}")
     print(f"Hash        : {item['request_hash']}")
-    print("-" * 80)
-    print(json.dumps(item["request"], ensure_ascii=False, indent=2))
+    request = item["request"]
+    if isinstance(request, dict):
+        facts = request.get("objective_risk")
+        normalized_payload = request.get("normalized_command")
+        summary = request.get("approval_manifest_summary")
+        if isinstance(normalized_payload, dict) and isinstance(summary, dict):
+            facts = command_risk_facts(
+                NormalizedCommand.model_validate(normalized_payload),
+                workspace_write=bool(request.get("workspace_write")),
+                manifest=summary,
+            )
+        if isinstance(facts, dict):
+            print("Objective facts (verified by MCP):")
+            for key, value in facts.items():
+                print(f"  {key}: {value}")
+        print("Model-provided context (not independently verified):")
+        print(f"  reason: {request.get('reason', '')}")
+        print(f"  risk_summary: {request.get('risk_summary', '')}")
+        print("-" * 80)
+        technical = {
+            key: value
+            for key, value in request.items()
+            if key not in {"reason", "risk_summary", "objective_risk"}
+        }
+        print("Technical details:")
+        print(json.dumps(technical, ensure_ascii=False, indent=2))
+    else:
+        print(json.dumps(request, ensure_ascii=False, indent=2))
     print("=" * 80)
 
 
@@ -157,6 +195,48 @@ def run_approval_ui(settings: Settings | None = None) -> None:
                     request = item["request"]
                     if not isinstance(request, dict):
                         raise TypeError("invalid approval request")
+                    if item.get("tool_name") == "request_workspace_rollback":
+                        expected_hash = sha256_text(canonical_json(request))
+                        if expected_hash != item.get("request_hash"):
+                            raise RuntimeError("rollback approval request hash mismatch")
+                        audit.approve_and_claim(
+                            operation_id, approver=settings.default_approver, note=note
+                        )
+                        with WorkspaceExecutionLock(settings):
+                            before = capture_workspace_state(settings, operation_id, "before")
+                            restored = restore_workspace_state(
+                                settings,
+                                str(request["expected_current_checkpoint"]),
+                                str(request["target_checkpoint"]),
+                            )
+                            after = capture_workspace_state(settings, operation_id, "after")
+                            change = compare_workspace_states(
+                                settings, before.manifest_path, after.manifest_path, operation_id
+                            )
+                        result = {
+                            "operation_id": operation_id,
+                            "status": "succeeded",
+                            "target_operation_id": request["target_operation_id"],
+                            **restored,
+                            **change,
+                            "rollback_state": "complete",
+                        }
+                        audit.update_operation(
+                            operation_id,
+                            status="succeeded",
+                            finished_at=utc_now_iso(),
+                            pre_workspace_path=before.manifest_path,
+                            post_workspace_path=after.manifest_path,
+                            diff_path=change["diff_path"],
+                            rollback_state="complete",
+                            result_json=canonical_json(result),
+                        )
+                        audit.add_event(operation_id, "workspace_rolled_back", result)
+                        print(
+                            "Approved and restored. Conflicting external changes would have stopped the operation."
+                        )
+                        pause_activity.clear()
+                        continue
                     normalized = NormalizedCommand.model_validate(request["normalized_command"])
                     manifest_digest = str(request["approval_manifest_digest"])
                     expected_hash = approval_hash(

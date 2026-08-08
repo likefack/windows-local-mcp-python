@@ -168,6 +168,7 @@ class Settings(BaseModel):
             "backups",
             "git-snapshots",
             "approval-staging",
+            "workspace-history",
         ):
             (self.data_dir / name).mkdir(parents=True, exist_ok=True)
         if self.protect_data_dir_acl and os.name == "nt":

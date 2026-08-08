@@ -6,6 +6,8 @@ import json
 from .approval_ui import run_approval_ui
 from .audit import AuditStore
 from .config import load_settings
+from .timeline import timeline_entry, timeline_list
+from .util import canonical_json, utc_now_iso
 
 
 def main() -> None:
@@ -18,6 +20,12 @@ def main() -> None:
     audit_parser = subparsers.add_parser("audit", help="最近の監査ログを表示")
     audit_parser.add_argument("--limit", type=int, default=20)
     audit_parser.add_argument("--status", default=None)
+
+    timeline_parser = subparsers.add_parser(
+        "timeline", help="Show bounded human-readable activity and rollback metadata"
+    )
+    timeline_parser.add_argument("--limit", type=int, default=20)
+    timeline_parser.add_argument("--operation", default=None)
 
     args = parser.parse_args()
 
@@ -40,6 +48,29 @@ def main() -> None:
                 indent=2,
             )
         )
+        return
+
+    if args.command == "timeline":
+        settings = load_settings()
+        store = AuditStore(settings)
+        result = (
+            timeline_entry(settings, store, args.operation)
+            if args.operation
+            else timeline_list(settings, store, args.limit)
+        )
+        access_id = store.create_operation(
+            tool_name="timeline_cli",
+            tier="read",
+            status="succeeded",
+            cwd=str(settings.workspace_root),
+            request={"limit": args.limit, "operation_id": args.operation},
+        )
+        store.update_operation(
+            access_id,
+            finished_at=utc_now_iso(),
+            result_json=canonical_json({"returned": 1 if args.operation else len(result)}),
+        )
+        print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

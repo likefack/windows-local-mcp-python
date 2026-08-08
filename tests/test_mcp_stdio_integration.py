@@ -64,6 +64,9 @@ def test_real_stdio_tools_list_and_file_round_trip(tmp_path: Path) -> None:
                 "request_host_command",
                 "poll_approval",
                 "audit_get",
+                "activity_timeline",
+                "activity_get",
+                "request_workspace_rollback",
             } <= tools.keys()
             assert {"execute", "start_command", "execute_approved"}.isdisjoint(tools.keys())
 
@@ -129,13 +132,14 @@ def test_real_stdio_tools_list_and_file_round_trip(tmp_path: Path) -> None:
             assert approval.structured_content["status"] == "pending"
             approval_id = approval.structured_content["approval_id"]
 
-            approval_record = await session.call_tool(
-                "audit_get", {"operation_id": approval_id}
-            )
+            approval_record = await session.call_tool("audit_get", {"operation_id": approval_id})
             assert not approval_record.is_error
             assert approval_record.structured_content is not None
             assert approval_record.structured_content["status"] == "pending_approval"
             assert approval_record.structured_content["approval_status"] == "pending"
+            facts = approval_record.structured_content["request"]["objective_risk"]
+            assert facts["network_declared"] is False
+            assert facts["network_access_possible"] is True
             assert approval_record.structured_content["worker_pid"] is None
             assert approval_record.structured_content["child_pid"] is None
 

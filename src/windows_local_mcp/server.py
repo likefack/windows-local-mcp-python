@@ -28,7 +28,13 @@ from .git_snapshot import capture_git_snapshot
 from .paths import Workspace
 from .policy import CommandPolicy, NormalizedCommand, approval_hash
 from .resources import WorkspaceExecutionLock, enforce_data_quota
+from .risk import command_risk_facts
+from .timeline import timeline_entry, timeline_list
 from .util import canonical_json, read_text_limited, sha256_bytes, sha256_text, utc_now_iso
+from .workspace_history import (
+    capture_workspace_state,
+    compare_workspace_states,
+)
 
 READ_ONLY = ToolAnnotations(
     readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False
@@ -57,12 +63,14 @@ runtime = Runtime()
 
 mcp = MCPServer(
     "Windows Local MCP",
-    version="0.3.0",
+    version="0.4.0",
     instructions=(
         "Operate inside the configured workspace. Use execute_readonly for safe Git/analyze "
         "operations, execute_workspace_write for constrained automatic source formatting, and "
         "adb_read for fixed read-only emulator operations. Test/build/general shell/destructive "
-        "ADB require request_host_command and local approval. request_host_command only stages "
+        "ADB require request_host_command and local approval. Activity tools expose bounded "
+        "operation details; workspace rollback is always a locally approved operation. "
+        "request_host_command only stages "
         "the request; local approval performs the dangerous execution once. Poll the result."
     ),
     log_level="INFO",
@@ -154,6 +162,11 @@ def session_info() -> dict[str, Any]:
             "read_only": "execute_readonly",
             "workspace_write": "execute_workspace_write",
             "adb_read": "adb_read",
+        },
+        "safe_network_isolation": {
+            "git_dart_flutter": "offline command/environment boundary",
+            "adb": "loopback-only command/environment boundary",
+            "os_enforced": False,
         },
         "transport": "stdio by default; optional loopback-only streamable-http",
     }
@@ -263,9 +276,7 @@ def write_file(
         if len(content_bytes) > runtime.settings.max_write_bytes:
             raise ValueError("write exceeds max_write_bytes")
         target = runtime.workspace.resolve_for_write(path)
-        with WorkspaceExecutionLock(
-            runtime.settings, target=target
-        ), runtime.workspace.lock_target(target):
+        with WorkspaceExecutionLock(runtime.settings), runtime.workspace.lock_target(target):
             target = runtime.workspace.resolve_for_write(path)
             parent_identity = runtime.workspace.identity(target.parent)
             if parent_identity is None:
@@ -297,6 +308,10 @@ def write_file(
                 status="running",
                 cwd=str(runtime.settings.workspace_root),
                 request=request,
+            )
+            pre_workspace = capture_workspace_state(runtime.settings, operation_id, "before")
+            runtime.audit.update_operation(
+                operation_id, pre_workspace_path=pre_workspace.manifest_path
             )
             diff_path = runtime.settings.data_dir / "diffs" / f"{operation_id}.diff"
             added, removed, diff_bytes = _write_bounded_diff(
@@ -353,12 +368,24 @@ def write_file(
                 "added_lines": added,
                 "removed_lines": removed,
             }
+            post_workspace = capture_workspace_state(runtime.settings, operation_id, "after")
+            workspace_change = compare_workspace_states(
+                runtime.settings,
+                pre_workspace.manifest_path,
+                post_workspace.manifest_path,
+                operation_id,
+            )
+            result.update(workspace_change)
+            result["rollback_state"] = "complete"
             runtime.audit.update_operation(
                 operation_id,
                 status="succeeded",
                 finished_at=utc_now_iso(),
-                diff_path=str(diff_path),
+                diff_path=str(workspace_change["diff_path"]),
                 backup_path=backup_path,
+                pre_workspace_path=pre_workspace.manifest_path,
+                post_workspace_path=post_workspace.manifest_path,
+                rollback_state="complete",
                 result_json=canonical_json(result),
             )
             runtime.audit.add_event(operation_id, "file_written", result)
@@ -655,9 +682,10 @@ def request_host_command(
     }
     operation_id = str(uuid.uuid4())
     try:
-        if len(reason) > runtime.settings.max_reason_characters or len(
-            risk_summary
-        ) > runtime.settings.max_reason_characters:
+        if (
+            len(reason) > runtime.settings.max_reason_characters
+            or len(risk_summary) > runtime.settings.max_reason_characters
+        ):
             raise ValueError("reason or risk_summary exceeds max_reason_characters")
         normalized = runtime.policy.normalize_host(
             command=command, cwd=cwd, network_expected=network_required
@@ -699,6 +727,9 @@ def request_host_command(
                 else max(10, min(max_runtime_seconds, runtime.settings.default_max_runtime_seconds))
             ),
         }
+        request["objective_risk"] = command_risk_facts(
+            normalized, workspace_write=workspace_write, manifest=manifest
+        )
         runtime.audit.create_operation(
             operation_id=operation_id,
             tool_name="request_host_command",
@@ -740,9 +771,7 @@ def poll_approval(approval_id: str) -> dict[str, Any]:
             "result": operation.get("result"),
             "error": operation.get("error"),
         }
-        _log_simple(
-            tool_name="poll_approval", request={"approval_id": approval_id}, result=result
-        )
+        _log_simple(tool_name="poll_approval", request={"approval_id": approval_id}, result=result)
         return result
     except Exception as error:
         _audit_rejection("poll_approval", {"approval_id": approval_id}, error)
@@ -778,6 +807,89 @@ def audit_get(operation_id: str) -> dict[str, Any]:
         return result
     except Exception as error:
         _audit_rejection("audit_get", request, error)
+        raise
+
+
+@mcp.tool(annotations=READ_ONLY)
+def activity_timeline(limit: int = 50) -> list[dict[str, Any]]:
+    """List human-readable, bounded operation history including changes and network policy."""
+    request = {"limit": limit}
+    try:
+        result = timeline_list(runtime.settings, runtime.audit, limit)
+        _log_simple(
+            tool_name="activity_timeline", request=request, result={"returned": len(result)}
+        )
+        return result
+    except Exception as error:
+        _audit_rejection("activity_timeline", request, error)
+        raise
+
+
+@mcp.tool(annotations=READ_ONLY)
+def activity_get(operation_id: str) -> dict[str, Any]:
+    """Return one detailed Timeline entry with bounded previews and unified diff."""
+    request = {"operation_id": operation_id}
+    try:
+        result = timeline_entry(runtime.settings, runtime.audit, operation_id)
+        _log_simple(tool_name="activity_get", request=request, result={"accessed": operation_id})
+        return result
+    except Exception as error:
+        _audit_rejection("activity_get", request, error)
+        raise
+
+
+@mcp.tool(annotations=APPROVAL_REQUEST)
+def request_workspace_rollback(operation_id: str, reason: str = "") -> dict[str, Any]:
+    """Request local human approval to restore the workspace to an operation completion point."""
+    request_input = {"operation_id": operation_id, "reason": reason}
+    try:
+        target = runtime.audit.get_operation(operation_id, include_events=False)
+        if not target.get("post_workspace_path"):
+            raise ValueError("target operation has no workspace completion checkpoint")
+        latest = runtime.audit.latest_workspace_checkpoint()
+        if latest is None:
+            raise ValueError("no current MCP workspace checkpoint is available")
+        rollback_id = str(uuid.uuid4())
+        now = datetime.now(UTC)
+        expires = (
+            now + timedelta(seconds=runtime.settings.approval_request_ttl_seconds)
+        ).isoformat()
+        request = {
+            "target_operation_id": operation_id,
+            "target_checkpoint": target["post_workspace_path"],
+            "expected_current_operation_id": latest["id"],
+            "expected_current_checkpoint": latest["post_workspace_path"],
+            "reason": reason,
+            "objective_risk": {
+                "writes_files": True,
+                "may_delete_files": True,
+                "workspace_access": "inside workspace only",
+                "network": False,
+                "external_state_change": False,
+                "rollback_of_rollback": "checkpointed",
+                "impact_scope": "all MCP-writable files changed after the target operation",
+            },
+        }
+        request_hash = sha256_text(canonical_json(request))
+        runtime.audit.create_operation(
+            operation_id=rollback_id,
+            tool_name="request_workspace_rollback",
+            tier="host_approval",
+            status="pending_approval",
+            cwd=str(runtime.settings.workspace_root),
+            request=request,
+            request_hash=request_hash,
+            approval_status="pending",
+            request_expires_at=expires,
+        )
+        return {
+            "approval_id": rollback_id,
+            "status": "pending",
+            "request_hash": request_hash,
+            "expires_at": expires,
+        }
+    except Exception as error:
+        _audit_rejection("request_workspace_rollback", request_input, error)
         raise
 
 

@@ -180,6 +180,22 @@ Retention deletes only known artifact roots and skips artifacts whose operation 
 
 All important MCP boundary actions create operations/events, including rejection before normalization, job poll/stop, approval poll/claim, audit access, timeout, stale identity, lock selection, and startup reconciliation. Secret-like fields are redacted; file content is represented by byte count and SHA. stdout/stderr and full file content are never copied into unbounded audit fields.
 
+### Activity Timeline
+
+`activity_timeline` and `activity_get` provide bounded, human-oriented projections of the durable audit store. Entries include operation/time/tool/cwd/command/status/result, bounded stdout and stderr previews, changed files, line counts, unified diff, errors, rollback classification, and the applied network policy. Reading the Timeline is itself audited and does not create an execution route.
+
+The same projection is available locally with `windows-local-mcp timeline --limit 20` or `windows-local-mcp timeline --operation OPERATION_ID`.
+
+Workspace-mutating operations capture pre/post content checkpoints outside the workspace while the existing workspace-wide mutation lock is held. This covers `write_file`, writing `dart format`, and approved commands that can execute against the original workspace. Commands running only in an immutable staged copy do not claim workspace rollbackability.
+
+`request_workspace_rollback` only creates a pending local approval. The local approval UI verifies the request hash, atomically consumes the one-shot grant, and restores the selected operation's post-state. It first proves that the current workspace still matches the latest MCP checkpoint. Any human or other-process change causes a conflict and stops before replacement. The rollback is itself checkpointed and audited. External effects such as email/API writes, device changes, Git push, and remote state are never classified as reversible.
+
+### Safe-tier network policy
+
+Every safe command receives an explicit per-command network policy in audit and Timeline. Git/Dart/Flutter safe grammars receive an offline policy; ADB receives a loopback-only policy and a fixed loopback server socket. Proxy, package-host, and Git transport environment values are replaced with local deny endpoints, while external-network work remains approval-only.
+
+The current implementation labels this enforcement precisely as `command-and-environment-boundary`. It is not a Windows Filtering Platform, AppContainer, VM, or kernel network sandbox and therefore cannot guarantee containment of a malicious native child that opens sockets directly. Deployments requiring that stronger property must place the worker under an OS-enforced broker; safe-tier fail-closed OS enforcement remains a documented security limitation rather than being misreported as active.
+
 ## 9. data_dir protection
 
 `data_dir` is resolved independently and must not lexically or effectively overlap workspace. Both roots must not be reparse points. On Windows, `protect_data_dir_acl=true` removes inherited ACLs and grants Full Control only to the current token SID and SYSTEM.
