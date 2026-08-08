@@ -85,7 +85,7 @@ Gitも入っていない場合は`git_enabled = false`へ変更します。保�
 - `s`: 今は判断せず次へ
 - `q`: 承認画面を終了
 
-`request_host_command`は承認要求を作るだけで、その呼出し時点では要求されたコマンドを実行しません。危険な実行はWindows側で`y`を選んだときだけ1回開始されます。ChatGPT側には`execute_approved`を公開せず、`poll_approval`または`poll_job`で結果だけ確認します。
+`request_sandbox_command`と`request_host_command`は承認要求を作るだけで、その呼出し時点では要求されたコマンドを実行しません。危険な実行はWindows側で`y`を選んだときだけ1回開始されます。前者はCodex Windows sandbox、後者は通常Windows user tokenという別のsecurity decisionです。sandbox unavailable/failedからhostへ暗黙fallbackしません。ChatGPT側には`execute_approved`を公開せず、`poll_approval`または`poll_job`で結果だけ確認します。
 
 ### 7. Secure MCP Tunnelへ登録する
 
@@ -158,19 +158,20 @@ Tunnelへは`powershell.exe -NoProfile -File <repo>\run-server.ps1 -Config <repo
 | `flutter analyze` | 無効 | `execute_readonly`。有効化後、`--no-pub`、検証済みpath、固定snapshotとdependency closure |
 | `dart analyze` / 表示だけの`dart format` | 無効 | `execute_readonly`。有効化後、完全文法とsnapshot |
 | 書込みを行う制約付き`dart format` | 無効 | `execute_workspace_write`。実workspace全体を直前固定して実行 |
-| Flutter/Dart test/build | 承認 | `request_host_command`で要求を作成し、Windows側承認後にsnapshotから1回実行 |
+| Flutter/Dart test/build | 承認 | `request_sandbox_command`で要求を作成し、Windows側承認後にApproved Sandboxで1回実行 |
 | ADB devices/固定read-only/screenshot | 無効 | `adb_read`。Emulator検証、serial allowlist、固定操作文法 |
-| ADB state change/general shell | 承認 | `request_host_command`後、ローカル利用者の承認が必要 |
-| PowerShell/general host command/network/delete | 承認 | `request_host_command`は要求作成のみ。対応機能、全入力manifest、期限、一回性を検証 |
+| ADB state change/general shell | 承認 | 原則`request_sandbox_command`。device/IPC等の実効能力とrollback不能範囲を承認UIに表示 |
+| Python/pytest/PowerShell/Node/npm/npx/project scripts | 承認 | `request_sandbox_command`。広いcommand grammarだがApproved Sandbox内で実行 |
+| network必須またはsandbox外host command | 承認 | `request_host_command`で別要求。real Windows user tokenで実行する最終経路 |
 | Streamable HTTP | 無効 | loopbackのみ。multi-principal modeは未実装のため起動拒否 |
 
 自動コマンドはまず共通のdeny-by-default文法で検証し、その後に`execute_readonly`、`execute_workspace_write`、`adb_read`のどれへ属するかを判定します。別のtoolへ誤って送られた操作は実行せず拒否します。旧generic `execute` / `start_command`はMCPへ公開しません。
 
-Tool Annotation（MCPホストへ伝える操作性質）もtoolごとに分離しています。`execute_readonly`と`adb_read`はread-only/non-destructive、`execute_workspace_write`はdestructiveだがclosed-world、`request_host_command`は「承認要求を作るだけ」なのでnon-destructive/closed-worldです。これはChatGPT側の不要な確認を減らすためのヒントであり、最終的な確認UIの有無はMCPホスト側の判断にも依存します。
+Tool Annotation（MCPホストへ伝える操作性質）もtoolごとに分離しています。`execute_readonly`と`adb_read`はread-only/non-destructive、`execute_workspace_write`はdestructiveだがclosed-world、2つのrequest toolは「承認要求を作るだけ」なのでnon-destructive/closed-worldです。これはChatGPT側の不要な確認を減らすためのヒントであり、最終的な確認UIの有無はMCPホスト側の判断にも依存します。
 
 ## 承認snapshot
 
-`request_host_command`は次を固定します。
+`request_sandbox_command`と`request_host_command`は次を固定します。Approved SandboxではさらにCodex executableのpath/size/mtime/SHA-256、backend mode、permission profileもapproval hashへ結合します。
 
 - 実行ファイルのbytes/identity
 - argv、cwd、reason、risk、network/workspace-write指定
@@ -184,6 +185,19 @@ Tool Annotation（MCPホストへ伝える操作性質）もtoolごとに分離�
 元workspaceを変更する承認操作では`workspace_write=true`が必要です。この場合はworkspace全体を固定し、MCP writeとcommand executionをcross-process lockで直列化します。したがって承認後の無関係なworkspace変更も意図的に失効させます。
 
 test/buildはread-only安全Tierではありません。元workspaceを変更しない場合でも、任意コードを実行するためローカル承認済みsnapshot実行です。
+
+## 3つのexecution tier
+
+```text
+Safe Sandbox --明示的な承認 escalationのみ--> Approved Sandbox
+Approved Sandbox --別の明示的承認のみ-----> Approved Host
+```
+
+- **Safe Sandbox**: Git、`dart analyze/format`、`flutter analyze`、限定ADBのstrict grammar。原則AppContainerで自動実行し、Internet/LAN、filesystem、descendantをOS境界で制限します。
+- **Approved Sandbox**: Python、pytest、PowerShell、Node、npm、npx、build tool、project script等。人間承認後、installed Codex CLIの`sandbox`専用entrypointをcommand launcherとして使用します。Codex agentは起動せず、prompt/model inference/OpenAI API通信やOpenAI authenticationをcommand実行のために要求しません。
+- **Approved Host**: real Windows user token。sandbox外の実効能力が必要な場合だけ、別の承認要求で使用します。Approved Sandboxの未導入、setup失敗、timeout、command failureを理由に自動選択しません。
+
+Safe commandのAppContainer setup/startup/既知ACL互換性failureは`failure_class=sandbox_compatibility`として停止し、Approved Sandboxで再試行可能と表示します。test failure、compile error、lint error、application error、通常のnon-zero exitは`command_failure`であり、escalation理由にはなりません。request作成もapprovalも自動ではありません。補助Git snapshot/repository probeとADB emulator identity probeもSafe brokerを通るため、本体の前後だけreal user tokenでexternal executableを起動しません。
 
 ## ファイル保護
 
@@ -200,9 +214,9 @@ NTFS ADS、Windows予約デバイス名、末尾dot/space、workspace外、symli
 
 方式選定では、Windows 8以降の安定APIであるAppContainerと、experimentalな`CreateProcessInSandbox`、OpenAI Codex Windows sandboxの専用低権限user + ACL + firewall/local policy方式を比較しました。本実装はexperimental APIへ依存せず、network capabilityを持たないAppContainer tokenとJob Objectを子孫へ継承させます。OpenAI方式と同等のmachine-wide sandboxを主張するものではありません。Windows 10/11を対象とし、profile/ACL作成は一度だけ、operationごとの追加承認は不要です。toolchain pathのACL互換性はmachine依存です。
 
-Git用workspace-read profile、Dart/Flutter用staged-read、Dart format用staged-write、ADB loopback profileは分離されています。Dart/Flutter/ADBへworkspace全体のACLは付与せず、Git起動直前にはprotected file/denied directoryのACLを再確認します。Safe Tier requestはeffective settings digestも保持するため、serverとworkerの間でnetwork isolation mode等が変われば実行を停止します。選択中のconfig fileはworkspace外に置く必要があります。
+Git用workspace-read profile、Dart/Flutter用staged-read、Dart format用staged-write、ADB loopback profileは分離されています。Git AppContainer identityにはGit自身が`HEAD/index/refs/objects/config`を解釈するためのworkspace read ACLを与えますが、MCP/modelへ返す内容はsafe Git grammar、pathspec、no-textconv/no-external-diff、bounded output、protected-content規則で別に制限します。Dart/Flutter/ADBへworkspace全体のACLは付与しません。Safe Tier requestはeffective settings digestも保持するため、serverとworkerの間でnetwork isolation mode等が変われば実行を停止します。選択中のconfig fileはworkspace外に置く必要があります。
 
-既定の`safe_network_isolation_mode = "appcontainer"`では、Safe Tier processをnetwork capabilityなしのWindows AppContainerで起動します。descendantも同じAppContainer tokenを継承します。ADBだけは別profileへloopback exemptionを付け、Internet/LAN capabilityは付けません。初回のみ次を実行します。
+既定の`safe_network_isolation_mode = "appcontainer"`では、Safe Tier processをnetwork capabilityなしのWindows AppContainerで起動します。descendantも同じAppContainer tokenを継承し、kill-on-close Job Objectへ入ります。childへ継承するHANDLEはstdin=NUL/stdout/stderrのallowlistだけです。ADBだけは別profileへloopback exemptionを付け、Internet/LAN capabilityは付けません。`ADB_SERVER_SOCKET=tcp:127.0.0.1:5037`は要求endpointですが、OS上の実効保証は5037限定ではなく一般loopback exemptionです。この差をTimeline/auditへ記録します。初回のみ次を実行します。
 
 ```powershell
 .\setup-network-isolation.ps1 -Config "$PWD\config.toml"
@@ -210,7 +224,17 @@ Git用workspace-read profile、Dart/Flutter用staged-read、Dart format用staged
 
 AppContainerから必要なFlutter SDKやuser-local Git等は、private local configの`safe_network_readable_paths`へtoolchain rootを列挙してください。setup/ACL/profile/process launchのいずれかが失敗した場合、Safe Tierを通常user processとして再実行せずfail closedにします。
 
+setupはprofileごとのACL grant ledgerをreconcileします。設定から外したtoolchain pathの古いACEを除去し、workspace/data_dirまたはそれらとancestor/descendant関係になるreadable pathを拒否します。
+
 `safe_network_isolation_mode = "compatibility"`は明示的legacy modeです。proxy poisoning、Git protocol、package host、ADB socket、command grammarは維持しますが、direct socket APIをOSで拒否する保証はなく、TimelineにもOS isolationとして表示しません。
+
+## Approved Sandbox backend
+
+本releaseは **installed Codex dependency** を採用します。`codex sandbox -c windows.sandbox="elevated" -P :workspace -C <cwd> -- <command...>`をargvで直接起動し、agent mode/app-server/model APIを経由しません。`codex.exe`とsandbox-only経路の`codex-command-runner.exe` / `codex-windows-sandbox-setup.exe`は、OpenAI Authenticode signer、path、size、mtime、SHA-256を承認内容へ結合します。実行時には3 binaryを再検証し、write/deleteを許さないfile handleをcommand終了まで保持します。versionは承認後に確認してauditへ保存します。
+
+OpenAIの現行Windows sandboxは、preferredなelevated modeで一度だけAdministrator/UAC setupを行い、専用の低権限local user、ACL、firewall/local policy、restricted token、Job管理を使用します。Windows 11推奨で、Windows 10は更新済み環境でbest effortです。Codex未導入、helper/setup未完了、version/probe/policy/launch failureは`approved_sandbox_unavailable`または`sandbox_backend_failure`で停止します。
+
+OpenAI CodexはApache-2.0なのでstandalone同梱は法的には検討できますが、CLI、setup helper、command runner、policy/protocol version、署名とsecurity updateを一体で配布・追従する必要があります。本releaseでは独自再実装や一部binaryの切り出しを避け、installed CLIへ薄く接続する方式を選びました。Codex未導入PCでのUXとversion skewはこの方式の制約です。
 
 ## ADB
 
@@ -245,7 +269,9 @@ checkpointは完全なworkspace manifestを保持しますが、内容は`worksp
 - `request_workspace_rollback`: 指定operation終了時点へworkspace全体を戻すpoint-in-time rollback
 - `request_selective_undo`: 指定operationのdeltaだけを3状態比較で除去するselective Undo
 
-どちらもlocal one-shot承認が必要です。復元は事前検証・staging・durable journal・適用・最終hash検証を行い、途中失敗時は開始前状態への自動復旧を試します。単一fileの`write_file`も置換前にwrite-ahead recovery journalを永続化します。これは複数fileに対するfailure-atomic best effortであり、OS filesystem transactionを称するものではありません。Undo/rollback自身も通常operationとしてbefore/afterを持つため、競合がなければさらにUndoできます。
+どちらもlocal one-shot承認が必要です。復元は事前検証・staging・durable journal・適用・最終hash検証を行い、途中失敗時は開始前状態への自動復旧を試します。`preflight/staged` crashは未適用を確認してterminal化、`applying/recovering`は開始前へ復旧、`applied_verified`はtarget到達を確認してaudit/journalを完了し、真に判断不能な場合だけ`recovery_required`を残します。単一fileの`write_file`も置換前にwrite-ahead recovery journalを永続化します。これは複数fileに対するfailure-atomic best effortであり、OS filesystem transactionを称するものではありません。Undo/rollback自身は自分に属するfresh before/after checkpointを持つため、古いoperationのretentionに不要に依存せず、競合がなければさらにUndoできます。
+
+完全checkpointでpolicy上除外したentryはreason付きでmanifestへ記録し、対象fileのsharing violation、I/O error、permission anomaly、traversal failureはcheckpoint failureとして停止します。不明fileを「存在しなかった」と扱ってrollbackで削除しません。CASによるblob deduplicationは維持しますが、完全性とexternal modification検出を弱める信頼できるchange journalがまだないため、manifest作成は引き続きO(workspace files)のfull scanです。
 
 `activity_timeline`/CLIの一覧は要約だけです。diff、stdout/stderr、events、全path、rollback/Undo preview、conflict技術情報は`activity_get(operation_id)`で確認します。
 
@@ -268,7 +294,7 @@ SQLiteの`operations`と`events`へ、成功だけでなく拒否、path/command
 ## 制約
 
 - Safe Tierのnetwork/process/file accessにはAppContainer境界を使いますが、MCP本体と承認済みhost commandを含むアプリ全体のVM/完全sandboxではありません。
-- AppContainer ACL/setupとGit/Dart/Flutter/ADBの実toolchain互換性はmachine依存です。setup済み実機で検証するまで、各toolが動作するとは主張しません。
+- AppContainer ACL/setupとGit/Dart/Flutter/ADBの実toolchain互換性はmachine依存です。本検証端末ではSafe Gitがancestor ACL互換性で停止し、ADB loopback setupもfail-closedになりました。成功していないtoolを検証済みとは扱いません。
 - 同一Windowsユーザーの別プロセスがdata_dirやtoolchainを悪意を持って改変する脅威は完全には隔離できません。
 - Flutter/Dart/ADBがない環境では、その実commandの成功は検証できません。機能を無効にすればインストールなしで起動できます。
 - Secure MCP Tunnelのアカウント側availability、認証、UIはOpenAI側機能です。このリポジトリへsecretを保存しません。

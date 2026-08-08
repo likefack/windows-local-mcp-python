@@ -79,6 +79,35 @@ def test_denied_command_is_audited(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     )
 
 
+def test_approved_sandbox_and_host_are_distinct_requests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, _ = load_server(tmp_path, monkeypatch)
+    codex = tmp_path / "trusted" / "codex.exe"
+    codex.parent.mkdir()
+    codex.write_bytes(b"fake installed codex")
+    server.runtime.settings.approved_sandbox_codex_path = codex
+
+    sandbox = server.request_sandbox_command(
+        [sys.executable, "-c", "print('sandbox')"],
+        reason="run broad developer command in approved sandbox",
+    )
+    sandbox_record = server.runtime.audit.get_operation(sandbox["approval_id"])
+    assert sandbox_record["tier"] == "approved_sandbox"
+    assert sandbox_record["request"]["sandbox_backend"]["authentication_required"] is False
+    assert sandbox_record["request"]["effective_sandbox_policy"]["network_policy"][
+        "internet"
+    ] == "deny"
+
+    host = server.request_host_command(
+        [sys.executable, "-c", "print('host')"],
+        reason="explicit host-only operation",
+    )
+    host_record = server.runtime.audit.get_operation(host["approval_id"])
+    assert host_record["tier"] == "approved_host"
+    assert host_record["request"]["sandbox_backend"] is None
+
+
 def test_backup_and_diff_limits_fail_before_replacement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

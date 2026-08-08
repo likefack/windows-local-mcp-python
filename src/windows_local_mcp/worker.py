@@ -22,11 +22,11 @@ from .approval import (
 from .audit import AuditStore
 from .child_env import build_command_environment
 from .command_traits import dart_format_writes
-from .config import load_settings
+from .config import Settings, load_settings
 from .git_snapshot import capture_git_snapshot
 from .network_isolation import apply_safe_network_environment, safe_network_policy
 from .paths import Workspace
-from .policy import CommandPolicy, NormalizedCommand
+from .policy import CommandPolicy, NormalizedCommand, approved_request_hash
 from .process_utils import (
     ProcessIdentity,
     build_process_argv,
@@ -39,6 +39,16 @@ from .resources import (
     WorkspaceExecutionLock,
     enforce_data_quota,
     scan_directory_bounded,
+)
+from .safe_process import SafeSandboxCompatibilityError, run_safe_process
+from .sandbox_backend import (
+    ApprovedSandboxUnavailable,
+    CodexSandboxBackend,
+    build_codex_sandbox_argv,
+    codex_sandbox_effective_policy,
+    hold_codex_sandbox_backend,
+    probe_codex_version,
+    verify_codex_sandbox_backend,
 )
 from .util import canonical_json, utc_now_iso
 from .workspace_history import (
@@ -60,8 +70,15 @@ def run_operation(operation_id: str) -> int:
     settings = load_settings()
     audit = AuditStore(settings)
     operation = audit.get_operation(operation_id, include_events=False)
+    operation["tier"] = {
+        "safe_command": "safe_sandbox",
+        "host_approval": "approved_host",
+    }.get(str(operation.get("tier")), operation.get("tier"))
     request = operation["request"]
     normalized = request["normalized_command"]
+    approved_tier = operation["tier"] in {"approved_sandbox", "approved_host"}
+    sandbox_backend: CodexSandboxBackend | None = None
+    sandbox_backend_version: str | None = None
     workspace_lock: WorkspaceExecutionLock | None = None
     tracks_workspace = _requires_workspace_execution_lock(operation, request, normalized)
     if tracks_workspace:
@@ -87,22 +104,34 @@ def run_operation(operation_id: str) -> int:
             audit.add_event(operation_id, "workspace_recovery_required", {})
             return 1
     try:
-        if operation["tier"] == "safe_command" and request.get(
+        if operation["tier"] == "safe_sandbox" and request.get(
             "settings_digest"
         ) != settings_digest(settings):
             raise RuntimeError("effective MCP settings changed before safe execution")
-        if operation["tier"] == "host_approval":
+        if approved_tier:
+            if approved_request_hash(request) != operation.get("request_hash"):
+                raise RuntimeError("approved request changed after local approval")
             verified = verify_approval_bundle(
                 settings=settings,
                 operation_id=operation_id,
                 expected_digest=request["approval_manifest_digest"],
             )
-            verified = materialize_execution_copy(
-                settings=settings, operation_id=operation_id, normalized=verified
-            )
-            normalized = verified.model_dump()
+            if bool(request.get("workspace_write")):
+                normalized = dict(request["normalized_command"])
+            else:
+                verified = materialize_execution_copy(
+                    settings=settings, operation_id=operation_id, normalized=verified
+                )
+                normalized = verified.model_dump()
+            if operation["tier"] == "approved_sandbox":
+                expected_backend = request.get("sandbox_backend")
+                if not isinstance(expected_backend, dict):
+                    raise ApprovedSandboxUnavailable(
+                        "Approved Sandbox request has no immutable backend binding"
+                    )
+                sandbox_backend = verify_codex_sandbox_backend(settings, expected_backend)
             audit.add_event(operation_id, "approval_bundle_verified", {})
-        elif operation["tier"] == "safe_command":
+        elif operation["tier"] == "safe_sandbox":
             safe_request = request.get("safe_request")
             if not isinstance(safe_request, dict):
                 raise RuntimeError("safe command is missing its original validated request")
@@ -167,7 +196,35 @@ def run_operation(operation_id: str) -> int:
     )
     audit.add_event(operation_id, "worker_started", {"worker_pid": os.getpid()})
 
-    pre_git = capture_git_snapshot(settings=settings, operation_id=operation_id, stage="before")
+    try:
+        pre_git = capture_git_snapshot(
+            settings=settings, operation_id=operation_id, stage="before"
+        )
+    except SafeSandboxCompatibilityError as snapshot_error:
+        if normalized.get("program_key") == "git":
+            result = _sandbox_compatibility_result(
+                operation_id,
+                snapshot_error,
+                phase="preflight",
+                source_tier=str(operation["tier"]),
+            )
+            audit.update_operation(
+                operation_id,
+                status="failed",
+                finished_at=utc_now_iso(),
+                result_json=canonical_json(result),
+                error=result["message"],
+            )
+            audit.add_event(operation_id, "safe_auxiliary_sandbox_incompatible", result)
+            if workspace_lock is not None:
+                workspace_lock.__exit__(None, None, None)
+            return 1
+        pre_git = None
+        audit.add_event(
+            operation_id,
+            "optional_git_snapshot_sandbox_incompatible",
+            {"phase": "preflight", "diagnostic": str(snapshot_error)[:1000]},
+        )
     if pre_git:
         audit.update_operation(operation_id, pre_git_path=pre_git)
     pre_workspace = None
@@ -198,20 +255,36 @@ def run_operation(operation_id: str) -> int:
     status = "failed"
     exit_code: int | None = None
     error: str | None = None
+    failure_class: str | None = None
     network_policy_payload: dict[str, object] | None = None
+    sandbox_backend_hold: Any | None = None
 
     try:
-        _verify_adb_target(normalized, settings.adb_emulator_only)
-        if operation["tier"] == "host_approval":
+        _verify_adb_target(normalized, settings)
+        if approved_tier:
             refreshed = audit.get_operation(operation_id, include_events=False)
             _ensure_approval_execution_fresh(refreshed)
+        if operation["tier"] == "approved_sandbox":
+            if sandbox_backend is None:
+                raise ApprovedSandboxUnavailable("Approved Sandbox backend is unavailable")
+            sandbox_backend_hold = hold_codex_sandbox_backend(sandbox_backend)
+            sandbox_backend = sandbox_backend_hold.__enter__()
+            sandbox_backend_version = probe_codex_version(sandbox_backend)
         child_env = build_command_environment(
             os.environ,
             extra_names=settings.child_environment_allowlist,
             nonce=nonce,
             git_command=normalized.get("program_key") == "git",
         )
-        if operation["tier"] == "safe_command":
+        if operation["tier"] == "approved_sandbox" and sandbox_backend is not None:
+            helper_directory = str(Path(sandbox_backend.executable).parent)
+            existing_path = child_env.get("PATH", "")
+            child_env["PATH"] = (
+                helper_directory
+                if not existing_path
+                else helper_directory + os.pathsep + existing_path
+            )
+        if operation["tier"] == "safe_sandbox":
             network_policy = safe_network_policy(
                 str(normalized.get("program_key", "")),
                 mode=settings.safe_network_isolation_mode,
@@ -225,6 +298,7 @@ def run_operation(operation_id: str) -> int:
                             settings,
                             str(normalized.get("program_key", "")),
                             workspace_write=tracks_workspace,
+                            operation_id=operation_id,
                         ),
                         "descendant_enforcement": "inherited AppContainer token",
                     }
@@ -234,6 +308,21 @@ def run_operation(operation_id: str) -> int:
                 operation_id, network_policy_json=canonical_json(network_policy_payload)
             )
             audit.add_event(operation_id, "network_policy_prepared", network_policy_payload)
+        elif operation["tier"] == "approved_sandbox":
+            network_policy = codex_sandbox_effective_policy(
+                workspace_write=bool(request.get("workspace_write"))
+            )
+            network_policy.update(
+                {
+                    "backend_version": sandbox_backend_version,
+                    "isolation_setup_status": "verified_before_launch",
+                    "enforcement_status": "prepared",
+                }
+            )
+            audit.update_operation(
+                operation_id, network_policy_json=canonical_json(network_policy)
+            )
+            audit.add_event(operation_id, "sandbox_policy_prepared", network_policy)
         else:
             network_policy = {
                 "name": "approved-host-network",
@@ -248,6 +337,8 @@ def run_operation(operation_id: str) -> int:
         runtime_root.mkdir(parents=True, exist_ok=True)
         try:
             Path(cwd).resolve(strict=True).relative_to(runtime_root.resolve(strict=True))
+            if operation["tier"] == "approved_sandbox":
+                raise ValueError("Codex launcher requires its installed user-local setup state")
             isolated_home = runtime_root / "home"
             isolated_temp = runtime_root / "temp"
             isolated_home.mkdir(exist_ok=True)
@@ -265,21 +356,42 @@ def run_operation(operation_id: str) -> int:
             )
         except (ValueError, FileNotFoundError):
             pass
-        if operation["tier"] == "safe_command" and normalized.get("program_key") == "adb":
+        if operation["tier"] == "safe_sandbox" and normalized.get("program_key") == "adb":
             cwd = str(runtime_root)
         if (
-            operation["tier"] == "safe_command"
+            operation["tier"] == "safe_sandbox"
             and settings.safe_network_isolation_mode == "appcontainer"
         ):
-            child = launch_appcontainer_process(
-                settings=settings,
-                program_key=str(normalized.get("program_key", "")),
-                executable=argv[0],
-                args=argv[1:],
+            try:
+                child = launch_appcontainer_process(
+                    settings=settings,
+                    program_key=str(normalized.get("program_key", "")),
+                    executable=argv[0],
+                    args=argv[1:],
+                    cwd=cwd,
+                    environment=child_env,
+                    creation_flags=creation_flags(),
+                    workspace_write=tracks_workspace,
+                    operation_id=operation_id,
+                )
+            except (OSError, PermissionError) as compatibility_error:
+                raise SafeSandboxCompatibilityError(
+                    "AppContainer setup/process launch was incompatible: "
+                    f"{type(compatibility_error).__name__}: {compatibility_error}"
+                ) from compatibility_error
+        elif operation["tier"] == "approved_sandbox":
+            if sandbox_backend is None:
+                raise ApprovedSandboxUnavailable("Approved Sandbox backend is unavailable")
+            child = subprocess.Popen(
+                build_codex_sandbox_argv(sandbox_backend, command=argv, cwd=cwd),
                 cwd=cwd,
-                environment=child_env,
-                creation_flags=creation_flags(),
-                workspace_write=tracks_workspace,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                shell=False,
+                creationflags=creation_flags(),
+                start_new_session=(os.name != "nt"),
+                env=child_env,
             )
         else:
             child = subprocess.Popen(
@@ -296,7 +408,7 @@ def run_operation(operation_id: str) -> int:
         if child.stdout is None or child.stderr is None:
             raise RuntimeError("failed to create bounded output pipes")
         child_identity = capture_process_identity(child.pid, nonce)
-        if operation["tier"] == "safe_command" and network_policy_payload is not None:
+        if operation["tier"] == "safe_sandbox" and network_policy_payload is not None:
             network_policy_payload["enforcement_status"] = "active"
             audit.update_operation(
                 operation_id, network_policy_json=canonical_json(network_policy_payload)
@@ -334,12 +446,14 @@ def run_operation(operation_id: str) -> int:
                 exit_code = None
                 status = "timed_out"
                 error = f"maximum runtime exceeded: {max_runtime} seconds"
+                failure_class = "runtime_limit"
                 break
             try:
                 exit_code = child.wait(timeout=min(0.5, remaining))
                 status = "succeeded" if exit_code == 0 else "failed"
                 error = None if exit_code == 0 else f"command exited with code {exit_code}"
-                if operation["tier"] == "safe_command":
+                failure_class = None if exit_code == 0 else "command_failure"
+                if operation["tier"] == "safe_sandbox":
                     storage_error = _safe_runtime_storage_error(
                         runtime_root,
                         byte_limit=runtime_limit,
@@ -348,9 +462,10 @@ def run_operation(operation_id: str) -> int:
                     if storage_error is not None:
                         status = "failed"
                         error = storage_error
+                        failure_class = "sandbox_resource_policy"
                 break
             except subprocess.TimeoutExpired:
-                if operation["tier"] == "safe_command":
+                if operation["tier"] == "safe_sandbox":
                     storage_error = _safe_runtime_storage_error(
                         runtime_root,
                         byte_limit=runtime_limit,
@@ -361,6 +476,7 @@ def run_operation(operation_id: str) -> int:
                         exit_code = None
                         status = "failed"
                         error = storage_error
+                        failure_class = "sandbox_resource_policy"
                         break
     except ApprovalExecutionExpired as exc:
         if child_identity is not None:
@@ -375,6 +491,37 @@ def run_operation(operation_id: str) -> int:
             "approval_expired_before_child_start",
             {"error": error[:1000]},
         )
+    except SafeSandboxCompatibilityError as exc:
+        if child_identity is not None:
+            _terminate_launched_child(child, child_identity)
+        elif child is not None:
+            child.terminate()
+        exit_code = None
+        status = "failed"
+        failure_class = "sandbox_compatibility"
+        error = (
+            "Safe Sandboxでこの操作を実行できませんでした。Reason: sandbox/tool "
+            "compatibility. Approved Sandboxなら人間承認後に再試行可能です。"
+        )
+        audit.add_event(
+            operation_id,
+            "safe_sandbox_compatibility_failure",
+            {"diagnostic": str(exc)[:1000]},
+        )
+    except ApprovedSandboxUnavailable as exc:
+        if child_identity is not None:
+            _terminate_launched_child(child, child_identity)
+        elif child is not None:
+            child.terminate()
+        exit_code = None
+        status = "failed"
+        failure_class = "sandbox_backend_failure"
+        error = f"Approved Sandbox unavailable; no host fallback occurred: {exc}"
+        audit.add_event(
+            operation_id,
+            "approved_sandbox_unavailable",
+            {"diagnostic": str(exc)[:1000], "host_fallback": False},
+        )
     except Exception as exc:  # noqa: BLE001 - every child failure must become a terminal job
         if child_identity is not None:
             _terminate_launched_child(child, child_identity)
@@ -382,6 +529,7 @@ def run_operation(operation_id: str) -> int:
             child.terminate()
         exit_code = None
         status = "failed"
+        failure_class = "launcher_failure" if child is None else "execution_failure"
         error = f"{type(exc).__name__}: {exc}"
     finally:
         if stdout_capture is not None:
@@ -389,12 +537,43 @@ def run_operation(operation_id: str) -> int:
         if stderr_capture is not None:
             stderr_capture.join()
         if child is not None and hasattr(child, "close"):
-            child.close()
+            try:
+                child.close()
+            except Exception as cleanup_error:  # noqa: BLE001 - stale ACL/profile is security state
+                status = "failed"
+                failure_class = "sandbox_cleanup_failure"
+                error = f"{type(cleanup_error).__name__}: {cleanup_error}"
+        if sandbox_backend_hold is not None:
+            try:
+                sandbox_backend_hold.__exit__(None, None, None)
+            except Exception as cleanup_error:  # noqa: BLE001 - launcher lock is security state
+                status = "failed"
+                failure_class = "sandbox_cleanup_failure"
+                error = f"{type(cleanup_error).__name__}: {cleanup_error}"
+
+    if (
+        operation["tier"] == "safe_sandbox"
+        and status == "failed"
+        and failure_class == "command_failure"
+        and normalized.get("program_key") == "git"
+        and b"fatal: Unable to read current working directory: Permission denied"
+        in stderr_path.read_bytes()
+    ):
+        failure_class = "sandbox_compatibility"
+        error = (
+            "Safe Sandboxでこの操作を実行できませんでした。Reason: Git/AppContainer "
+            "ancestor directory compatibility. Approved Sandboxなら人間承認後に再試行可能です。"
+        )
+        audit.add_event(
+            operation_id,
+            "safe_sandbox_compatibility_failure",
+            {"diagnostic": "Git for Windows AppContainer cwd compatibility", "exit_code": exit_code},
+        )
 
     workspace_transaction_applied = False
     if (
         status == "succeeded"
-        and operation["tier"] == "safe_command"
+        and operation["tier"] == "safe_sandbox"
         and normalized.get("program_key") == "dart"
         and dart_format_writes(list(normalized.get("args") or []))
     ):
@@ -428,7 +607,26 @@ def run_operation(operation_id: str) -> int:
             error = f"staged workspace write rejected: {type(staged_error).__name__}: {staged_error}"
 
     duration_ms = int((time.monotonic() - started) * 1000)
-    post_git = capture_git_snapshot(settings=settings, operation_id=operation_id, stage="after")
+    postflight_error: str | None = None
+    try:
+        post_git = capture_git_snapshot(
+            settings=settings, operation_id=operation_id, stage="after"
+        )
+    except SafeSandboxCompatibilityError as snapshot_error:
+        post_git = None
+        postflight_error = f"Safe Sandbox postflight probe failed: {snapshot_error}"
+        if status == "succeeded" and normalized.get("program_key") == "git":
+            status = "failed"
+            failure_class = "postflight_sandbox_failure"
+            error = (
+                "Command completed, but its required Safe Sandbox postflight audit failed; "
+                "no tier fallback occurred"
+            )
+        audit.add_event(
+            operation_id,
+            "safe_postflight_sandbox_failure",
+            {"diagnostic": str(snapshot_error)[:1000]},
+        )
     workspace_change: dict[str, object] = {
         "changed_files": [],
         "added_lines": 0,
@@ -446,7 +644,7 @@ def run_operation(operation_id: str) -> int:
             workspace_change["rollback_state"] = (
                 "complete" if workspace_change["changed_files"] else "not_applicable"
             )
-            if operation["tier"] == "host_approval":
+            if approved_tier and normalized.get("program_key") == "git":
                 # Approved host commands retain the user's OS token and can affect protected
                 # workspace entries (for example .git) that MCP checkpoints intentionally omit.
                 workspace_change["rollback_state"] = "partial"
@@ -486,6 +684,14 @@ def run_operation(operation_id: str) -> int:
         "stderr_path": str(stderr_path),
         "pre_git_path": pre_git,
         "post_git_path": post_git,
+        "execution_tier": operation["tier"],
+        "sandbox_backend": (
+            request.get("sandbox_backend") if operation["tier"] == "approved_sandbox" else None
+        ),
+        "sandbox_backend_version": sandbox_backend_version,
+        "failure_class": failure_class,
+        "postflight_error": postflight_error,
+        "host_fallback_performed": False,
         **workspace_change,
     }
     update_fields: dict[str, object] = {
@@ -501,7 +707,7 @@ def run_operation(operation_id: str) -> int:
         "post_workspace_path": post_workspace.manifest_path if post_workspace else None,
         "rollback_state": workspace_change.get("rollback_state"),
     }
-    if status == "expired" and operation["tier"] == "host_approval":
+    if status == "expired" and approved_tier:
         update_fields["approval_status"] = "expired"
     audit.update_operation(operation_id, **update_fields)
     audit.add_event(operation_id, "worker_finished", {"status": status, "exit_code": exit_code})
@@ -524,7 +730,7 @@ def _requires_workspace_execution_lock(
 ) -> bool:
     """Return whether execution can mutate the original workspace and needs exclusivity."""
     tier = operation.get("tier")
-    if tier == "safe_command":
+    if tier in {"safe_sandbox", "safe_command"}:
         if normalized.get("program_key") != "dart":
             return False
         args = list(normalized.get("args") or [])
@@ -532,7 +738,7 @@ def _requires_workspace_execution_lock(
             return False
         return dart_format_writes(args)
 
-    if tier == "host_approval":
+    if tier in {"approved_sandbox", "approved_host", "host_approval"}:
         if bool(request.get("workspace_write")):
             return True
         summary = request.get("approval_manifest_summary")
@@ -571,6 +777,33 @@ def _safe_runtime_storage_error(
     return None
 
 
+def _sandbox_compatibility_result(
+    operation_id: str,
+    error: BaseException,
+    *,
+    phase: str,
+    source_tier: str,
+) -> dict[str, object]:
+    safe_source = source_tier == "safe_sandbox"
+    return {
+        "operation_id": operation_id,
+        "status": "failed",
+        "execution_tier": source_tier,
+        "failure_class": "sandbox_compatibility" if safe_source else "safe_auxiliary_failure",
+        "failure_phase": phase,
+        "message": (
+            "Safe Sandboxでこの操作を実行できませんでした。Reason: sandbox/tool "
+            "compatibility. Approved Sandboxなら人間承認後に再試行可能です。"
+            if safe_source
+            else "Required Safe Sandbox audit helper failed; the approved command was not run."
+        ),
+        "approved_sandbox_retry_available": safe_source,
+        "approval_created": False,
+        "host_fallback_performed": False,
+        "diagnostic": f"{type(error).__name__}: {error}"[:1000],
+    }
+
+
 def _has_irreversible_effect(normalized: dict[str, object]) -> bool:
     if bool(normalized.get("network_expected")):
         return True
@@ -584,7 +817,11 @@ def _has_irreversible_effect(normalized: dict[str, object]) -> bool:
 
 
 def _ensure_approval_execution_fresh(operation: dict[str, object]) -> None:
-    if operation.get("tier") != "host_approval":
+    if operation.get("tier") not in {
+        "approved_sandbox",
+        "approved_host",
+        "host_approval",
+    }:
         return
     if operation.get("approval_status") != "approved" or not operation.get("claimed_at"):
         raise RuntimeError("approval execution grant is not active")
@@ -598,20 +835,20 @@ def _ensure_approval_execution_fresh(operation: dict[str, object]) -> None:
         raise ApprovalExecutionExpired("approval execution grant expired before child start")
 
 
-def _verify_adb_target(normalized: dict[str, object], emulator_only: bool) -> None:
-    if normalized.get("program_key") != "adb" or not emulator_only:
+def _verify_adb_target(normalized: dict[str, object], settings: Settings) -> None:
+    if normalized.get("program_key") != "adb" or not settings.adb_emulator_only:
         return
     args = list(normalized["args"])
     if len(args) < 2 or args[0] != "-s":
         return
     serial = args[1]
-    result = subprocess.run(
-        [str(normalized["executable"]), "-s", serial, "emu", "avd", "name"],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
+    result = run_safe_process(
+        settings=settings,
+        program_key="adb",
+        command=[str(normalized["executable"]), "-s", serial, "emu", "avd", "name"],
+        cwd=str(normalized["cwd"]),
         timeout=10,
-        check=False,
-        shell=False,
+        output_limit=4096,
     )
     if result.returncode != 0 or not result.stdout.strip():
         raise PermissionError("ADB target did not prove it is an Android Emulator")

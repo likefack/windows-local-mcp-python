@@ -4,8 +4,6 @@ import json
 import os
 import shutil
 import stat
-import subprocess
-import uuid
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -13,12 +11,8 @@ from urllib.parse import unquote, urlparse
 from .config import Settings
 from .paths import Workspace
 from .policy import NormalizedCommand
-from .resources import (
-    BoundedStreamCapture,
-    directory_size,
-    enforce_data_quota,
-    scan_directory_bounded,
-)
+from .resources import directory_size, enforce_data_quota, scan_directory_bounded
+from .safe_process import run_safe_process
 from .util import canonical_json, sha256_bytes, sha256_text
 
 _CODE_LOADERS = {
@@ -237,6 +231,32 @@ def materialize_execution_copy(
     run_cwd = run_root / "cwd"
     shutil.copytree(immutable_cwd, run_cwd, symlinks=False)
     _make_writable(run_cwd)
+    immutable_dependencies = stage_root / "dependencies"
+    if immutable_dependencies.exists():
+        run_dependencies = run_root / "dependencies"
+        shutil.copytree(immutable_dependencies, run_dependencies, symlinks=False)
+        package_config = run_cwd / ".dart_tool" / "package_config.json"
+        if package_config.exists():
+            payload = json.loads(package_config.read_text(encoding="utf-8"))
+            for item in payload.get("packages", []):
+                root_uri = str(item.get("rootUri", ""))
+                parsed = urlparse(root_uri)
+                if parsed.scheme != "file":
+                    continue
+                staged_dependency = Path(unquote(parsed.path.lstrip("/")))
+                if os.name == "nt" and parsed.path.startswith("/"):
+                    staged_dependency = Path(unquote(parsed.path[1:]))
+                staged_dependency = staged_dependency.resolve(strict=True)
+                try:
+                    relative_dependency = staged_dependency.relative_to(
+                        immutable_dependencies.resolve(strict=True)
+                    )
+                except ValueError:
+                    continue
+                item["rootUri"] = (
+                    (run_dependencies / relative_dependency).as_uri().rstrip("/") + "/"
+                )
+            package_config.write_text(canonical_json(payload), encoding="utf-8")
     result = normalized.model_copy(deep=True)
     result.args = [
         _rewrite_workspace_argument(value, immutable_cwd, run_cwd)
@@ -434,6 +454,14 @@ def _stage_dart_package_dependencies(
                     workspace=workspace,
                 )
             else:
+                if not any(
+                    _is_inside(dependency, allowed)
+                    for allowed in settings.safe_network_readable_paths
+                ):
+                    raise PermissionError(
+                        "external Dart package dependency is outside configured "
+                        f"safe_network_readable_paths: {dependency}"
+                    )
                 new_records = _copy_external_tree_bounded(
                     source=dependency,
                     destination=staged_dependency,
@@ -734,38 +762,20 @@ def _capture_git_state(
     per_stream = max(4096, settings.approval_manifest_max_bytes // (len(commands) * 2))
     result: dict[str, str] = {}
     for name, command in commands.items():
-        token = uuid.uuid4().hex
-        stdout_path = settings.data_dir / "outputs" / f"approval-git-{token}.out"
-        stderr_path = settings.data_dir / "outputs" / f"approval-git-{token}.err"
-        try:
-            process = subprocess.Popen(
-                command,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                shell=False,
+        captured = run_safe_process(
+            settings=settings,
+            program_key="git",
+            command=command,
+            cwd=normalized.cwd,
+            timeout=30,
+            output_limit=per_stream,
+        )
+        if captured.returncode != 0:
+            raise RuntimeError(
+                "Git approval-state capture failed: "
+                + captured.stderr.decode("utf-8", errors="replace")[:2000]
             )
-            if process.stdout is None or process.stderr is None:
-                raise RuntimeError("failed to capture Git approval state")
-            stdout_capture = BoundedStreamCapture(process.stdout, stdout_path, per_stream)
-            stderr_capture = BoundedStreamCapture(process.stderr, stderr_path, per_stream)
-            stdout_capture.start()
-            stderr_capture.start()
-            try:
-                exit_code = process.wait(timeout=30)
-            except subprocess.TimeoutExpired as error:
-                process.kill()
-                raise RuntimeError("Git approval-state capture timed out") from error
-            stdout_capture.join()
-            stderr_capture.join()
-            if exit_code != 0:
-                raise RuntimeError(
-                    f"Git approval-state capture failed: {stderr_capture.preview(2000)}"
-                )
-            if stdout_capture.truncated or stderr_capture.truncated:
-                raise ValueError("Git approval state exceeds approval_manifest_max_bytes")
-            result[name] = sha256_bytes(stdout_path.read_bytes())
-        finally:
-            stdout_path.unlink(missing_ok=True)
-            stderr_path.unlink(missing_ok=True)
+        if captured.stdout_truncated or captured.stderr_truncated:
+            raise ValueError("Git approval state exceeds approval_manifest_max_bytes")
+        result[name] = sha256_bytes(captured.stdout)
     return result

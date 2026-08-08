@@ -9,7 +9,7 @@ from .approval import verify_approval_bundle
 from .audit import TERMINAL_STATUSES, AuditStore
 from .config import Settings, load_settings
 from .executor import Executor
-from .policy import NormalizedCommand, approval_hash
+from .policy import NormalizedCommand, approved_request_hash
 from .resources import WorkspaceExecutionLock
 from .risk import command_risk_facts
 from .util import canonical_json, sha256_text, utc_now_iso
@@ -45,6 +45,7 @@ _COMMAND_ACTIVITY_TOOLS = {
     "execute_workspace_write",
     "adb_read",
     "request_host_command",
+    "request_sandbox_command",
     "request_workspace_rollback",
     "request_selective_undo",
 }
@@ -65,6 +66,34 @@ def _show(item: dict[str, object]) -> None:
             display = normalized_summary.get("display_command")
             if isinstance(display, list):
                 print("Command argv: " + json.dumps(display, ensure_ascii=True))
+        execution_tier = request.get("execution_tier") or item.get("tier")
+        print(f"Execution tier: {_terminal_safe(execution_tier)}")
+        backend = request.get("sandbox_backend")
+        if isinstance(backend, dict):
+            print(f"Sandbox     : {_terminal_safe(backend.get('name', 'unknown'))}")
+            print(f"Backend mode: {_terminal_safe(backend.get('windows_mode', 'unknown'))}")
+        effective_policy = request.get("effective_sandbox_policy")
+        if isinstance(effective_policy, dict):
+            filesystem = effective_policy.get("filesystem_policy")
+            network = effective_policy.get("network_policy")
+            if isinstance(filesystem, dict):
+                print("Filesystem  : " + _terminal_safe(json.dumps(filesystem, ensure_ascii=True)))
+            if isinstance(network, dict):
+                print("Network     : " + _terminal_safe(json.dumps(network, ensure_ascii=True)))
+            print(
+                "Descendants : "
+                + _terminal_safe(effective_policy.get("descendant_policy", "unknown"))
+            )
+            print(
+                "OS boundary  : "
+                + _terminal_safe(effective_policy.get("actual_execution_boundary", "unknown"))
+            )
+        if request.get("escalation_source_tier"):
+            print(
+                "Escalation  : "
+                f"{_terminal_safe(request.get('escalation_source_tier'))} / "
+                f"{_terminal_safe(request.get('escalation_reason', ''))}"
+            )
         operation_type = request.get("operation_type")
         if operation_type:
             print(f"Operation   : {_terminal_safe(operation_type)}")
@@ -86,6 +115,12 @@ def _show(item: dict[str, object]) -> None:
                 NormalizedCommand.model_validate(normalized_payload),
                 workspace_write=bool(request.get("workspace_write")),
                 manifest=summary,
+                execution_tier=str(request.get("execution_tier") or item.get("tier")),
+                sandbox_policy=(
+                    request.get("effective_sandbox_policy")
+                    if isinstance(request.get("effective_sandbox_policy"), dict)
+                    else None
+                ),
             )
         if isinstance(facts, dict):
             print(f"Risk level   : {facts.get('risk_level', 'unknown')}")
@@ -145,6 +180,7 @@ def _format_activity(operation: dict[str, object]) -> str | None:
 
     if status == "pending_approval" and tool in {
         "request_host_command",
+        "request_sandbox_command",
         "request_workspace_rollback",
         "request_selective_undo",
     }:
@@ -260,6 +296,7 @@ def run_approval_ui(settings: Settings | None = None) -> None:
                         if expected_hash != item.get("request_hash"):
                             raise RuntimeError("workspace control approval request hash mismatch")
                         before = None
+                        after = None
                         try:
                             with WorkspaceExecutionLock(settings):
                                 if workspace_recovery_required(settings):
@@ -315,10 +352,11 @@ def run_approval_ui(settings: Settings | None = None) -> None:
                                     str(request["target_checkpoint"]),
                                     operation_id=operation_id,
                                 )
+                                after = capture_workspace_state(settings, operation_id, "after")
                                 change = compare_workspace_states(
                                     settings,
                                     before.manifest_path,
-                                    str(request["target_checkpoint"]),
+                                    after.manifest_path,
                                     operation_id,
                                 )
                             result = {
@@ -336,7 +374,7 @@ def run_approval_ui(settings: Settings | None = None) -> None:
                                 status="succeeded",
                                 finished_at=utc_now_iso(),
                                 pre_workspace_path=before.manifest_path,
-                                post_workspace_path=str(request["target_checkpoint"]),
+                                post_workspace_path=after.manifest_path,
                                 diff_path=change["diff_path"],
                                 rollback_state="complete",
                                 result_json=canonical_json(result),
@@ -416,14 +454,8 @@ def run_approval_ui(settings: Settings | None = None) -> None:
                             print(f"Not applied: {control_error}")
                         pause_activity.clear()
                         continue
-                    normalized = NormalizedCommand.model_validate(request["normalized_command"])
                     manifest_digest = str(request["approval_manifest_digest"])
-                    expected_hash = approval_hash(
-                        normalized=normalized,
-                        reason=str(request.get("reason", "")),
-                        risk_summary=str(request.get("risk_summary", "")),
-                        manifest_digest=manifest_digest,
-                    )
+                    expected_hash = approved_request_hash(request)
                     if expected_hash != item.get("request_hash"):
                         raise RuntimeError("approval request hash mismatch")
                     verify_approval_bundle(

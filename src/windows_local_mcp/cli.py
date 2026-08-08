@@ -15,8 +15,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="windows-local-mcp")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser("server", help="MCPサーバーをstdioで起動")
-    subparsers.add_parser("approvals", help="承認UIを起動")
+    subparsers.add_parser("server", help="MCP serverをstdioで起動")
+    subparsers.add_parser("approvals", help="ローカル承認UIを起動")
 
     audit_parser = subparsers.add_parser("audit", help="最近の監査ログを表示")
     audit_parser.add_argument("--limit", type=int, default=20)
@@ -84,7 +84,9 @@ def main() -> None:
         store.update_operation(
             access_id,
             finished_at=utc_now_iso(),
-            result_json=canonical_json({"returned": 1 if args.operation else len(result)}),
+            result_json=canonical_json(
+                {"returned": 1 if args.operation else len(result)}
+            ),
         )
         print(json.dumps(result, ensure_ascii=False, indent=2))
 

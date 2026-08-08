@@ -6,7 +6,12 @@ from .policy import NormalizedCommand
 
 
 def command_risk_facts(
-    normalized: NormalizedCommand, *, workspace_write: bool, manifest: dict[str, Any]
+    normalized: NormalizedCommand,
+    *,
+    workspace_write: bool,
+    manifest: dict[str, Any],
+    execution_tier: str = "approved_host",
+    sandbox_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     key = normalized.program_key
     args = [value.casefold() for value in normalized.args]
@@ -40,16 +45,29 @@ def command_risk_facts(
         or adb_mutation,
     }
     detected = {name: value for name, value in detected.items() if value not in {False, None, ""}}
-    return {
-        "risk_level": "high" if high else ("medium" if staged or git_commit else "low"),
-        "detected_requested_effects": detected,
-        "effective_host_capabilities": {
+    if execution_tier == "approved_sandbox":
+        capabilities: dict[str, Any] = {
+            "identity": "Codex dedicated lower-privilege sandbox user/restricted token",
+            "filesystem_outside_workspace_write_os_possible": False,
+            "filesystem_read_scope": "broader than MCP workspace visibility; see sandbox policy",
+            "direct_network_os_possible": False,
+            "child_process_creation_os_possible": True,
+            "note": "Capabilities are backend guarantees, not effects detected in this command.",
+        }
+        impact_default = "sandboxed execution; workspace writes only when explicitly requested"
+    else:
+        capabilities = {
             "identity": "real Windows user token",
             "filesystem_outside_workspace_os_possible": True,
             "direct_socket_api_os_possible": True,
             "child_process_creation_os_possible": True,
             "note": "These are token capabilities, not effects detected in this command.",
-        },
+        }
+        impact_default = "staged execution copy; process still runs with the local account token"
+    result = {
+        "risk_level": "high" if high else ("medium" if staged or git_commit else "low"),
+        "detected_requested_effects": detected,
+        "effective_host_capabilities": capabilities,
         "rollback": "workspace files only"
         if workspace_write
         else (
@@ -62,6 +80,9 @@ def command_risk_facts(
         else (
             "external service or device"
             if git_push or normalized.network_expected or adb_mutation
-            else "staged execution copy; process still runs with the local account token"
+            else impact_default
         ),
     }
+    if sandbox_policy is not None:
+        result["effective_sandbox_policy"] = sandbox_policy
+    return result

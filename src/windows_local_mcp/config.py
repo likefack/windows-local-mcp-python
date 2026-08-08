@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_valid
 
 from .child_env import normalize_extra_environment_names, sanitize_process_environment
 from .git_env import strip_git_ambient_environment
+from .windows_system import windows_system_executable
 
 
 class Settings(BaseModel):
@@ -103,6 +104,11 @@ class Settings(BaseModel):
     safe_network_isolation_mode: Literal["appcontainer", "compatibility"] = "appcontainer"
     safe_network_profile_prefix: str = "WindowsLocalMCP.SafeTier"
     safe_network_readable_paths: list[Path] = Field(default_factory=list)
+    approved_sandbox_enabled: bool = True
+    approved_sandbox_backend: Literal["codex_cli"] = "codex_cli"
+    approved_sandbox_codex_path: Path | None = None
+    approved_sandbox_windows_mode: Literal["elevated"] = "elevated"
+    approved_sandbox_permission_profile: Literal[":workspace"] = ":workspace"
 
     _config_selection_source: str = PrivateAttr(default="direct_settings")
     _config_path: str | None = PrivateAttr(default=None)
@@ -129,6 +135,13 @@ class Settings(BaseModel):
         if value is None or str(value).strip() == "":
             raise ValueError("path must not be empty")
         return Path(os.path.expandvars(os.path.expanduser(str(value)))).resolve()
+
+    @field_validator("approved_sandbox_codex_path", mode="before")
+    @classmethod
+    def expand_optional_executable(cls, value: object) -> Path | None:
+        if value is None or not str(value).strip():
+            return None
+        return Path(os.path.expandvars(os.path.expanduser(str(value)))).resolve(strict=True)
 
     @field_validator("safe_network_readable_paths", mode="before")
     @classmethod
@@ -192,6 +205,22 @@ class Settings(BaseModel):
         for path in self.safe_network_readable_paths:
             if path == Path(path.anchor):
                 raise ValueError("safe_network_readable_paths cannot include a drive root")
+            if any(
+                _is_relative_to(path, protected) or _is_relative_to(protected, path)
+                for protected in (root, data)
+            ):
+                raise ValueError(
+                    "safe_network_readable_paths cannot overlap workspace_root, data_dir, "
+                    "or an ancestor of either"
+                )
+        codex_path = self.approved_sandbox_codex_path
+        if codex_path is not None:
+            if not codex_path.is_file() or _is_reparse(codex_path):
+                raise ValueError("approved_sandbox_codex_path must be a regular non-reparse file")
+            if _is_relative_to(codex_path, root) or _is_relative_to(codex_path, data):
+                raise ValueError(
+                    "approved_sandbox_codex_path must be outside workspace_root and data_dir"
+                )
         return self
 
     def ensure_directories(self) -> None:
@@ -255,7 +284,7 @@ def _is_reparse(path: Path) -> bool:
 
 def _protect_windows_acl(path: Path) -> None:
     identity = subprocess.run(
-        ["whoami.exe", "/user", "/fo", "csv", "/nh"],
+        [windows_system_executable("whoami.exe"), "/user", "/fo", "csv", "/nh"],
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -271,7 +300,7 @@ def _protect_windows_acl(path: Path) -> None:
         raise PermissionError("failed to parse the current Windows security principal SID")
     sid = row[1]
     reset = subprocess.run(
-        ["icacls.exe", str(path), "/reset", "/T", "/C"],
+        [windows_system_executable("icacls.exe"), str(path), "/reset", "/T", "/C"],
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -284,7 +313,7 @@ def _protect_windows_acl(path: Path) -> None:
         raise PermissionError(f"failed to reset data_dir ACL: {reset.stderr.strip()}")
     result = subprocess.run(
         [
-            "icacls.exe",
+            windows_system_executable("icacls.exe"),
             str(path),
             "/inheritance:r",
             "/grant:r",

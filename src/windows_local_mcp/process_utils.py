@@ -7,6 +7,8 @@ from pathlib import Path
 
 import psutil
 
+from .windows_system import windows_system_executable
+
 CMD_META = set("&|<>^%!`\r\n")
 
 
@@ -30,7 +32,7 @@ def build_process_argv(executable: str, args: list[str]) -> list[str]:
         command_line = " ".join(
             [_quote_cmd_arg(executable), *(_quote_cmd_arg(arg) for arg in args)]
         )
-        return ["cmd.exe", "/d", "/s", "/c", command_line]
+        return [windows_system_executable("cmd.exe"), "/d", "/s", "/c", command_line]
     return [executable, *args]
 
 

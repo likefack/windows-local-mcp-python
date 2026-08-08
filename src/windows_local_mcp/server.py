@@ -26,9 +26,13 @@ from .config import Settings, load_settings
 from .executor import Executor
 from .git_snapshot import capture_git_snapshot
 from .paths import Workspace
-from .policy import CommandPolicy, NormalizedCommand, approval_hash
+from .policy import CommandPolicy, NormalizedCommand, approved_request_hash
 from .resources import WorkspaceExecutionLock, enforce_data_quota
 from .risk import command_risk_facts
+from .sandbox_backend import (
+    codex_sandbox_effective_policy,
+    resolve_codex_sandbox_backend,
+)
 from .timeline import timeline_entry, timeline_list
 from .util import canonical_json, read_text_limited, sha256_bytes, sha256_text, utc_now_iso
 from .workspace_history import (
@@ -72,12 +76,13 @@ runtime = Runtime()
 
 mcp = MCPServer(
     "Windows Local MCP",
-    version="0.5.0",
+    version="0.6.0",
     instructions=(
         "Operate inside the configured workspace. Use execute_readonly for safe Git/analyze "
         "operations, execute_workspace_write for constrained automatic source formatting, and "
         "adb_read for fixed read-only emulator operations. Test/build/general shell/destructive "
-        "ADB require request_host_command and local approval. Activity tools expose bounded "
+        "ADB use request_sandbox_command and local approval by default; request_host_command "
+        "is the explicit last-resort host tier. Activity tools expose bounded "
         "operation details; workspace rollback is always a locally approved operation. "
         "request_host_command only stages "
         "the request; local approval performs the dangerous execution once. Poll the result."
@@ -479,7 +484,7 @@ def write_file(
                         recovery_state="recovery_required",
                         journal_path=recovery_journal,
                     ) from recovery_error
-                update_single_file_write_transaction(
+                recovery_journal = update_single_file_write_transaction(
                     runtime.settings,
                     operation_id,
                     state="failed_recovered",
@@ -493,7 +498,7 @@ def write_file(
                 raise WorkspaceMutationError(
                     f"write_file failed after replacement; starting state recovered: {post_error}",
                     recovery_state="failed_recovered",
-                    journal_path=pre_workspace.manifest_path,
+                    journal_path=recovery_journal,
                 ) from post_error
     except Exception as error:
         if operation_id is None:
@@ -604,7 +609,7 @@ def _run_automatic_tool(
             )
         return _queue_command(
             tool_name=tool_name,
-            tier="safe_command",
+            tier="safe_sandbox",
             normalized_command=normalized.model_dump(),
             safe_request=request,
             foreground_timeout_seconds=(
@@ -691,7 +696,7 @@ def git_info() -> dict[str, Any]:
             raise PermissionError("git capability is disabled")
         operation_id = runtime.audit.create_operation(
             tool_name="git_info",
-            tier="read",
+            tier="safe_sandbox",
             status="running",
             cwd=str(runtime.settings.workspace_root),
             request=request,
@@ -770,23 +775,28 @@ def stop_job(job_id: str) -> dict[str, Any]:
         raise
 
 
-@mcp.tool(annotations=APPROVAL_REQUEST)
-def request_host_command(
+def _request_approved_command(
+    *,
+    tool_name: str,
+    execution_tier: str,
     command: list[str],
-    cwd: str = ".",
-    reason: str = "",
-    network_required: bool = False,
-    risk_summary: str = "",
-    workspace_write: bool = False,
-    max_runtime_seconds: int | None = None,
+    cwd: str,
+    reason: str,
+    network_required: bool,
+    risk_summary: str,
+    workspace_write: bool,
+    max_runtime_seconds: int | None,
+    escalation_source_operation_id: str | None = None,
+    escalation_reason: str = "",
 ) -> dict[str, Any]:
-    """Stage an immutable approval request; this tool never launches the requested host command."""
     request_input = {
         "command": command,
         "cwd": cwd,
         "reason": reason,
         "network_required": network_required,
         "workspace_write": workspace_write,
+        "execution_tier": execution_tier,
+        "escalation_source_operation_id": escalation_source_operation_id,
     }
     operation_id = str(uuid.uuid4())
     try:
@@ -798,6 +808,31 @@ def request_host_command(
         normalized = runtime.policy.normalize_host(
             command=command, cwd=cwd, network_expected=network_required
         )
+        backend: dict[str, Any] | None = None
+        sandbox_policy: dict[str, Any] | None = None
+        backend_digest: str | None = None
+        if execution_tier == "approved_sandbox":
+            if network_required:
+                raise PermissionError(
+                    "Approved Sandbox is offline; request Approved Host separately only if "
+                    "network access is genuinely required"
+                )
+            backend = resolve_codex_sandbox_backend(runtime.settings).as_dict()
+            sandbox_policy = codex_sandbox_effective_policy(workspace_write=workspace_write)
+            backend_digest = sha256_text(canonical_json(backend))
+        if escalation_source_operation_id:
+            source = runtime.audit.get_operation(
+                escalation_source_operation_id, include_events=False
+            )
+            source_result = source.get("result") or {}
+            if (
+                source.get("tier") != "safe_sandbox"
+                or not isinstance(source_result, dict)
+                or source_result.get("failure_class") != "sandbox_compatibility"
+            ):
+                raise PermissionError(
+                    "Safe Sandbox escalation requires a recorded compatibility failure"
+                )
         with WorkspaceExecutionLock(runtime.settings):
             _, manifest, manifest_digest = prepare_approval_bundle(
                 settings=runtime.settings,
@@ -806,22 +841,26 @@ def request_host_command(
                 normalized=normalized,
                 workspace_write=workspace_write,
             )
-        request_hash = approval_hash(
-            normalized=normalized,
-            reason=reason,
-            risk_summary=risk_summary,
-            manifest_digest=manifest_digest,
-        )
         now = datetime.now(UTC)
         request_expires_at = (
             now + timedelta(seconds=runtime.settings.approval_request_ttl_seconds)
         ).isoformat()
         request = {
+            "approval_binding_version": 2,
             "normalized_command": normalized.model_dump(),
             "reason": reason,
             "risk_summary": risk_summary,
             "network_required": network_required,
             "workspace_write": workspace_write,
+            "execution_tier": execution_tier,
+            "sandbox_backend": backend,
+            "sandbox_backend_digest": backend_digest,
+            "effective_sandbox_policy": sandbox_policy,
+            "escalation_source_tier": (
+                "safe_sandbox" if escalation_source_operation_id else None
+            ),
+            "escalation_source_operation_id": escalation_source_operation_id,
+            "escalation_reason": escalation_reason,
             "approval_manifest_digest": manifest_digest,
             "approval_manifest_summary": {
                 "mode": manifest["mode"],
@@ -836,12 +875,17 @@ def request_host_command(
             ),
         }
         request["objective_risk"] = command_risk_facts(
-            normalized, workspace_write=workspace_write, manifest=manifest
+            normalized,
+            workspace_write=workspace_write,
+            manifest=manifest,
+            execution_tier=execution_tier,
+            sandbox_policy=sandbox_policy,
         )
+        request_hash = approved_request_hash(request)
         runtime.audit.create_operation(
             operation_id=operation_id,
-            tool_name="request_host_command",
-            tier="host_approval",
+            tool_name=tool_name,
+            tier=execution_tier,
             status="pending_approval",
             cwd=normalized.cwd,
             request=request,
@@ -854,11 +898,67 @@ def request_host_command(
             "status": "pending",
             "request_hash": request_hash,
             "expires_at": request_expires_at,
-            "message": "Local approval may execute it once; poll_approval for status/result.",
+            "execution_tier": execution_tier,
+            "message": (
+                "Local approval may execute it once in the selected boundary; "
+                "poll_approval for status/result. No fallback to another tier occurs."
+            ),
         }
     except Exception as error:
-        _audit_rejection("request_host_command", request_input, error)
+        _audit_rejection(tool_name, request_input, error)
         raise
+
+
+@mcp.tool(annotations=APPROVAL_REQUEST)
+def request_sandbox_command(
+    command: list[str],
+    cwd: str = ".",
+    reason: str = "",
+    network_required: bool = False,
+    risk_summary: str = "",
+    workspace_write: bool = False,
+    max_runtime_seconds: int | None = None,
+    escalation_source_operation_id: str | None = None,
+    escalation_reason: str = "",
+) -> dict[str, Any]:
+    """Stage a one-shot Approved Sandbox request; this call never executes the command."""
+    return _request_approved_command(
+        tool_name="request_sandbox_command",
+        execution_tier="approved_sandbox",
+        command=command,
+        cwd=cwd,
+        reason=reason,
+        network_required=network_required,
+        risk_summary=risk_summary,
+        workspace_write=workspace_write,
+        max_runtime_seconds=max_runtime_seconds,
+        escalation_source_operation_id=escalation_source_operation_id,
+        escalation_reason=escalation_reason,
+    )
+
+
+@mcp.tool(annotations=APPROVAL_REQUEST)
+def request_host_command(
+    command: list[str],
+    cwd: str = ".",
+    reason: str = "",
+    network_required: bool = False,
+    risk_summary: str = "",
+    workspace_write: bool = False,
+    max_runtime_seconds: int | None = None,
+) -> dict[str, Any]:
+    """Stage a separate one-shot Approved Host request; never a sandbox fallback."""
+    return _request_approved_command(
+        tool_name="request_host_command",
+        execution_tier="approved_host",
+        command=command,
+        cwd=cwd,
+        reason=reason,
+        network_required=network_required,
+        risk_summary=risk_summary,
+        workspace_write=workspace_write,
+        max_runtime_seconds=max_runtime_seconds,
+    )
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -993,7 +1093,7 @@ def request_workspace_rollback(operation_id: str, reason: str = "") -> dict[str,
         runtime.audit.create_operation(
             operation_id=rollback_id,
             tool_name="request_workspace_rollback",
-            tier="host_approval",
+            tier="approved_host",
             status="pending_approval",
             cwd=str(runtime.settings.workspace_root),
             request=request,
@@ -1091,7 +1191,7 @@ def request_selective_undo(operation_id: str, reason: str = "") -> dict[str, Any
         runtime.audit.create_operation(
             operation_id=undo_id,
             tool_name="request_selective_undo",
-            tier="host_approval",
+            tier="approved_host",
             status="pending_approval",
             cwd=str(runtime.settings.workspace_root),
             request=request,

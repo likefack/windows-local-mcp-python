@@ -102,6 +102,7 @@ def test_git_snapshot_ignores_hostile_repository_environment(
         data_dir=data,
         protect_data_dir_acl=False,
         git_enabled=True,
+        safe_network_isolation_mode="compatibility",
     )
     settings.ensure_directories()
 
@@ -140,6 +141,7 @@ def test_git_snapshot_does_not_climb_to_parent_repository(tmp_path: Path) -> Non
         data_dir=tmp_path / "data",
         protect_data_dir_acl=False,
         git_enabled=True,
+        safe_network_isolation_mode="compatibility",
     )
     settings.ensure_directories()
 

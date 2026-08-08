@@ -6,7 +6,7 @@ from typing import Any
 from .audit import AuditStore
 from .config import Settings
 from .util import read_text_limited
-from .workspace_history import describe_workspace_restore
+from .workspace_history import describe_workspace_restore, verify_checkpoint_integrity
 
 
 def timeline_entry(settings: Settings, audit: AuditStore, operation_id: str) -> dict[str, Any]:
@@ -17,12 +17,15 @@ def timeline_entry(settings: Settings, audit: AuditStore, operation_id: str) -> 
     result = operation.get("result") or {}
     command = normalized.get("display_command") if isinstance(normalized, dict) else None
     changed = result.get("changed_files", []) if isinstance(result, dict) else []
+    post_available = _checkpoint_available(settings, operation.get("post_workspace_path"))
+    pre_available = _checkpoint_available(settings, operation.get("pre_workspace_path"))
     entry = {
         "operation_id": operation["id"],
         "created_at": operation["created_at"],
         "finished_at": operation.get("finished_at"),
         "tool": operation["tool_name"],
         "tier": operation["tier"],
+        "execution_tier": operation["tier"],
         "status": operation["status"],
         "cwd": operation.get("cwd"),
         "request": request,
@@ -39,15 +42,29 @@ def timeline_entry(settings: Settings, audit: AuditStore, operation_id: str) -> 
         "unified_diff": _artifact_preview(settings, operation.get("diff_path")),
         "error": operation.get("error"),
         "rollback_state": operation.get("rollback_state") or "not_applicable",
-        "point_in_time_rollback_available": bool(operation.get("post_workspace_path")),
-        "selective_undo_available": bool(
-            operation.get("pre_workspace_path") and operation.get("post_workspace_path")
-        ),
+        "point_in_time_rollback_available": post_available,
+        "selective_undo_available": pre_available and post_available,
+        "checkpoint_integrity": {
+            "before": "verified" if pre_available else "missing_or_invalid",
+            "after": "verified" if post_available else "missing_or_invalid",
+        },
         "network_policy": operation.get("network_policy"),
+        "sandbox_backend": request.get("sandbox_backend")
+        if isinstance(request, dict)
+        else None,
+        "sandbox_detail": request.get("effective_sandbox_policy")
+        if isinstance(request, dict)
+        else None,
+        "escalation_source_tier": request.get("escalation_source_tier")
+        if isinstance(request, dict)
+        else None,
+        "escalation_reason": request.get("escalation_reason")
+        if isinstance(request, dict)
+        else None,
         "events": operation.get("events", []),
         "result": result,
     }
-    if operation.get("post_workspace_path"):
+    if post_available:
         latest = audit.latest_workspace_checkpoint()
         if latest and latest.get("post_workspace_path"):
             entry["point_in_time_rollback_preview"] = {
@@ -78,6 +95,8 @@ def timeline_list(settings: Settings, audit: AuditStore, limit: int = 50) -> lis
             else 0
         )
         network = operation.get("network_policy") or {}
+        post_available = _checkpoint_available(settings, operation.get("post_workspace_path"))
+        pre_available = _checkpoint_available(settings, operation.get("pre_workspace_path"))
         objective = request.get("objective_risk", {}) if isinstance(request, dict) else {}
         result.append(
             {
@@ -94,10 +113,9 @@ def timeline_list(settings: Settings, audit: AuditStore, limit: int = 50) -> lis
                 "removed_lines": payload.get("removed_lines", 0)
                 if isinstance(payload, dict)
                 else 0,
-                "point_in_time_rollback_available": bool(operation.get("post_workspace_path")),
-                "selective_undo_available": bool(
-                    operation.get("pre_workspace_path") and operation.get("post_workspace_path")
-                ),
+                "execution_tier": operation["tier"],
+                "point_in_time_rollback_available": post_available,
+                "selective_undo_available": pre_available and post_available,
                 "selective_undo_scope": "workspace_files_partial"
                 if operation.get("rollback_state") in {"partial", "unavailable"}
                 else "workspace_files_complete",
@@ -144,3 +162,13 @@ def _artifact_preview(settings: Settings, value: object) -> str:
         return read_text_limited(path, settings.max_diff_bytes)
     except (FileNotFoundError, OSError, PermissionError, ValueError):
         return "<diff unavailable>"
+
+
+def _checkpoint_available(settings: Settings, value: object) -> bool:
+    if not value:
+        return False
+    try:
+        verify_checkpoint_integrity(settings, str(value))
+        return True
+    except (FileNotFoundError, OSError, PermissionError, RuntimeError, TypeError, ValueError):
+        return False

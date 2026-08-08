@@ -13,6 +13,19 @@ dart_enabled = false
 adb_enabled = false
 powershell_enabled = false
 
+# Broad developer commands (Python/pytest/PowerShell/Node/npm/project scripts) use the
+# locally approved Codex Windows sandbox route. The adapter invokes only `codex sandbox`;
+# it does not start an agent or perform model/API calls. Missing or incompatible backends
+# fail closed and never fall back to the Windows user token.
+approved_sandbox_enabled = true
+approved_sandbox_backend = "codex_cli"
+# Optional absolute path to an installed Codex CLI. Empty enables trusted-path discovery.
+approved_sandbox_codex_path = ""
+# This release intentionally supports only the stronger elevated Windows sandbox and the
+# workspace permission profile. Initial Codex sandbox setup may require Administrator/UAC.
+approved_sandbox_windows_mode = "elevated"
+approved_sandbox_permission_profile = ":workspace"
+
 # ADB is a separate target boundary. The safe default accepts emulator-* serials only.
 adb_emulator_only = true
 adb_allowed_serials = []

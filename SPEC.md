@@ -106,19 +106,19 @@ This permits long-running isolated tests/builds, read-only analysis, and unrelat
 
 ## 5. Approval and immutable execution
 
-Preferred flow:
+Preferred flows:
 
 ```text
-request_host_command
+request_sandbox_command | request_host_command
   -> pending immutable manifest with request TTL
   -> local UI verifies and atomically approve+claims
-  -> MCP worker runs fixed content once
+  -> MCP worker runs fixed content once in the selected boundary
   -> ChatGPT poll_approval / poll_job
 ```
 
-`request_host_command` only stages local approval state and immutable inputs; it does not launch the requested process. Dangerous execution starts only from the local approval UI after the human approves it. There is no model-facing `execute_approved` tool, which avoids a second destructive/open-world MCP call after local approval.
+`request_sandbox_command` selects Approved Sandbox; `request_host_command` selects Approved Host. Both only stage local approval state and immutable inputs. There is no implicit Approved Sandbox to Approved Host fallback and no model-facing `execute_approved` tool.
 
-The approval hash covers normalized command, cwd, network flag, reason, risk, and manifest digest. The manifest covers:
+Approval binding version 2 hashes the complete canonical security-sensitive request, including execution tier, normalized command/cwd, workspace-write and runtime limits, escalation facts, risk, immutable manifest fields, effective policy, and Approved Sandbox backend identity. The manifest covers:
 
 - main executable bytes and filesystem identity;
 - complete argv;
@@ -149,7 +149,7 @@ Installed OS/toolchains are the trusted computing base. Their primary executable
 
 Commands intended to mutate the original workspace require `workspace_write=true`. The complete workspace (excluding direct `.git` bytes) is manifested, all source files are revalidated, and execution occurs while holding the workspace-wide form of the same mutation-lock family used by target writes. Any workspace addition, deletion, or content change after request invalidates approval.
 
-Git host operations additionally bind Git state obtained through Git. Direct `.git` MCP access remains prohibited.
+Git approved operations additionally bind Git state obtained through the Safe Sandbox Git broker. Direct `.git` MCP access remains prohibited.
 
 ### Expiry and one-shot semantics
 
@@ -201,11 +201,25 @@ Selective Undo compares operation-before, operation-after, and current content. 
 
 Every safe command receives an explicit per-command network policy in audit and Timeline. Git/Dart/Flutter safe grammars receive an offline policy; ADB receives a separate loopback-only profile and a fixed loopback server socket. Proxy, package-host, and Git transport environment values remain defense in depth.
 
-The default `appcontainer` mode launches the Safe Tier root with the stable AppContainer `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` mechanism and no Internet/LAN capability SIDs. Descendants inherit the AppContainer token and are placed in a per-operation Job Object with kill-on-close. Offline and ADB-loopback profiles are separate. One-time local setup creates the profiles and ACLs the workspace and explicitly configured toolchain paths; each disposable runtime tree receives its ACL only when launched. Dart workspace formatting runs in that disposable tree and only broker-validated target changes are applied to the real workspace. If profile creation, ACL setup, loopback exemption, Job assignment, or AppContainer process creation fails, Safe Tier fails closed and is not relaunched as a normal user process.
+The default `appcontainer` mode launches the Safe Tier root with the stable AppContainer `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` mechanism and no Internet/LAN capability SIDs. Descendants inherit the AppContainer token and are placed in a per-operation Job Object with kill-on-close. `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` restricts inherited handles to NUL stdin and the two output pipes. Offline and ADB-loopback profiles are separate. One-time local setup creates the profiles and reconciles an ACL grant ledger for the workspace and explicitly configured toolchain paths; removed paths lose stale profile ACEs. Each disposable runtime tree receives its ACL only when launched. Dart workspace formatting runs in that disposable tree and only broker-validated target changes are applied to the real workspace. If profile creation, ACL setup, loopback exemption, Job assignment, or AppContainer process creation fails, Safe Tier fails closed and is not relaunched as a normal user process.
 
-The implementation deliberately uses the documented AppContainer APIs available since Windows 8 instead of the experimental Windows Sandbox `CreateProcessInSandbox` API. Microsoft AppContainer provides token/capability, filesystem-ACL, process/credential, and network isolation; omitting network capability SIDs denies Internet/LAN, while the dedicated ADB profile gets only an explicit loopback exemption. OpenAI's current stronger Codex Windows sandbox instead uses one-time administrator-approved setup with dedicated lower-privilege users, filesystem permissions, firewall rules, and local policy. This project does not claim equivalence with that whole-system setup: AppContainer was selected for a public, per-workspace MCP because it is stable, inherited by descendants, compatible with explicit path ACLs, and normally set up on user-owned paths without running the server as Administrator. Windows 10/11 are the supported project targets; toolchains installed in locations not readable by the AppContainer must be listed in local configuration.
+The implementation deliberately retains AppContainer for narrowly-grammatical automatic commands. Git receives OS read access to its `.git` metadata, while model-visible output remains constrained by Git grammar/pathspec/no-textconv/no-external-diff/output policy. All automatic executable probes around a Safe operation, including Git snapshot/state and ADB emulator identity checks, use the same Safe broker.
 
-`compatibility` is an explicit legacy mode. It retains grammar/environment controls but is labelled `compatibility-command-and-environment-only`; it is never reported as OS isolation and is not an implicit fallback. AppContainer can reduce toolchain compatibility because required executable/runtime paths need explicit read/execute ACLs. Host-approved commands deliberately continue to run with the real Windows user token after approval.
+The ADB profile has an AppContainer loopback exemption. `ADB_SERVER_SOCKET=tcp:127.0.0.1:5037` constrains normal tool configuration, but the effective OS capability is general loopback access, not a per-port 5037 firewall rule. Internet/LAN capability SIDs remain absent. Audit must report both requested endpoint and effective capability.
+
+### Execution tier policy
+
+1. `safe_sandbox`: strict Git/Dart/Flutter/ADB grammar, automatic, normally AppContainer.
+2. `approved_sandbox`: broad developer command, one-shot human approval, installed Codex Windows sandbox.
+3. `approved_host`: real Windows user token, separate one-shot human approval, explicit last resort.
+
+Safe compatibility failures are restricted to setup, ACL/access incompatibility, unsupported OS mechanism, known sandbox compatibility diagnostics, or process startup failure. Ordinary non-zero exit, test failure, compile/lint failure, and application error remain command failures. The system may offer an Approved Sandbox retry, but it neither creates nor approves that request automatically. Unknown failures do not change tiers.
+
+Approved Sandbox uses the installed Codex CLI sandbox-only entrypoint with `windows.sandbox="elevated"` and the `:workspace` permission profile. The launcher plus adjacent command-runner and sandbox-setup helper form the minimum executable dependency closure: each must be validly Authenticode-signed by OpenAI, is path/hash/stat/signer-bound, revalidated after approval, and held against replacement through the child lifetime. The bound helper directory is first in the launcher PATH. Then `codex --version` is recorded and the fixed command is launched through `codex sandbox`. This does not start a Codex agent, send a prompt, authenticate with OpenAI, or perform model/API inference. The MCP's cwd/path/protected-file/environment/executable/approval/checkpoint/audit policies remain in force. Read-only code-loading commands operate on an immutable staged copy; source-write commands require `workspace_write=true`, a full manifest, and the workspace mutation lock.
+
+The selected distribution mode is installed-Codex dependency. It reuses upstream's CLI/setup helper/command runner/security update chain without copying Windows sandbox internals into this repository. Apache-2.0 permits a future standalone distribution, but safely redistributing the coordinated binaries, versioned policy/protocol, setup behavior, signing, notices, and update channel is deferred. Missing CLI, incomplete UAC setup, incompatible backend, initialization/policy/launch failure, or timeout fails closed. Host execution requires a new `approved_host` request.
+
+`compatibility` is an explicit legacy Safe mode. It retains grammar/environment controls but is labelled `compatibility-command-and-environment-only`; it is never reported as OS isolation and is not an implicit fallback.
 
 ### Configuration selection and local profiles
 

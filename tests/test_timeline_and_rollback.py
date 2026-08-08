@@ -340,6 +340,10 @@ def test_selective_undo_stops_on_overlapping_text_change(tmp_path: Path) -> None
     )
     assert preview["conflict_count"] == 1
     assert preview["conflicts"][0]["path"] == "a.txt"
+    context = preview["conflicts"][0]["bounded_text_context"]
+    assert context["before"].splitlines() == ["base"]
+    assert context["operation_after"].splitlines() == ["operation"]
+    assert context["current"].splitlines() == ["manual overlap"]
     assert target.read_text(encoding="utf-8") == "manual overlap\n"
 
 

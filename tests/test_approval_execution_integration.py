@@ -8,7 +8,7 @@ from windows_local_mcp.audit import AuditStore
 from windows_local_mcp.config import Settings
 from windows_local_mcp.executor import Executor
 from windows_local_mcp.paths import Workspace
-from windows_local_mcp.policy import NormalizedCommand
+from windows_local_mcp.policy import NormalizedCommand, approved_request_hash
 from windows_local_mcp.resources import WorkspaceExecutionLock
 
 
@@ -58,19 +58,23 @@ def _prepare_operation(
         normalized=command,
     )
     expires = (datetime.now(UTC) + timedelta(minutes=5)).isoformat()
+    request = {
+        "approval_binding_version": 2,
+        "normalized_command": command.model_dump(),
+        "approval_manifest_digest": digest,
+        "approval_manifest_summary": {"mode": manifest["mode"]},
+        "workspace_write": False,
+        "max_runtime_seconds": 30,
+        "execution_tier": "approved_host",
+    }
     store.create_operation(
         operation_id=operation_id,
         tool_name="request_host_command",
         tier="host_approval",
         status="pending_approval",
         cwd=str(workspace),
-        request={
-            "normalized_command": command.model_dump(),
-            "approval_manifest_digest": digest,
-            "approval_manifest_summary": {"mode": manifest["mode"]},
-            "workspace_write": False,
-            "max_runtime_seconds": 30,
-        },
+        request=request,
+        request_hash=approved_request_hash(request),
         approval_status="pending",
         request_expires_at=expires,
     )

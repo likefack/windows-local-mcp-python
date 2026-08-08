@@ -30,7 +30,7 @@ def safe_network_policy(program_key: str, *, mode: str = "appcontainer") -> Netw
     )
     if program_key == "adb":
         return NetworkPolicy(
-            "adb-loopback-only", "deny", "deny", "allow", enforcement
+            "adb-appcontainer-loopback-exempt", "deny", "deny", "allow-general-loopback", enforcement
         )
     return NetworkPolicy("offline", "deny", "deny", "deny", enforcement)
 

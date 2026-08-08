@@ -11,10 +11,13 @@ from .config import Settings
 from .resources import WorkspaceExecutionLock, prune_artifacts
 from .util import canonical_json, utc_now_iso
 from .workspace_history import (
+    capture_workspace_state,
     finalize_workspace_transaction,
     incomplete_workspace_transactions,
+    mark_workspace_transaction_audit_reconciled,
     mark_workspace_transaction_recovery_required,
     recover_incomplete_workspace_transaction,
+    verify_checkpoint_integrity,
 )
 
 TERMINAL_STATUSES = {
@@ -177,17 +180,46 @@ class AuditStore:
             if not operation_id:
                 continue
             recovery_error: str | None = None
-            if state in {"applying", "recovering"}:
+            reconciled_after_path: str | None = None
+            if state in {
+                "preflight",
+                "staged",
+                "applying",
+                "recovering",
+                "applied_verified",
+                "complete",
+            }:
                 try:
                     with WorkspaceExecutionLock(self.settings):
                         journal = recover_incomplete_workspace_transaction(
                             self.settings, journal
                         )
-                    state = "failed_recovered"
+                        if journal.get("state") in {"applied_verified", "complete"}:
+                            after_path = (
+                                self.settings.data_dir
+                                / "workspace-history"
+                                / "operations"
+                                / operation_id
+                                / "after"
+                                / "manifest.json"
+                            )
+                            if after_path.exists():
+                                verify_checkpoint_integrity(
+                                    self.settings, str(after_path)
+                                )
+                                reconciled_after_path = str(after_path.resolve(strict=True))
+                            else:
+                                reconciled_after_path = capture_workspace_state(
+                                    self.settings, operation_id, "after"
+                                ).manifest_path
+                    state = str(journal.get("state") or state)
                 except Exception as error:  # noqa: BLE001 - persist and block mutations
                     recovery_error = f"{type(error).__name__}: {error}"[:2000]
-                    mark_workspace_transaction_recovery_required(journal, error)
-                    state = "recovery_required"
+                    if journal.get("journal_error"):
+                        state = "recovery_required"
+                    else:
+                        mark_workspace_transaction_recovery_required(journal, error)
+                        state = "recovery_required"
             recovery_state = (
                 "failed_recovered"
                 if state == "failed_recovered"
@@ -198,35 +230,58 @@ class AuditStore:
             now = utc_now_iso()
             with self._lock, self._connect() as db:
                 row = db.execute(
-                    "SELECT status FROM operations WHERE id = ?", (operation_id,)
+                    "SELECT status, post_workspace_path FROM operations WHERE id = ?",
+                    (operation_id,),
                 ).fetchone()
                 if row is None:
+                    if state in {"failed_preflight", "failed_recovered", "complete"}:
+                        mark_workspace_transaction_audit_reconciled(
+                            self.settings, operation_id
+                        )
                     continue
-                if row["status"] in TERMINAL_STATUSES and state not in {
+                if (
+                    row["status"] in TERMINAL_STATUSES
+                    and state not in {"applied_verified", "complete"}
+                    and state not in {
                     "failed_recovered",
                     "recovery_required",
-                }:
-                    if state == "applied_verified":
-                        finalize_workspace_transaction(self.settings, operation_id)
+                    "failed_preflight",
+                    }
+                ):
+                    mark_workspace_transaction_audit_reconciled(
+                        self.settings, operation_id
+                    )
                     continue
-                applied_but_unrecorded = state == "applied_verified"
+                applied_but_unrecorded = state in {"applied_verified", "complete"}
+                reconciled_status = "succeeded" if applied_but_unrecorded else "interrupted"
+                reconciled_rollback = (
+                    "complete"
+                    if applied_but_unrecorded
+                    else "failed_preflight"
+                    if state == "failed_preflight"
+                    else recovery_state
+                )
                 db.execute(
                     """
-                    UPDATE operations SET status='interrupted', rollback_state=?,
+                    UPDATE operations SET status=?, rollback_state=?,
                         finished_at=?, updated_at=?, error=?,
                         pre_workspace_path=COALESCE(pre_workspace_path, ?),
                         post_workspace_path=CASE WHEN ? THEN ? ELSE post_workspace_path END
                     WHERE id=?
                     """,
                     (
-                        "applied_audit_incomplete" if applied_but_unrecorded else recovery_state,
+                        reconciled_status,
+                        reconciled_rollback,
                         now,
                         now,
                         recovery_error
-                        or f"incomplete workspace mutation detected in state {state}",
+                        if recovery_error
+                        else None
+                        if applied_but_unrecorded
+                        else f"incomplete workspace mutation detected in state {state}",
                         journal.get("before_manifest"),
                         applied_but_unrecorded,
-                        journal.get("target_manifest"),
+                        reconciled_after_path or journal.get("target_manifest"),
                         operation_id,
                     ),
                 )
@@ -241,14 +296,17 @@ class AuditStore:
                                 "journal_path": journal.get("journal_path"),
                                 "state": state,
                                 "recovery_state": (
-                                    "applied_audit_incomplete"
-                                    if applied_but_unrecorded
-                                    else recovery_state
+                                    reconciled_rollback
                                 ),
                             }
                         ),
                     ),
                 )
+            # SQLite context above has committed before the journal is terminalized.
+            if state == "applied_verified":
+                finalize_workspace_transaction(self.settings, operation_id)
+            else:
+                mark_workspace_transaction_audit_reconciled(self.settings, operation_id)
 
     def create_operation(
         self,

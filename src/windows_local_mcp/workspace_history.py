@@ -50,26 +50,69 @@ def capture_workspace_state(settings: Settings, operation_id: str, stage: str) -
         )
         workspace = Workspace(settings)
         denied = {name.casefold() for name in settings.write_denied_directories}
+        blocked = {name.casefold() for name in settings.blocked_file_names}
+        excluded: list[dict[str, str]] = []
+
+        def fail_walk(error: OSError) -> None:
+            raise RuntimeError(f"workspace checkpoint traversal failed: {error}") from error
+
         for root, dirs, files in os.walk(
-            settings.workspace_root, topdown=True, followlinks=False
+            settings.workspace_root,
+            topdown=True,
+            followlinks=False,
+            onerror=fail_walk,
         ):
             root_path = Path(root)
-            dirs[:] = [
-                name
-                for name in dirs
-                if name.casefold() not in denied and not (root_path / name).is_symlink()
-            ]
+            retained_dirs: list[str] = []
+            for name in sorted(dirs, key=str.casefold):
+                candidate = root_path / name
+                if name.casefold() in denied:
+                    excluded.append(
+                        {
+                            "path": candidate.relative_to(settings.workspace_root).as_posix(),
+                            "reason": "policy_write_denied_directory",
+                        }
+                    )
+                elif candidate.is_symlink():
+                    excluded.append(
+                        {
+                            "path": candidate.relative_to(settings.workspace_root).as_posix(),
+                            "reason": "policy_reparse_directory",
+                        }
+                    )
+                else:
+                    retained_dirs.append(name)
+            dirs[:] = retained_dirs
             for name in sorted(files, key=str.casefold):
                 source = root_path / name
                 relative = source.relative_to(settings.workspace_root)
+                folded = name.casefold()
+                if folded in blocked or (
+                    folded.startswith(".env.") and folded != ".env.example"
+                ):
+                    excluded.append(
+                        {"path": relative.as_posix(), "reason": "policy_blocked_file"}
+                    )
+                    continue
                 try:
                     verified = workspace.resolve_existing(str(relative), access="write")
                     stat = verified.stat()
-                    if not verified.is_file() or stat.st_nlink > 1:
+                    if not verified.is_file():
+                        excluded.append(
+                            {"path": relative.as_posix(), "reason": "policy_non_regular_file"}
+                        )
+                        continue
+                    if stat.st_nlink > 1:
+                        excluded.append(
+                            {"path": relative.as_posix(), "reason": "policy_hardlink"}
+                        )
                         continue
                     data = verified.read_bytes()
-                except (FileNotFoundError, PermissionError, OSError, ValueError):
-                    continue
+                except (FileNotFoundError, PermissionError, OSError, ValueError) as error:
+                    raise RuntimeError(
+                        f"workspace checkpoint could not capture {relative.as_posix()}: "
+                        f"{type(error).__name__}: {error}"
+                    ) from error
                 total += len(data)
                 if len(entries) + 1 > settings.approval_manifest_max_files:
                     raise ValueError("workspace history exceeds approval_manifest_max_files")
@@ -90,6 +133,8 @@ def capture_workspace_state(settings: Settings, operation_id: str, stage: str) -
             "operation_id": operation_id,
             "stage": stage,
             "files": entries,
+            "excluded": excluded,
+            "capture_complete": True,
         }
         manifest_path = base / "manifest.json"
         _write_json_atomic(manifest_path, payload)
@@ -317,7 +362,18 @@ def finalize_workspace_transaction(settings: Settings, operation_id: str) -> Non
     if journal.get("state") != "applied_verified":
         raise RuntimeError("workspace transaction is not ready for audit finalization")
     journal["state"] = "complete"
+    journal["audit_reconciled"] = True
     journal["completed_at"] = utc_now_iso()
+    _write_json_atomic(journal_path, journal)
+
+
+def mark_workspace_transaction_audit_reconciled(
+    settings: Settings, operation_id: str
+) -> None:
+    journal_path = _transaction_root(settings, operation_id) / "journal.json"
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    journal["audit_reconciled"] = True
+    journal["audit_reconciled_at"] = utc_now_iso()
     _write_json_atomic(journal_path, journal)
 
 
@@ -410,9 +466,20 @@ def incomplete_workspace_transactions(settings: Settings) -> list[dict[str, Any]
     for journal_path in root.glob("*/journal.json"):
         try:
             journal = json.loads(journal_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        except (OSError, ValueError) as error:
+            result.append(
+                {
+                    "operation_id": journal_path.parent.name,
+                    "state": "recovery_required",
+                    "journal_path": str(journal_path),
+                    "journal_error": f"{type(error).__name__}: {error}"[:1000],
+                }
+            )
             continue
-        if journal.get("state") not in _JOURNAL_TERMINAL:
+        if (
+            journal.get("state") not in _JOURNAL_TERMINAL
+            or journal.get("audit_reconciled") is not True
+        ):
             result.append({**journal, "journal_path": str(journal_path)})
     return result
 
@@ -425,7 +492,33 @@ def recover_incomplete_workspace_transaction(
     journal_path.resolve(strict=True).relative_to(
         (settings.data_dir / "workspace-history" / "transactions").resolve(strict=True)
     )
-    if journal.get("state") not in {"applying", "recovering"}:
+    state = str(journal.get("state") or "")
+    if state == "preflight":
+        if journal.get("applied_paths"):
+            raise RuntimeError("preflight journal unexpectedly records applied paths")
+        journal.update(state="failed_preflight", reconciled_at=utc_now_iso())
+        _write_json_atomic(journal_path, journal)
+        return journal
+    if state == "staged":
+        if journal.get("applied_paths"):
+            raise RuntimeError("staged journal unexpectedly records applied paths")
+        before_path = str(journal.get("before_manifest") or "")
+        if not before_path:
+            raise RuntimeError("staged journal has no before checkpoint")
+        verify_checkpoint_integrity(settings, before_path)
+        _scan_current_hashes(settings)
+        journal.update(state="failed_preflight", reconciled_at=utc_now_iso())
+        _write_json_atomic(journal_path, journal)
+        return journal
+    if state in {"applied_verified", "complete"}:
+        target_path = str(journal.get("target_manifest") or "")
+        if not target_path:
+            raise RuntimeError("applied journal has no target checkpoint")
+        target = verify_checkpoint_integrity(settings, target_path)
+        if _scan_current_hashes(settings) != target:
+            raise RuntimeError("applied workspace no longer matches its verified target")
+        return journal
+    if state not in {"applying", "recovering"}:
         return journal
     before_path = str(journal.get("before_manifest") or "")
     target_path = str(journal.get("target_manifest") or "")
@@ -640,7 +733,18 @@ def _selective_target(
         merged = _reverse_text_change(old, operation, current_text)
         if merged is None:
             conflicts.append(
-                _conflict(relative, "overlapping or ambiguous text changes", old_entry, operation_entry, current_entry)
+                _conflict(
+                    relative,
+                    "overlapping or ambiguous text changes",
+                    old_entry,
+                    operation_entry,
+                    current_entry,
+                    text_context={
+                        "before": _bounded_text_context(old),
+                        "operation_after": _bounded_text_context(operation),
+                        "current": _bounded_text_context(current_text),
+                    },
+                )
             )
             continue
         merged_bytes = merged.encode("utf-8")
@@ -772,8 +876,18 @@ def _apply_manifest(
 def _scan_current_hashes(settings: Settings) -> dict[str, str]:
     workspace = Workspace(settings)
     denied = {name.casefold() for name in settings.write_denied_directories}
+    blocked = {name.casefold() for name in settings.blocked_file_names}
     result: dict[str, str] = {}
-    for root, dirs, files in os.walk(settings.workspace_root, topdown=True, followlinks=False):
+
+    def fail_walk(error: OSError) -> None:
+        raise RuntimeError(f"workspace verification traversal failed: {error}") from error
+
+    for root, dirs, files in os.walk(
+        settings.workspace_root,
+        topdown=True,
+        followlinks=False,
+        onerror=fail_walk,
+    ):
         root_path = Path(root)
         dirs[:] = [
             name
@@ -782,12 +896,21 @@ def _scan_current_hashes(settings: Settings) -> dict[str, str]:
         ]
         for name in files:
             relative = (root_path / name).relative_to(settings.workspace_root)
+            folded = name.casefold()
+            if folded in blocked or (
+                folded.startswith(".env.") and folded != ".env.example"
+            ):
+                continue
             try:
                 path = workspace.resolve_existing(str(relative), access="write")
-                if path.is_file() and path.stat().st_nlink == 1:
-                    result[relative.as_posix()] = sha256_bytes(path.read_bytes())
-            except (FileNotFoundError, OSError, PermissionError, ValueError):
-                continue
+                if not path.is_file() or path.stat().st_nlink > 1:
+                    continue
+                result[relative.as_posix()] = sha256_bytes(path.read_bytes())
+            except (FileNotFoundError, OSError, PermissionError, ValueError) as error:
+                raise RuntimeError(
+                    f"workspace verification could not read {relative.as_posix()}: "
+                    f"{type(error).__name__}: {error}"
+                ) from error
     return result
 
 
@@ -834,6 +957,11 @@ def _load_manifest(settings: Settings, path: str) -> dict[str, Any]:
     resolved = Path(path).resolve(strict=True)
     resolved.relative_to((settings.data_dir / "workspace-history").resolve(strict=True))
     manifest = json.loads(resolved.read_text(encoding="utf-8"))
+    if manifest.get("capture_complete") is not True:
+        raise RuntimeError(
+            "workspace checkpoint has no verified complete-capture marker; legacy or partial "
+            "manifests cannot be used for restore/Undo"
+        )
     files = manifest.get("files")
     if not isinstance(files, list):
         raise TypeError("invalid workspace history manifest")
@@ -920,6 +1048,8 @@ def _write_generated_manifest(
             "operation_id": operation_id,
             "stage": stage,
             "files": [entries[key] for key in sorted(entries)],
+            "excluded": [],
+            "capture_complete": True,
         },
     )
     return str(path)
@@ -999,11 +1129,23 @@ def _conflict(
     before: dict[str, Any] | None,
     after: dict[str, Any] | None,
     current: dict[str, Any] | None,
+    *,
+    text_context: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    return {
+    result = {
         "path": path,
         "reason": reason,
         "before_sha256": _entry_digest(before),
         "operation_after_sha256": _entry_digest(after),
         "current_sha256": _entry_digest(current),
     }
+    if text_context:
+        result["bounded_text_context"] = text_context
+    return result
+
+
+def _bounded_text_context(value: str, limit: int = 800) -> str:
+    if len(value) <= limit:
+        return value
+    half = max(1, (limit - 40) // 2)
+    return value[:half] + "\n... conflict context truncated ...\n" + value[-half:]

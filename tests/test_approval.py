@@ -1,3 +1,4 @@
+import json
 import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -325,6 +326,14 @@ def test_dart_path_dependency_outside_cwd_is_copied_and_rewritten(tmp_path: Path
     ]
     assert len(staged_shared) == 1
     assert "approved" in staged_shared[0].read_text(encoding="utf-8")
+    runnable = materialize_execution_copy(
+        settings=settings,
+        operation_id="dart-path-dependency",
+        normalized=verified,
+    )
+    runnable_config = Path(runnable.cwd) / ".dart_tool" / "package_config.json"
+    assert "approval-staging" not in runnable_config.read_text(encoding="utf-8")
+    assert "dart-path-dependency-runtime" in runnable_config.read_text(encoding="utf-8")
 
 
 def test_non_file_dart_dependency_fails_closed(tmp_path: Path) -> None:
@@ -374,3 +383,39 @@ def test_verified_snapshot_materializes_separate_writable_run_copy(tmp_path: Pat
     assert Path(runnable.cwd).parent.name == "run-copy-runtime"
     Path(runnable.cwd, "main.py").write_text("runtime output", encoding="utf-8")
     assert Path(immutable.cwd, "main.py").read_text(encoding="utf-8") == "approved"
+
+
+def test_external_dart_dependency_requires_configured_read_root(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    project = settings.workspace_root / "app"
+    package_dir = project / ".dart_tool"
+    package_dir.mkdir(parents=True)
+    external = tmp_path / "private-package"
+    external.mkdir()
+    (external / "secret.dart").write_text("secret", encoding="utf-8")
+    package_dir.joinpath("package_config.json").write_text(
+        json.dumps(
+            {
+                "configVersion": 2,
+                "packages": [
+                    {"name": "external", "rootUri": external.as_uri(), "packageUri": ""}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    executable = make_executable(tmp_path)
+    command = NormalizedCommand(
+        executable=str(executable),
+        args=["analyze"],
+        cwd=str(project),
+        display_command=[str(executable), "analyze"],
+        program_key="dart",
+    )
+    with pytest.raises(PermissionError, match="safe_network_readable_paths"):
+        prepare_approval_bundle(
+            settings=settings,
+            workspace=Workspace(settings),
+            operation_id="external-dart-dependency",
+            normalized=command,
+        )

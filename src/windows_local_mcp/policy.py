@@ -130,7 +130,7 @@ class CommandPolicy:
             return self._result(executable, normalized_args, cwd_path, "adb")
 
         raise PermissionError(
-            f"{program} is not eligible for automatic execution; use request_host_command"
+            f"{program} is not eligible for automatic execution; use request_sandbox_command"
         )
 
     def normalize_host(
@@ -460,6 +460,8 @@ def approval_hash(
     reason: str,
     risk_summary: str,
     manifest_digest: str,
+    execution_tier: str = "approved_host",
+    backend_digest: str | None = None,
 ) -> str:
     payload = {
         "executable": normalized.executable,
@@ -469,5 +471,14 @@ def approval_hash(
         "reason": reason,
         "risk_summary": risk_summary,
         "manifest_digest": manifest_digest,
+        "execution_tier": execution_tier,
+        "backend_digest": backend_digest,
     }
     return sha256_text(canonical_json(payload))
+
+
+def approved_request_hash(request: dict[str, object]) -> str:
+    """Bind every persisted capability of a versioned Approved request."""
+    if request.get("approval_binding_version") != 2:
+        raise ValueError("approved request uses an unsupported approval binding version")
+    return sha256_text(canonical_json(request))
