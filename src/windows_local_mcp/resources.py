@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import threading
@@ -11,64 +12,115 @@ from typing import BinaryIO, Self
 
 from .config import Settings
 
+_LOCK_SLOT_COUNT = 32
+_LOCAL_LOCKS_GUARD = threading.Lock()
+_LOCAL_LOCKS: dict[str, threading.RLock] = {}
+
 
 class WorkspaceExecutionLock:
-    """Cross-process lock serializing MCP writes and command execution."""
+    """Cross-process mutation lock with workspace-wide and target-specific scopes.
 
-    def __init__(self, settings: Settings, timeout: float = 30.0) -> None:
-        self.path = settings.data_dir / "workspace.lock"
+    With no target, all lock slots are acquired and the caller has exclusive workspace-write
+    access. With a target, only the deterministic slot for that canonical path is acquired.
+    Hash collisions merely serialize unrelated target writes; they never weaken exclusion.
+    """
+
+    def __init__(
+        self,
+        settings: Settings,
+        timeout: float = 30.0,
+        *,
+        target: Path | None = None,
+    ) -> None:
+        self.lock_dir = settings.data_dir / "locks"
         self.timeout = timeout
-        self._file: BinaryIO | None = None
+        self.target = target
+        self._held: list[tuple[BinaryIO, threading.RLock]] = []
+        self._slots = (
+            [self._target_slot(target)] if target is not None else list(range(_LOCK_SLOT_COUNT))
+        )
 
     def __enter__(self) -> Self:
-        self._file = self.path.open("a+b")
-        if self.path.stat().st_size == 0:
-            self._file.write(b"0")
-            self._file.flush()
+        self.lock_dir.mkdir(parents=True, exist_ok=True)
         deadline = time.monotonic() + self.timeout
-        while True:
-            try:
-                self._lock_one_byte()
-                return self
-            except OSError:
-                if time.monotonic() >= deadline:
-                    self._file.close()
-                    self._file = None
-                    raise TimeoutError("workspace execution lock timed out") from None
-                time.sleep(0.05)
+        try:
+            for slot in self._slots:
+                self._acquire_slot(slot, deadline)
+            return self
+        except Exception:
+            self._release_all()
+            raise
 
     def __exit__(self, *_: object) -> None:
-        if self._file is None:
+        self._release_all()
+
+    @staticmethod
+    def _target_slot(target: Path) -> int:
+        canonical = os.path.normcase(str(target.resolve(strict=False))).encode("utf-8")
+        digest = hashlib.sha256(canonical).digest()
+        return int.from_bytes(digest[:8], "big") % _LOCK_SLOT_COUNT
+
+    def _acquire_slot(self, slot: int, deadline: float) -> None:
+        path = self.lock_dir / f"workspace-{slot:02d}.lock"
+        local_lock = _local_lock_for(path)
+        while True:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("workspace execution lock timed out")
+            if not local_lock.acquire(blocking=False):
+                time.sleep(0.05)
+                continue
+            file = path.open("a+b")
+            if path.stat().st_size == 0:
+                file.write(b"0")
+                file.flush()
+            try:
+                _lock_one_byte(file)
+            except OSError:
+                file.close()
+                local_lock.release()
+                time.sleep(0.05)
+                continue
+            self._held.append((file, local_lock))
             return
-        self._unlock_one_byte()
-        self._file.close()
-        self._file = None
 
-    def _lock_one_byte(self) -> None:
-        if self._file is None:
-            raise RuntimeError("lock file is not open")
-        self._file.seek(0)
-        if os.name == "nt":
-            import msvcrt
+    def _release_all(self) -> None:
+        while self._held:
+            file, local_lock = self._held.pop()
+            try:
+                _unlock_one_byte(file)
+            finally:
+                file.close()
+                local_lock.release()
 
-            msvcrt.locking(self._file.fileno(), msvcrt.LK_NBLCK, 1)
-        else:
-            import fcntl
 
-            fcntl.flock(self._file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+def _local_lock_for(path: Path) -> threading.RLock:
+    key = os.path.normcase(str(path.resolve(strict=False)))
+    with _LOCAL_LOCKS_GUARD:
+        return _LOCAL_LOCKS.setdefault(key, threading.RLock())
 
-    def _unlock_one_byte(self) -> None:
-        if self._file is None:
-            return
-        self._file.seek(0)
-        if os.name == "nt":
-            import msvcrt
 
-            msvcrt.locking(self._file.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            import fcntl
+def _lock_one_byte(file: BinaryIO) -> None:
+    file.seek(0)
+    if os.name == "nt":
+        import msvcrt
 
-            fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+        msvcrt.locking(file.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock_one_byte(file: BinaryIO) -> None:
+    file.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(file.fileno(), fcntl.LOCK_UN)
 
 
 class BoundedStreamCapture:

@@ -4,10 +4,13 @@ import argparse
 import os
 import subprocess
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .approval import materialize_execution_copy, verify_approval_bundle
 from .audit import AuditStore
+from .child_env import build_command_environment
+from .command_traits import dart_format_writes
 from .config import load_settings
 from .git_snapshot import capture_git_snapshot
 from .paths import Workspace
@@ -23,11 +26,13 @@ from .resources import BoundedStreamCapture, WorkspaceExecutionLock, enforce_dat
 from .util import canonical_json, utc_now_iso
 
 
+class ApprovalExecutionExpired(RuntimeError):
+    pass
+
+
 def run_operation(operation_id: str) -> int:
     settings = load_settings()
     audit = AuditStore(settings)
-    execution_lock = WorkspaceExecutionLock(settings)
-    execution_lock.__enter__()
     operation = audit.get_operation(operation_id, include_events=False)
     request = operation["request"]
     normalized = request["normalized_command"]
@@ -82,7 +87,6 @@ def run_operation(operation_id: str) -> int:
             "pre_execution_verification_failed",
             {"error": f"{type(error).__name__}: {error}"[:1000]},
         )
-        execution_lock.__exit__(None, None, None)
         return 1
 
     executable = normalized["executable"]
@@ -117,35 +121,33 @@ def run_operation(operation_id: str) -> int:
     child_identity: ProcessIdentity | None = None
     stdout_capture: BoundedStreamCapture | None = None
     stderr_capture: BoundedStreamCapture | None = None
+    status = "failed"
+    exit_code: int | None = None
+    error: str | None = None
+    workspace_lock: WorkspaceExecutionLock | None = None
 
     try:
+        if _requires_workspace_execution_lock(operation, request, normalized):
+            workspace_lock = WorkspaceExecutionLock(settings)
+            try:
+                workspace_lock.__enter__()
+            except TimeoutError as lock_error:
+                audit.add_event(
+                    operation_id,
+                    "workspace_lock_timeout",
+                    {"error": str(lock_error)[:1000]},
+                )
+                raise
         _verify_adb_target(normalized, settings.adb_emulator_only)
-        child_env = os.environ.copy()
-        for internal_name in (
-            "LOCAL_MCP_CONFIG",
-            "LOCAL_MCP_ROOT",
-            "LOCAL_MCP_TRANSPORT",
-            "LOCAL_MCP_HOST",
-            "LOCAL_MCP_PORT",
-        ):
-            child_env.pop(internal_name, None)
-        for injection_name in (
-            "PYTHONPATH",
-            "PYTHONHOME",
-            "NODE_PATH",
-            "NODE_OPTIONS",
-            "PSModulePath",
-            "JAVA_TOOL_OPTIONS",
-            "JDK_JAVA_OPTIONS",
-            "_JAVA_OPTIONS",
-            "GRADLE_OPTS",
-            "DART_VM_OPTIONS",
-            "FLUTTER_TOOL_ARGS",
-            "RUBYLIB",
-            "PERL5LIB",
-            "CLASSPATH",
-        ):
-            child_env.pop(injection_name, None)
+        if operation["tier"] == "host_approval":
+            refreshed = audit.get_operation(operation_id, include_events=False)
+            _ensure_approval_execution_fresh(refreshed)
+        child_env = build_command_environment(
+            os.environ,
+            extra_names=settings.child_environment_allowlist,
+            nonce=nonce,
+            git_command=normalized.get("program_key") == "git",
+        )
         runtime_root = settings.data_dir / "outputs" / f"{operation_id}-runtime"
         try:
             Path(cwd).resolve(strict=True).relative_to(runtime_root.resolve(strict=True))
@@ -166,7 +168,6 @@ def run_operation(operation_id: str) -> int:
             )
         except (ValueError, FileNotFoundError):
             pass
-        child_env["WINDOWS_LOCAL_MCP_JOB_NONCE"] = nonce
         child = subprocess.Popen(
             argv,
             cwd=cwd,
@@ -209,6 +210,19 @@ def run_operation(operation_id: str) -> int:
             exit_code = None
             status = "timed_out"
             error = f"maximum runtime exceeded: {max_runtime} seconds"
+    except ApprovalExecutionExpired as exc:
+        if child_identity is not None:
+            terminate_process_tree(child_identity)
+        elif child is not None:
+            child.terminate()
+        exit_code = None
+        status = "expired"
+        error = str(exc)
+        audit.add_event(
+            operation_id,
+            "approval_expired_before_child_start",
+            {"error": error[:1000]},
+        )
     except Exception as exc:  # noqa: BLE001 - every child failure must become a terminal job
         if child_identity is not None:
             terminate_process_tree(child_identity)
@@ -222,6 +236,8 @@ def run_operation(operation_id: str) -> int:
             stdout_capture.join()
         if stderr_capture is not None:
             stderr_capture.join()
+        if workspace_lock is not None:
+            workspace_lock.__exit__(None, None, None)
 
     duration_ms = int((time.monotonic() - started) * 1000)
     post_git = capture_git_snapshot(settings=settings, operation_id=operation_id, stage="after")
@@ -247,25 +263,67 @@ def run_operation(operation_id: str) -> int:
         "pre_git_path": pre_git,
         "post_git_path": post_git,
     }
-    audit.update_operation(
-        operation_id,
-        status=status,
-        finished_at=utc_now_iso(),
-        exit_code=exit_code,
-        post_git_path=post_git,
-        result_json=canonical_json(result),
-        error=error,
-        duration_ms=duration_ms,
-    )
+    update_fields: dict[str, object] = {
+        "status": status,
+        "finished_at": utc_now_iso(),
+        "exit_code": exit_code,
+        "post_git_path": post_git,
+        "result_json": canonical_json(result),
+        "error": error,
+        "duration_ms": duration_ms,
+    }
+    if status == "expired" and operation["tier"] == "host_approval":
+        update_fields["approval_status"] = "expired"
+    audit.update_operation(operation_id, **update_fields)
     audit.add_event(operation_id, "worker_finished", {"status": status, "exit_code": exit_code})
-    execution_lock.__exit__(None, None, None)
     return 0 if status == "succeeded" else 1
+
+
+def _requires_workspace_execution_lock(
+    operation: dict[str, object],
+    request: dict[str, object],
+    normalized: dict[str, object],
+) -> bool:
+    """Return whether execution can mutate the original workspace and needs exclusivity."""
+    tier = operation.get("tier")
+    if tier == "safe_command":
+        if normalized.get("program_key") != "dart":
+            return False
+        args = list(normalized.get("args") or [])
+        if not args or args[0] != "format":
+            return False
+        return dart_format_writes(args)
+
+    if tier == "host_approval":
+        if bool(request.get("workspace_write")):
+            return True
+        summary = request.get("approval_manifest_summary")
+        # Old audit rows or non-snapshot host commands remain conservative. They may execute
+        # against the real workspace, so keep the exclusive lock unless isolation is explicit.
+        return not (isinstance(summary, dict) and summary.get("mode") == "staged-cwd")
+
+    return True
+
+
+def _ensure_approval_execution_fresh(operation: dict[str, object]) -> None:
+    if operation.get("tier") != "host_approval":
+        return
+    if operation.get("approval_status") != "approved" or not operation.get("claimed_at"):
+        raise RuntimeError("approval execution grant is not active")
+    expires_value = operation.get("approval_expires_at")
+    if not expires_value:
+        raise ApprovalExecutionExpired("approval execution grant has no expiration")
+    expires_at = datetime.fromisoformat(str(expires_value))
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
+    if expires_at <= datetime.now(UTC):
+        raise ApprovalExecutionExpired("approval execution grant expired before child start")
 
 
 def _verify_adb_target(normalized: dict[str, object], emulator_only: bool) -> None:
     if normalized.get("program_key") != "adb" or not emulator_only:
         return
-    args = list(normalized["args"])  # type: ignore[arg-type]
+    args = list(normalized["args"])
     if len(args) < 2 or args[0] != "-s":
         return
     serial = args[1]

@@ -10,6 +10,9 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from .child_env import normalize_extra_environment_names, sanitize_process_environment
+from .git_env import strip_git_ambient_environment
+
 
 class Settings(BaseModel):
     """Validated, fail-closed configuration for one MCP instance/workspace."""
@@ -51,6 +54,10 @@ class Settings(BaseModel):
     )
     default_foreground_timeout_seconds: int = Field(default=30, ge=0, le=600)
     default_max_runtime_seconds: int = Field(default=1800, ge=10, le=86400)
+
+    # Parent environment is not inherited wholesale. Add only project-specific variables that a
+    # child genuinely needs; known injection/redirection variables are rejected even if listed.
+    child_environment_allowlist: list[str] = Field(default_factory=list)
 
     blocked_file_names: list[str] = Field(
         default_factory=lambda: [
@@ -124,6 +131,11 @@ class Settings(BaseModel):
                 raise ValueError("ADB serials must be non-empty and contain no whitespace")
             clean.append(serial)
         return clean
+
+    @field_validator("child_environment_allowlist")
+    @classmethod
+    def validate_child_environment_allowlist(cls, values: list[str]) -> list[str]:
+        return normalize_extra_environment_names(values)
 
     @model_validator(mode="after")
     def validate_security_boundaries(self) -> Settings:
@@ -228,6 +240,10 @@ def _default_data_dir() -> Path:
 
 
 def load_settings() -> Settings:
+    # Every production entrypoint calls load_settings(). Scrub Git repository/config overrides
+    # before any Git probe, snapshot, approval-state capture, or child process can inherit them.
+    strip_git_ambient_environment(os.environ)
+
     config_path_value = os.environ.get("LOCAL_MCP_CONFIG", "").strip()
     payload: dict[str, object] = {}
 
@@ -250,5 +266,11 @@ def load_settings() -> Settings:
         payload["data_dir"] = str(_default_data_dir())
 
     settings = Settings.model_validate(payload)
+    # After the config is resolved, discard unrelated ambient values from the MCP process itself.
+    # Internal Git probes and approval-state subprocesses then inherit the same minimal baseline.
+    sanitize_process_environment(
+        os.environ,
+        extra_names=settings.child_environment_allowlist,
+    )
     settings.ensure_directories()
     return settings

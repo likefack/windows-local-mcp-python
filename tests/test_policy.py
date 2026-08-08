@@ -70,6 +70,7 @@ def test_git_status_and_workspace_pathspec_remain_automatic(
     tmp_path: Path, fake_tools: Path
 ) -> None:
     settings = make_settings(tmp_path)
+    (settings.workspace_root / ".git").mkdir()
     source = settings.workspace_root / "src"
     source.mkdir()
     policy = CommandPolicy(settings, Workspace(settings))
@@ -77,9 +78,38 @@ def test_git_status_and_workspace_pathspec_remain_automatic(
     diff = policy.normalize_safe(
         program="git", args=["diff", "--name-only", "--", "src"], cwd="."
     )
+    log = policy.normalize_safe(program="git", args=["log", "-10", "--patch"], cwd=".")
     assert status.args[:2] == ["--no-pager", "status"]
     assert "--no-ext-diff" in diff.args
+    assert "--no-textconv" in diff.args
+    assert "--no-ext-diff" in log.args
+    assert "--no-textconv" in log.args
     assert str(source.resolve()) in diff.args
+
+
+def test_automatic_git_requires_workspace_root_marker(
+    tmp_path: Path, fake_tools: Path
+) -> None:
+    settings = make_settings(tmp_path)
+    policy = CommandPolicy(settings, Workspace(settings))
+    with pytest.raises(PermissionError, match="workspace_root itself"):
+        policy.normalize_safe(program="git", args=["status", "--short"], cwd=".")
+
+
+def test_automatic_tool_cannot_be_loaded_from_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = make_settings(tmp_path, dart_enabled=True)
+    executable = settings.workspace_root / "dart.exe"
+    executable.write_bytes(b"MZ fake")
+    monkeypatch.setattr(
+        CommandPolicy,
+        "_resolve_executable",
+        staticmethod(lambda _candidates: str(executable)),
+    )
+    policy = CommandPolicy(settings, Workspace(settings))
+    with pytest.raises(PermissionError, match="must not be loaded from the workspace"):
+        policy.normalize_safe(program="dart", args=["analyze"], cwd=".")
 
 
 def test_git_pathspec_cannot_escape_workspace(tmp_path: Path, fake_tools: Path) -> None:

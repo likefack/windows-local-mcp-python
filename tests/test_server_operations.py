@@ -71,10 +71,10 @@ def test_oversized_write_is_rejected_and_audited(
 def test_denied_command_is_audited(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     server, _ = load_server(tmp_path, monkeypatch)
     with pytest.raises(PermissionError):
-        server.execute("python", ["-c", "print(1)"])
+        server.execute_readonly("python", ["-c", "print(1)"])
     records = server.runtime.audit.list_operations(limit=10)
     assert any(
-        record["tool_name"] == "execute" and record["status"] == "rejected"
+        record["tool_name"] == "execute_readonly" and record["status"] == "rejected"
         for record in records
     )
 

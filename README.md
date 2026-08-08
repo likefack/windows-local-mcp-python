@@ -85,7 +85,7 @@ Gitも入っていない場合は`git_enabled = false`へ変更します。保�
 - `s`: 今は判断せず次へ
 - `q`: 承認画面を終了
 
-ChatGPT側で`execute_approved`をもう一度実行する必要はありません。ChatGPTは`poll_approval`で結果を確認します。
+`request_host_command`は承認要求を作るだけで、その呼出し時点では要求されたコマンドを実行しません。危険な実行はWindows側で`y`を選んだときだけ1回開始されます。ChatGPT側には`execute_approved`を公開せず、`poll_approval`または`poll_job`で結果だけ確認します。
 
 ### 7. Secure MCP Tunnelへ登録する
 
@@ -110,6 +110,7 @@ ChatGPTへ順に依頼します。
 2. 「workspace直下を一覧表示して」
 3. 「`mcp-test.txt`へ`hello`と書き、読み戻して」
 4. Gitを有効にした場合は「現在のbranch、HEAD、status、diff、staged diff、最近のcommitを`git_info`で表示して」
+5. Gitの安全なコマンド実行を確認する場合は「`execute_readonly`で`git status --short`を実行して」
 
 表示されたworkspaceが意図したフォルダーと違う場合は、操作を続けずTunnelと承認画面を終了し、`config.toml`を直してください。
 
@@ -148,19 +149,22 @@ Tunnelへは`powershell.exe -NoProfile -File <repo>\run-server.ps1 -Config <repo
 
 ## 能力と境界
 
-| 操作 | 既定 | 自動実行の条件 |
+| 操作 | 既定 | MCP tool / 自動実行の条件 |
 | --- | --- | --- |
-| workspace read/write/list/image | 有効 | path broker、容量、秘密名、reparse/hardlink、競合検証を通る |
-| Git status/diff/staged/branch/HEAD/log/changed files | 有効 | 読取専用の固定文法。`.git`直接アクセスは不可 |
-| `flutter analyze` | 無効 | 有効化後、`--no-pub`、検証済みpath、固定snapshotとdependency closure |
-| `dart analyze` / 制約付き`dart format` | 無効 | 有効化後、完全文法とsnapshot。formatは実workspace全体を直前固定 |
-| Flutter/Dart test/build | 承認 | 安全Tierではない。承認済みcwd snapshotから1回実行 |
-| ADB devices/固定read-only/screenshot | 無効 | Emulator検証、serial allowlist、固定操作文法 |
-| ADB state change/general shell | 承認 | ローカル利用者の承認が必要 |
-| PowerShell/general host command/network/delete | 承認 | 対応機能、全入力manifest、期限、一回性を検証 |
+| workspace read/write/list/image | 有効 | `read_file` / `write_file`等。path broker、容量、秘密名、reparse/hardlink、競合検証を通る |
+| Git status/diff/staged/branch/HEAD/log/changed files | 有効 | `git_info`または`execute_readonly`。読取専用の固定文法。`.git`直接アクセスは不可 |
+| `flutter analyze` | 無効 | `execute_readonly`。有効化後、`--no-pub`、検証済みpath、固定snapshotとdependency closure |
+| `dart analyze` / 表示だけの`dart format` | 無効 | `execute_readonly`。有効化後、完全文法とsnapshot |
+| 書込みを行う制約付き`dart format` | 無効 | `execute_workspace_write`。実workspace全体を直前固定して実行 |
+| Flutter/Dart test/build | 承認 | `request_host_command`で要求を作成し、Windows側承認後にsnapshotから1回実行 |
+| ADB devices/固定read-only/screenshot | 無効 | `adb_read`。Emulator検証、serial allowlist、固定操作文法 |
+| ADB state change/general shell | 承認 | `request_host_command`後、ローカル利用者の承認が必要 |
+| PowerShell/general host command/network/delete | 承認 | `request_host_command`は要求作成のみ。対応機能、全入力manifest、期限、一回性を検証 |
 | Streamable HTTP | 無効 | loopbackのみ。multi-principal modeは未実装のため起動拒否 |
 
-`execute`の安全文法に入らない形式は、推測で安全扱いせず`request_host_command`へ送るか拒否します。
+自動コマンドはまず共通のdeny-by-default文法で検証し、その後に`execute_readonly`、`execute_workspace_write`、`adb_read`のどれへ属するかを判定します。別のtoolへ誤って送られた操作は実行せず拒否します。旧generic `execute` / `start_command`はMCPへ公開しません。
+
+Tool Annotation（MCPホストへ伝える操作性質）もtoolごとに分離しています。`execute_readonly`と`adb_read`はread-only/non-destructive、`execute_workspace_write`はdestructiveだがclosed-world、`request_host_command`は「承認要求を作るだけ」なのでnon-destructive/closed-worldです。これはChatGPT側の不要な確認を減らすためのヒントであり、最終的な確認UIの有無はMCPホスト側の判断にも依存します。
 
 ## 承認snapshot
 
@@ -200,7 +204,7 @@ adb_emulator_only = true
 adb_allowed_serials = ["emulator-5554"]
 ```
 
-自動許可は`devices`、target指定`get-state`、限定`getprop`、`wm size/density`、限定`dumpsys`、`exec-out screencap -p`だけです。実行直前に`adb emu avd name`でEmulatorであることも確認します。`input`、`am`、`pm`、install、push/pull、汎用shell等は承認経路です。screenshot jobの完了後は`get_adb_screenshot`で画像を取得できます。
+自動許可は`adb_read`経由の`devices`、target指定`get-state`、限定`getprop`、`wm size/density`、限定`dumpsys`、`exec-out screencap -p`だけです。実行直前に`adb emu avd name`でEmulatorであることも確認します。`input`、`am`、`pm`、install、push/pull、汎用shell等は承認経路です。screenshot jobの完了後は`get_adb_screenshot`で画像を取得できます。
 
 ## Transportとprincipal
 

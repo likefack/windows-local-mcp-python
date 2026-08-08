@@ -15,7 +15,7 @@ Security objectives:
 
 ## 2. Capability switches
 
-`filesystem_enabled`, `git_enabled`, `flutter_enabled`, `dart_enabled`, `adb_enabled`, and `powershell_enabled` are independent. Disabled optional tools are not resolved at startup. `workspace_root` is mandatory; there is no current-directory fallback.
+`filesystem_enabled`, `git_enabled`, `flutter_enabled`, `dart_enabled`, `adb_enabled`, and `powershell_enabled` are independent. A disabled capability is disabled in both the automatic and approval paths; approval does not override an explicit `false`. Disabled optional tools are not resolved at startup. `workspace_root` is mandatory; there is no current-directory fallback.
 
 Dangerous configuration combinations fail startup validation:
 
@@ -38,16 +38,28 @@ All MCP file paths pass through `Workspace`.
 
 `write_file` additionally:
 
-1. takes a cross-process workspace execution lock and canonical-target thread lock;
+1. takes a target-scoped cross-process mutation slot plus the canonical-target thread lock;
 2. re-resolves target and reads/checks expected SHA inside the locks;
 3. enforces old/new/diff/backup/data quotas before replacement;
 4. writes and fsyncs a same-directory temporary file;
 5. revalidates parent `(device,inode)` and target full identity immediately before `os.replace`;
 6. verifies resulting SHA.
 
+Target slots are selected from the canonical target path. Different slots can proceed concurrently; the same target always maps to the same slot, while a hash collision only causes extra serialization. A workspace-wide writer acquires every slot, so it still excludes all target writes.
+
+Ordinary file reads do not take a mutation lock.
+
 ## 4. Automatic command tier
 
 Automatic execution uses complete subcommand grammars, not a first-token allowlist. Unknown flags, positional forms, config/output paths, or unsafe ambiguity are rejected and can be resubmitted through approval.
+
+The MCP surface is split after the deny-by-default grammar succeeds:
+
+- `execute_readonly`: safe Git reads, `flutter analyze`, `dart analyze`, and non-writing `dart format`.
+- `execute_workspace_write`: automatic commands intentionally modifying workspace source; currently writing `dart format`.
+- `adb_read`: only the fixed read-only ADB grammar.
+
+The split is presentation and host-policy metadata, not a second authorization system. All three call the same `CommandPolicy.normalize_safe()` and the same queue/executor path. A command routed to the wrong surface is rejected and directed to the matching tool.
 
 ### Git
 
@@ -56,6 +68,7 @@ Automatic subcommands: `status`, `diff`, `log`, `show`, restricted `rev-parse`, 
 - Force no pager; diff/show force `--no-ext-diff --no-textconv`.
 - Disallow `-C`, `--git-dir`, `--work-tree`, `--output`, config injection, pager/external helpers, and unknown flags.
 - Pathspec is accepted only after `--` and resolved inside workspace.
+- Git repository/config override environment variables are removed before Git subprocesses run.
 - `git_info` returns branch, HEAD, status, working diff, staged diff, recent log, and changed files through bounded subprocess capture.
 
 ### Flutter and Dart
@@ -76,6 +89,19 @@ ADB is separately disabled by default. Automatic forms are exact:
 
 Targeted calls require serial validation. `adb_emulator_only=true` requires an `emulator-*` serial and a successful `adb emu avd name` preflight. Optional `adb_allowed_serials` further narrows targets. General shell and state changes require approval.
 
+### Execution lock policy
+
+The workspace-wide mutation lock is no longer held for every command for the full child-process lifetime.
+
+- Safe Git reads, safe ADB reads, `flutter analyze`, `dart analyze`, and non-writing `dart format` execute without the workspace-wide mutation lock.
+- Approved code-loading commands in immutable `staged-cwd` snapshot mode, including test/build-style execution, run without the workspace-wide mutation lock because they execute from `data_dir`, not the original workspace.
+- A writing `dart format`, an approved command marked `workspace_write=true`, and approved commands that still execute against the original workspace keep the exclusive workspace-wide mutation lock through verification and child execution.
+- Snapshot/manifest creation may still take the workspace-wide lock briefly so the captured input set is coherent.
+- `write_file` uses one target slot rather than all slots, so unrelated file writes can proceed concurrently while still conflicting with workspace-wide writers.
+- Old approval rows that do not contain explicit snapshot metadata fail conservatively and keep the workspace-wide lock.
+
+This permits long-running isolated tests/builds, read-only analysis, and unrelated target writes to overlap without weakening the source-write boundary.
+
 ## 5. Approval and immutable execution
 
 Preferred flow:
@@ -88,7 +114,7 @@ request_host_command
   -> ChatGPT poll_approval / poll_job
 ```
 
-`execute_approved` remains compatibility-only. It cannot claim an already consumed grant.
+`request_host_command` only stages local approval state and immutable inputs; it does not launch the requested process. Dangerous execution starts only from the local approval UI after the human approves it. There is no model-facing `execute_approved` tool, which avoids a second destructive/open-world MCP call after local approval.
 
 The approval hash covers normalized command, cwd, network flag, reason, risk, and manifest digest. The manifest covers:
 
@@ -113,13 +139,13 @@ Code-loading commands that do not need to mutate the source run from an immutabl
 - file-based Dart/Flutter package dependencies outside `cwd` are copied and `package_config.json` is rewritten;
 - non-file or non-enumerable dependencies fail closed.
 
-The immutable copy is verified after local approval. The worker then creates a separate writable disposable run copy, so build artifacts cannot mutate the approved input copy. Unrelated workspace changes outside the approved `cwd` do not invalidate snapshot execution.
+The immutable copy is verified after local approval. The worker then creates a separate writable disposable run copy, so build artifacts cannot mutate the approved input copy. Unrelated workspace changes outside the approved `cwd` do not invalidate snapshot execution. Snapshot-backed child execution does not hold the workspace-wide mutation lock.
 
 Installed OS/toolchains are the trusted computing base. Their primary executable is content-bound. Complete OS DLL/toolchain virtualization is not provided.
 
 ### Source-write mode
 
-Commands intended to mutate the original workspace require `workspace_write=true`. The complete workspace (excluding direct `.git` bytes) is manifested, all source files are revalidated, and execution occurs while holding the same cross-process lock used by `write_file`. Any workspace addition, deletion, or content change after request invalidates approval.
+Commands intended to mutate the original workspace require `workspace_write=true`. The complete workspace (excluding direct `.git` bytes) is manifested, all source files are revalidated, and execution occurs while holding the workspace-wide form of the same mutation-lock family used by target writes. Any workspace addition, deletion, or content change after request invalidates approval.
 
 Git host operations additionally bind Git state obtained through Git. Direct `.git` MCP access remains prohibited.
 
@@ -129,6 +155,7 @@ Git host operations additionally bind Git state obtained through Git. Direct `.g
 - Separately approved compatibility grants have `approval_expires_at`.
 - Local approve-and-run performs approval and `claimed_at` assignment in one transaction.
 - Claim predicates require the correct status, future expiry, and `claimed_at IS NULL`.
+- The worker rechecks `approval_expires_at` immediately before `subprocess.Popen()`; an expired grant never starts the child process.
 
 ## 6. Process lifecycle
 
@@ -151,7 +178,7 @@ Retention deletes only known artifact roots and skips artifacts whose operation 
 
 ## 8. Audit
 
-All important MCP boundary actions create operations/events, including rejection before normalization, job poll/stop, approval poll/claim, audit access, timeout, stale identity, and startup reconciliation. Secret-like fields are redacted; file content is represented by byte count and SHA. stdout/stderr and full file content are never copied into unbounded audit fields.
+All important MCP boundary actions create operations/events, including rejection before normalization, job poll/stop, approval poll/claim, audit access, timeout, stale identity, lock selection, and startup reconciliation. Secret-like fields are redacted; file content is represented by byte count and SHA. stdout/stderr and full file content are never copied into unbounded audit fields.
 
 ## 9. data_dir protection
 
@@ -167,10 +194,15 @@ Authenticated multi-principal HTTP is not implemented. Setting `http_multi_princ
 
 ## 11. MCP annotations
 
-- pure local reads: read-only, non-destructive, closed-world
-- file writes: non-read-only, destructive, closed-world
-- safe command multiplexer: non-read-only, potentially destructive/open-world because ADB is a possible configured backend
-- approval/general host action: non-read-only, destructive, open-world
-- polls: read-only
+Annotations describe the real action performed by each model-facing call:
 
-Annotations are host hints and never replace server-side enforcement.
+- pure local reads and `execute_readonly`: read-only, non-destructive, closed-world;
+- `adb_read`: read-only, non-destructive, closed-world;
+- `write_file` and `execute_workspace_write`: non-read-only, destructive, closed-world;
+- `request_host_command`: non-read-only, non-destructive, closed-world because it only creates an approval request and cannot launch the host command;
+- polls: read-only;
+- process-stop controls remain explicitly mutating/destructive where appropriate.
+
+The generic `execute`, `start_command`, and `execute_approved` surfaces are not exposed to MCP clients. This prevents one broad annotation from making read-only Git/analyze calls appear destructive and prevents a second model-facing dangerous execution step after local approval.
+
+Annotations are host hints and never replace server-side enforcement. The ChatGPT/MCP host may still apply its own confirmation policy.

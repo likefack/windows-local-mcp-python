@@ -8,6 +8,7 @@ import uuid
 from typing import Any
 
 from .audit import TERMINAL_STATUSES, AuditStore
+from .child_env import build_worker_environment
 from .config import Settings
 from .process_utils import (
     ProcessIdentity,
@@ -27,8 +28,11 @@ class Executor:
 
     def launch(self, operation_id: str, foreground_timeout_seconds: int) -> dict[str, Any]:
         nonce = uuid.uuid4().hex
-        child_env = os.environ.copy()
-        child_env["WINDOWS_LOCAL_MCP_JOB_NONCE"] = nonce
+        child_env = build_worker_environment(
+            os.environ,
+            extra_names=self.settings.child_environment_allowlist,
+            nonce=nonce,
+        )
         process = subprocess.Popen(
             [
                 sys.executable,

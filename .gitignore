@@ -1,6 +1,7 @@
 .venv/
 __pycache__/
 .pytest_cache/
+.pytest-tmp-*/
 .ruff_cache/
 *.pyc
 config.toml
