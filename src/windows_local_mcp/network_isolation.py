@@ -22,12 +22,17 @@ class NetworkPolicy:
         }
 
 
-def safe_network_policy(program_key: str) -> NetworkPolicy:
+def safe_network_policy(program_key: str, *, mode: str = "appcontainer") -> NetworkPolicy:
+    enforcement = (
+        "windows-appcontainer"
+        if mode == "appcontainer"
+        else "compatibility-command-and-environment-only"
+    )
     if program_key == "adb":
         return NetworkPolicy(
-            "adb-loopback-only", "deny", "deny", "allow", "command-and-environment-boundary"
+            "adb-loopback-only", "deny", "deny", "allow", enforcement
         )
-    return NetworkPolicy("offline", "deny", "deny", "deny", "command-and-environment-boundary")
+    return NetworkPolicy("offline", "deny", "deny", "deny", enforcement)
 
 
 def apply_safe_network_environment(environment: dict[str, str], program_key: str) -> None:

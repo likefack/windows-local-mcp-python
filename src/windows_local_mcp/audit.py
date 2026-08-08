@@ -8,8 +8,14 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from .config import Settings
-from .resources import prune_artifacts
+from .resources import WorkspaceExecutionLock, prune_artifacts
 from .util import canonical_json, utc_now_iso
+from .workspace_history import (
+    finalize_workspace_transaction,
+    incomplete_workspace_transactions,
+    mark_workspace_transaction_recovery_required,
+    recover_incomplete_workspace_transaction,
+)
 
 TERMINAL_STATUSES = {
     "succeeded",
@@ -19,6 +25,7 @@ TERMINAL_STATUSES = {
     "rejected",
     "expired",
     "interrupted",
+    "conflict",
 }
 
 
@@ -28,6 +35,7 @@ class AuditStore:
         self.db_path = settings.data_dir / "audit.db"
         self._lock = threading.RLock()
         self._init_db()
+        self._reconcile_workspace_transactions()
         self._prune_database()
         prune_artifacts(settings, protected_ids=self._protected_operation_ids())
 
@@ -133,7 +141,7 @@ class AuditStore:
             stale_rows = db.execute(
                 """
                 SELECT id FROM operations
-                WHERE status IN ('succeeded','failed','cancelled','timed_out','rejected','expired','interrupted')
+                WHERE status IN ('succeeded','failed','cancelled','timed_out','rejected','expired','interrupted','conflict')
                 ORDER BY created_at DESC LIMIT -1 OFFSET ?
                 """,
                 (keep,),
@@ -150,10 +158,97 @@ class AuditStore:
                 """
                 SELECT id FROM operations
                 WHERE status NOT IN ('succeeded','failed','cancelled','timed_out',
-                                     'rejected','expired','interrupted')
+                                     'rejected','expired','interrupted','conflict')
                 """
             ).fetchall()
-        return {str(row["id"]) for row in rows}
+        protected = {str(row["id"]) for row in rows}
+        protected.update(
+            str(journal.get("operation_id"))
+            for journal in incomplete_workspace_transactions(self.settings)
+            if journal.get("operation_id")
+        )
+        return protected
+
+    def _reconcile_workspace_transactions(self) -> None:
+        """Surface interrupted mutation journals instead of silently treating them as complete."""
+        for journal in incomplete_workspace_transactions(self.settings):
+            operation_id = str(journal.get("operation_id") or "")
+            state = str(journal.get("state") or "unknown")
+            if not operation_id:
+                continue
+            recovery_error: str | None = None
+            if state in {"applying", "recovering"}:
+                try:
+                    with WorkspaceExecutionLock(self.settings):
+                        journal = recover_incomplete_workspace_transaction(
+                            self.settings, journal
+                        )
+                    state = "failed_recovered"
+                except Exception as error:  # noqa: BLE001 - persist and block mutations
+                    recovery_error = f"{type(error).__name__}: {error}"[:2000]
+                    mark_workspace_transaction_recovery_required(journal, error)
+                    state = "recovery_required"
+            recovery_state = (
+                "failed_recovered"
+                if state == "failed_recovered"
+                else "recovery_required"
+                if state == "recovery_required"
+                else "interrupted"
+            )
+            now = utc_now_iso()
+            with self._lock, self._connect() as db:
+                row = db.execute(
+                    "SELECT status FROM operations WHERE id = ?", (operation_id,)
+                ).fetchone()
+                if row is None:
+                    continue
+                if row["status"] in TERMINAL_STATUSES and state not in {
+                    "failed_recovered",
+                    "recovery_required",
+                }:
+                    if state == "applied_verified":
+                        finalize_workspace_transaction(self.settings, operation_id)
+                    continue
+                applied_but_unrecorded = state == "applied_verified"
+                db.execute(
+                    """
+                    UPDATE operations SET status='interrupted', rollback_state=?,
+                        finished_at=?, updated_at=?, error=?,
+                        pre_workspace_path=COALESCE(pre_workspace_path, ?),
+                        post_workspace_path=CASE WHEN ? THEN ? ELSE post_workspace_path END
+                    WHERE id=?
+                    """,
+                    (
+                        "applied_audit_incomplete" if applied_but_unrecorded else recovery_state,
+                        now,
+                        now,
+                        recovery_error
+                        or f"incomplete workspace mutation detected in state {state}",
+                        journal.get("before_manifest"),
+                        applied_but_unrecorded,
+                        journal.get("target_manifest"),
+                        operation_id,
+                    ),
+                )
+                db.execute(
+                    """INSERT INTO events(operation_id, occurred_at, event_type, payload_json)
+                    VALUES (?, ?, 'workspace_mutation_interrupted', ?)""",
+                    (
+                        operation_id,
+                        now,
+                        canonical_json(
+                            {
+                                "journal_path": journal.get("journal_path"),
+                                "state": state,
+                                "recovery_state": (
+                                    "applied_audit_incomplete"
+                                    if applied_but_unrecorded
+                                    else recovery_state
+                                ),
+                            }
+                        ),
+                    ),
+                )
 
     def create_operation(
         self,
@@ -174,6 +269,7 @@ class AuditStore:
         request_json = canonical_json(request)
         if len(request_json.encode("utf-8")) > self.settings.max_audit_record_bytes:
             raise ValueError("audit request exceeds max_audit_record_bytes")
+        self._ensure_audit_capacity(len(request_json.encode("utf-8")) + 8192)
         with self._lock, self._connect() as db:
             db.execute(
                 """
@@ -217,6 +313,10 @@ class AuditStore:
         ):
             raise ValueError("audit result exceeds max_audit_record_bytes")
         fields["updated_at"] = utc_now_iso()
+        self._ensure_audit_capacity(
+            sum(len(str(value).encode("utf-8", errors="replace")) for value in fields.values())
+            + 4096
+        )
         assignments = ", ".join(f"{key} = ?" for key in fields)
         values = list(fields.values()) + [operation_id]
         with self._lock, self._connect() as db:
@@ -235,6 +335,7 @@ class AuditStore:
             payload_json = canonical_json(
                 {"truncated": True, "original_bytes": len(payload_json.encode("utf-8"))}
             )
+        self._ensure_audit_capacity(len(payload_json.encode("utf-8")) + 4096)
         with self._lock, self._connect() as db:
             db.execute(
                 """
@@ -243,6 +344,55 @@ class AuditStore:
                 """,
                 (operation_id, utc_now_iso(), event_type, payload_json),
             )
+
+    def _ensure_audit_capacity(self, incoming_bytes: int) -> None:
+        """Keep long-lived audit/WAL growth inside a reserved share of data_dir."""
+        budget = max(
+            256 * 1024,
+            min(self.settings.max_data_dir_bytes // 4, 128 * 1024 * 1024),
+        )
+        with self._lock:
+            if self._audit_storage_bytes() + incoming_bytes <= budget:
+                return
+            self._prune_database()
+            for _ in range(20):
+                if self._audit_storage_bytes() + incoming_bytes <= budget:
+                    return
+                with self._connect() as db:
+                    rows = db.execute(
+                        """
+                        SELECT id FROM operations
+                        WHERE status IN ('succeeded','failed','cancelled','timed_out',
+                                         'rejected','expired','interrupted','conflict')
+                        ORDER BY COALESCE(finished_at, updated_at), created_at
+                        LIMIT 100
+                        """
+                    ).fetchall()
+                    ids = [str(row["id"]) for row in rows]
+                    if not ids:
+                        break
+                    placeholders = ",".join("?" for _ in ids)
+                    db.execute(
+                        f"DELETE FROM events WHERE operation_id IN ({placeholders})", ids
+                    )
+                    db.execute(f"DELETE FROM operations WHERE id IN ({placeholders})", ids)
+                with self._connect() as db:
+                    db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    db.execute("VACUUM")
+            if self._audit_storage_bytes() + incoming_bytes > budget:
+                raise RuntimeError(
+                    "audit storage budget is exhausted by active or pending operations"
+                )
+
+    def _audit_storage_bytes(self) -> int:
+        return sum(
+            path.stat().st_size if path.exists() else 0
+            for path in (
+                self.db_path,
+                self.db_path.with_name(self.db_path.name + "-wal"),
+                self.db_path.with_name(self.db_path.name + "-shm"),
+            )
+        )
 
     def get_operation(self, operation_id: str, *, include_events: bool = True) -> dict[str, Any]:
         with self._connect() as db:
@@ -434,7 +584,12 @@ class AuditStore:
         return self.get_operation(operation_id)
 
     def approve_and_claim(
-        self, operation_id: str, *, approver: str, note: str = ""
+        self,
+        operation_id: str,
+        *,
+        approver: str,
+        note: str = "",
+        expected_request_hash: str | None = None,
     ) -> dict[str, Any]:
         """Atomically approve a fresh request and consume its one execution grant."""
         now_value = datetime.now(UTC)
@@ -443,15 +598,28 @@ class AuditStore:
             now_value + timedelta(seconds=self.settings.approval_execution_ttl_seconds)
         ).isoformat()
         with self._lock, self._connect() as db:
+            hash_clause = " AND request_hash=?" if expected_request_hash is not None else ""
+            parameters: list[object] = [
+                approver,
+                note,
+                now,
+                grant_expires,
+                now,
+                now,
+                operation_id,
+                now,
+            ]
+            if expected_request_hash is not None:
+                parameters.append(expected_request_hash)
             cursor = db.execute(
-                """
+                f"""
                 UPDATE operations SET approval_status='approved', status='queued',
                     approval_by=?, approval_note=?, approved_at=?, approval_expires_at=?,
                     claimed_at=?, updated_at=?
                 WHERE id=? AND approval_status='pending' AND status='pending_approval'
-                    AND request_expires_at > ?
+                    AND request_expires_at > ?{hash_clause}
                 """,
-                (approver, note, now, grant_expires, now, now, operation_id, now),
+                parameters,
             )
             if cursor.rowcount != 1:
                 self._expire_one_locked(db, operation_id, now)

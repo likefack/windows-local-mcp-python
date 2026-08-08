@@ -5,14 +5,18 @@ import json
 import os
 import shutil
 import tempfile
+import uuid
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .config import Settings
 from .paths import Workspace
 from .resources import directory_size, enforce_data_quota
-from .util import canonical_json, sha256_bytes
+from .util import canonical_json, sha256_bytes, utc_now_iso
+
+_MANIFEST_VERSION = 2
+_JOURNAL_TERMINAL = {"complete", "failed_recovered", "failed_preflight"}
 
 
 @dataclass(frozen=True)
@@ -23,68 +27,77 @@ class WorkspaceState:
     total_bytes: int
 
 
+class WorkspaceMutationError(RuntimeError):
+    def __init__(self, message: str, *, recovery_state: str, journal_path: str) -> None:
+        super().__init__(message)
+        self.recovery_state = recovery_state
+        self.journal_path = journal_path
+
+
 def capture_workspace_state(settings: Settings, operation_id: str, stage: str) -> WorkspaceState:
-    """Capture MCP-writable workspace files without traversing protected/reparse paths."""
-    base = settings.data_dir / "workspace-history" / operation_id / stage
-    files_dir = base / "files"
-    files_dir.mkdir(parents=True, exist_ok=False)
+    """Capture a full manifest while storing file content once by SHA-256.
+
+    A manifest remains a complete point-in-time view. The content-addressed blob store makes
+    repeated checkpoints cheap without weakening untracked-file or deletion recovery.
+    """
+    base = _operation_root(settings, operation_id) / stage
+    base.mkdir(parents=True, exist_ok=False)
     try:
-        return _capture_workspace_state(settings, operation_id, stage, base, files_dir)
+        entries: list[dict[str, Any]] = []
+        total = 0
+        initial_data_bytes = directory_size(
+            settings.data_dir, stop_after=settings.max_data_dir_bytes
+        )
+        workspace = Workspace(settings)
+        denied = {name.casefold() for name in settings.write_denied_directories}
+        for root, dirs, files in os.walk(
+            settings.workspace_root, topdown=True, followlinks=False
+        ):
+            root_path = Path(root)
+            dirs[:] = [
+                name
+                for name in dirs
+                if name.casefold() not in denied and not (root_path / name).is_symlink()
+            ]
+            for name in sorted(files, key=str.casefold):
+                source = root_path / name
+                relative = source.relative_to(settings.workspace_root)
+                try:
+                    verified = workspace.resolve_existing(str(relative), access="write")
+                    stat = verified.stat()
+                    if not verified.is_file() or stat.st_nlink > 1:
+                        continue
+                    data = verified.read_bytes()
+                except (FileNotFoundError, PermissionError, OSError, ValueError):
+                    continue
+                total += len(data)
+                if len(entries) + 1 > settings.approval_manifest_max_files:
+                    raise ValueError("workspace history exceeds approval_manifest_max_files")
+                if total > settings.approval_manifest_max_bytes:
+                    raise ValueError("workspace history exceeds approval_manifest_max_bytes")
+                digest = sha256_bytes(data)
+                _store_blob(settings, digest, data, initial_data_bytes)
+                entries.append(
+                    {
+                        "path": relative.as_posix(),
+                        "size": len(data),
+                        "sha256": digest,
+                        "blob": digest,
+                    }
+                )
+        payload = {
+            "version": _MANIFEST_VERSION,
+            "operation_id": operation_id,
+            "stage": stage,
+            "files": entries,
+        }
+        manifest_path = base / "manifest.json"
+        _write_json_atomic(manifest_path, payload)
+        enforce_data_quota(settings)
+        return WorkspaceState(str(manifest_path), str(_blob_root(settings)), len(entries), total)
     except Exception:
         shutil.rmtree(base, ignore_errors=True)
         raise
-
-
-def _capture_workspace_state(
-    settings: Settings,
-    operation_id: str,
-    stage: str,
-    base: Path,
-    files_dir: Path,
-) -> WorkspaceState:
-    workspace = Workspace(settings)
-    entries: list[dict[str, Any]] = []
-    total = 0
-    initial_data_bytes = directory_size(settings.data_dir, stop_after=settings.max_data_dir_bytes)
-    denied = {name.casefold() for name in settings.write_denied_directories}
-    for root, dirs, files in os.walk(settings.workspace_root, topdown=True, followlinks=False):
-        root_path = Path(root)
-        dirs[:] = [
-            name
-            for name in dirs
-            if name.casefold() not in denied and not (root_path / name).is_symlink()
-        ]
-        for name in sorted(files, key=str.casefold):
-            source = root_path / name
-            relative = source.relative_to(settings.workspace_root)
-            try:
-                verified = workspace.resolve_existing(str(relative), access="write")
-                stat = verified.stat()
-                if not verified.is_file() or stat.st_nlink > 1:
-                    continue
-                data = verified.read_bytes()
-            except (FileNotFoundError, PermissionError, OSError, ValueError):
-                continue
-            total += len(data)
-            if len(entries) + 1 > settings.approval_manifest_max_files:
-                raise ValueError("workspace history exceeds approval_manifest_max_files")
-            if total > settings.approval_manifest_max_bytes:
-                raise ValueError("workspace history exceeds approval_manifest_max_bytes")
-            destination = files_dir / relative
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            if initial_data_bytes + total + 1024 > settings.max_data_dir_bytes:
-                raise RuntimeError("workspace history would exceed max_data_dir_bytes")
-            destination.write_bytes(data)
-            entries.append(
-                {"path": relative.as_posix(), "size": len(data), "sha256": sha256_bytes(data)}
-            )
-    payload = {"operation_id": operation_id, "stage": stage, "files": entries}
-    manifest = canonical_json(payload).encode("utf-8")
-    enforce_data_quota(settings, incoming_bytes=len(manifest))
-    manifest_path = base / "manifest.json"
-    manifest_path.write_bytes(manifest)
-    enforce_data_quota(settings)
-    return WorkspaceState(str(manifest_path), str(files_dir), len(entries), total)
 
 
 def compare_workspace_states(
@@ -92,12 +105,12 @@ def compare_workspace_states(
 ) -> dict[str, Any]:
     before = _load_manifest(settings, before_path)
     after = _load_manifest(settings, after_path)
-    before_map = {item["path"]: item for item in before["files"]}
-    after_map = {item["path"]: item for item in after["files"]}
+    before_map = _entry_map(before)
+    after_map = _entry_map(after)
     changed = sorted(
         path
         for path in before_map.keys() | after_map.keys()
-        if before_map.get(path) != after_map.get(path)
+        if _entry_digest(before_map.get(path)) != _entry_digest(after_map.get(path))
     )
     added_lines = removed_lines = 0
     chunks: list[str] = []
@@ -105,8 +118,8 @@ def compare_workspace_states(
     diff_bytes = 0
     truncated = False
     for relative in changed:
-        old = _state_bytes(Path(before_path), relative) if relative in before_map else b""
-        new = _state_bytes(Path(after_path), relative) if relative in after_map else b""
+        old = _entry_bytes(settings, Path(before_path), before_map.get(relative))
+        new = _entry_bytes(settings, Path(after_path), after_map.get(relative))
         try:
             old_text, new_text = old.decode("utf-8"), new.decode("utf-8")
         except UnicodeDecodeError:
@@ -142,100 +155,855 @@ def compare_workspace_states(
     diff_path.write_text("".join(chunks), encoding="utf-8")
     return {
         "changed_files": changed,
+        "changed_file_count": len(changed),
         "added_lines": added_lines,
         "removed_lines": removed_lines,
         "diff_path": str(diff_path),
     }
 
 
+def verify_checkpoint_integrity(settings: Settings, manifest_path: str) -> dict[str, str]:
+    """Re-hash every content object that may be used for a restore."""
+    manifest = _load_manifest(settings, manifest_path)
+    verified: dict[str, str] = {}
+    for relative, entry in _entry_map(manifest).items():
+        data = _entry_bytes(settings, Path(manifest_path), entry)
+        digest = sha256_bytes(data)
+        expected = str(entry["sha256"])
+        if digest != expected or len(data) != int(entry["size"]):
+            raise RuntimeError(f"checkpoint integrity verification failed: {relative}")
+        verified[relative] = digest
+    return verified
+
+
+def checkpoint_manifest_digest(settings: Settings, manifest_path: str) -> str:
+    """Bind an approval to the exact persisted manifest bytes after schema validation."""
+    manifest = _load_manifest(settings, manifest_path)
+    resolved = Path(str(manifest["_manifest_path"]))
+    return sha256_bytes(resolved.read_bytes())
+
+
 def restore_workspace_state(
-    settings: Settings, expected_path: str, target_path: str
+    settings: Settings,
+    expected_path: str,
+    target_path: str,
+    *,
+    operation_id: str | None = None,
 ) -> dict[str, Any]:
-    """Restore only if the workspace still equals the last MCP-recorded state."""
-    current = capture_workspace_state(settings, "rollback-check", os.urandom(8).hex())
-    expected = _load_manifest(settings, expected_path)
-    current_manifest = _load_manifest(settings, current.manifest_path)
-    if _hash_map(expected) != _hash_map(current_manifest):
-        expected_map, current_map = _hash_map(expected), _hash_map(current_manifest)
-        conflicts = sorted(
-            path
-            for path in expected_map.keys() | current_map.keys()
-            if expected_map.get(path) != current_map.get(path)
-        )
-        shutil.rmtree(Path(current.manifest_path).parents[1], ignore_errors=True)
-        raise RuntimeError(
-            "workspace changed after the last MCP operation; rollback conflicts: "
-            + ", ".join(conflicts[:20])
-        )
-    shutil.rmtree(Path(current.manifest_path).parents[1], ignore_errors=True)
-    target = _load_manifest(settings, target_path)
-    target_map = _hash_map(target)
-    expected_map = _hash_map(expected)
-    workspace = Workspace(settings)
-    for relative in sorted(expected_map.keys() - target_map.keys(), reverse=True):
-        path = workspace.resolve_for_write(relative)
-        parent_identity = workspace.identity(path.parent)
-        target_identity = workspace.identity(path)
-        if parent_identity is None:
-            raise RuntimeError("rollback delete parent disappeared")
-        workspace.revalidate_for_replace(
-            path, parent_identity=parent_identity, target_identity=target_identity
-        )
-        path.unlink(missing_ok=True)
-    for relative in sorted(target_map):
-        parent_relative = str(Path(relative).parent)
-        workspace.ensure_directory_for_write(parent_relative)
-        destination = workspace.resolve_for_write(relative)
-        source = Path(target_path).parent / "files" / Path(relative)
-        parent_identity = workspace.identity(destination.parent)
-        target_identity = workspace.identity(destination)
-        if parent_identity is None:
-            raise RuntimeError("rollback parent disappeared")
-        with tempfile.NamedTemporaryFile(mode="wb", delete=False, dir=destination.parent) as output:
-            output.write(source.read_bytes())
-            output.flush()
-            os.fsync(output.fileno())
-            temporary = Path(output.name)
-        try:
-            workspace.revalidate_for_replace(
-                destination, parent_identity=parent_identity, target_identity=target_identity
+    """Failure-atomic best-effort restore with durable interruption detection.
+
+    There is no claim of an OS-wide filesystem transaction. All validation and content staging
+    happen before the first workspace write. If applying fails, the captured starting state is
+    restored automatically; an unrecovered state remains durably marked recovery_required.
+    """
+    transaction_id = operation_id or f"restore-{uuid.uuid4()}"
+    transaction = _transaction_root(settings, transaction_id)
+    transaction.mkdir(parents=True, exist_ok=False)
+    journal_path = transaction / "journal.json"
+    journal: dict[str, Any] = {
+        "version": 1,
+        "operation_id": transaction_id,
+        "kind": "workspace_restore",
+        "state": "preflight",
+        "created_at": utc_now_iso(),
+        "expected_manifest": str(Path(expected_path).resolve(strict=True)),
+        "target_manifest": str(Path(target_path).resolve(strict=True)),
+        "applied_paths": [],
+    }
+    _write_json_atomic(journal_path, journal)
+    current: WorkspaceState | None = None
+    try:
+        expected_map = verify_checkpoint_integrity(settings, expected_path)
+        target_map = verify_checkpoint_integrity(settings, target_path)
+        current = capture_workspace_state(settings, transaction_id, "transaction-before")
+        current_map = verify_checkpoint_integrity(settings, current.manifest_path)
+        if expected_map != current_map:
+            conflicts = sorted(
+                path
+                for path in expected_map.keys() | current_map.keys()
+                if expected_map.get(path) != current_map.get(path)
             )
-            os.replace(temporary, destination)
-        finally:
-            temporary.unlink(missing_ok=True)
+            journal.update(state="failed_preflight", conflicts=conflicts[:200])
+            _write_json_atomic(journal_path, journal)
+            raise RuntimeError(
+                "workspace changed after approval preview; rollback conflicts: "
+                + ", ".join(conflicts[:20])
+            )
+        target_manifest = _load_manifest(settings, target_path)
+        current_manifest = _load_manifest(settings, current.manifest_path)
+        changed = _changed_paths(current_manifest, target_manifest)
+        _stage_manifest_files(settings, target_path, changed, transaction / "staged-target")
+        # Re-hash staged bytes as the final preflight step.
+        _verify_staged_files(target_manifest, transaction / "staged-target", changed)
+        journal.update(
+            state="staged",
+            before_manifest=current.manifest_path,
+            changed_paths=changed,
+        )
+        _write_json_atomic(journal_path, journal)
+    except Exception:
+        if journal.get("state") not in _JOURNAL_TERMINAL:
+            journal["state"] = "failed_preflight"
+            _write_json_atomic(journal_path, journal)
+        raise
+
+    try:
+        journal["state"] = "applying"
+        _write_json_atomic(journal_path, journal)
+        _apply_manifest(
+            settings,
+            target_path,
+            staged_root=transaction / "staged-target",
+            only_paths=set(journal["changed_paths"]),
+            journal=journal,
+            journal_path=journal_path,
+            expected_hashes=expected_map,
+        )
+        final_map = _scan_current_hashes(settings)
+        intended_map = _hash_map(_load_manifest(settings, target_path))
+        if final_map != intended_map:
+            raise RuntimeError("post-restore workspace verification did not match target")
+    except BaseException as apply_error:  # noqa: BLE001 - journal abrupt Python interruption too
+        journal.update(
+            state="recovering",
+            apply_error=f"{type(apply_error).__name__}: {apply_error}"[:2000],
+        )
+        _write_json_atomic(journal_path, journal)
+        try:
+            if current is None:
+                raise RuntimeError("transaction start state is unavailable")
+            verify_checkpoint_integrity(settings, current.manifest_path)
+            _apply_manifest(settings, current.manifest_path)
+            journal["state"] = "failed_recovered"
+            journal["recovered_at"] = utc_now_iso()
+            _write_json_atomic(journal_path, journal)
+            raise WorkspaceMutationError(
+                f"restore failed and the starting workspace was recovered: {apply_error}",
+                recovery_state="failed_recovered",
+                journal_path=str(journal_path),
+            ) from apply_error
+        except WorkspaceMutationError:
+            raise
+        except BaseException as recovery_error:
+            journal.update(
+                state="recovery_required",
+                recovery_error=f"{type(recovery_error).__name__}: {recovery_error}"[:2000],
+            )
+            _write_json_atomic(journal_path, journal)
+            raise WorkspaceMutationError(
+                f"restore failed and automatic recovery also failed: {recovery_error}",
+                recovery_state="recovery_required",
+                journal_path=str(journal_path),
+            ) from recovery_error
+
+    journal["state"] = "applied_verified"
+    journal["applied_at"] = utc_now_iso()
+    _write_json_atomic(journal_path, journal)
+    target_manifest = _load_manifest(settings, target_path)
+    current_manifest = _load_manifest(settings, expected_path)
+    target_map = _entry_map(target_manifest)
+    current_map = _entry_map(current_manifest)
     return {
         "restored_files": sorted(target_map),
-        "removed_files": sorted(expected_map.keys() - target_map.keys()),
+        "removed_files": sorted(current_map.keys() - target_map.keys()),
+        "transaction_journal": str(journal_path),
+        "failure_atomicity": "best_effort_with_automatic_recovery",
     }
+
+
+def finalize_workspace_transaction(settings: Settings, operation_id: str) -> None:
+    journal_path = _transaction_root(settings, operation_id) / "journal.json"
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    if journal.get("state") != "applied_verified":
+        raise RuntimeError("workspace transaction is not ready for audit finalization")
+    journal["state"] = "complete"
+    journal["completed_at"] = utc_now_iso()
+    _write_json_atomic(journal_path, journal)
+
+
+def prepare_selective_undo(
+    settings: Settings,
+    operation_id: str,
+    before_path: str,
+    after_path: str,
+) -> dict[str, Any]:
+    """Build and persist an approval-bound three-state selective undo plan."""
+    verify_checkpoint_integrity(settings, before_path)
+    verify_checkpoint_integrity(settings, after_path)
+    current = capture_workspace_state(settings, operation_id, "undo-preview-current")
+    verify_checkpoint_integrity(settings, current.manifest_path)
+    before = _load_manifest(settings, before_path)
+    after = _load_manifest(settings, after_path)
+    current_manifest = _load_manifest(settings, current.manifest_path)
+    desired, conflicts, automatic_merges = _selective_target(
+        settings, Path(before_path), before, Path(after_path), after, current_manifest
+    )
+    target_path = _write_generated_manifest(
+        settings, operation_id, "undo-preview-target", desired
+    )
+    preview = _restore_summary(current_manifest, _load_manifest(settings, target_path))
+    preview.update(
+        {
+            "expected_current_checkpoint": current.manifest_path,
+            "target_checkpoint": target_path,
+            "conflicts": conflicts,
+            "conflict_count": len(conflicts),
+            "automatic_merge_files": automatic_merges,
+            "automatic_merge": bool(automatic_merges),
+            "fully_reversible": not conflicts,
+            "undo_can_be_undone": True,
+        }
+    )
+    return preview
 
 
 def describe_workspace_restore(
     settings: Settings, expected_path: str, target_path: str
 ) -> dict[str, Any]:
-    expected_map = _hash_map(_load_manifest(settings, expected_path))
-    target_map = _hash_map(_load_manifest(settings, target_path))
-    changed = sorted(
-        path
-        for path in expected_map.keys() | target_map.keys()
-        if expected_map.get(path) != target_map.get(path)
+    expected = _load_manifest(settings, expected_path)
+    target = _load_manifest(settings, target_path)
+    result = _restore_summary(expected, target)
+    result.update(
+        {
+            "conflict_check": "current workspace must match the approval preview",
+            "automatic_merge": False,
+            "conflicts": [],
+            "fully_reversible": True,
+            "undo_can_be_undone": True,
+        }
     )
+    return result
+
+
+def build_workspace_target_from_bytes(
+    settings: Settings,
+    operation_id: str,
+    expected_manifest_path: str,
+    changes: dict[str, bytes],
+) -> str:
+    """Create a content-addressed target manifest for broker-validated file updates."""
+    expected = _load_manifest(settings, expected_manifest_path)
+    entries = dict(_entry_map(expected))
+    workspace = Workspace(settings)
+    initial_size = directory_size(settings.data_dir)
+    for relative, data in changes.items():
+        Workspace.validate_windows_syntax(relative)
+        workspace.resolve_existing(relative, allow_directory=False, access="write")
+        digest = sha256_bytes(data)
+        _store_blob(settings, digest, data, initial_size)
+        entries[relative] = {
+            "path": relative,
+            "size": len(data),
+            "sha256": digest,
+            "blob": digest,
+        }
+    return _write_generated_manifest(
+        settings, operation_id, "staged-workspace-write-target", entries
+    )
+
+
+def incomplete_workspace_transactions(settings: Settings) -> list[dict[str, Any]]:
+    root = settings.data_dir / "workspace-history" / "transactions"
+    result: list[dict[str, Any]] = []
+    if not root.exists():
+        return result
+    for journal_path in root.glob("*/journal.json"):
+        try:
+            journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if journal.get("state") not in _JOURNAL_TERMINAL:
+            result.append({**journal, "journal_path": str(journal_path)})
+    return result
+
+
+def recover_incomplete_workspace_transaction(
+    settings: Settings, journal: dict[str, Any]
+) -> dict[str, Any]:
+    """Recover an interrupted apply only when the live state is provably transaction-owned."""
+    journal_path = Path(str(journal["journal_path"]))
+    journal_path.resolve(strict=True).relative_to(
+        (settings.data_dir / "workspace-history" / "transactions").resolve(strict=True)
+    )
+    if journal.get("state") not in {"applying", "recovering"}:
+        return journal
+    before_path = str(journal.get("before_manifest") or "")
+    target_path = str(journal.get("target_manifest") or "")
+    if journal.get("kind") == "single_file_write":
+        if not before_path:
+            raise RuntimeError("interrupted write transaction has no recovery manifest")
+        before = verify_checkpoint_integrity(settings, before_path)
+        current = _scan_current_hashes(settings)
+        changed = set(journal.get("changed_paths") or [])
+        if len(changed) != 1:
+            raise RuntimeError("interrupted write transaction has an invalid target set")
+        relative = next(iter(changed))
+        before_sha = journal.get("expected_before_sha256")
+        after_sha = journal.get("intended_after_sha256")
+        all_paths = before.keys() | current.keys()
+        unexpected = [
+            path
+            for path in sorted(all_paths)
+            if (
+                current.get(path) not in {before_sha, after_sha}
+                if path == relative
+                else current.get(path) != before.get(path)
+            )
+        ]
+        if unexpected:
+            raise RuntimeError(
+                "workspace contains changes that cannot be attributed to the interrupted write: "
+                + ", ".join(unexpected[:20])
+            )
+        if current != before:
+            _apply_manifest(settings, before_path)
+            if _scan_current_hashes(settings) != before:
+                raise RuntimeError("automatic interrupted-write recovery verification failed")
+        journal.update(state="failed_recovered", recovered_at=utc_now_iso())
+        _write_json_atomic(journal_path, journal)
+        return journal
+    if not before_path or not target_path:
+        raise RuntimeError("interrupted workspace transaction has no recovery manifests")
+    before = verify_checkpoint_integrity(settings, before_path)
+    target = verify_checkpoint_integrity(settings, target_path)
+    current = _scan_current_hashes(settings)
+    changed = set(journal.get("changed_paths") or [])
+    all_paths = before.keys() | target.keys() | current.keys()
+    unexpected = [
+        path
+        for path in sorted(all_paths)
+        if (
+            current.get(path) not in {before.get(path), target.get(path)}
+            if path in changed
+            else current.get(path) != before.get(path)
+        )
+    ]
+    if unexpected:
+        raise RuntimeError(
+            "workspace contains changes that cannot be attributed to the interrupted restore: "
+            + ", ".join(unexpected[:20])
+        )
+    verify_checkpoint_integrity(settings, before_path)
+    _apply_manifest(settings, before_path)
+    if _scan_current_hashes(settings) != before:
+        raise RuntimeError("automatic interrupted-transaction recovery verification failed")
+    journal.update(state="failed_recovered", recovered_at=utc_now_iso())
+    _write_json_atomic(journal_path, journal)
+    return journal
+
+
+def mark_workspace_transaction_recovery_required(
+    journal: dict[str, Any], error: BaseException
+) -> None:
+    journal_path = Path(str(journal["journal_path"]))
+    journal.update(
+        state="recovery_required",
+        recovery_error=f"{type(error).__name__}: {error}"[:2000],
+        recovery_failed_at=utc_now_iso(),
+    )
+    _write_json_atomic(journal_path, journal)
+
+
+def workspace_recovery_required(settings: Settings) -> bool:
+    # Another already-running server/worker may acquire the mutation lock after the process
+    # that owned an applying journal crashed. Every nonterminal journal must therefore block,
+    # not only journals already promoted to the explicit recovery_required state.
+    return bool(incomplete_workspace_transactions(settings))
+
+
+def record_workspace_recovery_required(
+    settings: Settings,
+    operation_id: str,
+    before_manifest: str,
+    error: BaseException,
+) -> str:
+    """Persist a fail-closed marker for a non-transactional mutation recovery failure."""
+    transaction = _transaction_root(settings, operation_id)
+    transaction.mkdir(parents=True, exist_ok=False)
+    journal_path = transaction / "journal.json"
+    _write_json_atomic(
+        journal_path,
+        {
+            "version": 1,
+            "operation_id": operation_id,
+            "kind": "single_file_write_recovery",
+            "state": "recovery_required",
+            "created_at": utc_now_iso(),
+            "before_manifest": str(Path(before_manifest).resolve(strict=True)),
+            "recovery_error": f"{type(error).__name__}: {error}"[:2000],
+            "applied_paths": [],
+        },
+    )
+    return str(journal_path)
+
+
+def begin_single_file_write_transaction(
+    settings: Settings,
+    operation_id: str,
+    before_manifest: str,
+    relative_path: str,
+    before_sha256: str | None,
+    intended_after_sha256: str,
+) -> str:
+    """Durably record recovery data before the first single-file workspace mutation."""
+    transaction = _transaction_root(settings, operation_id)
+    transaction.mkdir(parents=True, exist_ok=False)
+    journal_path = transaction / "journal.json"
+    _write_json_atomic(
+        journal_path,
+        {
+            "version": 1,
+            "operation_id": operation_id,
+            "kind": "single_file_write",
+            "state": "applying",
+            "created_at": utc_now_iso(),
+            "before_manifest": str(Path(before_manifest).resolve(strict=True)),
+            "expected_before_sha256": before_sha256,
+            "intended_after_sha256": intended_after_sha256,
+            "changed_paths": [relative_path],
+            "applied_paths": [],
+        },
+    )
+    return str(journal_path)
+
+
+def update_single_file_write_transaction(
+    settings: Settings,
+    operation_id: str,
+    *,
+    state: str,
+    target_manifest: str | None = None,
+    error: BaseException | None = None,
+) -> str:
+    if state not in {"applied_verified", "failed_recovered", "recovery_required"}:
+        raise ValueError("invalid single-file write transaction state")
+    journal_path = _transaction_root(settings, operation_id) / "journal.json"
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    if journal.get("kind") != "single_file_write":
+        raise RuntimeError("workspace transaction is not a single-file write")
+    journal["state"] = state
+    journal[f"{state}_at"] = utc_now_iso()
+    if target_manifest is not None:
+        journal["target_manifest"] = str(Path(target_manifest).resolve(strict=True))
+    if error is not None:
+        journal["recovery_error"] = f"{type(error).__name__}: {error}"[:2000]
+    _write_json_atomic(journal_path, journal)
+    return str(journal_path)
+
+
+def _selective_target(
+    settings: Settings,
+    before_path: Path,
+    before: dict[str, Any],
+    after_path: Path,
+    after: dict[str, Any],
+    current: dict[str, Any],
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], list[str]]:
+    before_map = _entry_map(before)
+    after_map = _entry_map(after)
+    current_map = dict(_entry_map(current))
+    desired = dict(current_map)
+    conflicts: list[dict[str, Any]] = []
+    automatic_merges: list[str] = []
+    for relative in _changed_paths(before, after):
+        old_entry = before_map.get(relative)
+        operation_entry = after_map.get(relative)
+        current_entry = current_map.get(relative)
+        old_digest = _entry_digest(old_entry)
+        operation_digest = _entry_digest(operation_entry)
+        current_digest = _entry_digest(current_entry)
+        if current_digest == old_digest:
+            continue
+        if current_digest == operation_digest:
+            if old_entry is None:
+                desired.pop(relative, None)
+            else:
+                desired[relative] = old_entry
+            continue
+        if old_entry is None or operation_entry is None or current_entry is None:
+            conflicts.append(
+                _conflict(relative, "file lifecycle changed after the target operation", old_entry, operation_entry, current_entry)
+            )
+            continue
+        try:
+            old = _entry_bytes(settings, before_path, old_entry).decode("utf-8")
+            operation = _entry_bytes(settings, after_path, operation_entry).decode("utf-8")
+            current_bytes = _entry_bytes(
+                settings, Path(str(current["_manifest_path"])), current_entry
+            )
+            current_text = current_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            conflicts.append(
+                _conflict(relative, "binary content changed after the target operation", old_entry, operation_entry, current_entry)
+            )
+            continue
+        merged = _reverse_text_change(old, operation, current_text)
+        if merged is None:
+            conflicts.append(
+                _conflict(relative, "overlapping or ambiguous text changes", old_entry, operation_entry, current_entry)
+            )
+            continue
+        merged_bytes = merged.encode("utf-8")
+        digest = sha256_bytes(merged_bytes)
+        _store_blob(settings, digest, merged_bytes, directory_size(settings.data_dir))
+        desired[relative] = {
+            "path": relative,
+            "size": len(merged_bytes),
+            "sha256": digest,
+            "blob": digest,
+        }
+        automatic_merges.append(relative)
+    return desired, conflicts, automatic_merges
+
+
+def _reverse_text_change(before: str, after: str, current: str) -> str | None:
+    before_lines = before.splitlines(keepends=True)
+    after_lines = after.splitlines(keepends=True)
+    current_lines = current.splitlines(keepends=True)
+    groups = list(
+        difflib.SequenceMatcher(None, before_lines, after_lines, autojunk=False).get_grouped_opcodes(3)
+    )
+    replacements: list[tuple[int, int, list[str]]] = []
+    for group in groups:
+        old_start = min(item[1] for item in group)
+        old_end = max(item[2] for item in group)
+        new_start = min(item[3] for item in group)
+        new_end = max(item[4] for item in group)
+        old_chunk = before_lines[old_start:old_end]
+        new_chunk = after_lines[new_start:new_end]
+        matches = [
+            index
+            for index in range(len(current_lines) - len(new_chunk) + 1)
+            if current_lines[index : index + len(new_chunk)] == new_chunk
+        ]
+        if len(matches) != 1:
+            return None
+        start = matches[0]
+        replacements.append((start, start + len(new_chunk), old_chunk))
+    for start, end, replacement in sorted(replacements, reverse=True):
+        current_lines[start:end] = replacement
+    return "".join(current_lines)
+
+
+def _restore_summary(expected: dict[str, Any], target: dict[str, Any]) -> dict[str, Any]:
+    expected_map = _entry_map(expected)
+    target_map = _entry_map(target)
+    changed = _changed_paths(expected, target)
+    created = sorted(target_map.keys() - expected_map.keys())
+    deleted = sorted(expected_map.keys() - target_map.keys())
+    restored = sorted(set(changed) - set(created) - set(deleted))
     return {
         "files_that_would_change": changed,
-        "files_that_would_be_removed": sorted(expected_map.keys() - target_map.keys()),
-        "files_that_would_be_restored_or_created": sorted(target_map),
-        "conflict_check": "current workspace must still match latest MCP checkpoint",
+        "changed_file_count": len(changed),
+        "created_files": created,
+        "restored_files": restored,
+        "deleted_files": deleted,
+        "creates_files": bool(created),
+        "restores_files": bool(restored),
+        "deletes_files": bool(deleted),
     }
+
+
+def _apply_manifest(
+    settings: Settings,
+    manifest_path: str,
+    *,
+    staged_root: Path | None = None,
+    only_paths: set[str] | None = None,
+    journal: dict[str, Any] | None = None,
+    journal_path: Path | None = None,
+    expected_hashes: dict[str, str] | None = None,
+) -> None:
+    manifest = _load_manifest(settings, manifest_path)
+    target_map = _entry_map(manifest)
+    current = _scan_current_hashes(settings)
+    if expected_hashes is not None and current != expected_hashes:
+        raise RuntimeError("workspace changed during restore staging")
+    changed = only_paths or set(current.keys()) | set(target_map.keys())
+    workspace = Workspace(settings)
+    for relative in sorted((set(current) - set(target_map)) & changed, reverse=True):
+        destination = workspace.resolve_for_write(relative)
+        _verify_destination_digest(destination, current.get(relative), relative)
+        parent_identity = workspace.identity(destination.parent)
+        target_identity = workspace.identity(destination)
+        if parent_identity is None:
+            raise RuntimeError(f"restore delete parent disappeared: {relative}")
+        workspace.revalidate_for_replace(
+            destination, parent_identity=parent_identity, target_identity=target_identity
+        )
+        destination.unlink(missing_ok=True)
+        _journal_applied(journal, journal_path, relative)
+    for relative in sorted(set(target_map) & changed):
+        parent_relative = str(PurePosixPath(relative).parent)
+        workspace.ensure_directory_for_write(parent_relative)
+        destination = workspace.resolve_for_write(relative)
+        entry = target_map[relative]
+        source = (
+            staged_root / Path(relative)
+            if staged_root is not None and (staged_root / Path(relative)).exists()
+            else _entry_source(settings, Path(manifest_path), entry)
+        )
+        data = source.read_bytes()
+        if sha256_bytes(data) != entry["sha256"]:
+            raise RuntimeError(f"restore content changed after preflight: {relative}")
+        parent_identity = workspace.identity(destination.parent)
+        target_identity = workspace.identity(destination)
+        if parent_identity is None:
+            raise RuntimeError(f"restore parent disappeared: {relative}")
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="wb", delete=False, dir=destination.parent) as out:
+                out.write(data)
+                out.flush()
+                os.fsync(out.fileno())
+                temporary = Path(out.name)
+            _verify_destination_digest(destination, current.get(relative), relative)
+            workspace.revalidate_for_replace(
+                destination, parent_identity=parent_identity, target_identity=target_identity
+            )
+            os.replace(temporary, destination)
+            temporary = None
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        _journal_applied(journal, journal_path, relative)
+
+
+def _scan_current_hashes(settings: Settings) -> dict[str, str]:
+    workspace = Workspace(settings)
+    denied = {name.casefold() for name in settings.write_denied_directories}
+    result: dict[str, str] = {}
+    for root, dirs, files in os.walk(settings.workspace_root, topdown=True, followlinks=False):
+        root_path = Path(root)
+        dirs[:] = [
+            name
+            for name in dirs
+            if name.casefold() not in denied and not (root_path / name).is_symlink()
+        ]
+        for name in files:
+            relative = (root_path / name).relative_to(settings.workspace_root)
+            try:
+                path = workspace.resolve_existing(str(relative), access="write")
+                if path.is_file() and path.stat().st_nlink == 1:
+                    result[relative.as_posix()] = sha256_bytes(path.read_bytes())
+            except (FileNotFoundError, OSError, PermissionError, ValueError):
+                continue
+    return result
+
+
+def _verify_destination_digest(path: Path, expected: str | None, relative: str) -> None:
+    if path.exists():
+        if not path.is_file() or sha256_bytes(path.read_bytes()) != expected:
+            raise RuntimeError(f"workspace file changed during restore: {relative}")
+    elif expected is not None:
+        raise RuntimeError(f"workspace file disappeared during restore: {relative}")
+
+
+def _stage_manifest_files(
+    settings: Settings, manifest_path: str, changed: list[str], destination: Path
+) -> None:
+    manifest = _load_manifest(settings, manifest_path)
+    entries = _entry_map(manifest)
+    destination.mkdir(parents=True, exist_ok=False)
+    incoming = sum(int(entries[path]["size"]) for path in changed if path in entries)
+    enforce_data_quota(settings, incoming_bytes=incoming)
+    for relative in changed:
+        entry = entries.get(relative)
+        if entry is None:
+            continue
+        target = destination / Path(relative)
+        target.resolve(strict=False).relative_to(destination.resolve(strict=True))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(_entry_source(settings, Path(manifest_path), entry), target)
+
+
+def _verify_staged_files(
+    manifest: dict[str, Any], staged_root: Path, changed: list[str]
+) -> None:
+    entries = _entry_map(manifest)
+    for relative in changed:
+        entry = entries.get(relative)
+        if entry is None:
+            continue
+        data = (staged_root / Path(relative)).read_bytes()
+        if sha256_bytes(data) != entry["sha256"] or len(data) != int(entry["size"]):
+            raise RuntimeError(f"staged checkpoint integrity verification failed: {relative}")
 
 
 def _load_manifest(settings: Settings, path: str) -> dict[str, Any]:
     resolved = Path(path).resolve(strict=True)
     resolved.relative_to((settings.data_dir / "workspace-history").resolve(strict=True))
-    return json.loads(resolved.read_text(encoding="utf-8"))
+    manifest = json.loads(resolved.read_text(encoding="utf-8"))
+    files = manifest.get("files")
+    if not isinstance(files, list):
+        raise TypeError("invalid workspace history manifest")
+    seen: set[str] = set()
+    for item in files:
+        if not isinstance(item, dict):
+            raise TypeError("invalid workspace history entry")
+        relative = str(item.get("path", ""))
+        pure = PurePosixPath(relative)
+        digest = str(item.get("sha256", ""))
+        Workspace.validate_windows_syntax(relative)
+        if (
+            not relative
+            or "\\" in relative
+            or pure.as_posix() != relative
+            or pure.is_absolute()
+            or ".." in pure.parts
+            or relative in seen
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+            or int(item.get("size", -1)) < 0
+        ):
+            raise ValueError(f"invalid workspace history entry: {relative}")
+        seen.add(relative)
+    manifest["_manifest_path"] = str(resolved)
+    return manifest
+
+
+def _entry_map(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {str(item["path"]): item for item in manifest["files"]}
 
 
 def _hash_map(manifest: dict[str, Any]) -> dict[str, str]:
-    return {str(item["path"]): str(item["sha256"]) for item in manifest["files"]}
+    return {path: str(entry["sha256"]) for path, entry in _entry_map(manifest).items()}
 
 
-def _state_bytes(manifest_path: Path, relative: str) -> bytes:
-    return (manifest_path.parent / "files" / Path(relative)).read_bytes()
+def _entry_digest(entry: dict[str, Any] | None) -> str | None:
+    return None if entry is None else str(entry["sha256"])
+
+
+def _entry_source(settings: Settings, manifest_path: Path, entry: dict[str, Any]) -> Path:
+    blob = entry.get("blob")
+    if blob:
+        source = _blob_root(settings) / f"{blob}.blob"
+        source.resolve(strict=True).relative_to(_blob_root(settings).resolve(strict=True))
+        return source
+    # Version 1 compatibility for checkpoints created before content-addressed storage.
+    source = manifest_path.parent / "files" / Path(str(entry["path"]))
+    source.resolve(strict=True).relative_to((manifest_path.parent / "files").resolve(strict=True))
+    return source
+
+
+def _entry_bytes(
+    settings: Settings, manifest_path: Path, entry: dict[str, Any] | None
+) -> bytes:
+    if entry is None:
+        return b""
+    return _entry_source(settings, manifest_path, entry).read_bytes()
+
+
+def _changed_paths(before: dict[str, Any], after: dict[str, Any]) -> list[str]:
+    before_map = _entry_map(before)
+    after_map = _entry_map(after)
+    return sorted(
+        path
+        for path in before_map.keys() | after_map.keys()
+        if _entry_digest(before_map.get(path)) != _entry_digest(after_map.get(path))
+    )
+
+
+def _write_generated_manifest(
+    settings: Settings,
+    operation_id: str,
+    stage: str,
+    entries: dict[str, dict[str, Any]],
+) -> str:
+    base = _operation_root(settings, operation_id) / stage
+    base.mkdir(parents=True, exist_ok=False)
+    path = base / "manifest.json"
+    _write_json_atomic(
+        path,
+        {
+            "version": _MANIFEST_VERSION,
+            "operation_id": operation_id,
+            "stage": stage,
+            "files": [entries[key] for key in sorted(entries)],
+        },
+    )
+    return str(path)
+
+
+def _store_blob(settings: Settings, digest: str, data: bytes, initial_size: int) -> None:
+    root = _blob_root(settings)
+    root.mkdir(parents=True, exist_ok=True)
+    destination = root / f"{digest}.blob"
+    if destination.exists():
+        existing = destination.read_bytes()
+        if sha256_bytes(existing) != digest:
+            raise RuntimeError(f"content-addressed checkpoint blob is corrupt: {digest}")
+        return
+    if initial_size + len(data) > settings.max_data_dir_bytes:
+        raise RuntimeError("workspace history would exceed max_data_dir_bytes")
+    enforce_data_quota(settings, incoming_bytes=len(data))
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="wb", delete=False, dir=root) as output:
+            output.write(data)
+            output.flush()
+            os.fsync(output.fileno())
+            temporary = Path(output.name)
+        os.replace(temporary, destination)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
+    payload = canonical_json(value).encode("utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="wb", delete=False, dir=path.parent) as output:
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+            temporary = Path(output.name)
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _journal_applied(
+    journal: dict[str, Any] | None, journal_path: Path | None, relative: str
+) -> None:
+    if journal is None or journal_path is None:
+        return
+    journal.setdefault("applied_paths", []).append(relative)
+    _write_json_atomic(journal_path, journal)
+
+
+def _operation_root(settings: Settings, operation_id: str) -> Path:
+    if not operation_id or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_." for character in operation_id):
+        raise ValueError("invalid workspace history operation id")
+    return settings.data_dir / "workspace-history" / "operations" / operation_id
+
+
+def _transaction_root(settings: Settings, operation_id: str) -> Path:
+    if not operation_id or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_." for character in operation_id):
+        raise ValueError("invalid workspace transaction id")
+    return settings.data_dir / "workspace-history" / "transactions" / operation_id
+
+
+def _blob_root(settings: Settings) -> Path:
+    return settings.data_dir / "workspace-history" / "blobs"
+
+
+def _conflict(
+    path: str,
+    reason: str,
+    before: dict[str, Any] | None,
+    after: dict[str, Any] | None,
+    current: dict[str, Any] | None,
+) -> dict[str, Any]:
+    return {
+        "path": path,
+        "reason": reason,
+        "before_sha256": _entry_digest(before),
+        "operation_after_sha256": _entry_digest(after),
+        "current_sha256": _entry_digest(current),
+    }

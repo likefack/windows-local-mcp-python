@@ -7,8 +7,9 @@ import stat
 import subprocess
 import tomllib
 from pathlib import Path
+from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 
 from .child_env import normalize_extra_environment_names, sanitize_process_environment
 from .git_env import strip_git_ambient_environment
@@ -99,6 +100,14 @@ class Settings(BaseModel):
     http_port: int = Field(default=8000, ge=1, le=65535)
     http_multi_principal_enabled: bool = False
     protect_data_dir_acl: bool = True
+    safe_network_isolation_mode: Literal["appcontainer", "compatibility"] = "appcontainer"
+    safe_network_profile_prefix: str = "WindowsLocalMCP.SafeTier"
+    safe_network_readable_paths: list[Path] = Field(default_factory=list)
+
+    _config_selection_source: str = PrivateAttr(default="direct_settings")
+    _config_path: str | None = PrivateAttr(default=None)
+    _workspace_selection_source: str = PrivateAttr(default="settings")
+    _ambient_root_present: bool = PrivateAttr(default=False)
 
     @model_validator(mode="before")
     @classmethod
@@ -121,6 +130,18 @@ class Settings(BaseModel):
             raise ValueError("path must not be empty")
         return Path(os.path.expandvars(os.path.expanduser(str(value)))).resolve()
 
+    @field_validator("safe_network_readable_paths", mode="before")
+    @classmethod
+    def expand_readable_paths(cls, value: object) -> list[Path]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise TypeError("safe_network_readable_paths must be a list")
+        return [
+            Path(os.path.expandvars(os.path.expanduser(str(item)))).resolve()
+            for item in value
+        ]
+
     @field_validator("adb_allowed_serials")
     @classmethod
     def validate_serials(cls, values: list[str]) -> list[str]:
@@ -131,6 +152,15 @@ class Settings(BaseModel):
                 raise ValueError("ADB serials must be non-empty and contain no whitespace")
             clean.append(serial)
         return clean
+
+    @field_validator("safe_network_profile_prefix")
+    @classmethod
+    def validate_appcontainer_prefix(cls, value: str) -> str:
+        prefix = value.strip()
+        allowed = set("-_. ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
+        if not prefix or len(prefix) > 24 or any(character not in allowed for character in prefix):
+            raise ValueError("safe_network_profile_prefix is invalid")
+        return prefix
 
     @field_validator("child_environment_allowlist")
     @classmethod
@@ -143,14 +173,25 @@ class Settings(BaseModel):
         data = self.data_dir
         if _is_relative_to(data, root) or _is_relative_to(root, data):
             raise ValueError("data_dir and workspace_root must not overlap")
+        if self.http_enabled and self.http_multi_principal_enabled:
+            raise ValueError(
+                "multi-principal HTTP is unsupported without authenticated principal ownership"
+            )
         if self.http_enabled and not _is_loopback_host(self.http_host):
             raise ValueError("unauthenticated HTTP is restricted to a loopback host")
+        if self.http_enabled:
+            raise ValueError(
+                "streamable HTTP is disabled until authenticated principal ownership is configured"
+            )
         if self.http_multi_principal_enabled:
             raise ValueError(
                 "multi-principal HTTP is unsupported without authenticated principal ownership"
             )
         if self.safe_powershell_scripts and not self.powershell_enabled:
             raise ValueError("safe_powershell_scripts requires powershell_enabled=true")
+        for path in self.safe_network_readable_paths:
+            if path == Path(path.anchor):
+                raise ValueError("safe_network_readable_paths cannot include a drive root")
         return self
 
     def ensure_directories(self) -> None:
@@ -170,9 +211,26 @@ class Settings(BaseModel):
             "approval-staging",
             "workspace-history",
         ):
-            (self.data_dir / name).mkdir(parents=True, exist_ok=True)
+            directory = self.data_dir / name
+            directory.mkdir(parents=True, exist_ok=True)
+            if _is_reparse(directory):
+                raise ValueError(f"data_dir child must not be a reparse point: {directory}")
+        for name in ("operations", "blobs", "transactions"):
+            directory = self.data_dir / "workspace-history" / name
+            directory.mkdir(parents=True, exist_ok=True)
+            if _is_reparse(directory):
+                raise ValueError(f"workspace-history child must not be a reparse point: {directory}")
         if self.protect_data_dir_acl and os.name == "nt":
             _protect_windows_acl(self.data_dir)
+
+    def selection_info(self) -> dict[str, object]:
+        return {
+            "config_source": self._config_selection_source,
+            "config_path": self._config_path,
+            "workspace_source": self._workspace_selection_source,
+            "ambient_root_present": self._ambient_root_present,
+            "ambient_root_overrode_config": False,
+        }
 
 
 def _is_relative_to(candidate: Path, parent: Path) -> bool:
@@ -212,6 +270,18 @@ def _protect_windows_acl(path: Path) -> None:
     if not row or len(row) < 2 or not row[1].startswith("S-"):
         raise PermissionError("failed to parse the current Windows security principal SID")
     sid = row[1]
+    reset = subprocess.run(
+        ["icacls.exe", str(path), "/reset", "/T", "/C"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+        check=False,
+        shell=False,
+    )
+    if reset.returncode != 0:
+        raise PermissionError(f"failed to reset data_dir ACL: {reset.stderr.strip()}")
     result = subprocess.run(
         [
             "icacls.exe",
@@ -220,6 +290,8 @@ def _protect_windows_acl(path: Path) -> None:
             "/grant:r",
             f"*{sid}:(OI)(CI)F",
             "SYSTEM:(OI)(CI)F",
+            "/T",
+            "/C",
         ],
         capture_output=True,
         text=True,
@@ -248,13 +320,23 @@ def load_settings() -> Settings:
     config_path_value = os.environ.get("LOCAL_MCP_CONFIG", "").strip()
     payload: dict[str, object] = {}
 
+    config_path: Path | None = None
     if config_path_value:
         config_path = Path(config_path_value).expanduser().resolve(strict=True)
         with config_path.open("rb") as file:
             payload = tomllib.load(file)
 
     env_root = os.environ.get("LOCAL_MCP_ROOT", "").strip()
-    if env_root:
+    if config_path is not None and env_root:
+        if "workspace_root" not in payload or not str(payload["workspace_root"]).strip():
+            raise ValueError("explicit config must define workspace_root; LOCAL_MCP_ROOT cannot fill it")
+        configured = Path(str(payload["workspace_root"])).expanduser().resolve(strict=True)
+        ambient = Path(env_root).expanduser().resolve(strict=True)
+        if configured != ambient:
+            raise ValueError(
+                "LOCAL_MCP_ROOT conflicts with the explicitly selected config workspace_root"
+            )
+    elif env_root:
         payload["workspace_root"] = env_root
 
     if "workspace_root" not in payload or not str(payload["workspace_root"]).strip():
@@ -267,6 +349,16 @@ def load_settings() -> Settings:
         payload["data_dir"] = str(_default_data_dir())
 
     settings = Settings.model_validate(payload)
+    if config_path is not None and _is_relative_to(config_path, settings.workspace_root):
+        raise ValueError("the active config path must be outside workspace_root")
+    settings._config_selection_source = (
+        "LOCAL_MCP_CONFIG" if config_path is not None else "environment_only"
+    )
+    settings._config_path = str(config_path) if config_path is not None else None
+    settings._workspace_selection_source = (
+        "explicit_config" if config_path is not None else "LOCAL_MCP_ROOT"
+    )
+    settings._ambient_root_present = bool(env_root)
     # After the config is resolved, discard unrelated ambient values from the MCP process itself.
     # Internal Git probes and approval-state subprocesses then inherit the same minimal baseline.
     sanitize_process_environment(

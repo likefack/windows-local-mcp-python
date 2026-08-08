@@ -24,21 +24,32 @@ def command_risk_facts(
     )
     staged = manifest.get("mode") == "staged-cwd"
     high = deletes or git_push or adb_mutation or normalized.network_expected or workspace_write
-    return {
-        "risk_level": "high" if high else ("medium" if staged or git_commit else "low"),
-        "writes_workspace_declared": workspace_write or git_commit,
-        "may_delete_files": True if deletes else ("possible" if workspace_write else False),
-        "workspace_outside_access_possible": True,
-        "network_declared": normalized.network_expected,
-        "network_access_possible": True,
-        "external_state_change_possible": git_push or normalized.network_expected or adb_mutation,
+    detected: dict[str, Any] = {
+        "workspace_write_requested": workspace_write or git_commit,
+        "file_delete_command_detected": deletes,
+        "network_requested": normalized.network_expected,
         "git_operation": args[0]
         if key == "git"
         and args
         and args[0] in {"commit", "push", "reset", "checkout", "merge", "rebase"}
         else None,
-        "adb_device_state_change": adb_mutation,
-        "starts_child_processes": True,
+        "git_push_detected": git_push,
+        "adb_device_mutation_detected": adb_mutation,
+        "external_state_change_detected": git_push
+        or normalized.network_expected
+        or adb_mutation,
+    }
+    detected = {name: value for name, value in detected.items() if value not in {False, None, ""}}
+    return {
+        "risk_level": "high" if high else ("medium" if staged or git_commit else "low"),
+        "detected_requested_effects": detected,
+        "effective_host_capabilities": {
+            "identity": "real Windows user token",
+            "filesystem_outside_workspace_os_possible": True,
+            "direct_socket_api_os_possible": True,
+            "child_process_creation_os_possible": True,
+            "note": "These are token capabilities, not effects detected in this command.",
+        },
         "rollback": "workspace files only"
         if workspace_write
         else (

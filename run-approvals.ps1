@@ -1,5 +1,5 @@
 param(
-    [Parameter(Mandatory = $false)]
+    [Parameter(Mandatory = $true)]
     [string]$Config = ""
 )
 
@@ -16,6 +16,7 @@ if ($Config -ne "") {
         throw "Config file does not exist: $Config"
     }
     $env:LOCAL_MCP_CONFIG = (Resolve-Path -LiteralPath $Config).Path
+    Remove-Item Env:LOCAL_MCP_ROOT -ErrorAction SilentlyContinue
 }
 
 & $Python -m windows_local_mcp.cli approvals

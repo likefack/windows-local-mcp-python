@@ -6,8 +6,19 @@ import subprocess
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
-from .approval import materialize_execution_copy, verify_approval_bundle
+from .appcontainer import (
+    AppContainerProcess,
+    appcontainer_profile_name,
+    launch_appcontainer_process,
+)
+from .approval import (
+    collect_staged_workspace_write,
+    materialize_execution_copy,
+    settings_digest,
+    verify_approval_bundle,
+)
 from .audit import AuditStore
 from .child_env import build_command_environment
 from .command_traits import dart_format_writes
@@ -15,7 +26,7 @@ from .config import load_settings
 from .git_snapshot import capture_git_snapshot
 from .network_isolation import apply_safe_network_environment, safe_network_policy
 from .paths import Workspace
-from .policy import CommandPolicy
+from .policy import CommandPolicy, NormalizedCommand
 from .process_utils import (
     ProcessIdentity,
     build_process_argv,
@@ -23,9 +34,22 @@ from .process_utils import (
     creation_flags,
     terminate_process_tree,
 )
-from .resources import BoundedStreamCapture, WorkspaceExecutionLock, enforce_data_quota
+from .resources import (
+    BoundedStreamCapture,
+    WorkspaceExecutionLock,
+    enforce_data_quota,
+    scan_directory_bounded,
+)
 from .util import canonical_json, utc_now_iso
-from .workspace_history import capture_workspace_state, compare_workspace_states
+from .workspace_history import (
+    WorkspaceMutationError,
+    build_workspace_target_from_bytes,
+    capture_workspace_state,
+    compare_workspace_states,
+    finalize_workspace_transaction,
+    restore_workspace_state,
+    workspace_recovery_required,
+)
 
 
 class ApprovalExecutionExpired(RuntimeError):
@@ -38,7 +62,35 @@ def run_operation(operation_id: str) -> int:
     operation = audit.get_operation(operation_id, include_events=False)
     request = operation["request"]
     normalized = request["normalized_command"]
+    workspace_lock: WorkspaceExecutionLock | None = None
+    tracks_workspace = _requires_workspace_execution_lock(operation, request, normalized)
+    if tracks_workspace:
+        workspace_lock = WorkspaceExecutionLock(settings)
+        try:
+            workspace_lock.__enter__()
+        except TimeoutError as lock_error:
+            audit.update_operation(
+                operation_id, status="failed", finished_at=utc_now_iso(), error=str(lock_error)
+            )
+            audit.add_event(
+                operation_id, "workspace_lock_timeout", {"error": str(lock_error)[:1000]}
+            )
+            return 1
+        if workspace_recovery_required(settings):
+            workspace_lock.__exit__(None, None, None)
+            audit.update_operation(
+                operation_id,
+                status="failed",
+                finished_at=utc_now_iso(),
+                error="workspace mutation is blocked pending recovery",
+            )
+            audit.add_event(operation_id, "workspace_recovery_required", {})
+            return 1
     try:
+        if operation["tier"] == "safe_command" and request.get(
+            "settings_digest"
+        ) != settings_digest(settings):
+            raise RuntimeError("effective MCP settings changed before safe execution")
         if operation["tier"] == "host_approval":
             verified = verify_approval_bundle(
                 settings=settings,
@@ -78,6 +130,8 @@ def run_operation(operation_id: str) -> int:
                 normalized = fresh.model_dump()
             audit.add_event(operation_id, "safe_command_revalidated", {})
     except Exception as error:  # noqa: BLE001 - every verification failure must be persisted
+        if workspace_lock is not None:
+            workspace_lock.__exit__(None, None, None)
         audit.update_operation(
             operation_id,
             status="failed",
@@ -113,21 +167,6 @@ def run_operation(operation_id: str) -> int:
     )
     audit.add_event(operation_id, "worker_started", {"worker_pid": os.getpid()})
 
-    workspace_lock: WorkspaceExecutionLock | None = None
-    tracks_workspace = _requires_workspace_execution_lock(operation, request, normalized)
-    if tracks_workspace:
-        workspace_lock = WorkspaceExecutionLock(settings)
-        try:
-            workspace_lock.__enter__()
-        except TimeoutError as lock_error:
-            audit.update_operation(
-                operation_id, status="failed", finished_at=utc_now_iso(), error=str(lock_error)
-            )
-            audit.add_event(
-                operation_id, "workspace_lock_timeout", {"error": str(lock_error)[:1000]}
-            )
-            return 1
-
     pre_git = capture_git_snapshot(settings=settings, operation_id=operation_id, stage="before")
     if pre_git:
         audit.update_operation(operation_id, pre_git_path=pre_git)
@@ -152,13 +191,14 @@ def run_operation(operation_id: str) -> int:
 
     argv = build_process_argv(executable, args)
     started = time.monotonic()
-    child: subprocess.Popen[bytes] | None = None
+    child: Any | None = None
     child_identity: ProcessIdentity | None = None
     stdout_capture: BoundedStreamCapture | None = None
     stderr_capture: BoundedStreamCapture | None = None
     status = "failed"
     exit_code: int | None = None
     error: str | None = None
+    network_policy_payload: dict[str, object] | None = None
 
     try:
         _verify_adb_target(normalized, settings.adb_emulator_only)
@@ -172,12 +212,28 @@ def run_operation(operation_id: str) -> int:
             git_command=normalized.get("program_key") == "git",
         )
         if operation["tier"] == "safe_command":
-            network_policy = safe_network_policy(str(normalized.get("program_key", "")))
-            apply_safe_network_environment(child_env, str(normalized.get("program_key", "")))
-            audit.update_operation(
-                operation_id, network_policy_json=canonical_json(network_policy.as_dict())
+            network_policy = safe_network_policy(
+                str(normalized.get("program_key", "")),
+                mode=settings.safe_network_isolation_mode,
             )
-            audit.add_event(operation_id, "network_policy_applied", network_policy.as_dict())
+            apply_safe_network_environment(child_env, str(normalized.get("program_key", "")))
+            network_policy_payload = network_policy.as_dict()
+            if settings.safe_network_isolation_mode == "appcontainer":
+                network_policy_payload.update(
+                    {
+                        "isolation_profile": appcontainer_profile_name(
+                            settings,
+                            str(normalized.get("program_key", "")),
+                            workspace_write=tracks_workspace,
+                        ),
+                        "descendant_enforcement": "inherited AppContainer token",
+                    }
+                )
+            network_policy_payload["enforcement_status"] = "prepared"
+            audit.update_operation(
+                operation_id, network_policy_json=canonical_json(network_policy_payload)
+            )
+            audit.add_event(operation_id, "network_policy_prepared", network_policy_payload)
         else:
             network_policy = {
                 "name": "approved-host-network",
@@ -189,6 +245,7 @@ def run_operation(operation_id: str) -> int:
             audit.update_operation(operation_id, network_policy_json=canonical_json(network_policy))
             audit.add_event(operation_id, "network_policy_applied", network_policy)
         runtime_root = settings.data_dir / "outputs" / f"{operation_id}-runtime"
+        runtime_root.mkdir(parents=True, exist_ok=True)
         try:
             Path(cwd).resolve(strict=True).relative_to(runtime_root.resolve(strict=True))
             isolated_home = runtime_root / "home"
@@ -208,20 +265,43 @@ def run_operation(operation_id: str) -> int:
             )
         except (ValueError, FileNotFoundError):
             pass
-        child = subprocess.Popen(
-            argv,
-            cwd=cwd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            shell=False,
-            creationflags=creation_flags(),
-            start_new_session=(os.name != "nt"),
-            env=child_env,
-        )
+        if operation["tier"] == "safe_command" and normalized.get("program_key") == "adb":
+            cwd = str(runtime_root)
+        if (
+            operation["tier"] == "safe_command"
+            and settings.safe_network_isolation_mode == "appcontainer"
+        ):
+            child = launch_appcontainer_process(
+                settings=settings,
+                program_key=str(normalized.get("program_key", "")),
+                executable=argv[0],
+                args=argv[1:],
+                cwd=cwd,
+                environment=child_env,
+                creation_flags=creation_flags(),
+                workspace_write=tracks_workspace,
+            )
+        else:
+            child = subprocess.Popen(
+                argv,
+                cwd=cwd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                shell=False,
+                creationflags=creation_flags(),
+                start_new_session=(os.name != "nt"),
+                env=child_env,
+            )
         if child.stdout is None or child.stderr is None:
             raise RuntimeError("failed to create bounded output pipes")
         child_identity = capture_process_identity(child.pid, nonce)
+        if operation["tier"] == "safe_command" and network_policy_payload is not None:
+            network_policy_payload["enforcement_status"] = "active"
+            audit.update_operation(
+                operation_id, network_policy_json=canonical_json(network_policy_payload)
+            )
+            audit.add_event(operation_id, "network_policy_applied", network_policy_payload)
         audit.update_operation(
             operation_id,
             child_pid=child_identity.pid,
@@ -241,18 +321,50 @@ def run_operation(operation_id: str) -> int:
         )
         stdout_capture.start()
         stderr_capture.start()
-        try:
-            exit_code = child.wait(timeout=max_runtime)
-            status = "succeeded" if exit_code == 0 else "failed"
-            error = None if exit_code == 0 else f"command exited with code {exit_code}"
-        except subprocess.TimeoutExpired:
-            terminate_process_tree(child_identity)
-            exit_code = None
-            status = "timed_out"
-            error = f"maximum runtime exceeded: {max_runtime} seconds"
+        deadline = time.monotonic() + max_runtime
+        runtime_limit = min(
+            settings.approval_manifest_max_bytes + settings.max_write_bytes,
+            settings.max_data_dir_bytes // 2,
+        )
+        runtime_entry_limit = max(128, settings.approval_manifest_max_files * 4)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _terminate_launched_child(child, child_identity)
+                exit_code = None
+                status = "timed_out"
+                error = f"maximum runtime exceeded: {max_runtime} seconds"
+                break
+            try:
+                exit_code = child.wait(timeout=min(0.5, remaining))
+                status = "succeeded" if exit_code == 0 else "failed"
+                error = None if exit_code == 0 else f"command exited with code {exit_code}"
+                if operation["tier"] == "safe_command":
+                    storage_error = _safe_runtime_storage_error(
+                        runtime_root,
+                        byte_limit=runtime_limit,
+                        entry_limit=runtime_entry_limit,
+                    )
+                    if storage_error is not None:
+                        status = "failed"
+                        error = storage_error
+                break
+            except subprocess.TimeoutExpired:
+                if operation["tier"] == "safe_command":
+                    storage_error = _safe_runtime_storage_error(
+                        runtime_root,
+                        byte_limit=runtime_limit,
+                        entry_limit=runtime_entry_limit,
+                    )
+                    if storage_error is not None:
+                        _terminate_launched_child(child, child_identity)
+                        exit_code = None
+                        status = "failed"
+                        error = storage_error
+                        break
     except ApprovalExecutionExpired as exc:
         if child_identity is not None:
-            terminate_process_tree(child_identity)
+            _terminate_launched_child(child, child_identity)
         elif child is not None:
             child.terminate()
         exit_code = None
@@ -265,7 +377,7 @@ def run_operation(operation_id: str) -> int:
         )
     except Exception as exc:  # noqa: BLE001 - every child failure must become a terminal job
         if child_identity is not None:
-            terminate_process_tree(child_identity)
+            _terminate_launched_child(child, child_identity)
         elif child is not None:
             child.terminate()
         exit_code = None
@@ -276,6 +388,44 @@ def run_operation(operation_id: str) -> int:
             stdout_capture.join()
         if stderr_capture is not None:
             stderr_capture.join()
+        if child is not None and hasattr(child, "close"):
+            child.close()
+
+    workspace_transaction_applied = False
+    if (
+        status == "succeeded"
+        and operation["tier"] == "safe_command"
+        and normalized.get("program_key") == "dart"
+        and dart_format_writes(list(normalized.get("args") or []))
+    ):
+        try:
+            if pre_workspace is None:
+                raise RuntimeError("staged workspace write has no starting checkpoint")
+            staged_changes = collect_staged_workspace_write(
+                settings=settings,
+                operation_id=operation_id,
+                normalized=NormalizedCommand.model_validate(normalized),
+            )
+            if staged_changes:
+                target_manifest = build_workspace_target_from_bytes(
+                    settings,
+                    operation_id,
+                    pre_workspace.manifest_path,
+                    staged_changes,
+                )
+                restore_workspace_state(
+                    settings,
+                    pre_workspace.manifest_path,
+                    target_manifest,
+                    operation_id=operation_id,
+                )
+                workspace_transaction_applied = True
+        except WorkspaceMutationError as mutation_error:
+            status = "failed"
+            error = str(mutation_error)
+        except Exception as staged_error:  # noqa: BLE001 - do not broker unapproved output
+            status = "failed"
+            error = f"staged workspace write rejected: {type(staged_error).__name__}: {staged_error}"
 
     duration_ms = int((time.monotonic() - started) * 1000)
     post_git = capture_git_snapshot(settings=settings, operation_id=operation_id, stage="after")
@@ -355,6 +505,15 @@ def run_operation(operation_id: str) -> int:
         update_fields["approval_status"] = "expired"
     audit.update_operation(operation_id, **update_fields)
     audit.add_event(operation_id, "worker_finished", {"status": status, "exit_code": exit_code})
+    if workspace_transaction_applied:
+        try:
+            finalize_workspace_transaction(settings, operation_id)
+        except Exception as finalization_error:  # noqa: BLE001 - startup reconciles journal
+            audit.add_event(
+                operation_id,
+                "workspace_transaction_finalization_deferred",
+                {"error": f"{type(finalization_error).__name__}: {finalization_error}"[:1000]},
+            )
     return 0 if status == "succeeded" else 1
 
 
@@ -382,6 +541,34 @@ def _requires_workspace_execution_lock(
         return not (isinstance(summary, dict) and summary.get("mode") == "staged-cwd")
 
     return True
+
+
+def _terminate_launched_child(child: Any, identity: ProcessIdentity) -> None:
+    if isinstance(child, AppContainerProcess):
+        child.terminate()
+    else:
+        terminate_process_tree(identity)
+
+
+def _safe_runtime_storage_error(
+    runtime_root: Path, *, byte_limit: int, entry_limit: int
+) -> str | None:
+    try:
+        usage = scan_directory_bounded(
+            runtime_root,
+            stop_after_bytes=byte_limit,
+            stop_after_entries=entry_limit,
+            reject_alternate_streams=True,
+            reject_reparse_points=True,
+        )
+    except (OSError, RuntimeError) as exc:
+        return f"safe runtime storage validation failed: {exc}"
+    if usage.total_bytes > byte_limit or usage.entry_count > entry_limit:
+        return (
+            "safe runtime storage limit exceeded: "
+            f"{byte_limit} bytes or {entry_limit} entries"
+        )
+    return None
 
 
 def _has_irreversible_effect(normalized: dict[str, object]) -> bool:

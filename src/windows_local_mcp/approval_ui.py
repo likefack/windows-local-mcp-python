@@ -14,10 +14,30 @@ from .resources import WorkspaceExecutionLock
 from .risk import command_risk_facts
 from .util import canonical_json, sha256_text, utc_now_iso
 from .workspace_history import (
+    WorkspaceMutationError,
     capture_workspace_state,
+    checkpoint_manifest_digest,
     compare_workspace_states,
+    describe_workspace_restore,
+    finalize_workspace_transaction,
     restore_workspace_state,
+    workspace_recovery_required,
 )
+
+_BIDI_CONTROLS = set("\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
+
+
+def _terminal_safe(value: object) -> str:
+    """Make request-controlled text inert in a terminal approval boundary."""
+    text = str(value)
+    return "".join(
+        f"\\u{ord(character):04x}"
+        if ord(character) < 0x20
+        or 0x7F <= ord(character) <= 0x9F
+        or character in _BIDI_CONTROLS
+        else character
+        for character in text
+    )
 
 _READ_ACTIVITY_TOOLS = {"list_directory", "read_file", "get_image", "git_info"}
 _COMMAND_ACTIVITY_TOOLS = {
@@ -25,19 +45,39 @@ _COMMAND_ACTIVITY_TOOLS = {
     "execute_workspace_write",
     "adb_read",
     "request_host_command",
+    "request_workspace_rollback",
+    "request_selective_undo",
 }
 
 
 def _show(item: dict[str, object]) -> None:
     print("\n" + "=" * 80)
-    print(f"Approval ID : {item['id']}")
-    print(f"Created     : {item['created_at']}")
-    print(f"Expires     : {item['request_expires_at']}")
-    print(f"Tool        : {item['tool_name']}")
-    print(f"CWD         : {item['cwd']}")
-    print(f"Hash        : {item['request_hash']}")
+    print(f"Approval ID : {_terminal_safe(item['id'])}")
+    print(f"Created     : {_terminal_safe(item['created_at'])}")
+    print(f"Expires     : {_terminal_safe(item['request_expires_at'])}")
+    print(f"Tool        : {_terminal_safe(item['tool_name'])}")
+    print(f"CWD         : {_terminal_safe(item['cwd'])}")
+    print(f"Hash        : {_terminal_safe(item['request_hash'])}")
     request = item["request"]
     if isinstance(request, dict):
+        normalized_summary = request.get("normalized_command")
+        if isinstance(normalized_summary, dict):
+            display = normalized_summary.get("display_command")
+            if isinstance(display, list):
+                print("Command argv: " + json.dumps(display, ensure_ascii=True))
+        operation_type = request.get("operation_type")
+        if operation_type:
+            print(f"Operation   : {_terminal_safe(operation_type)}")
+            print(f"Target op   : {_terminal_safe(request.get('target_operation_id', ''))}")
+            preview = request.get("undo_preview")
+            if isinstance(preview, dict):
+                print(
+                    "Files       : "
+                    f"{preview.get('changed_file_count', 0)} changed; "
+                    f"create={bool(preview.get('creates_files'))}, "
+                    f"restore={bool(preview.get('restores_files'))}, "
+                    f"delete={bool(preview.get('deletes_files'))}"
+                )
         facts = request.get("objective_risk")
         normalized_payload = request.get("normalized_command")
         summary = request.get("approval_manifest_summary")
@@ -48,20 +88,30 @@ def _show(item: dict[str, object]) -> None:
                 manifest=summary,
             )
         if isinstance(facts, dict):
-            print("Objective facts (verified by MCP):")
-            for key, value in facts.items():
-                print(f"  {key}: {value}")
+            print(f"Risk level   : {facts.get('risk_level', 'unknown')}")
+            detected = facts.get("detected_requested_effects")
+            if isinstance(detected, dict) and detected:
+                print("Detected / requested effects (verified by MCP):")
+                for key, value in detected.items():
+                    if value not in {False, None, ""}:
+                        print(f"  {_terminal_safe(key)}: {_terminal_safe(value)}")
+            capabilities = facts.get("effective_host_capabilities")
+            if isinstance(capabilities, dict) and capabilities:
+                print("Effective host capabilities:")
+                for key, value in capabilities.items():
+                    if value not in {False, None, ""}:
+                        print(f"  {_terminal_safe(key)}: {_terminal_safe(value)}")
         print("Model-provided context (not independently verified):")
-        print(f"  reason: {request.get('reason', '')}")
-        print(f"  risk_summary: {request.get('risk_summary', '')}")
+        print(f"  reason: {_terminal_safe(request.get('reason', ''))}")
+        print(f"  risk_summary: {_terminal_safe(request.get('risk_summary', ''))}")
         print("-" * 80)
-        technical = {
-            key: value
-            for key, value in request.items()
+        technical_keys = sorted(
+            key
+            for key in request
             if key not in {"reason", "risk_summary", "objective_risk"}
-        }
-        print("Technical details:")
-        print(json.dumps(technical, ensure_ascii=False, indent=2))
+        )
+        print("Technical details are available through activity_get/audit_get.")
+        print(f"  fields: {', '.join(technical_keys)}")
     else:
         print(json.dumps(request, ensure_ascii=False, indent=2))
     print("=" * 80)
@@ -83,6 +133,9 @@ def _activity_detail(operation: dict[str, object]) -> str:
                 if isinstance(args, list):
                     short_args = " ".join(str(value) for value in args[:3])
                 return f"{program} {short_args}".strip()
+        target_operation = request.get("target_operation_id")
+        if isinstance(target_operation, str):
+            return f"{tool} target={target_operation}"
     return tool
 
 
@@ -90,7 +143,11 @@ def _format_activity(operation: dict[str, object]) -> str | None:
     tool = str(operation.get("tool_name") or "")
     status = str(operation.get("status") or "")
 
-    if status == "pending_approval" and tool == "request_host_command":
+    if status == "pending_approval" and tool in {
+        "request_host_command",
+        "request_workspace_rollback",
+        "request_selective_undo",
+    }:
         label = "Approval"
     elif status in {"queued", "running", "approved"} and tool in _COMMAND_ACTIVITY_TOOLS:
         label = "Running"
@@ -112,7 +169,7 @@ def _format_activity(operation: dict[str, object]) -> str | None:
     suffix = ""
     if label == "Finished":
         suffix = f" [{status}]"
-    return f"[{when}] {label:<8} {detail}{suffix}"
+    return _terminal_safe(f"[{when}] {label:<8} {detail}{suffix}")
 
 
 def _activity_loop(audit: AuditStore, stop: threading.Event, paused: threading.Event) -> None:
@@ -195,46 +252,168 @@ def run_approval_ui(settings: Settings | None = None) -> None:
                     request = item["request"]
                     if not isinstance(request, dict):
                         raise TypeError("invalid approval request")
-                    if item.get("tool_name") == "request_workspace_rollback":
+                    if item.get("tool_name") in {
+                        "request_workspace_rollback",
+                        "request_selective_undo",
+                    }:
                         expected_hash = sha256_text(canonical_json(request))
                         if expected_hash != item.get("request_hash"):
-                            raise RuntimeError("rollback approval request hash mismatch")
-                        audit.approve_and_claim(
-                            operation_id, approver=settings.default_approver, note=note
-                        )
-                        with WorkspaceExecutionLock(settings):
-                            before = capture_workspace_state(settings, operation_id, "before")
-                            restored = restore_workspace_state(
-                                settings,
-                                str(request["expected_current_checkpoint"]),
-                                str(request["target_checkpoint"]),
+                            raise RuntimeError("workspace control approval request hash mismatch")
+                        before = None
+                        try:
+                            with WorkspaceExecutionLock(settings):
+                                if workspace_recovery_required(settings):
+                                    raise RuntimeError(
+                                        "workspace mutation is blocked pending recovery"
+                                    )
+                                expected_checkpoint = str(
+                                    request["expected_current_checkpoint"]
+                                )
+                                target_checkpoint = str(request["target_checkpoint"])
+                                if checkpoint_manifest_digest(
+                                    settings, expected_checkpoint
+                                ) != request.get("expected_current_manifest_sha256"):
+                                    raise RuntimeError(
+                                        "approved current-checkpoint manifest changed"
+                                    )
+                                if checkpoint_manifest_digest(
+                                    settings, target_checkpoint
+                                ) != request.get("target_manifest_sha256"):
+                                    raise RuntimeError("approved target manifest changed")
+                                fresh_preview = describe_workspace_restore(
+                                    settings, expected_checkpoint, target_checkpoint
+                                )
+                                approved_preview = request.get("undo_preview")
+                                if not isinstance(approved_preview, dict):
+                                    raise TypeError("approved workspace preview is missing")
+                                for key in (
+                                    "files_that_would_change",
+                                    "changed_file_count",
+                                    "created_files",
+                                    "restored_files",
+                                    "deleted_files",
+                                ):
+                                    if fresh_preview.get(key) != approved_preview.get(key):
+                                        raise RuntimeError(
+                                            "approved workspace preview no longer matches manifests"
+                                        )
+                                audit.approve_and_claim(
+                                    operation_id,
+                                    approver=settings.default_approver,
+                                    note=note,
+                                    expected_request_hash=expected_hash,
+                                )
+                                before = capture_workspace_state(settings, operation_id, "before")
+                                audit.update_operation(
+                                    operation_id,
+                                    pre_workspace_path=before.manifest_path,
+                                    rollback_state="applying",
+                                )
+                                restored = restore_workspace_state(
+                                    settings,
+                                    str(request["expected_current_checkpoint"]),
+                                    str(request["target_checkpoint"]),
+                                    operation_id=operation_id,
+                                )
+                                change = compare_workspace_states(
+                                    settings,
+                                    before.manifest_path,
+                                    str(request["target_checkpoint"]),
+                                    operation_id,
+                                )
+                            result = {
+                                "operation_id": operation_id,
+                                "status": "succeeded",
+                                "operation_type": request["operation_type"],
+                                "target_operation_id": request["target_operation_id"],
+                                **restored,
+                                **change,
+                                "rollback_state": "complete",
+                                "undo_can_be_undone": True,
+                            }
+                            audit.update_operation(
+                                operation_id,
+                                status="succeeded",
+                                finished_at=utc_now_iso(),
+                                pre_workspace_path=before.manifest_path,
+                                post_workspace_path=str(request["target_checkpoint"]),
+                                diff_path=change["diff_path"],
+                                rollback_state="complete",
+                                result_json=canonical_json(result),
                             )
-                            after = capture_workspace_state(settings, operation_id, "after")
-                            change = compare_workspace_states(
-                                settings, before.manifest_path, after.manifest_path, operation_id
+                            audit.add_event(operation_id, "workspace_control_complete", result)
+                            try:
+                                finalize_workspace_transaction(settings, operation_id)
+                            except Exception as finalize_error:  # noqa: BLE001 - journal retained
+                                result["status"] = "interrupted"
+                                result["rollback_state"] = "applied_audit_incomplete"
+                                audit.update_operation(
+                                    operation_id,
+                                    status="interrupted",
+                                    rollback_state="applied_audit_incomplete",
+                                    result_json=canonical_json(result),
+                                    error=(
+                                        "workspace reached the approved target, but journal "
+                                        f"finalization failed: {finalize_error}"
+                                    ),
+                                )
+                                audit.add_event(
+                                    operation_id,
+                                    "workspace_control_applied_audit_incomplete",
+                                    result,
+                                )
+                                print(
+                                    "Applied, but audit finalization was interrupted; "
+                                    "startup reconciliation will finish the journal."
+                                )
+                            else:
+                                print(
+                                    "Approved and completed. This operation can itself be undone."
+                                )
+                        except WorkspaceMutationError as mutation_error:
+                            result = {
+                                "operation_id": operation_id,
+                                "status": "failed",
+                                "operation_type": request["operation_type"],
+                                "target_operation_id": request["target_operation_id"],
+                                "rollback_state": mutation_error.recovery_state,
+                                "transaction_journal": mutation_error.journal_path,
+                            }
+                            audit.update_operation(
+                                operation_id,
+                                status="failed",
+                                finished_at=utc_now_iso(),
+                                pre_workspace_path=(
+                                    before.manifest_path if before is not None else None
+                                ),
+                                rollback_state=mutation_error.recovery_state,
+                                result_json=canonical_json(result),
+                                error=str(mutation_error),
                             )
-                        result = {
-                            "operation_id": operation_id,
-                            "status": "succeeded",
-                            "target_operation_id": request["target_operation_id"],
-                            **restored,
-                            **change,
-                            "rollback_state": "complete",
-                        }
-                        audit.update_operation(
-                            operation_id,
-                            status="succeeded",
-                            finished_at=utc_now_iso(),
-                            pre_workspace_path=before.manifest_path,
-                            post_workspace_path=after.manifest_path,
-                            diff_path=change["diff_path"],
-                            rollback_state="complete",
-                            result_json=canonical_json(result),
-                        )
-                        audit.add_event(operation_id, "workspace_rolled_back", result)
-                        print(
-                            "Approved and restored. Conflicting external changes would have stopped the operation."
-                        )
+                            audit.add_event(operation_id, "workspace_control_failed", result)
+                            print(f"Failed: {mutation_error}")
+                        except Exception as control_error:  # noqa: BLE001 - persist preflight stop
+                            result = {
+                                "operation_id": operation_id,
+                                "status": "failed",
+                                "operation_type": request["operation_type"],
+                                "target_operation_id": request["target_operation_id"],
+                                "rollback_state": "failed_preflight",
+                            }
+                            audit.update_operation(
+                                operation_id,
+                                status="failed",
+                                finished_at=utc_now_iso(),
+                                rollback_state="failed_preflight",
+                                result_json=canonical_json(result),
+                                error=f"{type(control_error).__name__}: {control_error}",
+                            )
+                            audit.add_event(
+                                operation_id,
+                                "workspace_control_preflight_failed",
+                                {"error": str(control_error)[:1000]},
+                            )
+                            print(f"Not applied: {control_error}")
                         pause_activity.clear()
                         continue
                     normalized = NormalizedCommand.model_validate(request["normalized_command"])
@@ -256,6 +435,7 @@ def run_approval_ui(settings: Settings | None = None) -> None:
                         operation_id,
                         approver=settings.default_approver,
                         note=note,
+                        expected_request_hash=expected_hash,
                     )
                     executor.launch(operation_id, 0)
                     print("Approved and launched once. The MCP client can poll the result.")

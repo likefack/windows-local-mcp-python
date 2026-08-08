@@ -5,5 +5,8 @@ __pycache__/
 .ruff_cache/
 *.pyc
 config.toml
+config.local.toml
+config.*.local.toml
+.local-mcp/
 dist/
 build/

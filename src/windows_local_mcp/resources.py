@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import BinaryIO, Self
@@ -15,6 +17,13 @@ from .config import Settings
 _LOCK_SLOT_COUNT = 32
 _LOCAL_LOCKS_GUARD = threading.Lock()
 _LOCAL_LOCKS: dict[str, threading.RLock] = {}
+
+
+@dataclass(frozen=True)
+class DirectoryScan:
+    total_bytes: int
+    entry_count: int
+    files: tuple[Path, ...] = ()
 
 
 class WorkspaceExecutionLock:
@@ -212,6 +221,120 @@ def directory_size(path: Path, *, stop_after: int | None = None) -> int:
     return total
 
 
+def scan_directory_bounded(
+    path: Path,
+    *,
+    stop_after_bytes: int,
+    stop_after_entries: int,
+    collect_files: bool = False,
+    reject_alternate_streams: bool = False,
+    reject_reparse_points: bool = False,
+) -> DirectoryScan:
+    """Scan a process-writable tree without building an unbounded inventory.
+
+    Limits are reported by returning a value greater than the corresponding threshold.
+    Unsafe filesystem features are rejected immediately so NTFS allocation cannot hide from
+    the ordinary file-size quota and reparse points cannot redirect a later inventory walk.
+    """
+    total_bytes = 0
+    entry_count = 0
+    files: list[Path] = []
+    pending = [path]
+    while pending:
+        current = pending.pop()
+        try:
+            current_info = current.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        current_is_reparse = bool(
+            getattr(current_info, "st_file_attributes", 0) & 0x400
+        )
+        if reject_reparse_points and (current.is_symlink() or current_is_reparse):
+            raise RuntimeError(f"runtime tree contains a reparse point: {current}")
+        if reject_alternate_streams and _has_named_data_stream(current):
+            raise RuntimeError(
+                f"runtime tree contains an NTFS alternate data stream: {current}"
+            )
+        try:
+            entries = os.scandir(current)
+        except FileNotFoundError:
+            continue
+        with entries:
+            for entry in entries:
+                candidate = Path(entry.path)
+                entry_count += 1
+                if entry_count > stop_after_entries:
+                    return DirectoryScan(total_bytes, entry_count, tuple(files))
+                try:
+                    info = entry.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                is_reparse = bool(getattr(info, "st_file_attributes", 0) & 0x400)
+                if reject_reparse_points and (entry.is_symlink() or is_reparse):
+                    raise RuntimeError(f"runtime tree contains a reparse point: {candidate}")
+                if reject_alternate_streams and _has_named_data_stream(candidate):
+                    raise RuntimeError(
+                        f"runtime tree contains an NTFS alternate data stream: {candidate}"
+                    )
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(candidate)
+                    continue
+                if not entry.is_file(follow_symlinks=False):
+                    raise RuntimeError(f"runtime tree contains a non-regular entry: {candidate}")
+                total_bytes += info.st_size
+                if collect_files:
+                    files.append(candidate)
+                if total_bytes > stop_after_bytes:
+                    return DirectoryScan(total_bytes, entry_count, tuple(files))
+    return DirectoryScan(total_bytes, entry_count, tuple(files))
+
+
+def _has_named_data_stream(path: Path) -> bool:
+    if os.name != "nt":
+        return False
+
+    import ctypes
+    from ctypes import wintypes
+
+    class Win32FindStreamData(ctypes.Structure):
+        _fields_ = [("stream_size", ctypes.c_longlong), ("stream_name", wintypes.WCHAR * 296)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    find_first = kernel32.FindFirstStreamW
+    find_first.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+    find_first.restype = wintypes.HANDLE
+    find_next = kernel32.FindNextStreamW
+    find_next.argtypes = [wintypes.HANDLE, ctypes.c_void_p]
+    find_next.restype = wintypes.BOOL
+    find_close = kernel32.FindClose
+    find_close.argtypes = [wintypes.HANDLE]
+    find_close.restype = wintypes.BOOL
+
+    resolved = str(path.resolve(strict=True))
+    if not resolved.startswith("\\\\?\\"):
+        resolved = "\\\\?\\" + resolved
+    data = Win32FindStreamData()
+    handle = find_first(resolved, 0, ctypes.byref(data), 0)
+    invalid_handle = ctypes.c_void_p(-1).value
+    if handle == invalid_handle:
+        error = ctypes.get_last_error()
+        if error in {2, 38, 50, 87}:  # missing/no streams/unsupported filesystem
+            return False
+        raise OSError(error, f"FindFirstStreamW failed for {path}")
+    try:
+        while True:
+            if data.stream_name != "::$DATA":
+                return True
+            if find_next(handle, ctypes.byref(data)):
+                continue
+            error = ctypes.get_last_error()
+            if error == 38:  # ERROR_HANDLE_EOF
+                return False
+            raise OSError(error, f"FindNextStreamW failed for {path}")
+    finally:
+        find_close(handle)
+
+
 def enforce_data_quota(settings: Settings, *, incoming_bytes: int = 0) -> None:
     used = directory_size(settings.data_dir, stop_after=settings.max_data_dir_bytes)
     if used + incoming_bytes > settings.max_data_dir_bytes:
@@ -230,13 +353,12 @@ def prune_artifacts(settings: Settings, *, protected_ids: set[str] | None = None
             "backups",
             "git-snapshots",
             "approval-staging",
-            "workspace-history",
         )
     ]
     protected_ids = protected_ids or set()
+    removed = _prune_workspace_history(settings, protected_ids)
     cutoff = datetime.now(UTC) - timedelta(days=settings.retention_days)
     candidates: list[tuple[float, Path]] = []
-    removed = 0
     for root in artifact_roots:
         if not root.exists() or root.is_symlink():
             continue
@@ -263,6 +385,57 @@ def prune_artifacts(settings: Settings, *, protected_ids: set[str] | None = None
         _remove_artifact(candidate)
         used -= size
         removed += 1
+    return removed
+
+
+def _prune_workspace_history(settings: Settings, protected_ids: set[str]) -> int:
+    """Prune operation manifests first, then garbage-collect unreferenced SHA blobs."""
+    history = settings.data_dir / "workspace-history"
+    operations = history / "operations"
+    blobs = history / "blobs"
+    if not operations.exists() or operations.is_symlink():
+        return 0
+    cutoff = datetime.now(UTC) - timedelta(days=settings.retention_days)
+    candidates: list[tuple[float, Path]] = []
+    removed = 0
+    for candidate in operations.iterdir():
+        if candidate.is_symlink() or candidate.name in protected_ids:
+            continue
+        try:
+            modified = datetime.fromtimestamp(candidate.stat().st_mtime, UTC)
+        except FileNotFoundError:
+            continue
+        candidates.append((modified.timestamp(), candidate))
+        if modified < cutoff:
+            _remove_artifact(candidate)
+            removed += 1
+    remaining = [item for item in candidates if item[1].exists()]
+    for _, candidate in sorted(remaining)[: max(0, len(remaining) - settings.retention_max_operations)]:
+        _remove_artifact(candidate)
+        removed += 1
+    removed += _garbage_collect_workspace_blobs(operations, blobs)
+    return removed
+
+
+def _garbage_collect_workspace_blobs(operations: Path, blobs: Path) -> int:
+    if not blobs.exists() or blobs.is_symlink():
+        return 0
+    referenced: set[str] = set()
+    for manifest in operations.glob("**/manifest.json"):
+        try:
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            for item in payload.get("files", []):
+                blob = item.get("blob")
+                if isinstance(blob, str) and len(blob) == 64:
+                    referenced.add(blob)
+        except (OSError, ValueError, TypeError):
+            # Fail closed for retention: an unreadable manifest must not cause blob deletion.
+            return 0
+    removed = 0
+    for blob in blobs.glob("*.blob"):
+        if blob.stem not in referenced:
+            blob.unlink(missing_ok=True)
+            removed += 1
     return removed
 
 

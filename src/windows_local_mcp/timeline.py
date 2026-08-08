@@ -10,6 +10,7 @@ from .workspace_history import describe_workspace_restore
 
 
 def timeline_entry(settings: Settings, audit: AuditStore, operation_id: str) -> dict[str, Any]:
+    """Detailed activity view. Large artifacts are expanded only here."""
     operation = audit.get_operation(operation_id, include_events=True)
     request = operation.get("request") or {}
     normalized = request.get("normalized_command") if isinstance(request, dict) else None
@@ -24,6 +25,7 @@ def timeline_entry(settings: Settings, audit: AuditStore, operation_id: str) -> 
         "tier": operation["tier"],
         "status": operation["status"],
         "cwd": operation.get("cwd"),
+        "request": request,
         "target": request.get("path") if isinstance(request, dict) else None,
         "command": command,
         "exit_code": operation.get("exit_code"),
@@ -31,18 +33,24 @@ def timeline_entry(settings: Settings, audit: AuditStore, operation_id: str) -> 
         "stdout_preview": result.get("stdout_preview", "") if isinstance(result, dict) else "",
         "stderr_preview": result.get("stderr_preview", "") if isinstance(result, dict) else "",
         "changed_files": changed,
+        "changed_file_count": len(changed),
         "added_lines": result.get("added_lines", 0) if isinstance(result, dict) else 0,
         "removed_lines": result.get("removed_lines", 0) if isinstance(result, dict) else 0,
         "unified_diff": _artifact_preview(settings, operation.get("diff_path")),
         "error": operation.get("error"),
         "rollback_state": operation.get("rollback_state") or "not_applicable",
+        "point_in_time_rollback_available": bool(operation.get("post_workspace_path")),
+        "selective_undo_available": bool(
+            operation.get("pre_workspace_path") and operation.get("post_workspace_path")
+        ),
         "network_policy": operation.get("network_policy"),
         "events": operation.get("events", []),
+        "result": result,
     }
     if operation.get("post_workspace_path"):
         latest = audit.latest_workspace_checkpoint()
         if latest and latest.get("post_workspace_path"):
-            entry["rollback_preview"] = {
+            entry["point_in_time_rollback_preview"] = {
                 "target_operation_id": operation_id,
                 "current_checkpoint_operation_id": latest["id"],
                 **describe_workspace_restore(
@@ -55,10 +63,76 @@ def timeline_entry(settings: Settings, audit: AuditStore, operation_id: str) -> 
 
 
 def timeline_list(settings: Settings, audit: AuditStore, limit: int = 50) -> list[dict[str, Any]]:
-    return [
-        timeline_entry(settings, audit, str(item["id"]))
-        for item in audit.list_operations(limit=max(1, min(limit, 200)))
-    ]
+    """Lightweight summaries only; no diff, events, output, or path-list expansion."""
+    result: list[dict[str, Any]] = []
+    for item in audit.list_operations(limit=max(1, min(limit, 200))):
+        operation = audit.get_operation(str(item["id"]), include_events=False)
+        request = operation.get("request") or {}
+        payload = operation.get("result") or {}
+        normalized = request.get("normalized_command") if isinstance(request, dict) else None
+        display = normalized.get("display_command") if isinstance(normalized, dict) else None
+        changed = payload.get("changed_files", []) if isinstance(payload, dict) else []
+        conflicts = (
+            request.get("undo_preview", {}).get("conflict_count", 0)
+            if isinstance(request, dict) and isinstance(request.get("undo_preview"), dict)
+            else 0
+        )
+        network = operation.get("network_policy") or {}
+        objective = request.get("objective_risk", {}) if isinstance(request, dict) else {}
+        result.append(
+            {
+                "operation_id": operation["id"],
+                "time": operation.get("finished_at") or operation["created_at"],
+                "tool": operation["tool_name"],
+                "operation_type": _operation_type(operation["tool_name"]),
+                "status": operation["status"],
+                "summary": _summary(request, display),
+                "changed_file_count": len(changed),
+                "added_lines": payload.get("added_lines", 0)
+                if isinstance(payload, dict)
+                else 0,
+                "removed_lines": payload.get("removed_lines", 0)
+                if isinstance(payload, dict)
+                else 0,
+                "point_in_time_rollback_available": bool(operation.get("post_workspace_path")),
+                "selective_undo_available": bool(
+                    operation.get("pre_workspace_path") and operation.get("post_workspace_path")
+                ),
+                "selective_undo_scope": "workspace_files_partial"
+                if operation.get("rollback_state") in {"partial", "unavailable"}
+                else "workspace_files_complete",
+                "conflict_state": "conflict" if conflicts else "none",
+                "network_enforcement": network.get("enforcement", "not_applicable"),
+                "network_enforcement_status": network.get(
+                    "enforcement_status", "not_applicable"
+                ),
+                "risk": objective.get("risk_level", "none")
+                if isinstance(objective, dict)
+                else "none",
+            }
+        )
+    return result
+
+
+def _summary(request: dict[str, Any], display: object) -> str:
+    if isinstance(display, list):
+        value = " ".join(str(part) for part in display)
+    else:
+        value = str(
+            request.get("path")
+            or request.get("target_operation_id")
+            or request.get("operation_id")
+            or ""
+        )
+    return value if len(value) <= 200 else value[:197] + "..."
+
+
+def _operation_type(tool_name: str) -> str:
+    if tool_name == "request_workspace_rollback":
+        return "point_in_time_rollback"
+    if tool_name == "request_selective_undo":
+        return "selective_undo"
+    return "operation"
 
 
 def _artifact_preview(settings: Settings, value: object) -> str:

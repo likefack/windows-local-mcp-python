@@ -40,9 +40,11 @@ All MCP file paths pass through `Workspace`.
 
 1. takes a target-scoped cross-process mutation slot plus the canonical-target thread lock;
 2. re-resolves target and reads/checks expected SHA inside the locks;
-3. enforces old/new/diff/backup/data quotas before replacement;
-4. writes and fsyncs a same-directory temporary file;
-5. revalidates parent `(device,inode)` and target full identity immediately before `os.replace`;
+3. captures the before checkpoint and fsyncs a write-ahead recovery journal before replacement;
+4. enforces old/new/diff/backup/data quotas before replacement;
+5. writes and fsyncs a same-directory temporary file;
+6. revalidates parent `(device,inode)` and target full identity immediately before `os.replace`;
+7. verifies and journals the after checkpoint, and restores the before checkpoint after a detected failure. Interrupted writes are reconciled on startup and unresolved recovery checkpoints are retention-protected.
 6. verifies resulting SHA.
 
 Target slots are selected from the canonical target path. Different slots can proceed concurrently; the same target always maps to the same slot, while a hash collision only causes extra serialization. A workspace-wide writer acquires every slot, so it still excludes all target writes.
@@ -172,6 +174,7 @@ On Windows, processes use a new process group and no window. On other platforms 
 - stdout/stderr pipes drained by bounded head/tail collectors;
 - bounded Git snapshots;
 - total `data_dir` quota;
+- Safe Tier runtime byte and filesystem-entry quotas, with reparse points, non-regular entries, and NTFS alternate data streams rejected;
 - age and terminal-operation-count retention.
 
 Retention deletes only known artifact roots and skips artifacts whose operation is nonterminal.
@@ -182,19 +185,33 @@ All important MCP boundary actions create operations/events, including rejection
 
 ### Activity Timeline
 
-`activity_timeline` and `activity_get` provide bounded, human-oriented projections of the durable audit store. Entries include operation/time/tool/cwd/command/status/result, bounded stdout and stderr previews, changed files, line counts, unified diff, errors, rollback classification, and the applied network policy. Reading the Timeline is itself audited and does not create an execution route.
+`activity_timeline` is a summary projection only: operation/time/tool/type/status, a short command or target, changed-file and line counts, point-in-time rollback/selective-Undo availability, conflict state, network enforcement, and important risk. It never expands unified diffs, output previews, events, or full path lists. `activity_get(operation_id)` is the bounded detail projection for those artifacts and technical fields. The CLI follows the same list/detail split. Reading either view is audited and creates no execution route.
 
 The same projection is available locally with `windows-local-mcp timeline --limit 20` or `windows-local-mcp timeline --operation OPERATION_ID`.
 
-Workspace-mutating operations capture pre/post content checkpoints outside the workspace while the existing workspace-wide mutation lock is held. This covers `write_file`, writing `dart format`, and approved commands that can execute against the original workspace. Commands running only in an immutable staged copy do not claim workspace rollbackability.
+Workspace-mutating operations capture complete pre/post manifests outside the workspace while the existing workspace-wide mutation lock is held. File bytes are stored by SHA-256 in a content-addressed blob store, so unchanged content is not copied for each operation. Manifests still cover created, modified, deleted, untracked, and Git-ignored MCP-writable files. Retention removes operation manifests before garbage-collecting unreferenced blobs.
 
-`request_workspace_rollback` only creates a pending local approval. The local approval UI verifies the request hash, atomically consumes the one-shot grant, and restores the selected operation's post-state. It first proves that the current workspace still matches the latest MCP checkpoint. Any human or other-process change causes a conflict and stops before replacement. The rollback is itself checkpointed and audited. External effects such as email/API writes, device changes, Git push, and remote state are never classified as reversible.
+`request_workspace_rollback` means point-in-time rollback. `request_selective_undo` means remove only one operation's delta. Both create local approval requests, bind an exact preview/current manifest into the request hash, and are recorded as normal mutation operations with before/after state so the rollback or Undo can itself be selectively undone.
+
+Before either mutation writes the workspace, every referenced blob is re-hashed, the current state is checked against the approval preview, and required target bytes are staged. A durable transaction journal records preflight, staging, applying, recovery, and completion. Apply failures automatically attempt restoration of the transaction-start state. A recovered failure is `failed_recovered`; a failed recovery is `recovery_required`. Startup reconciliation surfaces non-terminal journals after process interruption. `complete` is written only after the final workspace hashes match the intended target. This is failure-atomic best effort over multiple files, not a claim of an OS filesystem transaction.
+
+Selective Undo compares operation-before, operation-after, and current content. Exact unchanged results are reverted directly. UTF-8 text uses bounded-context reverse hunks so independent later edits can remain. Ambiguous/overlapping text, changed binary content, and ambiguous file-lifecycle changes stop as conflicts before approval; no guessed overwrite is performed.
 
 ### Safe-tier network policy
 
-Every safe command receives an explicit per-command network policy in audit and Timeline. Git/Dart/Flutter safe grammars receive an offline policy; ADB receives a loopback-only policy and a fixed loopback server socket. Proxy, package-host, and Git transport environment values are replaced with local deny endpoints, while external-network work remains approval-only.
+Every safe command receives an explicit per-command network policy in audit and Timeline. Git/Dart/Flutter safe grammars receive an offline policy; ADB receives a separate loopback-only profile and a fixed loopback server socket. Proxy, package-host, and Git transport environment values remain defense in depth.
 
-The current implementation labels this enforcement precisely as `command-and-environment-boundary`. It is not a Windows Filtering Platform, AppContainer, VM, or kernel network sandbox and therefore cannot guarantee containment of a malicious native child that opens sockets directly. Deployments requiring that stronger property must place the worker under an OS-enforced broker; safe-tier fail-closed OS enforcement remains a documented security limitation rather than being misreported as active.
+The default `appcontainer` mode launches the Safe Tier root with the stable AppContainer `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` mechanism and no Internet/LAN capability SIDs. Descendants inherit the AppContainer token and are placed in a per-operation Job Object with kill-on-close. Offline and ADB-loopback profiles are separate. One-time local setup creates the profiles and ACLs the workspace and explicitly configured toolchain paths; each disposable runtime tree receives its ACL only when launched. Dart workspace formatting runs in that disposable tree and only broker-validated target changes are applied to the real workspace. If profile creation, ACL setup, loopback exemption, Job assignment, or AppContainer process creation fails, Safe Tier fails closed and is not relaunched as a normal user process.
+
+The implementation deliberately uses the documented AppContainer APIs available since Windows 8 instead of the experimental Windows Sandbox `CreateProcessInSandbox` API. Microsoft AppContainer provides token/capability, filesystem-ACL, process/credential, and network isolation; omitting network capability SIDs denies Internet/LAN, while the dedicated ADB profile gets only an explicit loopback exemption. OpenAI's current stronger Codex Windows sandbox instead uses one-time administrator-approved setup with dedicated lower-privilege users, filesystem permissions, firewall rules, and local policy. This project does not claim equivalence with that whole-system setup: AppContainer was selected for a public, per-workspace MCP because it is stable, inherited by descendants, compatible with explicit path ACLs, and normally set up on user-owned paths without running the server as Administrator. Windows 10/11 are the supported project targets; toolchains installed in locations not readable by the AppContainer must be listed in local configuration.
+
+`compatibility` is an explicit legacy mode. It retains grammar/environment controls but is labelled `compatibility-command-and-environment-only`; it is never reported as OS isolation and is not an implicit fallback. AppContainer can reduce toolchain compatibility because required executable/runtime paths need explicit read/execute ACLs. Host-approved commands deliberately continue to run with the real Windows user token after approval.
+
+### Configuration selection and local profiles
+
+An explicit `LOCAL_MCP_CONFIG` must contain `workspace_root` and the selected config file itself must be outside that workspace, so MCP writes cannot downgrade a later worker's security settings. Every queued Safe Tier request also binds the canonical effective-settings digest and the worker rechecks it before launch. A simultaneous `LOCAL_MCP_ROOT` is accepted only when it resolves to the same path; a mismatch fails startup instead of overriding the chosen config. Missing config/workspace paths never fall back. `session_info` reports the effective workspace, capabilities, config selection source, workspace source, and whether an ambient root was present without dumping secret values.
+
+Public code and `config.example.toml` remain generic. Machine/private values belong in ignored `config.toml`, `config.local.toml`, `config.*.local.toml`, or `.local-mcp/`. Launchers keep explicit `-Config` selection; there is no private-project schema switch or private branch requirement.
 
 ## 9. data_dir protection
 
@@ -204,7 +221,7 @@ ACL cannot distinguish two processes running as the same Windows user. MCP files
 
 ## 10. Transport and ownership
 
-Default transport is stdio. Streamable HTTP is disabled unless `http_enabled=true`, and only loopback hosts are accepted.
+Default transport is stdio. Streamable HTTP currently fails closed even when requested because authenticated principal ownership is not yet implemented.
 
 Authenticated multi-principal HTTP is not implemented. Setting `http_multi_principal_enabled=true` fails startup. Therefore no supported configuration exposes globally shared job/approval/audit identifiers to distinct authenticated principals. A future implementation must persist `principal_id` on every operation and include it in every create/get/list/poll/claim/execute/cancel/audit SQL predicate.
 

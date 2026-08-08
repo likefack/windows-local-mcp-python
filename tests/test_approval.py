@@ -5,10 +5,12 @@ from pathlib import Path
 import pytest
 
 from windows_local_mcp.approval import (
+    collect_staged_workspace_write,
     materialize_execution_copy,
     prepare_approval_bundle,
     verify_approval_bundle,
 )
+from windows_local_mcp.approval_ui import _terminal_safe
 from windows_local_mcp.audit import AuditStore
 from windows_local_mcp.config import Settings
 from windows_local_mcp.paths import Workspace
@@ -126,11 +128,61 @@ def test_workspace_write_approval_detects_any_workspace_change(tmp_path: Path) -
         workspace_write=True,
     )
     target.write_text("changed", encoding="utf-8")
-    assert manifest["mode"] == "source-workspace"
+    assert manifest["mode"] == "staged-workspace-write"
     with pytest.raises(RuntimeError, match="workspace files changed"):
         verify_approval_bundle(
             settings=settings, operation_id="source-write", expected_digest=digest
         )
+
+
+def test_approval_terminal_text_escapes_controls_and_bidi() -> None:
+    rendered = _terminal_safe("benign\x1b[2J\rforged\u202etxt")
+    assert "\x1b" not in rendered
+    assert "\r" not in rendered
+    assert "\u202e" not in rendered
+    assert rendered == r"benign\u001b[2J\u000dforged\u202etxt"
+
+
+def test_staged_dart_write_brokers_only_validated_target(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    selected = settings.workspace_root / "selected.dart"
+    other = settings.workspace_root / "other.dart"
+    selected.write_text("void main(){}\n", encoding="utf-8")
+    other.write_text("const other=1;\n", encoding="utf-8")
+    executable = make_executable(tmp_path)
+    command = NormalizedCommand(
+        executable=str(executable),
+        args=["format", str(selected)],
+        cwd=str(settings.workspace_root),
+        display_command=[str(executable), "format", str(selected)],
+        program_key="dart",
+    )
+    _, _, digest = prepare_approval_bundle(
+        settings=settings,
+        workspace=Workspace(settings),
+        operation_id="staged-dart",
+        normalized=command,
+        workspace_write=True,
+    )
+    verified = verify_approval_bundle(
+        settings=settings, operation_id="staged-dart", expected_digest=digest
+    )
+    run = materialize_execution_copy(
+        settings=settings, operation_id="staged-dart", normalized=verified
+    )
+    run_cwd = Path(run.cwd)
+    (run_cwd / "selected.dart").write_bytes(b"void main() {}\n")
+    (run_cwd / "other.dart").write_bytes(b"malicious\n")
+    with pytest.raises(PermissionError, match="outside validated targets"):
+        collect_staged_workspace_write(
+            settings=settings, operation_id="staged-dart", normalized=run
+        )
+
+    (run_cwd / "other.dart").write_bytes(other.read_bytes())
+    changes = collect_staged_workspace_write(
+        settings=settings, operation_id="staged-dart", normalized=run
+    )
+    assert changes == {"selected.dart": b"void main() {}\n"}
 
 
 def test_code_loader_external_input_is_rejected(tmp_path: Path) -> None:

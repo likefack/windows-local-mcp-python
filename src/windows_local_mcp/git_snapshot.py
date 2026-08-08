@@ -62,10 +62,13 @@ def capture_git_snapshot(
             "status",
             [git, "-C", str(root), "status", "--porcelain=v1", "--branch", "--untracked-files=all"],
         ),
-        ("diff", [git, "-C", str(root), "diff", "--binary", "--no-ext-diff", "--no-textconv"]),
+        (
+            "diff",
+            [git, "-C", str(root), "diff", "--stat", "--name-status", "--no-ext-diff", "--no-textconv"],
+        ),
         (
             "staged",
-            [git, "-C", str(root), "diff", "--cached", "--binary", "--no-ext-diff", "--no-textconv"],
+            [git, "-C", str(root), "diff", "--cached", "--stat", "--name-status", "--no-ext-diff", "--no-textconv"],
         ),
         (
             "recent",

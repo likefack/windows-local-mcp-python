@@ -31,6 +31,7 @@ def test_real_stdio_tools_list_and_file_round_trip(tmp_path: Path) -> None:
                 f'data_dir = "{data_text}"',
                 "protect_data_dir_acl = false",
                 "git_enabled = true",
+                'safe_network_isolation_mode = "compatibility"',
             ]
         ),
         encoding="utf-8",
@@ -67,6 +68,7 @@ def test_real_stdio_tools_list_and_file_round_trip(tmp_path: Path) -> None:
                 "activity_timeline",
                 "activity_get",
                 "request_workspace_rollback",
+                "request_selective_undo",
             } <= tools.keys()
             assert {"execute", "start_command", "execute_approved"}.isdisjoint(tools.keys())
 
@@ -138,8 +140,11 @@ def test_real_stdio_tools_list_and_file_round_trip(tmp_path: Path) -> None:
             assert approval_record.structured_content["status"] == "pending_approval"
             assert approval_record.structured_content["approval_status"] == "pending"
             facts = approval_record.structured_content["request"]["objective_risk"]
-            assert facts["network_declared"] is False
-            assert facts["network_access_possible"] is True
+            assert "network_requested" not in facts["detected_requested_effects"]
+            assert (
+                facts["effective_host_capabilities"]["direct_socket_api_os_possible"]
+                is True
+            )
             assert approval_record.structured_content["worker_pid"] is None
             assert approval_record.structured_content["child_pid"] is None
 

@@ -1,8 +1,9 @@
+ [CmdletBinding(DefaultParameterSetName = "Config")]
 param(
-    [Parameter(Mandatory = $false)]
+    [Parameter(Mandatory = $true, ParameterSetName = "Root")]
     [string]$Root = "",
 
-    [Parameter(Mandatory = $false)]
+    [Parameter(Mandatory = $true, ParameterSetName = "Config")]
     [string]$Config = ""
 )
 
@@ -19,6 +20,7 @@ if ($Root -ne "") {
         throw "workspace_root does not exist: $Root"
     }
     $env:LOCAL_MCP_ROOT = (Resolve-Path -LiteralPath $Root).Path
+    Remove-Item Env:LOCAL_MCP_CONFIG -ErrorAction SilentlyContinue
 }
 
 if ($Config -ne "") {
@@ -26,6 +28,7 @@ if ($Config -ne "") {
         throw "Config file does not exist: $Config"
     }
     $env:LOCAL_MCP_CONFIG = (Resolve-Path -LiteralPath $Config).Path
+    Remove-Item Env:LOCAL_MCP_ROOT -ErrorAction SilentlyContinue
 }
 
 & $Python -m windows_local_mcp.cli server

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 
 from .approval_ui import run_approval_ui
 from .audit import AuditStore
@@ -27,7 +28,22 @@ def main() -> None:
     timeline_parser.add_argument("--limit", type=int, default=20)
     timeline_parser.add_argument("--operation", default=None)
 
+    isolation_parser = subparsers.add_parser(
+        "setup-network-isolation",
+        help="Create the local AppContainer profiles and ACL grants used by Safe Tier",
+    )
+    isolation_parser.add_argument("--config", required=True)
+
     args = parser.parse_args()
+
+    if args.command == "setup-network-isolation":
+        os.environ["LOCAL_MCP_CONFIG"] = args.config
+        os.environ.pop("LOCAL_MCP_ROOT", None)
+        from .appcontainer import create_appcontainer_profiles
+
+        result = create_appcontainer_profiles(load_settings())
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
 
     if args.command == "server":
         from .server import main as server_main

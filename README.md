@@ -2,7 +2,7 @@
 
 OpenAI Secure MCP Tunnelを介して、ChatGPTから1つのWindows開発workspaceを操作するためのローカルMCPサーバーです。ファイル編集、Git状態取得、静的解析、承認付きtest/build、限定ADB操作を、監査ログと容量制限付きで提供します。
 
-> このソフトウェアはWindows Sandboxではありません。安全性は、1インスタンス1workspace、厳格な引数文法、不変snapshot、ローカル承認、プロセスidentity、監査によって成立します。管理者権限では起動しないでください。
+> Safe Tierは既定でWindows AppContainerによるOS強制network isolationを使用しますが、アプリ全体がWindows Sandbox/VMになるわけではありません。host承認commandは承認後に通常のWindows user tokenで動きます。1インスタンス1workspace、厳格な引数文法、snapshot、ローカル承認、process identity、監査も引き続き安全境界です。通常起動は管理者権限で行わないでください。
 
 ## まず選ぶ手順
 
@@ -127,6 +127,8 @@ py -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 Copy-Item config.example.toml config.toml
 # config.toml: set an explicit workspace_root and enable only needed capabilities
+# Add machine-local toolchain roots to safe_network_readable_paths, then run once:
+.\setup-network-isolation.ps1 -Config "$PWD\config.toml"
 .\.venv\Scripts\python.exe -m pytest -q
 .\.venv\Scripts\ruff.exe check .
 ```
@@ -145,7 +147,7 @@ stdio起動:
 
 Tunnelへは`powershell.exe -NoProfile -File <repo>\run-server.ps1 -Config <repo>\config.toml`をargv配列として登録します。shell文字列へ連結しないでください。
 
-複数プロジェクトでは、親フォルダーを巨大workspaceにせず、`config.project-a.toml`、`config.project-b.toml`のようにprofileを分け、1 MCPプロセスにつき1 workspaceを割り当てます。
+複数プロジェクトでは、親フォルダーを巨大workspaceにせず、ignored対象の`config.work-a.local.toml`、`config.work-b.local.toml`または`.local-mcp\`配下へprofileを分け、`-Config`で明示選択し、1 MCPプロセスにつき1 workspaceを割り当てます。`LOCAL_MCP_CONFIG`と異なる`LOCAL_MCP_ROOT`が残っている場合は、意図しない上書きではなく起動失敗になります。
 
 ## 能力と境界
 
@@ -194,6 +196,22 @@ test/buildはread-only安全Tierではありません。元workspaceを変更し
 
 NTFS ADS、Windows予約デバイス名、末尾dot/space、workspace外、symlink/junction/reparse、複数hardlinkを拒否します。writeはcanonical target単位のthread lockとdata_dir上のcross-process lockを取り、親/target identityをreplace直前に再検証します。
 
+## Safe Tier network isolation
+
+方式選定では、Windows 8以降の安定APIであるAppContainerと、experimentalな`CreateProcessInSandbox`、OpenAI Codex Windows sandboxの専用低権限user + ACL + firewall/local policy方式を比較しました。本実装はexperimental APIへ依存せず、network capabilityを持たないAppContainer tokenとJob Objectを子孫へ継承させます。OpenAI方式と同等のmachine-wide sandboxを主張するものではありません。Windows 10/11を対象とし、profile/ACL作成は一度だけ、operationごとの追加承認は不要です。toolchain pathのACL互換性はmachine依存です。
+
+Git用workspace-read profile、Dart/Flutter用staged-read、Dart format用staged-write、ADB loopback profileは分離されています。Dart/Flutter/ADBへworkspace全体のACLは付与せず、Git起動直前にはprotected file/denied directoryのACLを再確認します。Safe Tier requestはeffective settings digestも保持するため、serverとworkerの間でnetwork isolation mode等が変われば実行を停止します。選択中のconfig fileはworkspace外に置く必要があります。
+
+既定の`safe_network_isolation_mode = "appcontainer"`では、Safe Tier processをnetwork capabilityなしのWindows AppContainerで起動します。descendantも同じAppContainer tokenを継承します。ADBだけは別profileへloopback exemptionを付け、Internet/LAN capabilityは付けません。初回のみ次を実行します。
+
+```powershell
+.\setup-network-isolation.ps1 -Config "$PWD\config.toml"
+```
+
+AppContainerから必要なFlutter SDKやuser-local Git等は、private local configの`safe_network_readable_paths`へtoolchain rootを列挙してください。setup/ACL/profile/process launchのいずれかが失敗した場合、Safe Tierを通常user processとして再実行せずfail closedにします。
+
+`safe_network_isolation_mode = "compatibility"`は明示的legacy modeです。proxy poisoning、Git protocol、package host、ADB socket、command grammarは維持しますが、direct socket APIをOSで拒否する保証はなく、TimelineにもOS isolationとして表示しません。
+
 ## ADB
 
 ADBはworkspace filesystemと別の権限境界です。既定は完全無効です。
@@ -208,7 +226,7 @@ adb_allowed_serials = ["emulator-5554"]
 
 ## Transportとprincipal
 
-既定かつ推奨は`stdio + OpenAI Secure MCP Tunnel`です。HTTPは明示的な`http_enabled=true`が必要で、`127.0.0.1`、`::1`、`localhost`以外を拒否します。
+既定かつ推奨は`stdio + OpenAI Secure MCP Tunnel`です。認証済みprincipal ownershipが未実装のため、streamable HTTPは設定検証でfail-closedに停止します。
 
 この版は認証済みmulti-principal HTTPを実装していません。`http_multi_principal_enabled=true`は起動時に拒否されます。そのため、principal ownershipなしに他利用者のjob/approval/auditへアクセスできる構成は作れません。将来multi-principal HTTPを実装する場合は、operation所有者を認証principalへ永続化し、poll/claim/execute/cancel/auditの全照会にownership条件を必須化する必要があります。
 
@@ -219,6 +237,17 @@ adb_allowed_serials = ["emulator-5554"]
 Windowsでは`protect_data_dir_acl=true`が既定で、継承ACLを外し、現在のsecurity principalとSYSTEMへFull Controlを付与します。同一Windowsユーザー権限で動く任意プロセスからの改変まではACLで分離できません。MCPの通常ファイルツールからはdata_dirがworkspace外のため到達不能です。
 
 write、既存read、diff、backup、stdout/stderr、image、directory、approval manifest、data_dir全体に上限があります。stdout/stderrはpipeを常時drainし、bounded head/tailだけを保存するため、全量をメモリやdiskへ載せません。既定保持は14日/2000 terminal operationsで、active jobとpending approvalのartifactは削除しません。
+
+## checkpoint、point-in-time rollback、selective Undo
+
+checkpointは完全なworkspace manifestを保持しますが、内容は`workspace-history\blobs\<sha256>.blob`へ一度だけ保存します。同じbytesをoperationごとに複製しません。復元前には使用する全blobを再hashし、1件でも不一致ならworkspaceを書き換えません。
+
+- `request_workspace_rollback`: 指定operation終了時点へworkspace全体を戻すpoint-in-time rollback
+- `request_selective_undo`: 指定operationのdeltaだけを3状態比較で除去するselective Undo
+
+どちらもlocal one-shot承認が必要です。復元は事前検証・staging・durable journal・適用・最終hash検証を行い、途中失敗時は開始前状態への自動復旧を試します。単一fileの`write_file`も置換前にwrite-ahead recovery journalを永続化します。これは複数fileに対するfailure-atomic best effortであり、OS filesystem transactionを称するものではありません。Undo/rollback自身も通常operationとしてbefore/afterを持つため、競合がなければさらにUndoできます。
+
+`activity_timeline`/CLIの一覧は要約だけです。diff、stdout/stderr、events、全path、rollback/Undo preview、conflict技術情報は`activity_get(operation_id)`で確認します。
 
 ## 監査
 
@@ -238,7 +267,8 @@ SQLiteの`operations`と`events`へ、成功だけでなく拒否、path/command
 
 ## 制約
 
-- Windows AppContainer/VMによる完全なOS sandboxではありません。
+- Safe Tierのnetwork/process/file accessにはAppContainer境界を使いますが、MCP本体と承認済みhost commandを含むアプリ全体のVM/完全sandboxではありません。
+- AppContainer ACL/setupとGit/Dart/Flutter/ADBの実toolchain互換性はmachine依存です。setup済み実機で検証するまで、各toolが動作するとは主張しません。
 - 同一Windowsユーザーの別プロセスがdata_dirやtoolchainを悪意を持って改変する脅威は完全には隔離できません。
 - Flutter/Dart/ADBがない環境では、その実commandの成功は検証できません。機能を無効にすればインストールなしで起動できます。
 - Secure MCP Tunnelのアカウント側availability、認証、UIはOpenAI側機能です。このリポジトリへsecretを保存しません。

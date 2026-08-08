@@ -13,7 +13,12 @@ from urllib.parse import unquote, urlparse
 from .config import Settings
 from .paths import Workspace
 from .policy import NormalizedCommand
-from .resources import BoundedStreamCapture, directory_size, enforce_data_quota
+from .resources import (
+    BoundedStreamCapture,
+    directory_size,
+    enforce_data_quota,
+    scan_directory_bounded,
+)
 from .util import canonical_json, sha256_bytes, sha256_text
 
 _CODE_LOADERS = {
@@ -58,7 +63,7 @@ def prepare_approval_bundle(
         "version": 1,
         "operation_id": operation_id,
         "executable": executable_record,
-        "settings_digest": _settings_digest(settings),
+        "settings_digest": settings_digest(settings),
         "environment_digest": _environment_digest(),
         "mode": "source-workspace",
         "inputs": [],
@@ -74,7 +79,7 @@ def prepare_approval_bundle(
         )
         manifest["workspace_write"] = workspace_write
 
-        if normalized.program_key in _CODE_LOADERS and not workspace_write:
+        if normalized.program_key in _CODE_LOADERS:
             source_cwd = Path(normalized.cwd)
             staged_cwd = stage_root / "cwd"
             records = _copy_tree_bounded(
@@ -83,7 +88,9 @@ def prepare_approval_bundle(
                 settings=settings,
                 workspace=workspace,
             )
-            manifest["mode"] = "staged-cwd"
+            manifest["mode"] = (
+                "staged-workspace-write" if workspace_write else "staged-cwd"
+            )
             manifest["source_cwd"] = normalized.cwd
             manifest["staged_cwd"] = str(staged_cwd)
             manifest["inputs"] = records
@@ -156,7 +163,7 @@ def verify_approval_bundle(
     actual_digest = sha256_text(canonical_json(manifest))
     if stored_digest != expected_digest or actual_digest != expected_digest:
         raise RuntimeError("approval manifest digest mismatch")
-    if manifest.get("settings_digest") != _settings_digest(settings):
+    if manifest.get("settings_digest") != settings_digest(settings):
         raise RuntimeError("effective MCP settings changed after approval was requested")
     if manifest.get("environment_digest") != _environment_digest():
         raise RuntimeError("command-affecting environment changed after approval was requested")
@@ -173,6 +180,21 @@ def verify_approval_bundle(
         current = _file_record(staged)
         if current["sha256"] != record["sha256"] or current["size"] != record["size"]:
             raise RuntimeError("approved input changed after approval was requested")
+    if manifest.get("mode") == "staged-workspace-write":
+        for record in manifest.get("inputs", []):
+            source_value = record.get("source_path")
+            if not source_value:
+                continue
+            source = Path(str(source_value))
+            try:
+                source.relative_to(settings.workspace_root)
+            except ValueError:
+                continue
+            current = _file_record(
+                source, max_bytes=settings.approval_manifest_max_bytes
+            )
+            if current["sha256"] != record["sha256"] or current["size"] != record["size"]:
+                raise RuntimeError("workspace files changed after formatting was staged")
     for record in manifest.get("external_inputs", []):
         current = _file_record(Path(record["path"]), max_bytes=settings.approval_manifest_max_bytes)
         if current != record:
@@ -222,6 +244,81 @@ def materialize_execution_copy(
     ]
     result.cwd = str(run_cwd)
     return result
+
+
+def collect_staged_workspace_write(
+    *, settings: Settings, operation_id: str, normalized: NormalizedCommand
+) -> dict[str, bytes]:
+    """Accept only validated Dart-format target changes from its disposable run tree."""
+    stage_root = (settings.data_dir / "approval-staging" / operation_id).resolve(strict=True)
+    manifest = json.loads((stage_root / "manifest.json").read_text(encoding="utf-8"))
+    if manifest.get("mode") != "staged-workspace-write":
+        return {}
+    if normalized.program_key != "dart" or not normalized.args or normalized.args[0] != "format":
+        raise RuntimeError("staged workspace write is not a validated Dart format operation")
+    run_cwd = Path(normalized.cwd).resolve(strict=True)
+    runtime_root = (settings.data_dir / "outputs" / f"{operation_id}-runtime").resolve(
+        strict=True
+    )
+    run_cwd.relative_to(runtime_root)
+    staged_cwd = Path(str(manifest["staged_cwd"])).resolve(strict=True)
+    source_cwd = Path(str(manifest["source_cwd"])).resolve(strict=True)
+    original = NormalizedCommand.model_validate(manifest["execution"])
+    target_values = [value for value in original.args[1:] if not value.startswith("-")]
+    allowed_targets: list[Path] = []
+    for value in target_values:
+        staged_target = Path(value).resolve(strict=True)
+        allowed_targets.append(source_cwd / staged_target.relative_to(staged_cwd))
+    records: dict[str, dict[str, Any]] = {}
+    for record in manifest.get("inputs", []):
+        staged_path = Path(str(record["staged_path"])).resolve(strict=True)
+        try:
+            relative = staged_path.relative_to(staged_cwd).as_posix()
+        except ValueError:
+            continue
+        records[relative] = record
+    runtime_entry_limit = max(128, settings.approval_manifest_max_files * 4)
+    runtime_scan = scan_directory_bounded(
+        run_cwd,
+        stop_after_bytes=settings.approval_manifest_max_bytes,
+        stop_after_entries=runtime_entry_limit,
+        collect_files=True,
+        reject_alternate_streams=True,
+        reject_reparse_points=True,
+    )
+    if runtime_scan.entry_count > runtime_entry_limit:
+        raise RuntimeError("Dart formatter created too many runtime filesystem entries")
+    if runtime_scan.total_bytes > settings.approval_manifest_max_bytes:
+        raise RuntimeError("Dart formatter outputs exceed approval_manifest_max_bytes")
+    actual_files = {path.relative_to(run_cwd).as_posix() for path in runtime_scan.files}
+    if actual_files != set(records):
+        raise RuntimeError("Dart formatter created or deleted an unapproved file")
+    changes: dict[str, bytes] = {}
+    changed_bytes = 0
+    workspace = Workspace(settings)
+    for relative, record in records.items():
+        candidate = (run_cwd / Path(relative)).resolve(strict=True)
+        candidate.relative_to(run_cwd)
+        if candidate.is_symlink() or candidate.stat().st_nlink > 1:
+            raise PermissionError("Dart formatter output contains an unsafe file")
+        size = candidate.stat().st_size
+        if size > settings.max_write_bytes:
+            raise ValueError(f"Dart formatter output exceeds max_write_bytes: {relative}")
+        changed_bytes += size
+        if changed_bytes > settings.approval_manifest_max_bytes:
+            raise ValueError("Dart formatter outputs exceed approval_manifest_max_bytes")
+        data = candidate.read_bytes()
+        if sha256_bytes(data) == record["sha256"] and len(data) == int(record["size"]):
+            continue
+        source = (source_cwd / Path(relative)).resolve(strict=True)
+        if not any(source == target or _is_inside(source, target) for target in allowed_targets):
+            raise PermissionError(
+                f"Dart formatter changed a file outside validated targets: {relative}"
+            )
+        workspace_relative = source.relative_to(workspace.root).as_posix()
+        workspace.resolve_existing(workspace_relative, allow_directory=False, access="write")
+        changes[workspace_relative] = data
+    return changes
 
 
 def _copy_tree_bounded(
@@ -550,7 +647,7 @@ def _source_inventory(
     return inventory
 
 
-def _settings_digest(settings: Settings) -> str:
+def settings_digest(settings: Settings) -> str:
     return sha256_text(canonical_json(settings.model_dump(mode="json")))
 
 

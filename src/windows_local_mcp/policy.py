@@ -43,8 +43,7 @@ class CommandPolicy:
         "--oneline",
         "--decorate",
         "--no-decorate",
-        "--patch",
-        "-p",
+        "--no-patch",
     }
     SAFE_REVISION = re.compile(r"[A-Za-z0-9._/@~^{}+-]+")
     SAFE_FORMAT_LINE_LENGTH = re.compile(r"--line-length=(?:[1-9][0-9]{0,3})")
@@ -209,23 +208,53 @@ class CommandPolicy:
             }
             normalized = self._flags_and_pathspec(tail, allowed)
         elif subcommand == "diff":
+            has_paths = "--" in tail and bool(tail[tail.index("--") + 1 :])
+            explicit_content = any(value in {"--patch", "-p", "--binary"} for value in tail)
+            metadata_only = any(
+                value in {"--stat", "--name-only", "--name-status", "--check", "--quiet"}
+                for value in tail
+            )
+            content_output = has_paths and (explicit_content or not metadata_only)
             allowed = self.GIT_COMMON_FLAGS | {
                 "--cached",
                 "--staged",
                 "--check",
                 "--quiet",
                 "--exit-code",
-                "--binary",
                 "--no-renames",
             }
-            normalized = self._git_revisions_flags_paths(tail, allowed)
+            if has_paths:
+                allowed |= {"--patch", "-p", "--binary"}
+            normalized = self._git_revisions_flags_paths(
+                tail, allowed, files_only=content_output
+            )
+            if not has_paths and not any(
+                value in {"--stat", "--name-only", "--name-status", "--check", "--quiet"}
+                for value in normalized
+            ):
+                normalized.insert(0, "--stat")
             normalized = ["--no-ext-diff", "--no-textconv", *normalized]
         elif subcommand == "log":
             allowed = self.GIT_COMMON_FLAGS | {"--all", "--branches", "--tags"}
             normalized = self._git_revisions_flags_paths(tail, allowed, allow_count=True)
             normalized = ["--no-ext-diff", "--no-textconv", *normalized]
         elif subcommand == "show":
-            normalized = self._git_revisions_flags_paths(tail, self.GIT_COMMON_FLAGS)
+            has_paths = "--" in tail and bool(tail[tail.index("--") + 1 :])
+            explicit_content = any(value in {"--patch", "-p"} for value in tail)
+            metadata_only = any(
+                value in {"--stat", "--name-only", "--name-status", "--no-patch"}
+                for value in tail
+            )
+            content_output = has_paths and (explicit_content or not metadata_only)
+            allowed = self.GIT_COMMON_FLAGS | ({"--patch", "-p"} if has_paths else set())
+            normalized = self._git_revisions_flags_paths(
+                tail, allowed, files_only=content_output
+            )
+            if not has_paths and not any(
+                value in {"--stat", "--name-only", "--name-status", "--no-patch"}
+                for value in normalized
+            ):
+                normalized.insert(0, "--no-patch")
             normalized = ["--no-ext-diff", "--no-textconv", *normalized]
         elif subcommand == "rev-parse":
             permitted = {
@@ -269,6 +298,7 @@ class CommandPolicy:
         allowed: set[str],
         *,
         allow_count: bool = False,
+        files_only: bool = False,
     ) -> list[str]:
         if "--" in values:
             split = values.index("--")
@@ -287,7 +317,11 @@ class CommandPolicy:
             else:
                 raise PermissionError("Git revision or option is not in the safe grammar")
         if paths:
-            return [*normalized_head, "--", *self._normalize_read_paths(paths)]
+            return [
+                *normalized_head,
+                "--",
+                *self._normalize_read_paths(paths, files_only=files_only),
+            ]
         return normalized_head
 
     def _normalize_flutter(self, args: list[str]) -> list[str]:
@@ -391,9 +425,15 @@ class CommandPolicy:
         if self.settings.adb_emulator_only and not serial.casefold().startswith("emulator-"):
             raise PermissionError("physical or nonstandard ADB targets are disabled")
 
-    def _normalize_read_paths(self, paths: list[str]) -> list[str]:
+    def _normalize_read_paths(
+        self, paths: list[str], *, files_only: bool = False
+    ) -> list[str]:
         return [
-            str(self.workspace.resolve_existing(path, access="read"))
+            str(
+                self.workspace.resolve_existing(
+                    path, access="read", allow_directory=not files_only
+                )
+            )
             for path in paths
         ]
 

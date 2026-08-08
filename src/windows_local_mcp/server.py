@@ -14,7 +14,7 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver import Image
 from mcp.types import ToolAnnotations
 
-from .approval import prepare_approval_bundle
+from .approval import prepare_approval_bundle, settings_digest
 from .audit import AuditStore
 from .command_traits import (
     SafeExecutionKind,
@@ -32,8 +32,17 @@ from .risk import command_risk_facts
 from .timeline import timeline_entry, timeline_list
 from .util import canonical_json, read_text_limited, sha256_bytes, sha256_text, utc_now_iso
 from .workspace_history import (
+    WorkspaceMutationError,
+    begin_single_file_write_transaction,
     capture_workspace_state,
+    checkpoint_manifest_digest,
     compare_workspace_states,
+    describe_workspace_restore,
+    finalize_workspace_transaction,
+    prepare_selective_undo,
+    update_single_file_write_transaction,
+    verify_checkpoint_integrity,
+    workspace_recovery_required,
 )
 
 READ_ONLY = ToolAnnotations(
@@ -63,7 +72,7 @@ runtime = Runtime()
 
 mcp = MCPServer(
     "Windows Local MCP",
-    version="0.4.0",
+    version="0.5.0",
     instructions=(
         "Operate inside the configured workspace. Use execute_readonly for safe Git/analyze "
         "operations, execute_workspace_write for constrained automatic source formatting, and "
@@ -142,6 +151,13 @@ def _require_filesystem() -> None:
         raise PermissionError("filesystem capability is disabled")
 
 
+def _require_workspace_mutation_ready() -> None:
+    if workspace_recovery_required(runtime.settings):
+        raise RuntimeError(
+            "workspace mutation is blocked because an interrupted restore requires recovery"
+        )
+
+
 @mcp.tool(annotations=READ_ONLY)
 def session_info() -> dict[str, Any]:
     """Show workspace, capability switches, limits, and approval model."""
@@ -164,10 +180,12 @@ def session_info() -> dict[str, Any]:
             "adb_read": "adb_read",
         },
         "safe_network_isolation": {
-            "git_dart_flutter": "offline command/environment boundary",
-            "adb": "loopback-only command/environment boundary",
-            "os_enforced": False,
+            "mode": runtime.settings.safe_network_isolation_mode,
+            "git_dart_flutter": "AppContainer without network capabilities",
+            "adb": "separate AppContainer profile with explicit loopback exemption",
+            "os_enforced": runtime.settings.safe_network_isolation_mode == "appcontainer",
         },
+        "configuration_selection": runtime.settings.selection_info(),
         "transport": "stdio by default; optional loopback-only streamable-http",
     }
     result["operation_id"] = _log_simple(tool_name="session_info", request={}, result=result)
@@ -272,11 +290,13 @@ def write_file(
     operation_id: str | None = None
     try:
         _require_filesystem()
+        _require_workspace_mutation_ready()
         content_bytes = content.encode("utf-8")
         if len(content_bytes) > runtime.settings.max_write_bytes:
             raise ValueError("write exceeds max_write_bytes")
         target = runtime.workspace.resolve_for_write(path)
         with WorkspaceExecutionLock(runtime.settings), runtime.workspace.lock_target(target):
+            _require_workspace_mutation_ready()
             target = runtime.workspace.resolve_for_write(path)
             parent_identity = runtime.workspace.identity(target.parent)
             if parent_identity is None:
@@ -330,6 +350,15 @@ def write_file(
                 backup_path = str(backup_file)
 
             temp_path: Path | None = None
+            workspace_changed = False
+            begin_single_file_write_transaction(
+                runtime.settings,
+                operation_id,
+                pre_workspace.manifest_path,
+                runtime.workspace.relative(target),
+                before_sha if target_identity is not None else None,
+                sha256_bytes(content_bytes),
+            )
             try:
                 with tempfile.NamedTemporaryFile(
                     mode="wb",
@@ -349,47 +378,123 @@ def write_file(
                 )
                 os.replace(temp_path, target)
                 temp_path = None
+                workspace_changed = True
+            except Exception as write_error:
+                if not workspace_changed:
+                    update_single_file_write_transaction(
+                        runtime.settings,
+                        operation_id,
+                        state="failed_recovered",
+                        error=write_error,
+                    )
+                raise
             finally:
                 if temp_path is not None:
                     temp_path.unlink(missing_ok=True)
 
-            after_bytes = target.read_bytes()
-            after_sha = sha256_bytes(after_bytes)
-            if after_sha != sha256_bytes(content_bytes):
-                raise RuntimeError("post-write content verification failed")
-            result = {
-                "operation_id": operation_id,
-                "status": "succeeded",
-                "path": runtime.workspace.relative(target),
-                "before_sha256": before_sha,
-                "after_sha256": after_sha,
-                "diff_path": str(diff_path),
-                "backup_path": backup_path,
-                "added_lines": added,
-                "removed_lines": removed,
-            }
-            post_workspace = capture_workspace_state(runtime.settings, operation_id, "after")
-            workspace_change = compare_workspace_states(
-                runtime.settings,
-                pre_workspace.manifest_path,
-                post_workspace.manifest_path,
-                operation_id,
-            )
-            result.update(workspace_change)
-            result["rollback_state"] = "complete"
-            runtime.audit.update_operation(
-                operation_id,
-                status="succeeded",
-                finished_at=utc_now_iso(),
-                diff_path=str(workspace_change["diff_path"]),
-                backup_path=backup_path,
-                pre_workspace_path=pre_workspace.manifest_path,
-                post_workspace_path=post_workspace.manifest_path,
-                rollback_state="complete",
-                result_json=canonical_json(result),
-            )
-            runtime.audit.add_event(operation_id, "file_written", result)
-            return result
+            try:
+                after_bytes = target.read_bytes()
+                after_sha = sha256_bytes(after_bytes)
+                if after_sha != sha256_bytes(content_bytes):
+                    raise RuntimeError("post-write content verification failed")
+                result = {
+                    "operation_id": operation_id,
+                    "status": "succeeded",
+                    "path": runtime.workspace.relative(target),
+                    "before_sha256": before_sha,
+                    "after_sha256": after_sha,
+                    "diff_path": str(diff_path),
+                    "backup_path": backup_path,
+                    "added_lines": added,
+                    "removed_lines": removed,
+                }
+                post_workspace = capture_workspace_state(runtime.settings, operation_id, "after")
+                workspace_change = compare_workspace_states(
+                    runtime.settings,
+                    pre_workspace.manifest_path,
+                    post_workspace.manifest_path,
+                    operation_id,
+                )
+                result.update(workspace_change)
+                result["rollback_state"] = "complete"
+                update_single_file_write_transaction(
+                    runtime.settings,
+                    operation_id,
+                    state="applied_verified",
+                    target_manifest=post_workspace.manifest_path,
+                )
+                runtime.audit.update_operation(
+                    operation_id,
+                    status="succeeded",
+                    finished_at=utc_now_iso(),
+                    diff_path=str(workspace_change["diff_path"]),
+                    backup_path=backup_path,
+                    pre_workspace_path=pre_workspace.manifest_path,
+                    post_workspace_path=post_workspace.manifest_path,
+                    rollback_state="complete",
+                    result_json=canonical_json(result),
+                )
+                finalize_workspace_transaction(runtime.settings, operation_id)
+                runtime.audit.add_event(operation_id, "file_written", result)
+                return result
+            except Exception as post_error:
+                if not workspace_changed:
+                    raise
+                try:
+                    if target_identity is None:
+                        target.unlink(missing_ok=True)
+                    else:
+                        recovery_temp: Path | None = None
+                        try:
+                            with tempfile.NamedTemporaryFile(
+                                mode="wb", delete=False, dir=target.parent
+                            ) as recovery:
+                                recovery.write(previous_bytes)
+                                recovery.flush()
+                                os.fsync(recovery.fileno())
+                                recovery_temp = Path(recovery.name)
+                            os.replace(recovery_temp, target)
+                            recovery_temp = None
+                        finally:
+                            if recovery_temp is not None:
+                                recovery_temp.unlink(missing_ok=True)
+                    recovered = target.read_bytes() if target.exists() else b""
+                    existed_before = target_identity is not None
+                    if recovered != previous_bytes or target.exists() != existed_before:
+                        raise RuntimeError("write recovery verification failed")
+                except Exception as recovery_error:
+                    recovery_journal = update_single_file_write_transaction(
+                        runtime.settings,
+                        operation_id,
+                        state="recovery_required",
+                        error=recovery_error,
+                    )
+                    runtime.audit.update_operation(
+                        operation_id,
+                        rollback_state="recovery_required",
+                        pre_workspace_path=pre_workspace.manifest_path,
+                    )
+                    raise WorkspaceMutationError(
+                        "write_file failed after replacement and automatic recovery failed",
+                        recovery_state="recovery_required",
+                        journal_path=recovery_journal,
+                    ) from recovery_error
+                update_single_file_write_transaction(
+                    runtime.settings,
+                    operation_id,
+                    state="failed_recovered",
+                    error=post_error,
+                )
+                runtime.audit.update_operation(
+                    operation_id,
+                    rollback_state="failed_recovered",
+                    pre_workspace_path=pre_workspace.manifest_path,
+                )
+                raise WorkspaceMutationError(
+                    f"write_file failed after replacement; starting state recovered: {post_error}",
+                    recovery_state="failed_recovered",
+                    journal_path=pre_workspace.manifest_path,
+                ) from post_error
     except Exception as error:
         if operation_id is None:
             _audit_rejection("write_file", request_input, error)
@@ -451,6 +556,8 @@ def _queue_command(
         dart_writes = normalized_model.program_key == "dart" and dart_format_writes(
             normalized_model.args
         )
+        if dart_writes:
+            _require_workspace_mutation_ready()
         with WorkspaceExecutionLock(runtime.settings):
             _, _, execution_manifest_digest = prepare_approval_bundle(
                 settings=runtime.settings,
@@ -463,6 +570,7 @@ def _queue_command(
         "normalized_command": normalized_command,
         "safe_request": safe_request,
         "execution_manifest_digest": execution_manifest_digest,
+        "settings_digest": settings_digest(runtime.settings),
         "max_runtime_seconds": max_runtime,
     }
     runtime.audit.create_operation(
@@ -843,13 +951,23 @@ def request_workspace_rollback(operation_id: str, reason: str = "") -> dict[str,
     """Request local human approval to restore the workspace to an operation completion point."""
     request_input = {"operation_id": operation_id, "reason": reason}
     try:
+        _require_workspace_mutation_ready()
         target = runtime.audit.get_operation(operation_id, include_events=False)
         if not target.get("post_workspace_path"):
             raise ValueError("target operation has no workspace completion checkpoint")
-        latest = runtime.audit.latest_workspace_checkpoint()
-        if latest is None:
-            raise ValueError("no current MCP workspace checkpoint is available")
         rollback_id = str(uuid.uuid4())
+        with WorkspaceExecutionLock(runtime.settings):
+            verify_checkpoint_integrity(
+                runtime.settings, str(target["post_workspace_path"])
+            )
+            current = capture_workspace_state(
+                runtime.settings, rollback_id, "rollback-preview-current"
+            )
+            preview = describe_workspace_restore(
+                runtime.settings,
+                current.manifest_path,
+                str(target["post_workspace_path"]),
+            )
         now = datetime.now(UTC)
         expires = (
             now + timedelta(seconds=runtime.settings.approval_request_ttl_seconds)
@@ -857,18 +975,19 @@ def request_workspace_rollback(operation_id: str, reason: str = "") -> dict[str,
         request = {
             "target_operation_id": operation_id,
             "target_checkpoint": target["post_workspace_path"],
-            "expected_current_operation_id": latest["id"],
-            "expected_current_checkpoint": latest["post_workspace_path"],
+            "expected_current_checkpoint": current.manifest_path,
+            "expected_current_manifest_sha256": checkpoint_manifest_digest(
+                runtime.settings, current.manifest_path
+            ),
+            "target_manifest_sha256": checkpoint_manifest_digest(
+                runtime.settings, str(target["post_workspace_path"])
+            ),
+            "operation_type": "point_in_time_rollback",
+            "undo_preview": preview,
             "reason": reason,
-            "objective_risk": {
-                "writes_files": True,
-                "may_delete_files": True,
-                "workspace_access": "inside workspace only",
-                "network": False,
-                "external_state_change": False,
-                "rollback_of_rollback": "checkpointed",
-                "impact_scope": "all MCP-writable files changed after the target operation",
-            },
+            "objective_risk": _workspace_mutation_risk(
+                "point_in_time_rollback", operation_id, preview
+            ),
         }
         request_hash = sha256_text(canonical_json(request))
         runtime.audit.create_operation(
@@ -887,10 +1006,136 @@ def request_workspace_rollback(operation_id: str, reason: str = "") -> dict[str,
             "status": "pending",
             "request_hash": request_hash,
             "expires_at": expires,
+            "operation_type": "point_in_time_rollback",
+            "preview": preview,
         }
     except Exception as error:
         _audit_rejection("request_workspace_rollback", request_input, error)
         raise
+
+
+@mcp.tool(annotations=APPROVAL_REQUEST)
+def request_selective_undo(operation_id: str, reason: str = "") -> dict[str, Any]:
+    """Request approval to remove only one operation's changes using a three-state merge."""
+    request_input = {"operation_id": operation_id, "reason": reason}
+    undo_id = str(uuid.uuid4())
+    try:
+        _require_workspace_mutation_ready()
+        target = runtime.audit.get_operation(operation_id, include_events=False)
+        before_path = target.get("pre_workspace_path")
+        after_path = target.get("post_workspace_path")
+        if not before_path or not after_path:
+            raise ValueError("target operation has no before/after workspace delta")
+        with WorkspaceExecutionLock(runtime.settings):
+            preview = prepare_selective_undo(
+                runtime.settings,
+                undo_id,
+                str(before_path),
+                str(after_path),
+            )
+        target_rollback_state = str(target.get("rollback_state") or "not_applicable")
+        preview["target_rollback_state"] = target_rollback_state
+        if target_rollback_state in {"partial", "unavailable"}:
+            preview["fully_reversible"] = False
+            preview["reversibility_limitation"] = (
+                "Only MCP-writable workspace files are covered; protected or external effects "
+                "of the target operation are not reversible."
+            )
+        request = {
+            "target_operation_id": operation_id,
+            "operation_type": "selective_undo",
+            "target_before_checkpoint": before_path,
+            "target_after_checkpoint": after_path,
+            "expected_current_checkpoint": preview["expected_current_checkpoint"],
+            "target_checkpoint": preview["target_checkpoint"],
+            "expected_current_manifest_sha256": checkpoint_manifest_digest(
+                runtime.settings, str(preview["expected_current_checkpoint"])
+            ),
+            "target_manifest_sha256": checkpoint_manifest_digest(
+                runtime.settings, str(preview["target_checkpoint"])
+            ),
+            "undo_preview": preview,
+            "reason": reason,
+            "objective_risk": _workspace_mutation_risk(
+                "selective_undo", operation_id, preview
+            ),
+        }
+        if preview["conflict_count"]:
+            runtime.audit.create_operation(
+                operation_id=undo_id,
+                tool_name="request_selective_undo",
+                tier="workspace_control",
+                status="conflict",
+                cwd=str(runtime.settings.workspace_root),
+                request=request,
+            )
+            runtime.audit.update_operation(
+                undo_id,
+                finished_at=utc_now_iso(),
+                rollback_state="conflict",
+                result_json=canonical_json(preview),
+                error="selective undo requires human conflict resolution",
+            )
+            runtime.audit.add_event(undo_id, "selective_undo_conflict", preview)
+            return {
+                "operation_id": undo_id,
+                "status": "conflict",
+                "operation_type": "selective_undo",
+                "preview": preview,
+            }
+        now = datetime.now(UTC)
+        expires = (
+            now + timedelta(seconds=runtime.settings.approval_request_ttl_seconds)
+        ).isoformat()
+        request_hash = sha256_text(canonical_json(request))
+        runtime.audit.create_operation(
+            operation_id=undo_id,
+            tool_name="request_selective_undo",
+            tier="host_approval",
+            status="pending_approval",
+            cwd=str(runtime.settings.workspace_root),
+            request=request,
+            request_hash=request_hash,
+            approval_status="pending",
+            request_expires_at=expires,
+        )
+        return {
+            "approval_id": undo_id,
+            "status": "pending",
+            "request_hash": request_hash,
+            "expires_at": expires,
+            "operation_type": "selective_undo",
+            "preview": preview,
+        }
+    except Exception as error:
+        _audit_rejection("request_selective_undo", request_input, error)
+        raise
+
+
+def _workspace_mutation_risk(
+    operation_type: str, target_operation_id: str, preview: dict[str, Any]
+) -> dict[str, Any]:
+    return {
+        "risk_level": "high" if preview.get("deletes_files") else "medium",
+        "detected_requested_effects": {
+            "workspace_mutation": True,
+            "operation_type": operation_type,
+            "target_operation_id": target_operation_id,
+            "changed_file_count": preview.get("changed_file_count", 0),
+            "creates_files": bool(preview.get("creates_files")),
+            "restores_files": bool(preview.get("restores_files")),
+            "deletes_files": bool(preview.get("deletes_files")),
+            "conflict_count": preview.get("conflict_count", 0),
+            "automatic_merge": bool(preview.get("automatic_merge")),
+            "fully_reversible": bool(preview.get("fully_reversible")),
+            "undo_can_be_undone": True,
+        },
+        "effective_host_capabilities": {
+            "filesystem_scope": "MCP-writable workspace paths through the path broker",
+            "network": "not used",
+            "child_process": "not used",
+        },
+    }
 
 
 def main() -> None:

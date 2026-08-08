@@ -23,6 +23,17 @@ adb_allowed_serials = []
 # LOCAL_MCP_* are rejected even if listed here.
 child_environment_allowlist = []
 
+# Safe Tier network isolation. "appcontainer" is fail-closed and requires the one-time
+# setup-network-isolation command. "compatibility" is an explicit legacy mode: it retains
+# proxy poisoning/tool protocol restrictions but is NOT an OS network security boundary.
+safe_network_isolation_mode = "appcontainer"
+safe_network_profile_prefix = "WindowsLocalMCP.SafeTier"
+
+# Machine-local toolchain roots that AppContainer commands must read/execute, for example a
+# Flutter SDK or user-local Git installation. Put actual absolute paths only in ignored local
+# config/profile files; do not commit private or machine-specific paths.
+safe_network_readable_paths = []
+
 # File and artifact limits.
 max_text_file_bytes = 2097152
 max_write_bytes = 2097152

@@ -44,7 +44,7 @@ class Workspace:
         self._reject_reparse_chain(self.root)
 
     @staticmethod
-    def _validate_windows_syntax(user_path: str) -> None:
+    def validate_windows_syntax(user_path: str) -> None:
         if not user_path or "\x00" in user_path:
             raise ValueError("path must be non-empty and contain no NUL")
         windows = PureWindowsPath(user_path)
@@ -114,7 +114,7 @@ class Workspace:
         allow_directory: bool = True,
         access: str = "read",
     ) -> Path:
-        self._validate_windows_syntax(user_path)
+        self.validate_windows_syntax(user_path)
         candidate = self.root / user_path
         self._check_inside(candidate.resolve(strict=False))
         self._reject_reparse_chain(candidate)
@@ -134,7 +134,7 @@ class Workspace:
         return path
 
     def resolve_for_write(self, user_path: str) -> Path:
-        self._validate_windows_syntax(user_path)
+        self.validate_windows_syntax(user_path)
         lexical = self.root / user_path
         unresolved = lexical.resolve(strict=False)
         self._check_inside(unresolved)
@@ -153,7 +153,7 @@ class Workspace:
 
     def ensure_directory_for_write(self, user_path: str) -> Path:
         """Create a workspace directory chain while rechecking every Windows path component."""
-        self._validate_windows_syntax(user_path)
+        self.validate_windows_syntax(user_path)
         lexical = self.root / user_path
         self._check_inside(lexical.resolve(strict=False))
         self._check_access(lexical, access="write")

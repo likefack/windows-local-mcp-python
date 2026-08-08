@@ -68,6 +68,64 @@ def test_load_requires_explicit_workspace(monkeypatch: pytest.MonkeyPatch) -> No
         load_settings()
 
 
+def test_explicit_config_workspace_is_not_overridden_by_ambient_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configured = tmp_path / "configured"
+    ambient = tmp_path / "ambient"
+    configured.mkdir()
+    ambient.mkdir()
+    data = tmp_path / "data"
+    config = tmp_path / "selected.toml"
+    config.write_text(
+        f'workspace_root = "{configured.as_posix()}"\n'
+        f'data_dir = "{data.as_posix()}"\n'
+        "protect_data_dir_acl = false\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LOCAL_MCP_CONFIG", str(config))
+    monkeypatch.setenv("LOCAL_MCP_ROOT", str(ambient))
+    with pytest.raises(ValueError, match="conflicts"):
+        load_settings()
+
+
+def test_session_selection_metadata_reports_explicit_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = tmp_path / "selected.toml"
+    config.write_text(
+        f'workspace_root = "{workspace.as_posix()}"\n'
+        f'data_dir = "{(tmp_path / "data").as_posix()}"\n'
+        "protect_data_dir_acl = false\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LOCAL_MCP_CONFIG", str(config))
+    monkeypatch.delenv("LOCAL_MCP_ROOT", raising=False)
+    settings = load_settings()
+    assert settings.selection_info()["workspace_source"] == "explicit_config"
+    assert settings.selection_info()["ambient_root_overrode_config"] is False
+
+
+def test_active_config_must_be_outside_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = workspace / "config.local.toml"
+    config.write_text(
+        f'workspace_root = "{workspace.as_posix()}"\n'
+        f'data_dir = "{(tmp_path / "data").as_posix()}"\n'
+        "protect_data_dir_acl = false\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LOCAL_MCP_CONFIG", str(config))
+    monkeypatch.delenv("LOCAL_MCP_ROOT", raising=False)
+    with pytest.raises(ValueError, match="outside workspace_root"):
+        load_settings()
+
+
 def test_disabled_optional_capabilities_do_not_resolve_tools(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
     root.mkdir()

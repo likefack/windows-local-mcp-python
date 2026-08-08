@@ -4,6 +4,8 @@ import sys
 import threading
 from pathlib import Path
 
+import pytest
+
 from windows_local_mcp.audit import AuditStore
 from windows_local_mcp.config import Settings
 from windows_local_mcp.executor import Executor
@@ -12,6 +14,7 @@ from windows_local_mcp.resources import (
     BoundedStreamCapture,
     WorkspaceExecutionLock,
     enforce_data_quota,
+    scan_directory_bounded,
 )
 
 
@@ -90,6 +93,37 @@ def test_data_dir_quota_rejects_additional_artifacts(tmp_path: Path) -> None:
         assert "quota exceeded" in str(error)
     else:
         raise AssertionError("data_dir quota must reject additional bytes")
+
+
+def test_bounded_directory_scan_stops_on_entry_count(tmp_path: Path) -> None:
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    for index in range(5):
+        (runtime / f"{index}.txt").write_bytes(b"")
+    scan = scan_directory_bounded(
+        runtime,
+        stop_after_bytes=1024,
+        stop_after_entries=3,
+        collect_files=True,
+    )
+    assert scan.entry_count == 4
+    assert len(scan.files) <= 3
+
+
+def test_bounded_directory_scan_rejects_named_stream(monkeypatch, tmp_path: Path) -> None:
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    (runtime / "output.txt").write_text("ok", encoding="utf-8")
+    monkeypatch.setattr(
+        "windows_local_mcp.resources._has_named_data_stream", lambda path: path == runtime
+    )
+    with pytest.raises(RuntimeError, match="alternate data stream"):
+        scan_directory_bounded(
+            runtime,
+            stop_after_bytes=1024,
+            stop_after_entries=10,
+            reject_alternate_streams=True,
+        )
 
 
 def test_target_write_lock_allows_different_targets_and_blocks_conflicts(tmp_path: Path) -> None:

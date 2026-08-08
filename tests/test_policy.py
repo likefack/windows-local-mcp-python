@@ -78,13 +78,49 @@ def test_git_status_and_workspace_pathspec_remain_automatic(
     diff = policy.normalize_safe(
         program="git", args=["diff", "--name-only", "--", "src"], cwd="."
     )
-    log = policy.normalize_safe(program="git", args=["log", "-10", "--patch"], cwd=".")
+    log = policy.normalize_safe(program="git", args=["log", "-10", "--stat"], cwd=".")
     assert status.args[:2] == ["--no-pager", "status"]
     assert "--no-ext-diff" in diff.args
     assert "--no-textconv" in diff.args
     assert "--no-ext-diff" in log.args
     assert "--no-textconv" in log.args
     assert str(source.resolve()) in diff.args
+
+
+def test_git_patch_requires_regular_file_pathspec(
+    tmp_path: Path, fake_tools: Path
+) -> None:
+    settings = make_settings(tmp_path)
+    (settings.workspace_root / ".git").mkdir()
+    source = settings.workspace_root / "src"
+    source.mkdir()
+    file = source / "main.py"
+    file.write_text("print('safe')\n", encoding="utf-8")
+    policy = CommandPolicy(settings, Workspace(settings))
+
+    with pytest.raises(IsADirectoryError):
+        policy.normalize_safe(
+            program="git", args=["diff", "--patch", "--", "src"], cwd="."
+        )
+    for flags in (
+        ["--patch", "--stat"],
+        ["--patch", "--name-only"],
+        ["--binary", "--stat"],
+    ):
+        with pytest.raises(IsADirectoryError):
+            policy.normalize_safe(
+                program="git", args=["diff", *flags, "--", "src"], cwd="."
+            )
+    with pytest.raises(IsADirectoryError):
+        policy.normalize_safe(
+            program="git",
+            args=["show", "--patch", "--stat", "--", "src"],
+            cwd=".",
+        )
+    command = policy.normalize_safe(
+        program="git", args=["diff", "--patch", "--", "src/main.py"], cwd="."
+    )
+    assert str(file.resolve()) in command.args
 
 
 def test_automatic_git_requires_workspace_root_marker(
