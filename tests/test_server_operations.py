@@ -55,6 +55,25 @@ def test_concurrent_write_with_same_expected_hash_has_one_winner(
     assert target.read_text(encoding="utf-8") in {"first", "second"}
 
 
+def test_crlf_read_identity_is_the_raw_commit_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, root = load_server(tmp_path, monkeypatch)
+    target = root / "windows.txt"
+    target.write_bytes(b"first\r\nsecond\r\n")
+
+    inspected = server.read_file("windows.txt")
+    assert inspected["sha256"] == sha256_bytes(b"first\r\nsecond\r\n")
+    assert inspected["newline"] == "crlf"
+    result = server.write_file(
+        "windows.txt",
+        "changed\r\n",
+        expected_sha256=inspected["sha256"],
+    )
+    assert result["before_sha256"] == inspected["sha256"]
+    assert target.read_bytes() == b"changed\r\n"
+
+
 def test_oversized_write_is_rejected_and_audited(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -87,13 +106,14 @@ def test_approved_sandbox_and_host_are_distinct_requests(
     codex.parent.mkdir()
     codex.write_bytes(b"fake installed codex")
     server.runtime.settings.approved_sandbox_codex_path = codex
+    server.runtime.settings.approved_sandbox_require_live_verification = False
 
     sandbox = server.request_sandbox_command(
         [sys.executable, "-c", "print('sandbox')"],
         reason="run broad developer command in approved sandbox",
     )
     sandbox_record = server.runtime.audit.get_operation(sandbox["approval_id"])
-    assert sandbox_record["tier"] == "approved_sandbox"
+    assert sandbox_record["tier"] == "codex_sandbox"
     assert sandbox_record["request"]["sandbox_backend"]["authentication_required"] is False
     assert sandbox_record["request"]["effective_sandbox_policy"]["network_policy"][
         "internet"
@@ -123,5 +143,9 @@ def test_backup_and_diff_limits_fail_before_replacement(
     server.runtime.settings.max_backup_bytes = 4096
     server.runtime.settings.max_diff_bytes = 1024
     with pytest.raises(ValueError, match="max_diff_bytes"):
-        server.write_file("bounded.txt", "b\n" * 1000)
+        server.write_file(
+            "bounded.txt",
+            "b\n" * 1000,
+            expected_sha256=sha256_bytes(target.read_bytes()),
+        )
     assert target.read_text(encoding="utf-8") == original

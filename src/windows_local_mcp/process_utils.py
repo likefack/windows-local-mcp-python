@@ -104,3 +104,25 @@ def terminate_process_tree(identity: ProcessIdentity, timeout: float = 8.0) -> b
         except psutil.NoSuchProcess:
             pass
     return True
+
+
+def process_tree_write_bytes(identity: ProcessIdentity) -> int | None:
+    """Return cumulative filesystem writes for the bound process tree.
+
+    None means the identity or one of its currently visible descendants could not be
+    accounted for. Sandboxed callers treat that uncertainty as a failed resource boundary.
+    """
+    if not process_identity_matches(identity):
+        return None
+    try:
+        process = psutil.Process(identity.pid)
+        members = [process, *process.children(recursive=True)]
+        total = 0
+        for member in members:
+            try:
+                total += int(member.io_counters().write_bytes)
+            except psutil.NoSuchProcess:
+                continue
+        return total
+    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+        return None

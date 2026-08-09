@@ -9,14 +9,16 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from functools import wraps
 from pathlib import Path
-from typing import BinaryIO, Self
+from typing import Any, BinaryIO, Self
 
 from .config import Settings
 
 _LOCK_SLOT_COUNT = 32
 _LOCAL_LOCKS_GUARD = threading.Lock()
 _LOCAL_LOCKS: dict[str, threading.RLock] = {}
+_NAMED_LOCK_DEPTH = threading.local()
 
 
 @dataclass(frozen=True)
@@ -100,6 +102,67 @@ class WorkspaceExecutionLock:
             finally:
                 file.close()
                 local_lock.release()
+
+
+class NamedControlPlaneLock:
+    """Cross-process lock for one trusted-store lifecycle, with same-thread nesting."""
+
+    def __init__(self, settings: Settings, name: str, timeout: float = 30.0) -> None:
+        if not name or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789-" for character in name):
+            raise ValueError("invalid control-plane lock name")
+        self.path = settings.data_dir / "locks" / f"control-{name}.lock"
+        self.timeout = timeout
+        self._file: BinaryIO | None = None
+        self._local_lock: threading.RLock | None = None
+        self._nested = False
+
+    def __enter__(self) -> Self:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        key = os.path.normcase(str(self.path.resolve(strict=False)))
+        depths = getattr(_NAMED_LOCK_DEPTH, "depths", {})
+        _NAMED_LOCK_DEPTH.depths = depths
+        if depths.get(key, 0):
+            depths[key] += 1
+            self._nested = True
+            return self
+        local_lock = _local_lock_for(self.path)
+        deadline = time.monotonic() + self.timeout
+        while time.monotonic() < deadline:
+            if not local_lock.acquire(blocking=False):
+                time.sleep(0.05)
+                continue
+            file = self.path.open("a+b")
+            if self.path.stat().st_size == 0:
+                file.write(b"0")
+                file.flush()
+            try:
+                _lock_one_byte(file)
+            except OSError:
+                file.close()
+                local_lock.release()
+                time.sleep(0.05)
+                continue
+            self._file = file
+            self._local_lock = local_lock
+            depths[key] = 1
+            return self
+        raise TimeoutError(f"control-plane lock timed out: {self.path.name}")
+
+    def __exit__(self, *_: object) -> None:
+        key = os.path.normcase(str(self.path.resolve(strict=False)))
+        depths = getattr(_NAMED_LOCK_DEPTH, "depths", {})
+        depth = depths.get(key, 0)
+        if depth > 1:
+            depths[key] = depth - 1
+            return
+        depths.pop(key, None)
+        if self._file is not None:
+            try:
+                _unlock_one_byte(self._file)
+            finally:
+                self._file.close()
+        if self._local_lock is not None:
+            self._local_lock.release()
 
 
 def _local_lock_for(path: Path) -> threading.RLock:
@@ -343,6 +406,16 @@ def enforce_data_quota(settings: Settings, *, incoming_bytes: int = 0) -> None:
         )
 
 
+def _workspace_history_serialized(function: Any) -> Any:
+    @wraps(function)
+    def locked(settings: Settings, *args: Any, **kwargs: Any) -> Any:
+        with NamedControlPlaneLock(settings, "workspace-cas"):
+            return function(settings, *args, **kwargs)
+
+    return locked
+
+
+@_workspace_history_serialized
 def prune_artifacts(settings: Settings, *, protected_ids: set[str] | None = None) -> int:
     """Apply age and size retention only to known artifact directories."""
     artifact_roots = [
@@ -353,6 +426,7 @@ def prune_artifacts(settings: Settings, *, protected_ids: set[str] | None = None
             "backups",
             "git-snapshots",
             "approval-staging",
+            "binary-transfers",
         )
     ]
     protected_ids = protected_ids or set()
@@ -385,6 +459,38 @@ def prune_artifacts(settings: Settings, *, protected_ids: set[str] | None = None
         _remove_artifact(candidate)
         used -= size
         removed += 1
+    if settings.sandbox_scratch_dir is not None:
+        scratch_candidates: list[tuple[float, Path]] = []
+        for root in (
+            settings.sandbox_scratch_dir / "approval-inputs",
+            settings.sandbox_scratch_dir / "runs",
+            settings.sandbox_scratch_dir / "live-verification",
+        ):
+            if not root.exists() or root.is_symlink():
+                continue
+            for candidate in root.iterdir():
+                if candidate.is_symlink() or candidate.name in protected_ids:
+                    continue
+                try:
+                    modified = datetime.fromtimestamp(candidate.stat().st_mtime, UTC)
+                except FileNotFoundError:
+                    continue
+                if modified < cutoff:
+                    _remove_artifact(candidate)
+                    removed += 1
+                else:
+                    scratch_candidates.append((modified.timestamp(), candidate))
+        scratch_used = directory_size(
+            settings.sandbox_scratch_dir,
+            stop_after=settings.max_sandbox_scratch_bytes,
+        )
+        for _, candidate in sorted(scratch_candidates):
+            if scratch_used <= settings.max_sandbox_scratch_bytes:
+                break
+            size = directory_size(candidate) if candidate.is_dir() else candidate.stat().st_size
+            _remove_artifact(candidate)
+            scratch_used -= size
+            removed += 1
     return removed
 
 

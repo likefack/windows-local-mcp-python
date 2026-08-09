@@ -141,6 +141,26 @@ def test_disabled_optional_capabilities_do_not_resolve_tools(tmp_path: Path) -> 
     assert not settings.powershell_enabled
 
 
+def test_obsolete_appcontainer_configuration_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = tmp_path / "obsolete.toml"
+    config.write_text(
+        f'workspace_root = "{workspace.as_posix()}"\n'
+        f'data_dir = "{(tmp_path / "data").as_posix()}"\n'
+        "protect_data_dir_acl = false\n"
+        'safe_network_isolation_mode = "appcontainer"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LOCAL_MCP_CONFIG", str(config))
+    monkeypatch.delenv("LOCAL_MCP_ROOT", raising=False)
+
+    with pytest.raises(ValueError, match="obsolete Safe Tier/AppContainer"):
+        load_settings()
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows ACL integration")
 def test_data_dir_acl_grants_current_principal_and_system(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
@@ -161,6 +181,14 @@ def test_data_dir_acl_grants_current_principal_and_system(tmp_path: Path) -> Non
         ).stdout
         assert "SYSTEM" in acl
         assert "(F)" in acl
+        namespace = data / "control-plane" / "namespace.json"
+        assert namespace.read_bytes()
+        nested = data / "control-plane" / "acl-roundtrip.bin"
+        nested.write_bytes(b"roundtrip")
+        assert nested.read_bytes() == b"roundtrip"
+        # The marker path avoids a recursive ACL reset on ordinary startup while still
+        # checking that the protected namespace remains usable by the bound principal.
+        settings.ensure_directories()
     finally:
         subprocess.run(
             ["icacls.exe", str(data), "/inheritance:e", "/T", "/C"],

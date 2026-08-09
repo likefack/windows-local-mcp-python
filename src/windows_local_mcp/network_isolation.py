@@ -22,17 +22,21 @@ class NetworkPolicy:
         }
 
 
-def safe_network_policy(program_key: str, *, mode: str = "appcontainer") -> NetworkPolicy:
-    enforcement = (
-        "windows-appcontainer"
-        if mode == "appcontainer"
-        else "compatibility-command-and-environment-only"
-    )
+def safe_network_policy(program_key: str, *, mode: str = "broker") -> NetworkPolicy:
+    if mode != "broker":
+        raise ValueError("legacy Safe Tier network modes are no longer supported")
+    enforcement = "broker-fixed-grammar-and-environment"
     if program_key == "adb":
         return NetworkPolicy(
-            "adb-appcontainer-loopback-exempt", "deny", "deny", "allow-general-loopback", enforcement
+            "adb-fixed-read-loopback", "not-used-by-grammar", "not-used-by-grammar", "allow-adb-server", enforcement
         )
-    return NetworkPolicy("offline", "deny", "deny", "deny", enforcement)
+    return NetworkPolicy(
+        "broker-fixed-operation",
+        "not-used-by-grammar",
+        "not-used-by-grammar",
+        "not-used-by-grammar",
+        enforcement,
+    )
 
 
 def apply_safe_network_environment(environment: dict[str, str], program_key: str) -> None:

@@ -46,7 +46,6 @@ class CommandPolicy:
         "--no-patch",
     }
     SAFE_REVISION = re.compile(r"[A-Za-z0-9._/@~^{}+-]+")
-    SAFE_FORMAT_LINE_LENGTH = re.compile(r"--line-length=(?:[1-9][0-9]{0,3})")
     SAFE_LOG_COUNT = re.compile(r"-(?:[1-9]|[1-9][0-9]|1[0-9]{2}|200)")
     ADB_PROPERTIES: ClassVar[set[str]] = {
         "ro.build.version.release",
@@ -111,17 +110,11 @@ class CommandPolicy:
             executable = self._resolve_safe_executable(("git.exe", "git"))
             return self._result(executable, normalized_args, cwd_path, "git")
 
-        if key == "flutter":
-            self._require_enabled("flutter", self.settings.flutter_enabled)
-            normalized_args = self._normalize_flutter(args)
-            executable = self._resolve_safe_executable(("flutter.bat", "flutter.cmd", "flutter"))
-            return self._result(executable, normalized_args, cwd_path, "flutter")
-
-        if key == "dart":
-            self._require_enabled("dart", self.settings.dart_enabled)
-            normalized_args = self._normalize_dart(args)
-            executable = self._resolve_safe_executable(("dart.exe", "dart"))
-            return self._result(executable, normalized_args, cwd_path, "dart")
+        if key in {"flutter", "dart"}:
+            raise PermissionError(
+                f"{key} processing may load project-controlled code or plugins; "
+                "use request_sandbox_command"
+            )
 
         if key == "adb":
             self._require_enabled("adb", self.settings.adb_enabled)
@@ -278,7 +271,19 @@ class CommandPolicy:
             }
             normalized = self._flags_and_pathspec(tail, allowed)
 
-        return ["--no-pager", subcommand, *normalized]
+        return [
+            "--no-pager",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "-c",
+            "diff.external=",
+            "-c",
+            "credential.helper=",
+            subcommand,
+            *normalized,
+        ]
 
     def _flags_and_pathspec(self, values: list[str], allowed: set[str]) -> list[str]:
         if "--" in values:
@@ -323,73 +328,6 @@ class CommandPolicy:
                 *self._normalize_read_paths(paths, files_only=files_only),
             ]
         return normalized_head
-
-    def _normalize_flutter(self, args: list[str]) -> list[str]:
-        if args[0].casefold() != "analyze":
-            raise PermissionError(f"flutter {args[0]} loads or executes code and requires approval")
-        allowed_flags = {
-            "--fatal-infos",
-            "--fatal-warnings",
-            "--no-fatal-infos",
-            "--no-fatal-warnings",
-            "--no-pub",
-        }
-        flags: list[str] = []
-        paths: list[str] = []
-        for value in args[1:]:
-            if value.startswith("-"):
-                if value not in allowed_flags:
-                    raise PermissionError("Flutter option is not in the safe grammar")
-                flags.append(value)
-            else:
-                paths.append(value)
-        if "--no-pub" not in flags:
-            flags.insert(0, "--no-pub")
-        return ["analyze", *flags, *self._normalize_read_paths(paths)]
-
-    def _normalize_dart(self, args: list[str]) -> list[str]:
-        subcommand = args[0].casefold()
-        if subcommand == "test":
-            raise PermissionError("dart test loads project code and requires human approval")
-        if subcommand == "analyze":
-            flags: list[str] = []
-            paths: list[str] = []
-            for value in args[1:]:
-                if value in {"--fatal-infos", "--fatal-warnings"}:
-                    flags.append(value)
-                elif value.startswith("-"):
-                    raise PermissionError("Dart analyze option is not in the safe grammar")
-                else:
-                    paths.append(value)
-            if len(paths) > 1:
-                raise PermissionError("dart analyze accepts at most one validated path")
-            return ["analyze", *flags, *self._normalize_read_paths(paths)]
-        if subcommand == "format":
-            flags: list[str] = []
-            paths: list[str] = []
-            output_mode = "write"
-            for value in args[1:]:
-                if value in {"--set-exit-if-changed", "--show", "--output=show"}:
-                    flags.append(value)
-                    if value in {"--show", "--output=show"}:
-                        output_mode = "show"
-                elif value == "--output=none":
-                    flags.append(value)
-                    output_mode = "none"
-                elif self.SAFE_FORMAT_LINE_LENGTH.fullmatch(value):
-                    flags.append(value)
-                elif value.startswith("-"):
-                    raise PermissionError("Dart format option is not in the safe grammar")
-                else:
-                    paths.append(value)
-            if not paths:
-                paths = ["."]
-            access = "write" if output_mode == "write" else "read"
-            normalized_paths = [
-                str(self.workspace.resolve_existing(path, access=access)) for path in paths
-            ]
-            return ["format", *flags, *normalized_paths]
-        raise PermissionError(f"dart {args[0]} is not eligible for automatic execution")
 
     def _normalize_adb(self, args: list[str]) -> list[str]:
         if args in (["devices"], ["devices", "-l"]):
@@ -479,6 +417,6 @@ def approval_hash(
 
 def approved_request_hash(request: dict[str, object]) -> str:
     """Bind every persisted capability of a versioned Approved request."""
-    if request.get("approval_binding_version") != 2:
+    if request.get("approval_binding_version") != 3:
         raise ValueError("approved request uses an unsupported approval binding version")
     return sha256_text(canonical_json(request))

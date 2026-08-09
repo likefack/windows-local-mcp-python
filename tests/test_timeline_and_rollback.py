@@ -3,7 +3,6 @@ from pathlib import Path
 
 import pytest
 
-from windows_local_mcp.appcontainer import appcontainer_profile_name
 from windows_local_mcp.audit import AuditStore
 from windows_local_mcp.config import Settings
 from windows_local_mcp.network_isolation import (
@@ -106,7 +105,7 @@ def test_timeline_exposes_diff_result_and_network_policy(tmp_path: Path) -> None
     assert entry["changed_files"] == ["a.txt"]
     assert entry["added_lines"] == 1
     assert "+new" in entry["unified_diff"]
-    assert entry["network_policy"]["internet"] == "deny"
+    assert entry["network_policy"]["internet"] == "not-used-by-grammar"
 
     summary = next(
         item for item in timeline_list(settings, audit) if item["operation_id"] == operation_id
@@ -141,23 +140,6 @@ def test_safe_network_policy_preserves_only_adb_loopback() -> None:
     apply_safe_network_environment(offline_environment, "dart")
     assert offline_environment["NO_PROXY"] == ""
     assert offline_environment["PUB_HOSTED_URL"].startswith("http://127.0.0.1:")
-
-
-def test_appcontainer_profiles_are_workspace_scoped_and_separate_adb(tmp_path: Path) -> None:
-    (tmp_path / "first").mkdir()
-    (tmp_path / "second").mkdir()
-    first = settings_for(tmp_path / "first")
-    second = settings_for(tmp_path / "second")
-    first_read = appcontainer_profile_name(first, "git")
-    first_write = appcontainer_profile_name(first, "dart", workspace_write=True)
-    first_adb = appcontainer_profile_name(first, "adb")
-    second_read = appcontainer_profile_name(second, "git")
-    assert len({first_read, first_write, first_adb, second_read}) == 4
-    assert safe_network_policy("git").enforcement == "windows-appcontainer"
-    assert (
-        safe_network_policy("git", mode="compatibility").enforcement
-        == "compatibility-command-and-environment-only"
-    )
 
 
 def test_approval_facts_do_not_treat_model_network_flag_as_os_fact() -> None:
@@ -241,7 +223,7 @@ def test_restore_failure_recovers_starting_workspace(
         nonlocal calls
         calls += 1
         if calls == 1:
-            target.write_text("partial\n", encoding="utf-8")
+            original_apply(*args, **kwargs)
             raise OSError("injected apply failure")
         original_apply(*args, **kwargs)
 
@@ -255,6 +237,35 @@ def test_restore_failure_recovers_starting_workspace(
         )
     assert caught.value.recovery_state == "failed_recovered"
     assert target.read_text(encoding="utf-8") == "current\n"
+
+
+def test_restore_recovery_does_not_overwrite_unjournaled_concurrent_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = settings_for(tmp_path)
+    target = settings.workspace_root / "a.txt"
+    target.write_text("before\n", encoding="utf-8")
+    desired = capture_workspace_state(settings, "conflict-desired", "after")
+    target.write_text("current\n", encoding="utf-8")
+    current = capture_workspace_state(settings, "conflict-current", "after")
+    import windows_local_mcp.workspace_history as history
+
+    def inject_unjournaled_change(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        target.write_text("third-party\n", encoding="utf-8")
+        raise OSError("injected unjournaled change")
+
+    monkeypatch.setattr(history, "_apply_manifest", inject_unjournaled_change)
+    with pytest.raises(WorkspaceMutationError) as caught:
+        restore_workspace_state(
+            settings,
+            current.manifest_path,
+            desired.manifest_path,
+            operation_id="recover-conflict-operation",
+        )
+
+    assert caught.value.recovery_state == "recovery_required"
+    assert target.read_text(encoding="utf-8") == "third-party\n"
 
 
 def test_single_file_recovery_failure_blocks_later_mutations(tmp_path: Path) -> None:

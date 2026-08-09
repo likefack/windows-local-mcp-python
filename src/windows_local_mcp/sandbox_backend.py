@@ -15,6 +15,7 @@ from typing import Any
 
 from .config import Settings
 from .tool_safety import ensure_external_tool_executable
+from .util import canonical_json, sha256_text
 
 _CODEX_VERSION = re.compile(r"^codex-cli\s+([^\s]+)")
 _OPENAI_AUTHENTICODE_NAMES = ('O="OpenAI OpCo, LLC"', 'CN="OpenAI OpCo, LLC"')
@@ -218,6 +219,45 @@ def verify_codex_sandbox_backend(
                 f"Approved Sandbox backend changed after approval request: {key}"
             )
     return backend
+
+
+def require_codex_sandbox_live_verification(
+    settings: Settings, backend: CodexSandboxBackend
+) -> dict[str, Any]:
+    """Bind execution to successful live checks of this exact installed backend."""
+    if not settings.approved_sandbox_require_live_verification:
+        return {"required": False, "verified": False}
+    marker = settings.data_dir / "control-plane" / "sandbox-live-verification.json"
+    try:
+        evidence = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise ApprovedSandboxUnavailable(
+            "Codex Sandbox has not completed Windows live verification for this profile"
+        ) from error
+    required_checks = {
+        "simple_command",
+        "python_child",
+        "source_read",
+        "scratch_write",
+        "control_plane_denied",
+        "network_denied",
+        "grandchild_contained",
+        "timeout_terminated",
+        "filesystem_limit_enforced",
+    }
+    checks = evidence.get("checks")
+    if (
+        evidence.get("version") != 1
+        or evidence.get("passed") is not True
+        or evidence.get("backend_digest")
+        != sha256_text(canonical_json(backend.as_dict()))
+        or not isinstance(checks, dict)
+        or any(checks.get(name) is not True for name in required_checks)
+    ):
+        raise ApprovedSandboxUnavailable(
+            "Codex Sandbox live verification is missing, failed, or stale for this backend"
+        )
+    return evidence
 
 
 @contextmanager
