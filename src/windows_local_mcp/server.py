@@ -343,9 +343,13 @@ def _atomic_binary_mutation(
             if parent_identity is None:
                 raise RuntimeError("write parent disappeared")
             target_identity = runtime.workspace.identity(target)
-            before = target.read_bytes() if target.exists() else b""
-            if len(before) > runtime.settings.max_structured_file_bytes:
-                raise ValueError("structured file exceeds max_structured_file_bytes")
+            if target.exists():
+                source_size = target.stat().st_size
+                if source_size > runtime.settings.max_structured_file_bytes:
+                    raise ValueError("structured file exceeds max_structured_file_bytes")
+                before = target.read_bytes()
+            else:
+                before = b""
             before_sha = sha256_bytes(before)
             if target.exists() and require_expected_for_existing and expected_sha256 is None:
                 raise ValueError("expected_sha256 is required when replacing an existing file")
@@ -357,6 +361,15 @@ def _atomic_binary_mutation(
                 raise TypeError("binary mutation transform must return bytes")
             if len(after) > runtime.settings.max_structured_file_bytes:
                 raise ValueError("result exceeds max_structured_file_bytes")
+            current_exists = target.exists()
+            if current_exists != (target_identity is not None):
+                raise RuntimeError("structured file changed concurrently before commit")
+            if current_exists:
+                current_size = target.stat().st_size
+                if current_size > runtime.settings.max_structured_file_bytes:
+                    raise RuntimeError("structured file changed beyond the configured size limit")
+                if sha256_bytes(target.read_bytes()) != before_sha:
+                    raise RuntimeError("source is stale or concurrently modified")
             after_sha = sha256_bytes(after)
             request = {
                 "path": runtime.workspace.relative(target),
@@ -396,6 +409,11 @@ def _atomic_binary_mutation(
                 runtime.workspace.revalidate_for_replace(
                     target, parent_identity=parent_identity, target_identity=target_identity
                 )
+                current_exists = target.exists()
+                if current_exists != (target_identity is not None):
+                    raise RuntimeError("structured file changed concurrently before replacement")
+                if current_exists and sha256_bytes(target.read_bytes()) != before_sha:
+                    raise RuntimeError("source is stale or concurrently modified")
                 os.replace(temp_path, target)
                 temp_path = None
                 workspace_changed = True
@@ -495,6 +513,8 @@ def structured_file_inspect(
     try:
         _require_filesystem()
         source = runtime.workspace.resolve_existing(path, allow_directory=False)
+        if source.stat().st_size > runtime.settings.max_structured_file_bytes:
+            raise ValueError("structured file exceeds max_structured_file_bytes")
         data = source.read_bytes()
         result = inspect_structured(data, runtime.workspace.relative(source), runtime.settings, format=format, range_ref=range_ref)
         result["path"] = runtime.workspace.relative(source)
@@ -514,7 +534,7 @@ def structured_file_apply(
     reason: str = "",
     format: str | None = None,
 ) -> dict[str, Any]:
-    """Apply declarative format-specific operations through the broker; scripts are not accepted."""
+    """Apply declarative format-specific operations through the broker; existing files require expected_sha256."""
     request = {"path": path, "operations": operations, "expected_sha256": expected_sha256, "reason": reason, "format": format}
     try:
         kind = infer_format(path, format)
@@ -532,6 +552,7 @@ def structured_file_apply(
             request_summary={"format": kind, "operations": [item.get("op") for item in operations]},
             transform=apply,
             allow_create=allow_create,
+            require_expected_for_existing=True,
         )
     except Exception as error:
         _audit_rejection("structured_file_apply", request, error)
@@ -547,6 +568,8 @@ def zip_entry_read(path: str, entry: str) -> dict[str, Any]:
         archive = runtime.workspace.resolve_existing(path, allow_directory=False)
         if infer_format(runtime.workspace.relative(archive)) != "zip":
             raise ValueError("path must be a ZIP file")
+        if archive.stat().st_size > runtime.settings.max_structured_file_bytes:
+            raise ValueError("structured file exceeds max_structured_file_bytes")
         payload = read_zip_entry(archive.read_bytes(), entry, runtime.settings)
         if len(payload) > runtime.settings.max_transfer_chunk_bytes:
             raise ValueError(
@@ -596,6 +619,8 @@ def zip_entry_extract(
             archive = runtime.workspace.resolve_existing(path, allow_directory=False)
             if infer_format(runtime.workspace.relative(archive)) != "zip":
                 raise ValueError("path must be a ZIP file")
+            if archive.stat().st_size > runtime.settings.max_structured_file_bytes:
+                raise ValueError("structured file exceeds max_structured_file_bytes")
             data = archive.read_bytes()
             if sha256_bytes(data) != expected_archive_sha256:
                 raise RuntimeError("expected_archive_sha256 mismatch; archive is stale or concurrently modified")
@@ -616,6 +641,7 @@ def zip_entry_extract(
             request_summary={"archive_path": path, "entry": entry, "expected_archive_sha256": expected_archive_sha256},
             transform=extract,
             allow_create=True,
+            require_expected_for_existing=True,
         )
     except Exception as error:
         _audit_rejection("zip_entry_extract", request, error)
@@ -686,6 +712,9 @@ def structured_file_download_chunk(transfer_id: str, offset: int) -> dict[str, A
         if not isinstance(offset, int) or offset < 0 or offset % int(manifest["chunk_bytes"]) != 0:
             raise ValueError("offset must be a non-negative chunk boundary")
         source = runtime.workspace.resolve_existing(str(manifest["path"]), allow_directory=False)
+        size = source.stat().st_size
+        if size != int(manifest["bytes"]) or size > runtime.settings.max_structured_file_bytes:
+            raise RuntimeError("source changed during transfer; begin a new download")
         data = source.read_bytes()
         if len(data) != int(manifest["bytes"]) or sha256_bytes(data) != manifest["sha256"]:
             raise RuntimeError("source changed during transfer; begin a new download")
@@ -713,8 +742,11 @@ def structured_file_upload_begin(path: str, total_bytes: int, sha256: str, expec
         target = runtime.workspace.resolve_for_write(path)
         if target.exists() and expected_sha256 is None:
             raise ValueError("expected_sha256 is required when replacing an existing file")
-        if target.exists() and sha256_bytes(target.read_bytes()) != expected_sha256:
-            raise RuntimeError("expected_sha256 mismatch; target is stale or concurrently modified")
+        if target.exists():
+            if target.stat().st_size > runtime.settings.max_structured_file_bytes:
+                raise ValueError("structured file exceeds max_structured_file_bytes")
+            if sha256_bytes(target.read_bytes()) != expected_sha256:
+                raise RuntimeError("expected_sha256 mismatch; target is stale or concurrently modified")
         transfer_id = str(uuid.uuid4())
         root = _transfer_root(transfer_id)
         root.mkdir(parents=True, exist_ok=False)
@@ -766,7 +798,10 @@ def structured_file_upload_commit(transfer_id: str, reason: str = "") -> dict[st
         root, manifest = _load_transfer(transfer_id, "upload")
         if int(manifest["received"]) != int(manifest["bytes"]):
             raise RuntimeError("upload is incomplete and cannot be committed")
-        payload = (root / "payload.bin").read_bytes()
+        payload_path = root / "payload.bin"
+        if payload_path.stat().st_size != int(manifest["bytes"]):
+            raise RuntimeError("staged upload does not match declared byte identity")
+        payload = payload_path.read_bytes()
         if len(payload) != int(manifest["bytes"]) or sha256_bytes(payload) != manifest["sha256"]:
             raise RuntimeError("staged upload does not match declared byte identity")
 
