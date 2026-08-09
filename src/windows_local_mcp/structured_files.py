@@ -638,6 +638,26 @@ def _safe_zip_name(name: str) -> str:
     return "/".join(parts)
 
 
+def _validate_zip_paths(paths: list[tuple[str, bool]]) -> None:
+    seen: set[str] = set()
+    files: set[str] = set()
+    normalized: list[tuple[str, bool]] = []
+    for name, is_directory in paths:
+        safe = _safe_zip_name(name)
+        folded = safe.casefold()
+        if folded in seen:
+            raise StructuredFileError("ZIP contains duplicate or colliding entry names")
+        seen.add(folded)
+        normalized.append((safe, is_directory))
+        if not is_directory:
+            files.add(folded)
+    for name, _ in normalized:
+        parts = name.casefold().split("/")
+        for end in range(1, len(parts)):
+            if "/".join(parts[:end]) in files:
+                raise StructuredFileError("ZIP contains a file/directory path collision")
+
+
 def _zip_entries(data: bytes, settings: Settings) -> tuple[zipfile.ZipFile, list[zipfile.ZipInfo]]:
     try:
         archive = zipfile.ZipFile(io.BytesIO(data))
@@ -647,10 +667,11 @@ def _zip_entries(data: bytes, settings: Settings) -> tuple[zipfile.ZipFile, list
     if len(entries) > settings.max_zip_entries:
         archive.close()
         raise StructuredFileError("ZIP entry count exceeds max_zip_entries")
-    names = [_safe_zip_name(info.filename) for info in entries if not info.is_dir()]
-    if len(names) != len({name.casefold() for name in names}):
+    try:
+        _validate_zip_paths([(info.filename, info.is_dir()) for info in entries])
+    except Exception:
         archive.close()
-        raise StructuredFileError("ZIP contains duplicate or colliding entry names")
+        raise
     expanded = sum(info.file_size for info in entries)
     if expanded > settings.max_zip_expanded_bytes:
         archive.close()
@@ -674,7 +695,7 @@ def read_zip_entry(data: bytes, name: str, settings: Settings) -> bytes:
     safe_name = _safe_zip_name(name)
     archive, entries = _zip_entries(data, settings)
     try:
-        matches = [info for info in entries if not info.is_dir() and _safe_zip_name(info.filename) == safe_name]
+        matches = [info for info in entries if not info.is_dir() and _safe_zip_name(info.filename).casefold() == safe_name.casefold()]
         if len(matches) != 1:
             raise StructuredFileError("ZIP entry was not found")
         payload = archive.read(matches[0])
@@ -696,13 +717,24 @@ def _zip_payload(op: dict[str, Any]) -> bytes:
     raise StructuredFileError("ZIP entry operation needs text or base64")
 
 
+def _matching_zip_key(entries: dict[str, tuple[zipfile.ZipInfo | None, bytes]], name: str) -> str | None:
+    folded = name.casefold()
+    for existing in entries:
+        if existing.casefold() == folded:
+            return existing
+    return None
+
+
 def _transform_zip(data: bytes, operations: list[Any], settings: Settings) -> bytes:
     entries: dict[str, tuple[zipfile.ZipInfo | None, bytes]] = {}
+    directories: list[zipfile.ZipInfo] = []
     if data:
         archive, infos = _zip_entries(data, settings)
         try:
             for info in infos:
-                if not info.is_dir():
+                if info.is_dir():
+                    directories.append(copy(info))
+                else:
                     entries[_safe_zip_name(info.filename)] = (info, archive.read(info))
         finally:
             archive.close()
@@ -711,20 +743,32 @@ def _transform_zip(data: bytes, operations: list[Any], settings: Settings) -> by
         name = op["op"]
         if name in {"entry_add", "entry_replace"}:
             entry = _safe_zip_name(_text(op.get("name"), "name"))
-            if name == "entry_add" and entry in entries:
-                raise StructuredFileError("ZIP entry already exists")
-            entries[entry] = (None, _zip_payload(op))
+            existing = _matching_zip_key(entries, entry)
+            if name == "entry_add":
+                if existing is not None:
+                    raise StructuredFileError("ZIP entry already exists")
+                entries[entry] = (None, _zip_payload(op))
+            else:
+                if existing is None:
+                    raise StructuredFileError("ZIP entry does not exist")
+                entries[existing] = (None, _zip_payload(op))
         elif name == "entry_delete":
             entry = _safe_zip_name(_text(op.get("name"), "name"))
-            if entry not in entries:
+            existing = _matching_zip_key(entries, entry)
+            if existing is None:
                 raise StructuredFileError("ZIP entry does not exist")
-            del entries[entry]
+            del entries[existing]
         else:
             raise StructuredFileError(f"unsupported ZIP operation: {name}")
-    if len(entries) > settings.max_zip_entries or sum(len(value[1]) for value in entries.values()) > settings.max_zip_expanded_bytes:
+    _validate_zip_paths(
+        [(info.filename, True) for info in directories] + [(name, False) for name in entries]
+    )
+    if len(entries) + len(directories) > settings.max_zip_entries or sum(len(value[1]) for value in entries.values()) > settings.max_zip_expanded_bytes:
         raise StructuredFileError("resulting ZIP exceeds configured limits")
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=False) as archive:
+        for info in directories:
+            archive.writestr(copy(info), b"")
         for name, (info, payload) in sorted(entries.items()):
             if info is not None:
                 clone = copy(info)
@@ -732,7 +776,10 @@ def _transform_zip(data: bytes, operations: list[Any], settings: Settings) -> by
                 archive.writestr(clone, payload)
             else:
                 archive.writestr(name, payload)
-    return output.getvalue()
+    result = output.getvalue()
+    verified, _ = _zip_entries(result, settings)
+    verified.close()
+    return result
 
 
 def _inspect_image(data: bytes, settings: Settings) -> dict[str, Any]:
@@ -751,6 +798,11 @@ def _inspect_image(data: bytes, settings: Settings) -> dict[str, Any]:
         raise StructuredFileError("unsupported or corrupt image") from error
 
 
+def _require_image_pixels(width: int, height: int, settings: Settings) -> None:
+    if width <= 0 or height <= 0 or width * height > settings.max_image_pixels:
+        raise StructuredFileError("image pixel count exceeds max_image_pixels")
+
+
 def _transform_image(data: bytes, operations: list[Any], settings: Settings) -> tuple[bytes, str | None]:
     Image, UnidentifiedImageError = _image_module()
     Image.MAX_IMAGE_PIXELS = settings.max_image_pixels
@@ -759,9 +811,15 @@ def _transform_image(data: bytes, operations: list[Any], settings: Settings) -> 
     except UnidentifiedImageError as error:
         raise StructuredFileError("unsupported or corrupt image") from error
     try:
-        if image.width * image.height > settings.max_image_pixels:
-            raise StructuredFileError("image pixel count exceeds max_image_pixels")
+        _require_image_pixels(image.width, image.height, settings)
+        if getattr(image, "n_frames", 1) != 1:
+            raise StructuredFileError(
+                "multi-frame image transformation is unsupported; use the container processing path"
+            )
         source_format = image.format
+        source_exif = image.info.get("exif")
+        source_icc = image.info.get("icc_profile")
+        source_dpi = image.info.get("dpi")
         output_format: str | None = None
         quality: int | None = None
         strip_metadata = False
@@ -770,6 +828,7 @@ def _transform_image(data: bytes, operations: list[Any], settings: Settings) -> 
             name = op["op"]
             if name == "resize":
                 width, height = _index(op.get("width"), "width", minimum=1), _index(op.get("height"), "height", minimum=1)
+                _require_image_pixels(width, height, settings)
                 image = image.resize((width, height))
             elif name == "thumbnail":
                 width, height = _index(op.get("max_width"), "max_width", minimum=1), _index(op.get("max_height"), "max_height", minimum=1)
@@ -778,7 +837,10 @@ def _transform_image(data: bytes, operations: list[Any], settings: Settings) -> 
                 box = op.get("box")
                 if not isinstance(box, list) or len(box) != 4:
                     raise StructuredFileError("crop box must be [left, top, right, bottom]")
-                image = image.crop(tuple(_index(value, "crop coordinate") for value in box))
+                left, top, right, bottom = tuple(_index(value, "crop coordinate") for value in box)
+                if not (left < right <= image.width and top < bottom <= image.height):
+                    raise StructuredFileError("crop box must stay within the source image")
+                image = image.crop((left, top, right, bottom))
             elif name == "rotate":
                 angle = op.get("degrees")
                 if not isinstance(angle, (int, float)):
@@ -804,6 +866,7 @@ def _transform_image(data: bytes, operations: list[Any], settings: Settings) -> 
                 strip_metadata = True
             else:
                 raise StructuredFileError(f"unsupported image operation: {name}")
+            _require_image_pixels(image.width, image.height, settings)
         output_format = output_format or source_format or "PNG"
         if output_format == "JPEG" and image.mode not in {"RGB", "L"}:
             image = image.convert("RGB")
@@ -813,6 +876,13 @@ def _transform_image(data: bytes, operations: list[Any], settings: Settings) -> 
             kwargs["quality"] = quality
         if strip_metadata:
             kwargs["exif"] = b""
+        else:
+            if isinstance(source_exif, bytes):
+                kwargs["exif"] = source_exif
+            if isinstance(source_icc, bytes):
+                kwargs["icc_profile"] = source_icc
+            if isinstance(source_dpi, tuple) and len(source_dpi) == 2:
+                kwargs["dpi"] = source_dpi
         image.save(output, format=output_format, **kwargs)
         return output.getvalue(), output_format
     finally:
