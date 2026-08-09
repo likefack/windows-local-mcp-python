@@ -10,7 +10,7 @@ import tempfile
 import uuid
 from datetime import UTC, datetime, timedelta
 from itertools import islice
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from mcp.server import MCPServer
@@ -22,21 +22,27 @@ from .audit import AuditStore
 from .command_traits import (
     SafeExecutionKind,
     classify_safe_execution,
-    dart_format_writes,
     recommended_tool,
 )
 from .config import Settings, load_settings
+from .control_plane import (
+    assert_trusted_runtime,
+    control_plane_generation,
+)
+from .control_plane_guard import assert_control_plane_healthy
 from .executor import Executor
 from .git_snapshot import capture_git_snapshot
 from .paths import Workspace
 from .policy import CommandPolicy, NormalizedCommand, approved_request_hash
-from .resources import WorkspaceExecutionLock, enforce_data_quota
+from .redaction import redact_command_args, redact_text
+from .resources import NamedControlPlaneLock, WorkspaceExecutionLock, enforce_data_quota
 from .risk import command_risk_facts
 from .sandbox_backend import (
     codex_sandbox_effective_policy,
+    require_codex_sandbox_live_verification,
     resolve_codex_sandbox_backend,
 )
-from .structured_files import infer_format, read_zip_entry
+from .structured_files import infer_format, read_zip_entries, read_zip_entry
 from .structured_files import inspect as inspect_structured
 from .structured_files import transform as transform_structured
 from .timeline import timeline_entry, timeline_list
@@ -44,12 +50,16 @@ from .util import canonical_json, read_text_limited, sha256_bytes, sha256_text, 
 from .workspace_history import (
     WorkspaceMutationError,
     begin_single_file_write_transaction,
+    build_workspace_target_from_bytes,
     capture_workspace_state,
     checkpoint_manifest_digest,
     compare_workspace_states,
     describe_workspace_restore,
     finalize_workspace_transaction,
+    mark_workspace_transaction_audit_reconciled,
     prepare_selective_undo,
+    restore_workspace_state,
+    rollback_applied_workspace_transaction,
     update_single_file_write_transaction,
     verify_checkpoint_integrity,
     workspace_recovery_required,
@@ -72,6 +82,7 @@ CONTROL = ToolAnnotations(
 class Runtime:
     def __init__(self) -> None:
         self.settings: Settings = load_settings()
+        assert_trusted_runtime(self.settings)
         self.workspace = Workspace(self.settings)
         self.audit = AuditStore(self.settings)
         self.policy = CommandPolicy(self.settings, self.workspace)
@@ -84,10 +95,11 @@ mcp = MCPServer(
     "Windows Local MCP",
     version="0.6.0",
     instructions=(
-        "Operate inside the configured workspace. Use execute_readonly for safe Git/analyze "
-        "operations, execute_workspace_write for constrained automatic source formatting, and "
-        "adb_read for fixed read-only emulator operations. Test/build/general shell/destructive "
-        "ADB use request_sandbox_command and local approval by default; request_host_command "
+        "Operate inside the configured workspace. Use broker primitives for bounded file, "
+        "artifact, Git-read, and fixed ADB-read operations. DOCX/XLSX/CSV/TSV/ZIP/image work "
+        "uses bounded structured processing or hash-bound container artifacts. Project code, "
+        "plugins, Flutter/Dart processing, test/build, and general commands use "
+        "request_sandbox_command; request_host_command "
         "is the explicit last-resort host tier. Activity tools expose bounded "
         "operation details; workspace rollback is always a locally approved operation. "
         "request_host_command only stages "
@@ -114,9 +126,18 @@ def _safe_request(value: Any, *, depth: int = 0) -> Any:
         return result
     if isinstance(value, list):
         return [_safe_request(item, depth=depth + 1) for item in value[:200]]
-    if isinstance(value, str) and len(value) > 4000:
-        return {"characters": len(value), "sha256": sha256_text(value)}
+    if isinstance(value, str):
+        if len(value) > 4000:
+            return {"characters": len(value), "sha256": sha256_text(value)}
+        return redact_text(value)
     return value
+
+
+def _redacted_normalized(normalized: NormalizedCommand) -> dict[str, Any]:
+    payload = normalized.model_dump()
+    payload["args"] = redact_command_args(normalized.args)
+    payload["display_command"] = redact_command_args(normalized.display_command)
+    return payload
 
 
 def _log_simple(
@@ -125,7 +146,7 @@ def _log_simple(
     request: dict[str, Any],
     result: Any,
     status: str = "succeeded",
-    tier: str = "read",
+    tier: str = "broker",
 ) -> str:
     operation_id = runtime.audit.create_operation(
         tool_name=tool_name,
@@ -147,7 +168,7 @@ def _log_simple(
 def _audit_rejection(tool_name: str, request: dict[str, Any], error: Exception) -> None:
     operation_id = runtime.audit.create_operation(
         tool_name=tool_name,
-        tier="denied",
+        tier="broker",
         status="rejected",
         cwd=str(runtime.settings.workspace_root),
         request=_safe_request(request),
@@ -158,6 +179,7 @@ def _audit_rejection(tool_name: str, request: dict[str, Any], error: Exception) 
 
 
 def _require_filesystem() -> None:
+    assert_control_plane_healthy(runtime.settings)
     if not runtime.settings.filesystem_enabled:
         raise PermissionError("filesystem capability is disabled")
 
@@ -169,9 +191,43 @@ def _require_workspace_mutation_ready() -> None:
         )
 
 
+def _codex_sandbox_capability() -> dict[str, Any]:
+    status: dict[str, Any] = {
+        "configured": runtime.settings.approved_sandbox_codex_path is not None,
+        "enabled": runtime.settings.approved_sandbox_enabled,
+        "available": False,
+        "live_verified": False,
+    }
+    if not runtime.settings.approved_sandbox_enabled:
+        status["unavailable_reason"] = "disabled by configuration"
+        return status
+    try:
+        backend = resolve_codex_sandbox_backend(runtime.settings).as_dict()
+        status["available"] = True
+        status["backend"] = {
+            key: backend[key]
+            for key in ("name", "provenance", "signature_status", "signer_subject")
+        }
+        marker = runtime.settings.data_dir / "control-plane" / "sandbox-live-verification.json"
+        if marker.is_file():
+            evidence = json.loads(marker.read_text(encoding="utf-8"))
+            if (
+                evidence.get("backend_digest") == sha256_text(canonical_json(backend))
+                and evidence.get("passed") is True
+            ):
+                status["live_verified"] = True
+                status["live_verified_at"] = evidence.get("verified_at")
+            else:
+                status["live_verification_stale"] = True
+    except Exception as error:  # noqa: BLE001 - availability must never break session_info
+        status["unavailable_reason"] = redact_text(f"{type(error).__name__}: {error}")
+    return status
+
+
 @mcp.tool(annotations=READ_ONLY)
 def session_info() -> dict[str, Any]:
     """Show workspace, capability switches, limits, and approval model."""
+    codex_sandbox = _codex_sandbox_capability()
     result = {
         "workspace_root": str(runtime.settings.workspace_root),
         "data_dir": str(runtime.settings.data_dir),
@@ -183,6 +239,46 @@ def session_info() -> dict[str, Any]:
             "adb": runtime.settings.adb_enabled,
             "powershell": runtime.settings.powershell_enabled,
             "structured_files": runtime.settings.filesystem_enabled,
+            "codex_sandbox_configured": runtime.settings.approved_sandbox_enabled,
+            "approved_host_configured": runtime.settings.approved_host_enabled,
+            "status": {
+                "broker": {
+                    "configured": True,
+                    "enabled": runtime.settings.filesystem_enabled,
+                    "available": True,
+                    "live_verified": True,
+                    "evidence": "startup filesystem identity/lock/replace probe",
+                },
+                "structured_processing": {
+                    "configured": True,
+                    "enabled": runtime.settings.filesystem_enabled,
+                    "available": runtime.settings.filesystem_enabled,
+                    "live_verified": False,
+                },
+                "chatgpt_container": {
+                    "configured": "client-dependent",
+                    "enabled": "client-dependent",
+                    "available": "unknown-to-WLMCP",
+                    "live_verified": False,
+                },
+                "codex_sandbox": codex_sandbox,
+                "approved_host": {
+                    "configured": runtime.settings.approved_host_enabled,
+                    "enabled": runtime.settings.approved_host_enabled,
+                    "available": runtime.settings.approved_host_enabled and os.name == "nt",
+                    "live_verified": False,
+                },
+            },
+        },
+        "architecture": {
+            "version": "broker-centered-sandboxed-processing-v1",
+            "layers": {
+                "broker": "closed-world file, artifact, Git-read, fixed ADB-read, checkpoint, transaction, rollback, and audit primitives",
+                "structured_processing": "bounded declarative WLMCP processing or hash-bound ChatGPT container artifacts",
+                "codex_sandbox": "open-ended execution, project-controlled code/plugins, Flutter/Dart processing, test/build, and general commands",
+                "approved_host": "separately approved operations requiring real Windows user authority",
+            },
+            "legacy_safe_tier": "obsolete; fixed operations are broker primitives",
         },
         "adb_emulator_only": runtime.settings.adb_emulator_only,
         "approval_flow": "request -> local approve-and-run -> poll",
@@ -191,11 +287,10 @@ def session_info() -> dict[str, Any]:
             "workspace_write": "execute_workspace_write",
             "adb_read": "adb_read",
         },
-        "safe_network_isolation": {
-            "mode": runtime.settings.safe_network_isolation_mode,
-            "git_dart_flutter": "AppContainer without network capabilities",
-            "adb": "separate AppContainer profile with explicit loopback exemption",
-            "os_enforced": runtime.settings.safe_network_isolation_mode == "appcontainer",
+        "execution_boundaries": {
+            "broker": "closed-world validation; no general command surface",
+            "codex_sandbox": "configured independently; live verification reported separately",
+            "approved_host": "separate approval; never an automatic fallback",
         },
         "configuration_selection": runtime.settings.selection_info(),
         "transport": "stdio by default; optional loopback-only streamable-http",
@@ -268,12 +363,21 @@ def read_file(
         _require_filesystem()
         file_path = runtime.workspace.resolve_existing(path, allow_directory=False)
         text = read_text_limited(file_path, runtime.settings.max_text_file_bytes)
+        raw = text.encode("utf-8")
         lines = text.splitlines()
         start = 1 if start_line is None else max(1, start_line)
         end = len(lines) if end_line is None else min(len(lines), max(start, end_line))
         result = {
             "path": runtime.workspace.relative(file_path),
-            "sha256": sha256_text(text),
+            "sha256": sha256_bytes(raw),
+            "raw_bytes": len(raw),
+            "newline": (
+                "mixed"
+                if "\r\n" in text and "\n" in text.replace("\r\n", "")
+                else "crlf"
+                if "\r\n" in text
+                else "lf"
+            ),
             "start_line": start,
             "end_line": end,
             "total_lines": len(lines),
@@ -321,11 +425,13 @@ def _atomic_binary_mutation(
     transform: Any,
     allow_create: bool = False,
     require_expected_for_existing: bool = False,
+    source_bindings: tuple[tuple[str, str], ...] = (),
 ) -> dict[str, Any]:
     """Apply one verified binary replacement through the normal workspace journal.
 
-    Transforming is performed while the target lock is held and receives immutable source bytes.
-    This is the shared commit boundary for local structured editing and uploaded artifacts.
+    The transform passed here must be a completed, bounded artifact operation. Expensive parsing
+    and transformation happens before this commit boundary. Source bindings are checked again
+    while the workspace mutation lock is held.
     """
     _require_filesystem()
     _require_workspace_mutation_ready()
@@ -356,6 +462,8 @@ def _atomic_binary_mutation(
             if expected_sha256 is not None and expected_sha256 != before_sha:
                 raise RuntimeError("expected_sha256 mismatch; source is stale or concurrently modified")
 
+            _verify_binary_source_bindings(source_bindings)
+
             after, semantic = transform(before)
             if not isinstance(after, bytes):
                 raise TypeError("binary mutation transform must return bytes")
@@ -381,7 +489,7 @@ def _atomic_binary_mutation(
             }
             operation_id = runtime.audit.create_operation(
                 tool_name=tool_name,
-                tier="broker",
+                tier="structured_processing",
                 status="running",
                 cwd=str(runtime.settings.workspace_root),
                 request=_safe_request(request),
@@ -414,6 +522,7 @@ def _atomic_binary_mutation(
                     raise RuntimeError("structured file changed concurrently before replacement")
                 if current_exists and sha256_bytes(target.read_bytes()) != before_sha:
                     raise RuntimeError("source is stale or concurrently modified")
+                _verify_binary_source_bindings(source_bindings)
                 os.replace(temp_path, target)
                 temp_path = None
                 workspace_changed = True
@@ -439,8 +548,9 @@ def _atomic_binary_mutation(
                 update_single_file_write_transaction(
                     runtime.settings, operation_id, state="applied_verified", target_manifest=post_workspace.manifest_path
                 )
-                runtime.audit.update_operation(
+                runtime.audit.transition_operation(
                     operation_id,
+                    from_statuses={"running"},
                     status="succeeded",
                     finished_at=utc_now_iso(),
                     diff_path=str(workspace_change["diff_path"]),
@@ -455,6 +565,12 @@ def _atomic_binary_mutation(
             except Exception as error:
                 if workspace_changed:
                     try:
+                        live_exists = target.exists()
+                        live_bytes = target.read_bytes() if live_exists else b""
+                        if not live_exists or live_bytes != after:
+                            raise RuntimeError(
+                                "automatic recovery refused to overwrite a concurrent target change"
+                            )
                         if target_identity is None:
                             target.unlink(missing_ok=True)
                         else:
@@ -471,8 +587,12 @@ def _atomic_binary_mutation(
                         journal = update_single_file_write_transaction(
                             runtime.settings, operation_id, state="recovery_required", error=recovery_error
                         )
-                        runtime.audit.update_operation(
-                            operation_id, status="failed", finished_at=utc_now_iso(), rollback_state="recovery_required",
+                        runtime.audit.transition_operation(
+                            operation_id,
+                            from_statuses={"running"},
+                            status="failed",
+                            finished_at=utc_now_iso(),
+                            rollback_state="recovery_required",
                             error=f"{type(recovery_error).__name__}: {recovery_error}",
                         )
                         raise WorkspaceMutationError(
@@ -495,13 +615,55 @@ def _atomic_binary_mutation(
                 if temp_path is not None:
                     temp_path.unlink(missing_ok=True)
                 if operation_id is not None:
-                    record = runtime.audit.get_operation(operation_id)
-                    if record is not None and record["status"] == "running":
-                        runtime.audit.update_operation(
-                            operation_id, status="failed", finished_at=utc_now_iso(),
-                            error="structured mutation failed before replacement",
-                        )
+                    transitioned = runtime.audit.transition_operation(
+                        operation_id,
+                        from_statuses={"running"},
+                        status="failed",
+                        finished_at=utc_now_iso(),
+                        error="structured mutation failed before replacement",
+                    )
+                    if transitioned:
                         runtime.audit.add_event(operation_id, "failed", {"path": path})
+
+
+def _read_bounded_binary(
+    path: str, *, allow_missing: bool = False
+) -> tuple[Path, bytes, bool]:
+    """Read one stable workspace file under its target lock for off-lock processing."""
+    target = runtime.workspace.resolve_for_write(path) if allow_missing else runtime.workspace.resolve_existing(
+        path, allow_directory=False
+    )
+    with WorkspaceExecutionLock(runtime.settings, target=target), runtime.workspace.lock_target(target):
+        target = runtime.workspace.resolve_for_write(path)
+        if not target.exists():
+            if allow_missing:
+                return target, b"", False
+            raise FileNotFoundError(path)
+        identity = runtime.workspace.identity(target)
+        parent_identity = runtime.workspace.identity(target.parent)
+        if parent_identity is None:
+            raise RuntimeError("source parent disappeared")
+        size = target.stat().st_size
+        if size > runtime.settings.max_structured_file_bytes:
+            raise ValueError("structured file exceeds max_structured_file_bytes")
+        data = target.read_bytes()
+        runtime.workspace.revalidate_for_replace(
+            target,
+            parent_identity=parent_identity,
+            target_identity=identity,
+        )
+        if target.read_bytes() != data:
+            raise RuntimeError("source changed while preparing the processing artifact")
+        return target, data, True
+
+
+def _verify_binary_source_bindings(bindings: tuple[tuple[str, str], ...]) -> None:
+    for path, expected in bindings:
+        source = runtime.workspace.resolve_existing(path, allow_directory=False)
+        if source.stat().st_size > runtime.settings.max_structured_file_bytes:
+            raise RuntimeError("bound source exceeds max_structured_file_bytes")
+        if sha256_bytes(source.read_bytes()) != expected:
+            raise RuntimeError(f"bound source changed before commit: {path}")
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -539,9 +701,21 @@ def structured_file_apply(
     try:
         kind = infer_format(path, format)
         allow_create = kind in {"csv", "tsv", "zip"}
+        _target, prepared_source, source_exists = _read_bounded_binary(
+            path, allow_missing=allow_create
+        )
+        prepared_sha = sha256_bytes(prepared_source)
+        if source_exists and expected_sha256 is None:
+            raise ValueError("expected_sha256 is required when replacing an existing file")
+        if expected_sha256 is not None and expected_sha256 != prepared_sha:
+            raise RuntimeError("expected_sha256 mismatch; source is stale or concurrently modified")
+        output, semantic = transform_structured(
+            prepared_source, path, operations, runtime.settings, format=format
+        )
 
         def apply(source: bytes) -> tuple[bytes, dict[str, Any]]:
-            output, semantic = transform_structured(source, path, operations, runtime.settings, format=format)
+            if source != prepared_source:
+                raise RuntimeError("source changed while the structured artifact was processed")
             return output, semantic
 
         return _atomic_binary_mutation(
@@ -614,21 +788,19 @@ def zip_entry_extract(
     try:
         if not re.fullmatch(r"[0-9a-f]{64}", expected_archive_sha256):
             raise ValueError("expected_archive_sha256 must be a lowercase SHA-256 digest")
+        archive, archive_data, _archive_exists = _read_bounded_binary(path)
+        archive_relative = runtime.workspace.relative(archive)
+        if infer_format(archive_relative) != "zip":
+            raise ValueError("path must be a ZIP file")
+        if sha256_bytes(archive_data) != expected_archive_sha256:
+            raise RuntimeError("expected_archive_sha256 mismatch; archive is stale or concurrently modified")
+        payload = read_zip_entry(archive_data, entry, runtime.settings)
 
         def extract(_: bytes) -> tuple[bytes, dict[str, Any]]:
-            archive = runtime.workspace.resolve_existing(path, allow_directory=False)
-            if infer_format(runtime.workspace.relative(archive)) != "zip":
-                raise ValueError("path must be a ZIP file")
-            if archive.stat().st_size > runtime.settings.max_structured_file_bytes:
-                raise ValueError("structured file exceeds max_structured_file_bytes")
-            data = archive.read_bytes()
-            if sha256_bytes(data) != expected_archive_sha256:
-                raise RuntimeError("expected_archive_sha256 mismatch; archive is stale or concurrently modified")
-            payload = read_zip_entry(data, entry, runtime.settings)
             return payload, {
                 "format": "zip",
                 "operation": "entry_extract",
-                "archive_path": runtime.workspace.relative(archive),
+                "archive_path": archive_relative,
                 "archive_sha256": expected_archive_sha256,
                 "entry": entry,
             }
@@ -642,16 +814,173 @@ def zip_entry_extract(
             transform=extract,
             allow_create=True,
             require_expected_for_existing=True,
+            source_bindings=((archive_relative, expected_archive_sha256),),
         )
     except Exception as error:
         _audit_rejection("zip_entry_extract", request, error)
         raise
 
 
+@mcp.tool(annotations=LOCAL_WRITE)
+def zip_extract_many(
+    path: str,
+    output_directory: str,
+    expected_archive_sha256: str,
+    entries: list[str] | None = None,
+    reason: str = "",
+) -> dict[str, Any]:
+    """Extract selected or all ZIP files as one recoverable workspace transaction."""
+    request = {
+        "path": path,
+        "output_directory": output_directory,
+        "expected_archive_sha256": expected_archive_sha256,
+        "entries": entries,
+        "reason": reason,
+    }
+    operation_id: str | None = None
+    try:
+        _require_filesystem()
+        _require_workspace_mutation_ready()
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_archive_sha256):
+            raise ValueError("expected_archive_sha256 must be a lowercase SHA-256 digest")
+        archive, archive_data, _exists = _read_bounded_binary(path)
+        archive_relative = runtime.workspace.relative(archive)
+        if infer_format(archive_relative) != "zip":
+            raise ValueError("path must be a ZIP file")
+        if sha256_bytes(archive_data) != expected_archive_sha256:
+            raise RuntimeError("expected_archive_sha256 mismatch; archive is stale or concurrently modified")
+        extracted = read_zip_entries(archive_data, entries, runtime.settings)
+        changes: dict[str, bytes] = {}
+        base = PureWindowsPath(output_directory)
+        for entry, payload in extracted.items():
+            relative = str(base / PureWindowsPath(entry.replace("/", "\\")))
+            target = runtime.workspace.resolve_planned_write(relative)
+            normalized = PureWindowsPath(runtime.workspace.relative(target)).as_posix()
+            if normalized.casefold() == archive_relative.casefold():
+                raise ValueError("ZIP extraction cannot overwrite its source archive")
+            changes[normalized] = payload
+        operation_id = runtime.audit.create_operation(
+            tool_name="zip_extract_many",
+            tier="structured_processing",
+            status="running",
+            cwd=str(runtime.settings.workspace_root),
+            request=_safe_request(request),
+        )
+        with WorkspaceExecutionLock(runtime.settings):
+            _require_workspace_mutation_ready()
+            _verify_binary_source_bindings(((archive_relative, expected_archive_sha256),))
+            before = capture_workspace_state(runtime.settings, operation_id, "before")
+            target_manifest = build_workspace_target_from_bytes(
+                runtime.settings,
+                operation_id,
+                before.manifest_path,
+                changes,
+            )
+            runtime.audit.update_operation(operation_id, pre_workspace_path=before.manifest_path)
+            applied = False
+            try:
+                restore_workspace_state(
+                    runtime.settings,
+                    before.manifest_path,
+                    target_manifest,
+                    operation_id=operation_id,
+                )
+                applied = True
+                _verify_binary_source_bindings(
+                    ((archive_relative, expected_archive_sha256),)
+                )
+            except Exception as operation_error:
+                if applied:
+                    recovered = rollback_applied_workspace_transaction(
+                        runtime.settings, operation_id
+                    )
+                    raise WorkspaceMutationError(
+                        f"ZIP extraction was rolled back after source verification failed: {operation_error}",
+                        recovery_state=str(recovered["rollback_state"]),
+                        journal_path=str(recovered["transaction_journal"]),
+                    ) from operation_error
+                raise
+            after = capture_workspace_state(runtime.settings, operation_id, "after")
+            workspace_change = compare_workspace_states(
+                runtime.settings, before.manifest_path, after.manifest_path, operation_id
+            )
+            result = {
+                "operation_id": operation_id,
+                "status": "succeeded",
+                "execution_path": "broker_direct",
+                "archive_path": archive_relative,
+                "archive_sha256": expected_archive_sha256,
+                "extracted_files": sorted(changes),
+                "extracted_file_count": len(changes),
+                "rollback_state": "complete",
+                **workspace_change,
+            }
+            runtime.audit.transition_operation(
+                operation_id,
+                from_statuses={"running"},
+                status="succeeded",
+                finished_at=utc_now_iso(),
+                pre_workspace_path=before.manifest_path,
+                post_workspace_path=after.manifest_path,
+                diff_path=str(workspace_change["diff_path"]),
+                rollback_state="complete",
+                result_json=canonical_json(result),
+            )
+            finalize_workspace_transaction(runtime.settings, operation_id)
+            runtime.audit.add_event(operation_id, "zip_extracted", result)
+            return result
+    except Exception as error:
+        if operation_id is not None:
+            transitioned = runtime.audit.transition_operation(
+                operation_id,
+                from_statuses={"running"},
+                status="failed",
+                finished_at=utc_now_iso(),
+                rollback_state=getattr(error, "recovery_state", "not_applied"),
+                error=f"{type(error).__name__}: {error}",
+            )
+            if transitioned:
+                if getattr(error, "recovery_state", None) == "failed_recovered":
+                    mark_workspace_transaction_audit_reconciled(
+                        runtime.settings, operation_id
+                    )
+                runtime.audit.add_event(
+                    operation_id, "failed", {"error": f"{type(error).__name__}: {error}"}
+                )
+        else:
+            _audit_rejection("zip_extract_many", request, error)
+        raise
+
+
 def _transfer_root(transfer_id: str) -> Path:
     if not re.fullmatch(r"[0-9a-f-]{36}", transfer_id):
         raise ValueError("invalid transfer id")
-    return runtime.settings.data_dir / "structured-transfers" / transfer_id
+    return runtime.settings.data_dir / "binary-transfers" / transfer_id
+
+
+def _admit_transfer() -> None:
+    root = runtime.settings.data_dir / "binary-transfers"
+    open_count = 0
+    if root.is_dir() and not root.is_symlink():
+        for manifest_path in root.glob("*/manifest.json"):
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if manifest.get("state") == "open":
+                try:
+                    created = datetime.fromisoformat(str(manifest["created_at"]))
+                except (KeyError, TypeError, ValueError):
+                    raise RuntimeError("binary transfer manifest has invalid lifetime binding")
+                if datetime.now(UTC) - created > timedelta(
+                    seconds=runtime.settings.approval_request_ttl_seconds
+                ):
+                    manifest["state"] = "expired"
+                    _write_transfer_manifest(manifest_path.parent, manifest)
+                    continue
+                open_count += 1
+                if open_count >= runtime.settings.max_open_transfers:
+                    raise RuntimeError("open binary transfer admission limit reached")
 
 
 def _write_transfer_manifest(root: Path, manifest: dict[str, Any]) -> None:
@@ -666,6 +995,8 @@ def _load_transfer(transfer_id: str, expected_direction: str) -> tuple[Path, dic
     if not manifest_path.is_file():
         raise FileNotFoundError("transfer session was not found")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("version") not in {1, 2}:
+        raise RuntimeError("transfer session version is unsupported")
     if manifest.get("direction") != expected_direction or manifest.get("state") != "open":
         raise RuntimeError("transfer session is not open for this operation")
     created = datetime.fromisoformat(str(manifest["created_at"]))
@@ -677,8 +1008,8 @@ def _load_transfer(transfer_id: str, expected_direction: str) -> tuple[Path, dic
 
 
 @mcp.tool(annotations=READ_ONLY)
-def structured_file_download_begin(path: str, chunk_bytes: int | None = None) -> dict[str, Any]:
-    """Begin a hash-bound, byte-exact download for ChatGPT-side processing."""
+def artifact_download_begin(path: str, chunk_bytes: int | None = None) -> dict[str, Any]:
+    """Begin a hash-bound, byte-exact download of any bounded regular file."""
     request = {"path": path, "chunk_bytes": chunk_bytes}
     try:
         _require_filesystem()
@@ -690,21 +1021,24 @@ def structured_file_download_begin(path: str, chunk_bytes: int | None = None) ->
         if not isinstance(chunk, int) or chunk < 4096 or chunk > runtime.settings.max_transfer_chunk_bytes:
             raise ValueError("chunk_bytes is outside the configured bound")
         data = source.read_bytes()
-        transfer_id = str(uuid.uuid4())
-        root = _transfer_root(transfer_id)
-        root.mkdir(parents=True, exist_ok=False)
-        manifest = {"version": 1, "direction": "download", "state": "open", "created_at": utc_now_iso(), "path": runtime.workspace.relative(source), "sha256": sha256_bytes(data), "bytes": len(data), "chunk_bytes": chunk}
-        _write_transfer_manifest(root, manifest)
+        with NamedControlPlaneLock(runtime.settings, "binary-transfer"):
+            _admit_transfer()
+            enforce_data_quota(runtime.settings, incoming_bytes=4096)
+            transfer_id = str(uuid.uuid4())
+            root = _transfer_root(transfer_id)
+            root.mkdir(parents=True, exist_ok=False)
+            manifest = {"version": 1, "direction": "download", "state": "open", "created_at": utc_now_iso(), "path": runtime.workspace.relative(source), "sha256": sha256_bytes(data), "bytes": len(data), "chunk_bytes": chunk}
+            _write_transfer_manifest(root, manifest)
         result = {"transfer_id": transfer_id, "path": manifest["path"], "bytes": len(data), "sha256": manifest["sha256"], "chunk_bytes": chunk, "chunk_count": (len(data) + chunk - 1) // chunk, "execution_path": "transfer"}
-        result["operation_id"] = _log_simple(tool_name="structured_file_download_begin", request=request, result=result)
+        result["operation_id"] = _log_simple(tool_name="artifact_download_begin", request=request, result=result)
         return result
     except Exception as error:
-        _audit_rejection("structured_file_download_begin", request, error)
+        _audit_rejection("artifact_download_begin", request, error)
         raise
 
 
 @mcp.tool(annotations=READ_ONLY)
-def structured_file_download_chunk(transfer_id: str, offset: int) -> dict[str, Any]:
+def artifact_download_chunk(transfer_id: str, offset: int) -> dict[str, Any]:
     """Read one base64 chunk; it fails if the source changed after download_begin."""
     request = {"transfer_id": transfer_id, "offset": offset}
     try:
@@ -722,17 +1056,23 @@ def structured_file_download_chunk(transfer_id: str, offset: int) -> dict[str, A
             raise ValueError("offset is outside the source file")
         payload = data[offset : offset + int(manifest["chunk_bytes"])]
         result = {"transfer_id": transfer_id, "offset": offset, "bytes": len(payload), "base64": base64.b64encode(payload).decode("ascii"), "next_offset": offset + len(payload), "complete": offset + len(payload) == len(data), "sha256": sha256_bytes(payload)}
-        _log_simple(tool_name="structured_file_download_chunk", request=request, result={key: value for key, value in result.items() if key != "base64"})
+        _log_simple(tool_name="artifact_download_chunk", request=request, result={key: value for key, value in result.items() if key != "base64"})
         return result
     except Exception as error:
-        _audit_rejection("structured_file_download_chunk", request, error)
+        _audit_rejection("artifact_download_chunk", request, error)
         raise
 
 
 @mcp.tool(annotations=CONTROL)
-def structured_file_upload_begin(path: str, total_bytes: int, sha256: str, expected_sha256: str | None = None) -> dict[str, Any]:
-    """Stage a ChatGPT-side artifact. It cannot affect the workspace until commit succeeds."""
-    request = {"path": path, "total_bytes": total_bytes, "sha256": sha256, "expected_sha256": expected_sha256}
+def artifact_upload_begin(
+    path: str,
+    total_bytes: int,
+    sha256: str,
+    expected_sha256: str | None = None,
+    source_transfer_id: str | None = None,
+) -> dict[str, Any]:
+    """Stage any bounded binary artifact without changing the workspace."""
+    request = {"path": path, "total_bytes": total_bytes, "sha256": sha256, "expected_sha256": expected_sha256, "source_transfer_id": source_transfer_id}
     try:
         _require_filesystem()
         if not isinstance(total_bytes, int) or total_bytes < 0 or total_bytes > runtime.settings.max_structured_file_bytes:
@@ -747,83 +1087,143 @@ def structured_file_upload_begin(path: str, total_bytes: int, sha256: str, expec
                 raise ValueError("structured file exceeds max_structured_file_bytes")
             if sha256_bytes(target.read_bytes()) != expected_sha256:
                 raise RuntimeError("expected_sha256 mismatch; target is stale or concurrently modified")
-        transfer_id = str(uuid.uuid4())
-        root = _transfer_root(transfer_id)
-        root.mkdir(parents=True, exist_ok=False)
-        (root / "payload.bin").touch()
-        manifest = {"version": 1, "direction": "upload", "state": "open", "created_at": utc_now_iso(), "path": runtime.workspace.relative(target), "bytes": total_bytes, "sha256": sha256, "expected_sha256": expected_sha256, "received": 0}
-        _write_transfer_manifest(root, manifest)
+        source_binding = None
+        if source_transfer_id is not None:
+            _source_root, source_manifest = _load_transfer(source_transfer_id, "download")
+            source_binding = {
+                "path": source_manifest["path"],
+                "sha256": source_manifest["sha256"],
+                "bytes": source_manifest["bytes"],
+            }
+        with NamedControlPlaneLock(runtime.settings, "binary-transfer"):
+            _admit_transfer()
+            enforce_data_quota(runtime.settings, incoming_bytes=total_bytes + 4096)
+            transfer_id = str(uuid.uuid4())
+            root = _transfer_root(transfer_id)
+            root.mkdir(parents=True, exist_ok=False)
+            (root / "payload.bin").touch()
+            manifest = {"version": 2, "direction": "upload", "state": "open", "created_at": utc_now_iso(), "path": runtime.workspace.relative(target), "bytes": total_bytes, "sha256": sha256, "expected_sha256": expected_sha256, "received": 0, "source_binding": source_binding}
+            _write_transfer_manifest(root, manifest)
         result = {"transfer_id": transfer_id, "path": manifest["path"], "total_bytes": total_bytes, "chunk_bytes_max": runtime.settings.max_transfer_chunk_bytes, "execution_path": "transfer"}
-        result["operation_id"] = _log_simple(tool_name="structured_file_upload_begin", request=request, result=result, tier="transfer")
+        result["operation_id"] = _log_simple(tool_name="artifact_upload_begin", request=request, result=result, tier="broker")
         return result
     except Exception as error:
-        _audit_rejection("structured_file_upload_begin", request, error)
+        _audit_rejection("artifact_upload_begin", request, error)
         raise
 
 
 @mcp.tool(annotations=CONTROL)
-def structured_file_upload_chunk(transfer_id: str, offset: int, base64_chunk: str) -> dict[str, Any]:
+def artifact_upload_chunk(transfer_id: str, offset: int, base64_chunk: str) -> dict[str, Any]:
     """Append one exact, bounded base64 upload chunk at the next expected offset."""
     try:
-        root, manifest = _load_transfer(transfer_id, "upload")
-        if offset != int(manifest["received"]):
-            raise RuntimeError("upload chunk offset is not the next expected offset")
+        root = _transfer_root(transfer_id)
         try:
             payload = base64.b64decode(base64_chunk, validate=True)
         except ValueError as error:
             raise ValueError("base64_chunk must be valid base64") from error
         if not payload or len(payload) > runtime.settings.max_transfer_chunk_bytes:
             raise ValueError("upload chunk is outside the configured bound")
-        if offset + len(payload) > int(manifest["bytes"]):
-            raise ValueError("upload exceeds declared total_bytes")
-        with (root / "payload.bin").open("ab") as output:
-            output.write(payload)
-            output.flush()
-            os.fsync(output.fileno())
-        manifest["received"] = offset + len(payload)
-        _write_transfer_manifest(root, manifest)
+        with NamedControlPlaneLock(runtime.settings, f"transfer-{transfer_id}"):
+            root, manifest = _load_transfer(transfer_id, "upload")
+            if offset != int(manifest["received"]):
+                raise RuntimeError("upload chunk offset is not the next expected offset")
+            if offset + len(payload) > int(manifest["bytes"]):
+                raise ValueError("upload exceeds declared total_bytes")
+            with NamedControlPlaneLock(runtime.settings, "binary-transfer"):
+                enforce_data_quota(runtime.settings, incoming_bytes=len(payload))
+                with (root / "payload.bin").open("ab") as output:
+                    output.write(payload)
+                    output.flush()
+                    os.fsync(output.fileno())
+            manifest["received"] = offset + len(payload)
+            _write_transfer_manifest(root, manifest)
         result = {"transfer_id": transfer_id, "received": manifest["received"], "complete": manifest["received"] == manifest["bytes"], "chunk_sha256": sha256_bytes(payload)}
-        _log_simple(tool_name="structured_file_upload_chunk", request={"transfer_id": transfer_id, "offset": offset, "chunk_bytes": len(payload), "chunk_sha256": result["chunk_sha256"]}, result=result, tier="transfer")
+        _log_simple(tool_name="artifact_upload_chunk", request={"transfer_id": transfer_id, "offset": offset, "chunk_bytes": len(payload), "chunk_sha256": result["chunk_sha256"]}, result=result, tier="broker")
         return result
     except Exception as error:
-        _audit_rejection("structured_file_upload_chunk", {"transfer_id": transfer_id, "offset": offset}, error)
+        _audit_rejection("artifact_upload_chunk", {"transfer_id": transfer_id, "offset": offset}, error)
         raise
 
 
 @mcp.tool(annotations=LOCAL_WRITE)
-def structured_file_upload_commit(transfer_id: str, reason: str = "") -> dict[str, Any]:
+def artifact_upload_commit(transfer_id: str, reason: str = "") -> dict[str, Any]:
     """Verify a complete staged upload and atomically commit it with checkpoint and rollback."""
     request = {"transfer_id": transfer_id, "reason": reason}
     try:
-        root, manifest = _load_transfer(transfer_id, "upload")
-        if int(manifest["received"]) != int(manifest["bytes"]):
-            raise RuntimeError("upload is incomplete and cannot be committed")
-        payload_path = root / "payload.bin"
-        if payload_path.stat().st_size != int(manifest["bytes"]):
-            raise RuntimeError("staged upload does not match declared byte identity")
-        payload = payload_path.read_bytes()
-        if len(payload) != int(manifest["bytes"]) or sha256_bytes(payload) != manifest["sha256"]:
-            raise RuntimeError("staged upload does not match declared byte identity")
+        with NamedControlPlaneLock(runtime.settings, f"transfer-{transfer_id}"):
+            root, manifest = _load_transfer(transfer_id, "upload")
+            if int(manifest["received"]) != int(manifest["bytes"]):
+                raise RuntimeError("upload is incomplete and cannot be committed")
+            payload_path = root / "payload.bin"
+            if payload_path.stat().st_size != int(manifest["bytes"]):
+                raise RuntimeError("staged upload does not match declared byte identity")
+            payload = payload_path.read_bytes()
+            if len(payload) != int(manifest["bytes"]) or sha256_bytes(payload) != manifest["sha256"]:
+                raise RuntimeError("staged upload does not match declared byte identity")
 
-        def apply(_: bytes) -> tuple[bytes, dict[str, Any]]:
-            return payload, {"execution_path": "transfer", "transfer_id": transfer_id, "format": infer_format(str(manifest["path"]))}
+            def apply(_: bytes) -> tuple[bytes, dict[str, Any]]:
+                return payload, {
+                    "execution_path": "transfer",
+                    "transfer_id": transfer_id,
+                    "artifact_kind": "opaque_binary",
+                    "embedded_code_executed": False,
+                }
 
-        result = _atomic_binary_mutation(
-            tool_name="structured_file_upload_commit",
-            path=str(manifest["path"]),
-            expected_sha256=manifest.get("expected_sha256"),
-            reason=reason,
-            request_summary={"transfer_id": transfer_id, "declared_bytes": manifest["bytes"], "declared_sha256": manifest["sha256"]},
-            transform=apply,
-            allow_create=True,
-            require_expected_for_existing=True,
-        )
-        manifest["state"] = "committed"
-        _write_transfer_manifest(root, manifest)
-        return result
+            source_binding = manifest.get("source_binding")
+            source_bindings: tuple[tuple[str, str], ...] = ()
+            if source_binding is not None:
+                source_bindings = ((str(source_binding["path"]), str(source_binding["sha256"])),)
+            result = _atomic_binary_mutation(
+                tool_name="artifact_upload_commit",
+                path=str(manifest["path"]),
+                expected_sha256=manifest.get("expected_sha256"),
+                reason=reason,
+                request_summary={"transfer_id": transfer_id, "declared_bytes": manifest["bytes"], "declared_sha256": manifest["sha256"]},
+                transform=apply,
+                allow_create=True,
+                require_expected_for_existing=True,
+                source_bindings=source_bindings,
+            )
+            manifest["state"] = "committed"
+            _write_transfer_manifest(root, manifest)
+            return result
     except Exception as error:
-        _audit_rejection("structured_file_upload_commit", request, error)
+        _audit_rejection("artifact_upload_commit", request, error)
         raise
+
+
+# Compatibility names remain thin aliases; the security boundary and audit identity are the
+# format-independent artifact broker above.
+@mcp.tool(annotations=READ_ONLY)
+def structured_file_download_begin(path: str, chunk_bytes: int | None = None) -> dict[str, Any]:
+    return artifact_download_begin(path, chunk_bytes)
+
+
+@mcp.tool(annotations=READ_ONLY)
+def structured_file_download_chunk(transfer_id: str, offset: int) -> dict[str, Any]:
+    return artifact_download_chunk(transfer_id, offset)
+
+
+@mcp.tool(annotations=CONTROL)
+def structured_file_upload_begin(
+    path: str,
+    total_bytes: int,
+    sha256: str,
+    expected_sha256: str | None = None,
+) -> dict[str, Any]:
+    return artifact_upload_begin(path, total_bytes, sha256, expected_sha256)
+
+
+@mcp.tool(annotations=CONTROL)
+def structured_file_upload_chunk(
+    transfer_id: str, offset: int, base64_chunk: str
+) -> dict[str, Any]:
+    return artifact_upload_chunk(transfer_id, offset, base64_chunk)
+
+
+@mcp.tool(annotations=LOCAL_WRITE)
+def structured_file_upload_commit(transfer_id: str, reason: str = "") -> dict[str, Any]:
+    return artifact_upload_commit(transfer_id, reason)
 
 
 @mcp.tool(annotations=LOCAL_WRITE)
@@ -865,6 +1265,8 @@ def write_file(
             except UnicodeDecodeError as error:
                 raise ValueError("existing file is not UTF-8 text") from error
             before_sha = sha256_bytes(previous_bytes)
+            if target.exists() and expected_sha256 is None:
+                raise ValueError("expected_sha256 is required when replacing an existing file")
             if expected_sha256 is not None and expected_sha256 != before_sha:
                 raise RuntimeError("expected_sha256 mismatch")
 
@@ -877,7 +1279,7 @@ def write_file(
             }
             operation_id = runtime.audit.create_operation(
                 tool_name="write_file",
-                tier="workspace_write",
+                tier="broker",
                 status="running",
                 cwd=str(runtime.settings.workspace_root),
                 request=request,
@@ -976,8 +1378,9 @@ def write_file(
                     state="applied_verified",
                     target_manifest=post_workspace.manifest_path,
                 )
-                runtime.audit.update_operation(
+                runtime.audit.transition_operation(
                     operation_id,
+                    from_statuses={"running"},
                     status="succeeded",
                     finished_at=utc_now_iso(),
                     diff_path=str(workspace_change["diff_path"]),
@@ -994,6 +1397,12 @@ def write_file(
                 if not workspace_changed:
                     raise
                 try:
+                    live_exists = target.exists()
+                    live_bytes = target.read_bytes() if live_exists else b""
+                    if not live_exists or live_bytes != content_bytes:
+                        raise RuntimeError(
+                            "automatic recovery refused to overwrite a concurrent target change"
+                        )
                     if target_identity is None:
                         target.unlink(missing_ok=True)
                     else:
@@ -1052,8 +1461,9 @@ def write_file(
         if operation_id is None:
             _audit_rejection("write_file", request_input, error)
         else:
-            runtime.audit.update_operation(
+            runtime.audit.transition_operation(
                 operation_id,
+                from_statuses={"running"},
                 status="failed",
                 finished_at=utc_now_iso(),
                 error=f"{type(error).__name__}: {error}",
@@ -1100,30 +1510,18 @@ def _queue_command(
     max_runtime_seconds: int,
     safe_request: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if len(runtime.audit.list_active_operations()) >= runtime.settings.max_concurrent_jobs:
+        raise RuntimeError("concurrent job admission limit exceeded")
     max_runtime = max(10, min(max_runtime_seconds, runtime.settings.default_max_runtime_seconds))
     timeout = max(0, min(foreground_timeout_seconds, 600))
     operation_id = str(uuid.uuid4())
-    normalized_model = NormalizedCommand.model_validate(normalized_command)
     execution_manifest_digest: str | None = None
-    if normalized_model.program_key in {"flutter", "dart"}:
-        dart_writes = normalized_model.program_key == "dart" and dart_format_writes(
-            normalized_model.args
-        )
-        if dart_writes:
-            _require_workspace_mutation_ready()
-        with WorkspaceExecutionLock(runtime.settings):
-            _, _, execution_manifest_digest = prepare_approval_bundle(
-                settings=runtime.settings,
-                workspace=runtime.workspace,
-                operation_id=operation_id,
-                normalized=normalized_model,
-                workspace_write=dart_writes,
-            )
     request = {
         "normalized_command": normalized_command,
         "safe_request": safe_request,
         "execution_manifest_digest": execution_manifest_digest,
         "settings_digest": settings_digest(runtime.settings),
+        "control_plane_generation": control_plane_generation(runtime.settings),
         "max_runtime_seconds": max_runtime,
     }
     runtime.audit.create_operation(
@@ -1157,7 +1555,7 @@ def _run_automatic_tool(
             )
         return _queue_command(
             tool_name=tool_name,
-            tier="safe_sandbox",
+            tier="broker",
             normalized_command=normalized.model_dump(),
             safe_request=request,
             foreground_timeout_seconds=(
@@ -1184,7 +1582,7 @@ def execute_readonly(
     foreground_timeout_seconds: int | None = None,
     max_runtime_seconds: int | None = None,
 ) -> dict[str, Any]:
-    """Run validated read-only Git/Flutter/Dart commands; use timeout 0 for a background job."""
+    """Run a fixed-grammar Git read as a broker primitive; open-ended tools use Sandbox."""
     return _run_automatic_tool(
         tool_name="execute_readonly",
         expected_kind=SafeExecutionKind.READ_ONLY,
@@ -1204,7 +1602,7 @@ def execute_workspace_write(
     foreground_timeout_seconds: int | None = None,
     max_runtime_seconds: int | None = None,
 ) -> dict[str, Any]:
-    """Run only validated automatic commands that intentionally modify workspace source files."""
+    """Legacy surface; project-controlled formatting now belongs in Codex Sandbox."""
     return _run_automatic_tool(
         tool_name="execute_workspace_write",
         expected_kind=SafeExecutionKind.WORKSPACE_WRITE,
@@ -1244,7 +1642,7 @@ def git_info() -> dict[str, Any]:
             raise PermissionError("git capability is disabled")
         operation_id = runtime.audit.create_operation(
             tool_name="git_info",
-            tier="safe_sandbox",
+            tier="broker",
             status="running",
             cwd=str(runtime.settings.workspace_root),
             request=request,
@@ -1256,8 +1654,9 @@ def git_info() -> dict[str, Any]:
             raise RuntimeError("workspace is not a Git worktree or Git is unavailable")
         content = read_text_limited(Path(snapshot), runtime.settings.max_diff_bytes)
         result = {"operation_id": operation_id, "snapshot_path": snapshot, "content": content}
-        runtime.audit.update_operation(
+        runtime.audit.transition_operation(
             operation_id,
+            from_statuses={"running"},
             status="succeeded",
             finished_at=utc_now_iso(),
             result_json=canonical_json({"snapshot_path": snapshot, "bytes": len(content.encode())}),
@@ -1316,7 +1715,7 @@ def stop_job(job_id: str) -> dict[str, Any]:
     """Stop a job only after durable process identity verification."""
     try:
         result = runtime.executor.stop(job_id)
-        _log_simple(tool_name="stop_job", request={"job_id": job_id}, result=result, tier="control")
+        _log_simple(tool_name="stop_job", request={"job_id": job_id}, result=result, tier="broker")
         return result
     except Exception as error:
         _audit_rejection("stop_job", {"job_id": job_id}, error)
@@ -1334,8 +1733,6 @@ def _request_approved_command(
     risk_summary: str,
     workspace_write: bool,
     max_runtime_seconds: int | None,
-    escalation_source_operation_id: str | None = None,
-    escalation_reason: str = "",
 ) -> dict[str, Any]:
     request_input = {
         "command": command,
@@ -1344,10 +1741,15 @@ def _request_approved_command(
         "network_required": network_required,
         "workspace_write": workspace_write,
         "execution_tier": execution_tier,
-        "escalation_source_operation_id": escalation_source_operation_id,
     }
     operation_id = str(uuid.uuid4())
     try:
+        reason = redact_text(reason)
+        risk_summary = redact_text(risk_summary)
+        if len(runtime.audit.list_pending_approvals()) >= runtime.settings.max_pending_approvals:
+            raise RuntimeError("pending approval admission limit exceeded")
+        if execution_tier == "approved_host" and not runtime.settings.approved_host_enabled:
+            raise PermissionError("Approved Host is disabled by configuration")
         if (
             len(reason) > runtime.settings.max_reason_characters
             or len(risk_summary) > runtime.settings.max_reason_characters
@@ -1359,28 +1761,17 @@ def _request_approved_command(
         backend: dict[str, Any] | None = None
         sandbox_policy: dict[str, Any] | None = None
         backend_digest: str | None = None
-        if execution_tier == "approved_sandbox":
+        if execution_tier == "codex_sandbox":
             if network_required:
                 raise PermissionError(
                     "Approved Sandbox is offline; request Approved Host separately only if "
                     "network access is genuinely required"
                 )
-            backend = resolve_codex_sandbox_backend(runtime.settings).as_dict()
+            resolved_backend = resolve_codex_sandbox_backend(runtime.settings)
+            require_codex_sandbox_live_verification(runtime.settings, resolved_backend)
+            backend = resolved_backend.as_dict()
             sandbox_policy = codex_sandbox_effective_policy(workspace_write=workspace_write)
             backend_digest = sha256_text(canonical_json(backend))
-        if escalation_source_operation_id:
-            source = runtime.audit.get_operation(
-                escalation_source_operation_id, include_events=False
-            )
-            source_result = source.get("result") or {}
-            if (
-                source.get("tier") != "safe_sandbox"
-                or not isinstance(source_result, dict)
-                or source_result.get("failure_class") != "sandbox_compatibility"
-            ):
-                raise PermissionError(
-                    "Safe Sandbox escalation requires a recorded compatibility failure"
-                )
         with WorkspaceExecutionLock(runtime.settings):
             _, manifest, manifest_digest = prepare_approval_bundle(
                 settings=runtime.settings,
@@ -1394,9 +1785,10 @@ def _request_approved_command(
             now + timedelta(seconds=runtime.settings.approval_request_ttl_seconds)
         ).isoformat()
         request = {
-            "approval_binding_version": 2,
-            "normalized_command": normalized.model_dump(),
-            "reason": reason,
+            "approval_binding_version": 3,
+            "control_plane_generation": control_plane_generation(runtime.settings),
+            "normalized_command": _redacted_normalized(normalized),
+            "reason": redact_text(reason),
             "risk_summary": risk_summary,
             "network_required": network_required,
             "workspace_write": workspace_write,
@@ -1404,11 +1796,6 @@ def _request_approved_command(
             "sandbox_backend": backend,
             "sandbox_backend_digest": backend_digest,
             "effective_sandbox_policy": sandbox_policy,
-            "escalation_source_tier": (
-                "safe_sandbox" if escalation_source_operation_id else None
-            ),
-            "escalation_source_operation_id": escalation_source_operation_id,
-            "escalation_reason": escalation_reason,
             "approval_manifest_digest": manifest_digest,
             "approval_manifest_summary": {
                 "mode": manifest["mode"],
@@ -1466,13 +1853,11 @@ def request_sandbox_command(
     risk_summary: str = "",
     workspace_write: bool = False,
     max_runtime_seconds: int | None = None,
-    escalation_source_operation_id: str | None = None,
-    escalation_reason: str = "",
 ) -> dict[str, Any]:
     """Stage a one-shot Approved Sandbox request; this call never executes the command."""
     return _request_approved_command(
         tool_name="request_sandbox_command",
-        execution_tier="approved_sandbox",
+        execution_tier="codex_sandbox",
         command=command,
         cwd=cwd,
         reason=reason,
@@ -1480,8 +1865,6 @@ def request_sandbox_command(
         risk_summary=risk_summary,
         workspace_write=workspace_write,
         max_runtime_seconds=max_runtime_seconds,
-        escalation_source_operation_id=escalation_source_operation_id,
-        escalation_reason=escalation_reason,
     )
 
 
@@ -1632,16 +2015,17 @@ def request_workspace_rollback(operation_id: str, reason: str = "") -> dict[str,
             ),
             "operation_type": "point_in_time_rollback",
             "undo_preview": preview,
-            "reason": reason,
+            "reason": redact_text(reason),
             "objective_risk": _workspace_mutation_risk(
                 "point_in_time_rollback", operation_id, preview
             ),
+            "control_plane_generation": control_plane_generation(runtime.settings),
         }
         request_hash = sha256_text(canonical_json(request))
         runtime.audit.create_operation(
             operation_id=rollback_id,
             tool_name="request_workspace_rollback",
-            tier="approved_host",
+            tier="broker",
             status="pending_approval",
             cwd=str(runtime.settings.workspace_root),
             request=request,
@@ -1703,16 +2087,17 @@ def request_selective_undo(operation_id: str, reason: str = "") -> dict[str, Any
                 runtime.settings, str(preview["target_checkpoint"])
             ),
             "undo_preview": preview,
-            "reason": reason,
+            "reason": redact_text(reason),
             "objective_risk": _workspace_mutation_risk(
                 "selective_undo", operation_id, preview
             ),
+            "control_plane_generation": control_plane_generation(runtime.settings),
         }
         if preview["conflict_count"]:
             runtime.audit.create_operation(
                 operation_id=undo_id,
                 tool_name="request_selective_undo",
-                tier="workspace_control",
+                tier="broker",
                 status="conflict",
                 cwd=str(runtime.settings.workspace_root),
                 request=request,
@@ -1739,7 +2124,7 @@ def request_selective_undo(operation_id: str, reason: str = "") -> dict[str, Any
         runtime.audit.create_operation(
             operation_id=undo_id,
             tool_name="request_selective_undo",
-            tier="approved_host",
+            tier="broker",
             status="pending_approval",
             cwd=str(runtime.settings.workspace_root),
             request=request,

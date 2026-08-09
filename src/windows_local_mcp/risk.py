@@ -45,7 +45,7 @@ def command_risk_facts(
         or adb_mutation,
     }
     detected = {name: value for name, value in detected.items() if value not in {False, None, ""}}
-    if execution_tier == "approved_sandbox":
+    if execution_tier in {"codex_sandbox", "approved_sandbox"}:
         capabilities: dict[str, Any] = {
             "identity": "Codex dedicated lower-privilege sandbox user/restricted token",
             "filesystem_outside_workspace_write_os_possible": False,
