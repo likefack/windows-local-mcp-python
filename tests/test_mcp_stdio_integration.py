@@ -31,7 +31,6 @@ def test_real_stdio_tools_list_and_file_round_trip(tmp_path: Path) -> None:
                 f'data_dir = "{data_text}"',
                 "protect_data_dir_acl = false",
                 "git_enabled = true",
-                'safe_network_isolation_mode = "compatibility"',
             ]
         ),
         encoding="utf-8",

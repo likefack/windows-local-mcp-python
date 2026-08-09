@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from windows_local_mcp.approval import (
-    collect_staged_workspace_write,
+    collect_staged_workspace_changes,
     materialize_execution_copy,
     prepare_approval_bundle,
     verify_approval_bundle,
@@ -144,7 +144,7 @@ def test_approval_terminal_text_escapes_controls_and_bidi() -> None:
     assert rendered == r"benign\u001b[2J\u000dforged\u202etxt"
 
 
-def test_staged_dart_write_brokers_only_validated_target(tmp_path: Path) -> None:
+def test_staged_sandbox_write_returns_a_closed_world_workspace_delta(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
     selected = settings.workspace_root / "selected.dart"
     other = settings.workspace_root / "other.dart"
@@ -174,16 +174,14 @@ def test_staged_dart_write_brokers_only_validated_target(tmp_path: Path) -> None
     run_cwd = Path(run.cwd)
     (run_cwd / "selected.dart").write_bytes(b"void main() {}\n")
     (run_cwd / "other.dart").write_bytes(b"malicious\n")
-    with pytest.raises(PermissionError, match="outside validated targets"):
-        collect_staged_workspace_write(
-            settings=settings, operation_id="staged-dart", normalized=run
-        )
-
-    (run_cwd / "other.dart").write_bytes(other.read_bytes())
-    changes = collect_staged_workspace_write(
+    changes, deletions = collect_staged_workspace_changes(
         settings=settings, operation_id="staged-dart", normalized=run
     )
-    assert changes == {"selected.dart": b"void main() {}\n"}
+    assert changes == {
+        "other.dart": b"malicious\n",
+        "selected.dart": b"void main() {}\n",
+    }
+    assert deletions == set()
 
 
 def test_code_loader_external_input_is_rejected(tmp_path: Path) -> None:
@@ -318,7 +316,7 @@ def test_dart_path_dependency_outside_cwd_is_copied_and_rewritten(tmp_path: Path
         expected_digest=digest,
     )
     staged_config = Path(verified.cwd) / ".dart_tool" / "package_config.json"
-    assert "approval-staging" in staged_config.read_text(encoding="utf-8")
+    assert "approval-inputs" in staged_config.read_text(encoding="utf-8")
     staged_shared = [
         Path(record["staged_path"])
         for record in manifest["inputs"]
@@ -332,8 +330,12 @@ def test_dart_path_dependency_outside_cwd_is_copied_and_rewritten(tmp_path: Path
         normalized=verified,
     )
     runnable_config = Path(runnable.cwd) / ".dart_tool" / "package_config.json"
-    assert "approval-staging" not in runnable_config.read_text(encoding="utf-8")
-    assert "dart-path-dependency-runtime" in runnable_config.read_text(encoding="utf-8")
+    runnable_text = runnable_config.read_text(encoding="utf-8")
+    assert "approval-inputs" not in runnable_text
+    assert settings.sandbox_scratch_dir is not None
+    assert (
+        settings.sandbox_scratch_dir / "runs" / "dart-path-dependency"
+    ).as_uri() in runnable_text
 
 
 def test_non_file_dart_dependency_fails_closed(tmp_path: Path) -> None:
@@ -380,7 +382,9 @@ def test_verified_snapshot_materializes_separate_writable_run_copy(tmp_path: Pat
         settings=settings, operation_id="run-copy", normalized=immutable
     )
     assert Path(runnable.cwd).name == "cwd"
-    assert Path(runnable.cwd).parent.name == "run-copy-runtime"
+    assert Path(runnable.cwd).parent.name == "run-copy"
+    assert Path(runnable.cwd).parent.parent.name == "runs"
+    assert settings.sandbox_scratch_dir in Path(runnable.cwd).parents
     Path(runnable.cwd, "main.py").write_text("runtime output", encoding="utf-8")
     assert Path(immutable.cwd, "main.py").read_text(encoding="utf-8") == "approved"
 
@@ -412,7 +416,7 @@ def test_external_dart_dependency_requires_configured_read_root(tmp_path: Path) 
         display_command=[str(executable), "analyze"],
         program_key="dart",
     )
-    with pytest.raises(PermissionError, match="safe_network_readable_paths"):
+    with pytest.raises(PermissionError, match="sandbox_dependency_readable_paths"):
         prepare_approval_bundle(
             settings=settings,
             workspace=Workspace(settings),

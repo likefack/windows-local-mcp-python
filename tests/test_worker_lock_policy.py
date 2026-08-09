@@ -20,14 +20,12 @@ def test_read_only_safe_commands_do_not_take_workspace_lock() -> None:
         assert not _requires_workspace_execution_lock(operation, request, normalized)
 
 
-def test_dart_format_that_writes_original_workspace_keeps_exclusive_lock() -> None:
-    operation, request, normalized = _safe(
-        "dart", ["format", "C:\\workspace\\lib"]
-    )
-    assert _requires_workspace_execution_lock(operation, request, normalized)
+def test_legacy_safe_rows_do_not_restore_a_fifth_policy_tier() -> None:
+    operation, request, normalized = _safe("dart", ["format", "C:\\workspace\\lib"])
+    assert not _requires_workspace_execution_lock(operation, request, normalized)
 
 
-def test_snapshot_backed_host_execution_does_not_take_workspace_lock() -> None:
+def test_snapshot_backed_approved_host_does_not_lock_unrelated_workspace_writes() -> None:
     operation: dict[str, object] = {"tier": "host_approval"}
     request: dict[str, object] = {
         "workspace_write": False,

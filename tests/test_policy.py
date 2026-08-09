@@ -79,7 +79,9 @@ def test_git_status_and_workspace_pathspec_remain_automatic(
         program="git", args=["diff", "--name-only", "--", "src"], cwd="."
     )
     log = policy.normalize_safe(program="git", args=["log", "-10", "--stat"], cwd=".")
-    assert status.args[:2] == ["--no-pager", "status"]
+    assert status.args[0] == "--no-pager"
+    assert "credential.helper=" in status.args
+    assert status.args[-2:] == ["status", "--short"]
     assert "--no-ext-diff" in diff.args
     assert "--no-textconv" in diff.args
     assert "--no-ext-diff" in log.args
@@ -132,7 +134,7 @@ def test_automatic_git_requires_workspace_root_marker(
         policy.normalize_safe(program="git", args=["status", "--short"], cwd=".")
 
 
-def test_automatic_tool_cannot_be_loaded_from_workspace(
+def test_project_controlled_tools_are_never_broker_commands(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     settings = make_settings(tmp_path, dart_enabled=True)
@@ -144,7 +146,7 @@ def test_automatic_tool_cannot_be_loaded_from_workspace(
         staticmethod(lambda _candidates: str(executable)),
     )
     policy = CommandPolicy(settings, Workspace(settings))
-    with pytest.raises(PermissionError, match="must not be loaded from the workspace"):
+    with pytest.raises(PermissionError, match="request_sandbox_command"):
         policy.normalize_safe(program="dart", args=["analyze"], cwd=".")
 
 
@@ -165,20 +167,20 @@ def test_flutter_code_loading_requires_approval(
 ) -> None:
     settings = make_settings(tmp_path, flutter_enabled=True)
     policy = CommandPolicy(settings, Workspace(settings))
-    with pytest.raises(PermissionError, match="requires approval"):
+    with pytest.raises(PermissionError, match="request_sandbox_command"):
         policy.normalize_safe(program="flutter", args=[subcommand], cwd=".")
 
 
-def test_flutter_analyze_forces_no_pub_and_validates_path(
+def test_flutter_analyze_uses_codex_sandbox_instead_of_broker_grammar(
     tmp_path: Path, fake_tools: Path
 ) -> None:
     settings = make_settings(tmp_path, flutter_enabled=True)
     app = settings.workspace_root / "app"
     app.mkdir()
     policy = CommandPolicy(settings, Workspace(settings))
-    command = policy.normalize_safe(program="flutter", args=["analyze", "app"], cwd=".")
-    assert command.args[:2] == ["analyze", "--no-pub"]
-    with pytest.raises(PermissionError):
+    with pytest.raises(PermissionError, match="request_sandbox_command"):
+        policy.normalize_safe(program="flutter", args=["analyze", "app"], cwd=".")
+    with pytest.raises(PermissionError, match="request_sandbox_command"):
         policy.normalize_safe(program="flutter", args=["analyze", ".."], cwd=".")
 
 
@@ -187,21 +189,21 @@ def test_dart_test_and_external_format_are_rejected(
 ) -> None:
     settings = make_settings(tmp_path, dart_enabled=True)
     policy = CommandPolicy(settings, Workspace(settings))
-    with pytest.raises(PermissionError, match="requires human approval"):
+    with pytest.raises(PermissionError, match="request_sandbox_command"):
         policy.normalize_safe(program="dart", args=["test"], cwd=".")
     with pytest.raises(PermissionError):
         policy.normalize_safe(program="dart", args=["format", ".."], cwd=".")
 
 
-def test_dart_format_inside_workspace_remains_automatic(
+def test_dart_format_inside_workspace_uses_codex_sandbox(
     tmp_path: Path, fake_tools: Path
 ) -> None:
     settings = make_settings(tmp_path, dart_enabled=True)
     source = settings.workspace_root / "lib"
     source.mkdir()
     policy = CommandPolicy(settings, Workspace(settings))
-    command = policy.normalize_safe(program="dart", args=["format", "lib"], cwd=".")
-    assert command.args == ["format", str(source.resolve())]
+    with pytest.raises(PermissionError, match="request_sandbox_command"):
+        policy.normalize_safe(program="dart", args=["format", "lib"], cwd=".")
 
 
 @pytest.mark.parametrize(

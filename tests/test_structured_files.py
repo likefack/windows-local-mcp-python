@@ -9,6 +9,9 @@ from pathlib import Path
 
 import pytest
 from docx import Document
+from docx.opc.constants import RELATIONSHIP_TYPE
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 from openpyxl import Workbook, load_workbook
 from PIL import Image
 
@@ -62,6 +65,20 @@ def xlsx_bytes() -> bytes:
     return output.getvalue()
 
 
+def add_hyperlink(paragraph, text: str, url: str) -> None:
+    relationship = paragraph.part.relate_to(
+        url, RELATIONSHIP_TYPE.HYPERLINK, is_external=True
+    )
+    hyperlink = OxmlElement("w:hyperlink")
+    hyperlink.set(qn("r:id"), relationship)
+    run = OxmlElement("w:r")
+    value = OxmlElement("w:t")
+    value.text = text
+    run.append(value)
+    hyperlink.append(run)
+    paragraph._p.append(hyperlink)
+
+
 def test_docx_xlsx_and_csv_use_the_checkpointed_local_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -81,7 +98,7 @@ def test_docx_xlsx_and_csv_use_the_checkpointed_local_path(
     assert result["execution_path"] == "broker_direct"
     assert result["rollback_state"] == "complete"
     record = server.runtime.audit.get_operation(result["operation_id"])
-    assert record["tier"] == "broker"
+    assert record["tier"] == "structured_processing"
     assert record["child_pid"] is None
     document = Document(root / "report.docx")
     assert document.paragraphs[1].text == "edited text"
@@ -186,6 +203,188 @@ def test_transfer_rejects_stale_and_incomplete_uploads(tmp_path: Path, monkeypat
         server.structured_file_upload_commit(upload["transfer_id"])
 
 
+def test_generic_artifact_transfer_binds_distinct_source_until_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, root = load_server(tmp_path, monkeypatch)
+    source = root / "source.pdf"
+    source.write_bytes(b"opaque-pdf-source")
+    download = server.artifact_download_begin("source.pdf")
+    payload = b"processed-pdf-result"
+    upload = server.artifact_upload_begin(
+        "result.pdf",
+        len(payload),
+        sha256_bytes(payload),
+        source_transfer_id=download["transfer_id"],
+    )
+    server.artifact_upload_chunk(
+        upload["transfer_id"], 0, base64.b64encode(payload).decode("ascii")
+    )
+    source.write_bytes(b"changed-after-container-read")
+    with pytest.raises(RuntimeError, match="bound source changed"):
+        server.artifact_upload_commit(upload["transfer_id"])
+    assert not (root / "result.pdf").exists()
+
+
+def test_generic_artifact_transfer_commits_unknown_structured_format_as_opaque_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, root = load_server(tmp_path, monkeypatch)
+    source = root / "source.pptx"
+    source.write_bytes(b"opaque-presentation-source")
+    download = server.artifact_download_begin("source.pptx")
+    payload = b"processed-presentation-result"
+    upload = server.artifact_upload_begin(
+        "result.pptx",
+        len(payload),
+        sha256_bytes(payload),
+        source_transfer_id=download["transfer_id"],
+    )
+    server.artifact_upload_chunk(
+        upload["transfer_id"], 0, base64.b64encode(payload).decode("ascii")
+    )
+
+    result = server.artifact_upload_commit(upload["transfer_id"])
+
+    assert (root / "result.pptx").read_bytes() == payload
+    assert result["artifact_kind"] == "opaque_binary"
+    assert result["embedded_code_executed"] is False
+
+
+def test_artifact_upload_reserves_data_quota_before_accepting_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, _root = load_server(tmp_path, monkeypatch)
+    from windows_local_mcp.resources import directory_size
+
+    used = directory_size(server.runtime.settings.data_dir)
+    server.runtime.settings.max_data_dir_bytes = used + 8192
+    payload = b"x" * 8192
+
+    with pytest.raises(RuntimeError, match="quota exceeded"):
+        server.artifact_upload_begin(
+            "result.pdf", len(payload), sha256_bytes(payload)
+        )
+
+
+def test_csv_preserves_bom_delimiter_quotes_crlf_and_final_newline_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, root = load_server(tmp_path, monkeypatch)
+    original = b'\xef\xbb\xbf"name";"value"\r\n"a";"1"'
+    path = root / "identity.csv"
+    path.write_bytes(original)
+    inspected = server.structured_file_inspect("identity.csv")
+    assert inspected["encoding"] == "utf-8-sig"
+    assert inspected["delimiter"] == ";"
+    assert inspected["quotechar"] == '"'
+    assert inspected["newline"] == "\r\n"
+    assert inspected["final_newline"] is False
+
+    server.structured_file_apply(
+        "identity.csv",
+        [{"op": "cell_set", "row": 1, "column": 1, "value": "2"}],
+        expected_sha256=sha256_bytes(original),
+    )
+    updated = path.read_bytes()
+    assert updated.startswith(b"\xef\xbb\xbf")
+    assert b";" in updated and b"\r\n" in updated
+    assert not updated.endswith(b"\r\n")
+
+
+def test_structured_edits_reject_oversized_ranges_before_materialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, root = load_server(tmp_path, monkeypatch)
+    workbook = root / "bounded.xlsx"
+    workbook.write_bytes(xlsx_bytes())
+    with pytest.raises(Exception, match="max_structured_elements"):
+        server.structured_file_apply(
+            "bounded.xlsx",
+            [
+                {
+                    "op": "range_clear",
+                    "sheet": "Data",
+                    "range": "A1:XFD1048576",
+                }
+            ],
+            expected_sha256=sha256_bytes(workbook.read_bytes()),
+        )
+
+    csv_path = root / "bounded.csv"
+    csv_path.write_bytes(b"a,b\n")
+    with pytest.raises(Exception, match="max_structured_elements"):
+        server.structured_file_apply(
+            "bounded.csv",
+            [
+                {
+                    "op": "cell_set",
+                    "row": 0,
+                    "column": server.runtime.settings.max_structured_elements,
+                    "value": "x",
+                }
+            ],
+            expected_sha256=sha256_bytes(csv_path.read_bytes()),
+        )
+
+
+def test_zip_multi_extract_is_one_checkpointed_transaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, root = load_server(tmp_path, monkeypatch)
+    package = io.BytesIO()
+    with zipfile.ZipFile(package, "w") as archive:
+        archive.writestr("one.txt", b"one")
+        archive.writestr("nested/two.txt", b"two")
+    source = root / "bundle.zip"
+    source.write_bytes(package.getvalue())
+
+    result = server.zip_extract_many(
+        "bundle.zip",
+        "expanded",
+        sha256_bytes(source.read_bytes()),
+    )
+    assert result["extracted_file_count"] == 2
+    assert result["rollback_state"] == "complete"
+    assert (root / "expanded" / "one.txt").read_bytes() == b"one"
+    assert (root / "expanded" / "nested" / "two.txt").read_bytes() == b"two"
+
+
+def test_zip_multi_extract_rolls_back_outputs_when_source_changes_after_apply(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, root = load_server(tmp_path, monkeypatch)
+    package = io.BytesIO()
+    with zipfile.ZipFile(package, "w") as archive:
+        archive.writestr("one.txt", b"one")
+        archive.writestr("nested/two.txt", b"two")
+    source = root / "bundle.zip"
+    original = package.getvalue()
+    source.write_bytes(original)
+    real_verify = server._verify_binary_source_bindings
+    calls = 0
+
+    def change_source_on_postflight(bindings):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            source.write_bytes(b"third-party-change")
+        return real_verify(bindings)
+
+    monkeypatch.setattr(server, "_verify_binary_source_bindings", change_source_on_postflight)
+
+    with pytest.raises(RuntimeError, match="bound source changed"):
+        server.zip_extract_many(
+            "bundle.zip",
+            "expanded",
+            sha256_bytes(original),
+        )
+
+    assert source.read_bytes() == b"third-party-change"
+    assert not (root / "expanded" / "one.txt").exists()
+    assert not (root / "expanded" / "nested" / "two.txt").exists()
+
+
 def test_existing_structured_edit_requires_source_hash(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -257,6 +456,136 @@ def test_docx_run_formatting_is_scoped_and_section_size_is_inspectable(
     assert inspected["sections"][0]["header"][0] == "header text"
     assert inspected["sections"][0]["page_width_inches"] == pytest.approx(8.0, rel=0.01)
     assert inspected["sections"][0]["page_height_inches"] == pytest.approx(10.0, rel=0.01)
+
+
+def test_docx_practical_editing_preserves_untouched_media_and_relationships(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, root = load_server(tmp_path, monkeypatch)
+    document = Document()
+    paragraph = document.add_paragraph()
+    paragraph.add_run("hello ").bold = True
+    paragraph.add_run("world").italic = True
+    linked = document.add_paragraph("link: ")
+    add_hyperlink(linked, "OpenAI", "https://openai.com/")
+    picture = io.BytesIO()
+    Image.new("RGB", (4, 4), "red").save(picture, format="PNG")
+    document.add_paragraph().add_run().add_picture(io.BytesIO(picture.getvalue()))
+    table = document.add_table(rows=2, cols=2)
+    table.cell(0, 0).text = "a"
+    table.cell(0, 1).text = "b"
+    document.sections[0].header.paragraphs[0].text = "old header"
+    output = io.BytesIO()
+    document.save(output)
+    path = root / "preserve.docx"
+    path.write_bytes(output.getvalue())
+    with zipfile.ZipFile(path) as package:
+        media_before = {
+            name: package.read(name)
+            for name in package.namelist()
+            if name.startswith("word/media/")
+        }
+
+    server.structured_file_apply(
+        "preserve.docx",
+        [
+            {"op": "replace_text", "search": "hello world", "replace": "updated"},
+            {"op": "table_row_insert", "table": 0, "row": 1, "values": ["x", "y"]},
+            {"op": "table_column_add", "table": 0, "values": ["c", "d", "e"]},
+            {"op": "table_cell_format", "table": 0, "row": 0, "column": 0, "format": {"shading": "FFFF00"}},
+            {"op": "header_footer_set", "section": 0, "area": "header", "paragraph": 0, "text": "new header"},
+            {"op": "style_update", "style": "Normal", "run": {"font_size_pt": 11}, "paragraph": {"space_after_pt": 3}},
+        ],
+        expected_sha256=sha256_bytes(path.read_bytes()),
+    )
+
+    updated = Document(path)
+    assert updated.paragraphs[0].text == "updated"
+    assert len(updated.tables[0].rows) == 3
+    assert len(updated.tables[0].columns) == 3
+    assert updated.sections[0].header.paragraphs[0].text == "new header"
+    assert any(
+        relation.target_ref == "https://openai.com/"
+        for relation in updated.part.rels.values()
+    )
+    with zipfile.ZipFile(path) as package:
+        assert {
+            name: package.read(name)
+            for name in package.namelist()
+            if name.startswith("word/media/")
+        } == media_before
+
+
+def test_docx_table_text_replacement_rejects_inline_relationship_loss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, root = load_server(tmp_path, monkeypatch)
+    document = Document()
+    table = document.add_table(rows=1, cols=1)
+    add_hyperlink(table.cell(0, 0).paragraphs[0], "linked", "https://example.test/")
+    output = io.BytesIO()
+    document.save(output)
+    path = root / "linked-cell.docx"
+    path.write_bytes(output.getvalue())
+
+    with pytest.raises(Exception, match="full-text replacement is unsupported"):
+        server.structured_file_apply(
+            "linked-cell.docx",
+            [
+                {
+                    "op": "table_cell_set",
+                    "table": 0,
+                    "row": 0,
+                    "column": 0,
+                    "text": "replacement",
+                }
+            ],
+            expected_sha256=sha256_bytes(path.read_bytes()),
+        )
+
+
+def test_xlsx_copy_fill_and_common_features_preserve_untouched_sheet_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, root = load_server(tmp_path, monkeypatch)
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    sheet.sheet_properties.tabColor = "1072BA"
+    sheet.append(["Value", "Double"])
+    for value in (2, 3, 4):
+        sheet.append([value, None])
+    sheet["B2"] = "=A2*2"
+    output = io.BytesIO()
+    book.save(output)
+    path = root / "daily.xlsx"
+    path.write_bytes(output.getvalue())
+
+    server.structured_file_apply(
+        "daily.xlsx",
+        [
+            {"op": "range_fill", "sheet": "Data", "source": "B2", "target": "B2:B4"},
+            {"op": "freeze_panes_set", "sheet": "Data", "cell": "A2"},
+            {"op": "autofilter_set", "sheet": "Data", "range": "A1:B4"},
+            {"op": "table_add", "sheet": "Data", "name": "DailyData", "range": "A1:B4"},
+            {"op": "validation_add", "sheet": "Data", "type": "whole", "formula1": "0", "range": "A2:A4"},
+            {"op": "conditional_cell_is", "sheet": "Data", "range": "B2:B4", "operator": "greaterThan", "formula": "5", "fill": "00FF00"},
+            {"op": "chart_add", "sheet": "Data", "type": "line", "data_range": "B1:B4", "anchor": "D2"},
+            {"op": "page_setup_set", "sheet": "Data", "values": {"orientation": "landscape", "fitToWidth": 1}},
+        ],
+        expected_sha256=sha256_bytes(path.read_bytes()),
+    )
+    updated = load_workbook(path, data_only=False)
+    sheet = updated["Data"]
+    assert [sheet[f"B{row}"].value for row in range(2, 5)] == ["=A2*2", "=A3*2", "=A4*2"]
+    assert sheet.sheet_properties.tabColor.rgb.endswith("1072BA")
+    assert sheet.freeze_panes == "A2"
+    assert sheet.auto_filter.ref == "A1:B4"
+    assert "DailyData" in sheet.tables
+    assert len(sheet.data_validations.dataValidation) == 1
+    assert len(sheet._charts) == 1
+    assert sheet.page_setup.orientation == "landscape"
+    updated.close()
 
 
 def test_zip_preserves_directories_and_rejects_windows_collisions(

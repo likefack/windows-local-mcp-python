@@ -6,6 +6,7 @@ from pathlib import Path
 from windows_local_mcp.approval import prepare_approval_bundle
 from windows_local_mcp.audit import AuditStore
 from windows_local_mcp.config import Settings
+from windows_local_mcp.control_plane import control_plane_generation
 from windows_local_mcp.executor import Executor
 from windows_local_mcp.paths import Workspace
 from windows_local_mcp.policy import NormalizedCommand, approved_request_hash
@@ -59,7 +60,8 @@ def _prepare_operation(
     )
     expires = (datetime.now(UTC) + timedelta(minutes=5)).isoformat()
     request = {
-        "approval_binding_version": 2,
+        "approval_binding_version": 3,
+        "control_plane_generation": control_plane_generation(settings),
         "normalized_command": command.model_dump(),
         "approval_manifest_digest": digest,
         "approval_manifest_summary": {"mode": manifest["mode"]},
@@ -70,7 +72,7 @@ def _prepare_operation(
     store.create_operation(
         operation_id=operation_id,
         tool_name="request_host_command",
-        tier="host_approval",
+        tier="approved_host",
         status="pending_approval",
         cwd=str(workspace),
         request=request,
@@ -174,3 +176,41 @@ def test_expired_claim_is_rejected_immediately_before_child_start(
     )
     stdout_path = operation.get("stdout_path")
     assert not stdout_path or not os.path.exists(stdout_path)
+
+
+def test_approved_host_control_plane_tamper_is_detected_and_blocks_future_work(
+    tmp_path: Path, monkeypatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    data = tmp_path / "data"
+    config = tmp_path / "config.toml"
+    _write_config(workspace, data, config)
+    monkeypatch.setenv("LOCAL_MCP_CONFIG", str(config))
+    monkeypatch.delenv("LOCAL_MCP_ROOT", raising=False)
+    operation_id = "approved-host-control-plane-tamper"
+    database = data / "audit.db"
+    script = (
+        "import sqlite3\n"
+        f"database={str(database)!r}\n"
+        f"operation_id={operation_id!r}\n"
+        "connection=sqlite3.connect(database)\n"
+        "connection.execute('UPDATE operations SET request_hash=? WHERE id=?', "
+        "('f'*64, operation_id))\n"
+        "connection.commit()\n"
+    )
+
+    settings, store, executor = _prepare_operation(
+        workspace=workspace,
+        data=data,
+        operation_id=operation_id,
+        script_text=script,
+    )
+    store.approve_and_claim(operation_id, approver="integration-test")
+    result = executor.launch(operation_id, 30)
+    operation = store.get_operation(operation_id)
+
+    assert result["status"] == "failed"
+    assert operation["result"]["failure_class"] == "control_plane_tamper_unknown"
+    assert "could not be verified" in str(operation["error"])
+    assert (settings.data_dir / "control-plane" / "tamper-detected.json").is_file()

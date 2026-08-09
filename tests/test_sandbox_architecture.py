@@ -1,20 +1,12 @@
 from __future__ import annotations
 
-import ctypes
 import json
 import sys
-from ctypes import wintypes
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
-from windows_local_mcp.appcontainer import (
-    PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    _acl_write_ahead_ledger,
-    _configure_kernel32,
-    appcontainer_profile_name,
-)
 from windows_local_mcp.audit import AuditStore
 from windows_local_mcp.config import Settings
 from windows_local_mcp.policy import approved_request_hash
@@ -115,7 +107,7 @@ def test_codex_policy_is_offline_and_does_not_trust_target_stderr() -> None:
 
 def test_approved_request_hash_binds_capability_fields() -> None:
     request: dict[str, object] = {
-        "approval_binding_version": 2,
+        "approval_binding_version": 3,
         "normalized_command": {"executable": "python.exe", "args": ["test.py"]},
         "workspace_write": False,
         "max_runtime_seconds": 30,
@@ -140,52 +132,8 @@ def test_safe_readable_path_cannot_overlap_security_roots(tmp_path: Path) -> Non
             workspace_root=workspace,
             data_dir=tmp_path / "data",
             protect_data_dir_acl=False,
-            safe_network_readable_paths=[tmp_path],
+            sandbox_dependency_readable_paths=[tmp_path],
         )
-
-
-def test_appcontainer_identity_binds_readable_path_policy_and_operation(tmp_path: Path) -> None:
-    settings = _settings(tmp_path)
-    sdk_a = tmp_path / "sdk-a"
-    sdk_b = tmp_path / "sdk-b"
-    sdk_a.mkdir()
-    sdk_b.mkdir()
-    settings.safe_network_readable_paths = [sdk_a]
-    first = appcontainer_profile_name(settings, "dart", operation_id="operation-a")
-    settings.safe_network_readable_paths = [sdk_b]
-    changed_policy = appcontainer_profile_name(settings, "dart", operation_id="operation-a")
-    changed_operation = appcontainer_profile_name(
-        settings, "dart", operation_id="operation-b"
-    )
-    assert first != changed_policy
-    assert changed_policy != changed_operation
-    assert len(first) <= 64
-    assert len(changed_policy) <= 64
-    assert len(changed_operation) <= 64
-
-
-def test_acl_write_ahead_keeps_displaced_sid_until_cleanup() -> None:
-    ledger = _acl_write_ahead_ledger(
-        {"old-sid": [r"C:\SDK-A"], "same-sid": [r"C:\Old"]},
-        {"same-sid", "new-sid"},
-        {r"C:\SDK-B"},
-    )
-    assert ledger["old-sid"] == [r"C:\SDK-A"]
-    assert set(ledger["same-sid"]) == {r"C:\Old", r"C:\SDK-B"}
-    assert ledger["new-sid"] == [r"C:\SDK-B"]
-
-
-@pytest.mark.skipif(sys.platform != "win32", reason="Win32 pointer-size contract")
-def test_appcontainer_win32_signatures_keep_pointer_sized_handles() -> None:
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    _configure_kernel32(kernel32)
-    assert ctypes.sizeof(wintypes.HANDLE) == ctypes.sizeof(ctypes.c_void_p)
-    assert kernel32.CloseHandle.argtypes == [wintypes.HANDLE]
-    assert kernel32.AssignProcessToJobObject.argtypes == [
-        wintypes.HANDLE,
-        wintypes.HANDLE,
-    ]
-    assert PROC_THREAD_ATTRIBUTE_HANDLE_LIST == 0x00020002
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows system-directory contract")
