@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import base64
 import difflib
+import json
 import os
+import re
 import shutil
 import tempfile
 import uuid
@@ -33,6 +36,9 @@ from .sandbox_backend import (
     codex_sandbox_effective_policy,
     resolve_codex_sandbox_backend,
 )
+from .structured_files import infer_format, read_zip_entry
+from .structured_files import inspect as inspect_structured
+from .structured_files import transform as transform_structured
 from .timeline import timeline_entry, timeline_list
 from .util import canonical_json, read_text_limited, sha256_bytes, sha256_text, utc_now_iso
 from .workspace_history import (
@@ -176,6 +182,7 @@ def session_info() -> dict[str, Any]:
             "dart": runtime.settings.dart_enabled,
             "adb": runtime.settings.adb_enabled,
             "powershell": runtime.settings.powershell_enabled,
+            "structured_files": runtime.settings.filesystem_enabled,
         },
         "adb_emulator_only": runtime.settings.adb_emulator_only,
         "approval_flow": "request -> local approve-and-run -> poll",
@@ -192,6 +199,32 @@ def session_info() -> dict[str, Any]:
         },
         "configuration_selection": runtime.settings.selection_info(),
         "transport": "stdio by default; optional loopback-only streamable-http",
+        "structured_file_processing": {
+            "chatgpt_container": (
+                "a first-class path via hash-bound transfer when container capabilities, format "
+                "preservation, transfer cost, and latency make it the better choice"
+            ),
+            "broker_direct": (
+                "a first-class path when WLMCP can deterministically validate inputs, outputs, "
+                "resource bounds, mutation targets, and side effects; the current built-in "
+                "declarative transforms use this route"
+            ),
+            "transfer": "hash-bound, chunked byte-exact download/upload staging",
+            "external_processing_policy": (
+                "external-process use alone does not require Codex Sandbox. Use Sandbox when "
+                "WLMCP cannot close and verify the effective side effects (for example arbitrary "
+                "code or project-controlled helpers). A bounded helper may run broker-directed but "
+                "must return its result for broker validation and transactional commit; never "
+                "fall back automatically to Approved Host"
+            ),
+            "route_selection": [
+                "available capabilities",
+                "closed-world verifiability",
+                "format preservation",
+                "file and resource limits",
+                "transfer cost and latency",
+            ],
+        },
     }
     result["operation_id"] = _log_simple(tool_name="session_info", request={}, result=result)
     return result
@@ -275,6 +308,486 @@ def get_image(path: str) -> Image:
         return Image(path=image_path)
     except Exception as error:
         _audit_rejection("get_image", request, error)
+        raise
+
+
+def _atomic_binary_mutation(
+    *,
+    tool_name: str,
+    path: str,
+    expected_sha256: str | None,
+    reason: str,
+    request_summary: dict[str, Any],
+    transform: Any,
+    allow_create: bool = False,
+    require_expected_for_existing: bool = False,
+) -> dict[str, Any]:
+    """Apply one verified binary replacement through the normal workspace journal.
+
+    Transforming is performed while the target lock is held and receives immutable source bytes.
+    This is the shared commit boundary for local structured editing and uploaded artifacts.
+    """
+    _require_filesystem()
+    _require_workspace_mutation_ready()
+    operation_id: str | None = None
+    with WorkspaceExecutionLock(runtime.settings):
+        target = runtime.workspace.resolve_for_write(path)
+        if not target.exists() and not allow_create:
+            raise FileNotFoundError("structured editing requires an existing file")
+        with runtime.workspace.lock_target(target):
+            _require_workspace_mutation_ready()
+            target = runtime.workspace.resolve_for_write(path)
+            if not target.exists() and not allow_create:
+                raise FileNotFoundError("structured editing requires an existing file")
+            parent_identity = runtime.workspace.identity(target.parent)
+            if parent_identity is None:
+                raise RuntimeError("write parent disappeared")
+            target_identity = runtime.workspace.identity(target)
+            before = target.read_bytes() if target.exists() else b""
+            if len(before) > runtime.settings.max_structured_file_bytes:
+                raise ValueError("structured file exceeds max_structured_file_bytes")
+            before_sha = sha256_bytes(before)
+            if target.exists() and require_expected_for_existing and expected_sha256 is None:
+                raise ValueError("expected_sha256 is required when replacing an existing file")
+            if expected_sha256 is not None and expected_sha256 != before_sha:
+                raise RuntimeError("expected_sha256 mismatch; source is stale or concurrently modified")
+
+            after, semantic = transform(before)
+            if not isinstance(after, bytes):
+                raise TypeError("binary mutation transform must return bytes")
+            if len(after) > runtime.settings.max_structured_file_bytes:
+                raise ValueError("result exceeds max_structured_file_bytes")
+            after_sha = sha256_bytes(after)
+            request = {
+                "path": runtime.workspace.relative(target),
+                "expected_sha256": expected_sha256,
+                "reason": reason,
+                "before_sha256": before_sha,
+                "before_bytes": len(before),
+                **request_summary,
+            }
+            operation_id = runtime.audit.create_operation(
+                tool_name=tool_name,
+                tier="broker",
+                status="running",
+                cwd=str(runtime.settings.workspace_root),
+                request=_safe_request(request),
+            )
+            pre_workspace = capture_workspace_state(runtime.settings, operation_id, "before")
+            runtime.audit.update_operation(operation_id, pre_workspace_path=pre_workspace.manifest_path)
+            begin_single_file_write_transaction(
+                runtime.settings,
+                operation_id,
+                pre_workspace.manifest_path,
+                runtime.workspace.relative(target),
+                before_sha if target_identity is not None else None,
+                after_sha,
+            )
+            temp_path: Path | None = None
+            workspace_changed = False
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="wb", delete=False, dir=target.parent, prefix=f".{target.name}.", suffix=".tmp"
+                ) as temp:
+                    temp.write(after)
+                    temp.flush()
+                    os.fsync(temp.fileno())
+                    temp_path = Path(temp.name)
+                runtime.workspace.revalidate_for_replace(
+                    target, parent_identity=parent_identity, target_identity=target_identity
+                )
+                os.replace(temp_path, target)
+                temp_path = None
+                workspace_changed = True
+                if target.read_bytes() != after:
+                    raise RuntimeError("post-write content verification failed")
+                post_workspace = capture_workspace_state(runtime.settings, operation_id, "after")
+                workspace_change = compare_workspace_states(
+                    runtime.settings, pre_workspace.manifest_path, post_workspace.manifest_path, operation_id
+                )
+                result = {
+                    "operation_id": operation_id,
+                    "status": "succeeded",
+                    "execution_path": "broker_direct",
+                    "path": runtime.workspace.relative(target),
+                    "before_sha256": before_sha,
+                    "after_sha256": after_sha,
+                    "before_bytes": len(before),
+                    "after_bytes": len(after),
+                    "rollback_state": "complete",
+                    **semantic,
+                    **workspace_change,
+                }
+                update_single_file_write_transaction(
+                    runtime.settings, operation_id, state="applied_verified", target_manifest=post_workspace.manifest_path
+                )
+                runtime.audit.update_operation(
+                    operation_id,
+                    status="succeeded",
+                    finished_at=utc_now_iso(),
+                    diff_path=str(workspace_change["diff_path"]),
+                    pre_workspace_path=pre_workspace.manifest_path,
+                    post_workspace_path=post_workspace.manifest_path,
+                    rollback_state="complete",
+                    result_json=canonical_json(_safe_request(result)),
+                )
+                finalize_workspace_transaction(runtime.settings, operation_id)
+                runtime.audit.add_event(operation_id, "structured_file_written", _safe_request(result))
+                return result
+            except Exception as error:
+                if workspace_changed:
+                    try:
+                        if target_identity is None:
+                            target.unlink(missing_ok=True)
+                        else:
+                            with tempfile.NamedTemporaryFile(mode="wb", delete=False, dir=target.parent) as recovery:
+                                recovery.write(before)
+                                recovery.flush()
+                                os.fsync(recovery.fileno())
+                                recovery_path = Path(recovery.name)
+                            os.replace(recovery_path, target)
+                        restored = target.read_bytes() if target.exists() else b""
+                        if restored != before or target.exists() != (target_identity is not None):
+                            raise RuntimeError("binary mutation recovery verification failed")
+                    except Exception as recovery_error:
+                        journal = update_single_file_write_transaction(
+                            runtime.settings, operation_id, state="recovery_required", error=recovery_error
+                        )
+                        runtime.audit.update_operation(
+                            operation_id, status="failed", finished_at=utc_now_iso(), rollback_state="recovery_required",
+                            error=f"{type(recovery_error).__name__}: {recovery_error}",
+                        )
+                        raise WorkspaceMutationError(
+                            "structured file mutation failed and automatic recovery failed",
+                            recovery_state="recovery_required", journal_path=journal,
+                        ) from recovery_error
+                    update_single_file_write_transaction(
+                        runtime.settings, operation_id, state="failed_recovered", error=error
+                    )
+                    raise WorkspaceMutationError(
+                        f"structured file mutation failed; starting state recovered: {error}",
+                        recovery_state="failed_recovered",
+                        journal_path=str(runtime.settings.data_dir / "workspace-history" / "transactions" / operation_id / "journal.json"),
+                    ) from error
+                update_single_file_write_transaction(
+                    runtime.settings, operation_id, state="failed_recovered", error=error
+                )
+                raise
+            finally:
+                if temp_path is not None:
+                    temp_path.unlink(missing_ok=True)
+                if operation_id is not None:
+                    record = runtime.audit.get_operation(operation_id)
+                    if record is not None and record["status"] == "running":
+                        runtime.audit.update_operation(
+                            operation_id, status="failed", finished_at=utc_now_iso(),
+                            error="structured mutation failed before replacement",
+                        )
+                        runtime.audit.add_event(operation_id, "failed", {"path": path})
+
+
+@mcp.tool(annotations=READ_ONLY)
+def structured_file_inspect(
+    path: str, format: str | None = None, range_ref: str | None = None
+) -> dict[str, Any]:
+    """Inspect a bounded DOCX, XLSX, CSV/TSV, ZIP, or image without mutating it."""
+    request = {"path": path, "format": format, "range_ref": range_ref}
+    try:
+        _require_filesystem()
+        source = runtime.workspace.resolve_existing(path, allow_directory=False)
+        data = source.read_bytes()
+        result = inspect_structured(data, runtime.workspace.relative(source), runtime.settings, format=format, range_ref=range_ref)
+        result["path"] = runtime.workspace.relative(source)
+        result["execution_paths"] = ["broker_direct", "transfer"]
+        result["operation_id"] = _log_simple(tool_name="structured_file_inspect", request=request, result=result)
+        return result
+    except Exception as error:
+        _audit_rejection("structured_file_inspect", request, error)
+        raise
+
+
+@mcp.tool(annotations=LOCAL_WRITE)
+def structured_file_apply(
+    path: str,
+    operations: list[dict[str, Any]],
+    expected_sha256: str | None = None,
+    reason: str = "",
+    format: str | None = None,
+) -> dict[str, Any]:
+    """Apply declarative format-specific operations through the broker; scripts are not accepted."""
+    request = {"path": path, "operations": operations, "expected_sha256": expected_sha256, "reason": reason, "format": format}
+    try:
+        kind = infer_format(path, format)
+        allow_create = kind in {"csv", "tsv", "zip"}
+
+        def apply(source: bytes) -> tuple[bytes, dict[str, Any]]:
+            output, semantic = transform_structured(source, path, operations, runtime.settings, format=format)
+            return output, semantic
+
+        return _atomic_binary_mutation(
+            tool_name="structured_file_apply",
+            path=path,
+            expected_sha256=expected_sha256,
+            reason=reason,
+            request_summary={"format": kind, "operations": [item.get("op") for item in operations]},
+            transform=apply,
+            allow_create=allow_create,
+        )
+    except Exception as error:
+        _audit_rejection("structured_file_apply", request, error)
+        raise
+
+
+@mcp.tool(annotations=READ_ONLY)
+def zip_entry_read(path: str, entry: str) -> dict[str, Any]:
+    """Return one validated ZIP entry as a bounded base64 artifact payload."""
+    request = {"path": path, "entry": entry}
+    try:
+        _require_filesystem()
+        archive = runtime.workspace.resolve_existing(path, allow_directory=False)
+        if infer_format(runtime.workspace.relative(archive)) != "zip":
+            raise ValueError("path must be a ZIP file")
+        payload = read_zip_entry(archive.read_bytes(), entry, runtime.settings)
+        if len(payload) > runtime.settings.max_transfer_chunk_bytes:
+            raise ValueError(
+                "ZIP entry exceeds max_transfer_chunk_bytes; use zip_entry_extract for local extraction"
+            )
+        result = {
+            "path": runtime.workspace.relative(archive),
+            "entry": entry,
+            "bytes": len(payload),
+            "sha256": sha256_bytes(payload),
+            "base64": base64.b64encode(payload).decode("ascii"),
+        }
+        result["operation_id"] = _log_simple(
+            tool_name="zip_entry_read",
+            request=request,
+            result={key: value for key, value in result.items() if key != "base64"},
+        )
+        return result
+    except Exception as error:
+        _audit_rejection("zip_entry_read", request, error)
+        raise
+
+
+@mcp.tool(annotations=LOCAL_WRITE)
+def zip_entry_extract(
+    path: str,
+    entry: str,
+    output_path: str,
+    expected_archive_sha256: str,
+    expected_output_sha256: str | None = None,
+    reason: str = "",
+) -> dict[str, Any]:
+    """Atomically extract one safe ZIP entry to the workspace with source and output bindings."""
+    request = {
+        "path": path,
+        "entry": entry,
+        "output_path": output_path,
+        "expected_archive_sha256": expected_archive_sha256,
+        "expected_output_sha256": expected_output_sha256,
+        "reason": reason,
+    }
+    try:
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_archive_sha256):
+            raise ValueError("expected_archive_sha256 must be a lowercase SHA-256 digest")
+
+        def extract(_: bytes) -> tuple[bytes, dict[str, Any]]:
+            archive = runtime.workspace.resolve_existing(path, allow_directory=False)
+            if infer_format(runtime.workspace.relative(archive)) != "zip":
+                raise ValueError("path must be a ZIP file")
+            data = archive.read_bytes()
+            if sha256_bytes(data) != expected_archive_sha256:
+                raise RuntimeError("expected_archive_sha256 mismatch; archive is stale or concurrently modified")
+            payload = read_zip_entry(data, entry, runtime.settings)
+            return payload, {
+                "format": "zip",
+                "operation": "entry_extract",
+                "archive_path": runtime.workspace.relative(archive),
+                "archive_sha256": expected_archive_sha256,
+                "entry": entry,
+            }
+
+        return _atomic_binary_mutation(
+            tool_name="zip_entry_extract",
+            path=output_path,
+            expected_sha256=expected_output_sha256,
+            reason=reason,
+            request_summary={"archive_path": path, "entry": entry, "expected_archive_sha256": expected_archive_sha256},
+            transform=extract,
+            allow_create=True,
+        )
+    except Exception as error:
+        _audit_rejection("zip_entry_extract", request, error)
+        raise
+
+
+def _transfer_root(transfer_id: str) -> Path:
+    if not re.fullmatch(r"[0-9a-f-]{36}", transfer_id):
+        raise ValueError("invalid transfer id")
+    return runtime.settings.data_dir / "structured-transfers" / transfer_id
+
+
+def _write_transfer_manifest(root: Path, manifest: dict[str, Any]) -> None:
+    temporary = root / "manifest.tmp"
+    temporary.write_text(canonical_json(manifest), encoding="utf-8")
+    os.replace(temporary, root / "manifest.json")
+
+
+def _load_transfer(transfer_id: str, expected_direction: str) -> tuple[Path, dict[str, Any]]:
+    root = _transfer_root(transfer_id)
+    manifest_path = root / "manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError("transfer session was not found")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("direction") != expected_direction or manifest.get("state") != "open":
+        raise RuntimeError("transfer session is not open for this operation")
+    created = datetime.fromisoformat(str(manifest["created_at"]))
+    if datetime.now(UTC) - created > timedelta(seconds=runtime.settings.approval_request_ttl_seconds):
+        manifest["state"] = "expired"
+        _write_transfer_manifest(root, manifest)
+        raise RuntimeError("transfer session expired")
+    return root, manifest
+
+
+@mcp.tool(annotations=READ_ONLY)
+def structured_file_download_begin(path: str, chunk_bytes: int | None = None) -> dict[str, Any]:
+    """Begin a hash-bound, byte-exact download for ChatGPT-side processing."""
+    request = {"path": path, "chunk_bytes": chunk_bytes}
+    try:
+        _require_filesystem()
+        source = runtime.workspace.resolve_existing(path, allow_directory=False)
+        size = source.stat().st_size
+        if size > runtime.settings.max_structured_file_bytes:
+            raise ValueError("structured file exceeds max_structured_file_bytes")
+        chunk = runtime.settings.max_transfer_chunk_bytes if chunk_bytes is None else chunk_bytes
+        if not isinstance(chunk, int) or chunk < 4096 or chunk > runtime.settings.max_transfer_chunk_bytes:
+            raise ValueError("chunk_bytes is outside the configured bound")
+        data = source.read_bytes()
+        transfer_id = str(uuid.uuid4())
+        root = _transfer_root(transfer_id)
+        root.mkdir(parents=True, exist_ok=False)
+        manifest = {"version": 1, "direction": "download", "state": "open", "created_at": utc_now_iso(), "path": runtime.workspace.relative(source), "sha256": sha256_bytes(data), "bytes": len(data), "chunk_bytes": chunk}
+        _write_transfer_manifest(root, manifest)
+        result = {"transfer_id": transfer_id, "path": manifest["path"], "bytes": len(data), "sha256": manifest["sha256"], "chunk_bytes": chunk, "chunk_count": (len(data) + chunk - 1) // chunk, "execution_path": "transfer"}
+        result["operation_id"] = _log_simple(tool_name="structured_file_download_begin", request=request, result=result)
+        return result
+    except Exception as error:
+        _audit_rejection("structured_file_download_begin", request, error)
+        raise
+
+
+@mcp.tool(annotations=READ_ONLY)
+def structured_file_download_chunk(transfer_id: str, offset: int) -> dict[str, Any]:
+    """Read one base64 chunk; it fails if the source changed after download_begin."""
+    request = {"transfer_id": transfer_id, "offset": offset}
+    try:
+        _root, manifest = _load_transfer(transfer_id, "download")
+        if not isinstance(offset, int) or offset < 0 or offset % int(manifest["chunk_bytes"]) != 0:
+            raise ValueError("offset must be a non-negative chunk boundary")
+        source = runtime.workspace.resolve_existing(str(manifest["path"]), allow_directory=False)
+        data = source.read_bytes()
+        if len(data) != int(manifest["bytes"]) or sha256_bytes(data) != manifest["sha256"]:
+            raise RuntimeError("source changed during transfer; begin a new download")
+        if offset >= len(data):
+            raise ValueError("offset is outside the source file")
+        payload = data[offset : offset + int(manifest["chunk_bytes"])]
+        result = {"transfer_id": transfer_id, "offset": offset, "bytes": len(payload), "base64": base64.b64encode(payload).decode("ascii"), "next_offset": offset + len(payload), "complete": offset + len(payload) == len(data), "sha256": sha256_bytes(payload)}
+        _log_simple(tool_name="structured_file_download_chunk", request=request, result={key: value for key, value in result.items() if key != "base64"})
+        return result
+    except Exception as error:
+        _audit_rejection("structured_file_download_chunk", request, error)
+        raise
+
+
+@mcp.tool(annotations=CONTROL)
+def structured_file_upload_begin(path: str, total_bytes: int, sha256: str, expected_sha256: str | None = None) -> dict[str, Any]:
+    """Stage a ChatGPT-side artifact. It cannot affect the workspace until commit succeeds."""
+    request = {"path": path, "total_bytes": total_bytes, "sha256": sha256, "expected_sha256": expected_sha256}
+    try:
+        _require_filesystem()
+        if not isinstance(total_bytes, int) or total_bytes < 0 or total_bytes > runtime.settings.max_structured_file_bytes:
+            raise ValueError("total_bytes is outside the configured bound")
+        if not re.fullmatch(r"[0-9a-f]{64}", sha256):
+            raise ValueError("sha256 must be a lowercase SHA-256 digest")
+        target = runtime.workspace.resolve_for_write(path)
+        if target.exists() and expected_sha256 is None:
+            raise ValueError("expected_sha256 is required when replacing an existing file")
+        if target.exists() and sha256_bytes(target.read_bytes()) != expected_sha256:
+            raise RuntimeError("expected_sha256 mismatch; target is stale or concurrently modified")
+        transfer_id = str(uuid.uuid4())
+        root = _transfer_root(transfer_id)
+        root.mkdir(parents=True, exist_ok=False)
+        (root / "payload.bin").touch()
+        manifest = {"version": 1, "direction": "upload", "state": "open", "created_at": utc_now_iso(), "path": runtime.workspace.relative(target), "bytes": total_bytes, "sha256": sha256, "expected_sha256": expected_sha256, "received": 0}
+        _write_transfer_manifest(root, manifest)
+        result = {"transfer_id": transfer_id, "path": manifest["path"], "total_bytes": total_bytes, "chunk_bytes_max": runtime.settings.max_transfer_chunk_bytes, "execution_path": "transfer"}
+        result["operation_id"] = _log_simple(tool_name="structured_file_upload_begin", request=request, result=result, tier="transfer")
+        return result
+    except Exception as error:
+        _audit_rejection("structured_file_upload_begin", request, error)
+        raise
+
+
+@mcp.tool(annotations=CONTROL)
+def structured_file_upload_chunk(transfer_id: str, offset: int, base64_chunk: str) -> dict[str, Any]:
+    """Append one exact, bounded base64 upload chunk at the next expected offset."""
+    try:
+        root, manifest = _load_transfer(transfer_id, "upload")
+        if offset != int(manifest["received"]):
+            raise RuntimeError("upload chunk offset is not the next expected offset")
+        try:
+            payload = base64.b64decode(base64_chunk, validate=True)
+        except ValueError as error:
+            raise ValueError("base64_chunk must be valid base64") from error
+        if not payload or len(payload) > runtime.settings.max_transfer_chunk_bytes:
+            raise ValueError("upload chunk is outside the configured bound")
+        if offset + len(payload) > int(manifest["bytes"]):
+            raise ValueError("upload exceeds declared total_bytes")
+        with (root / "payload.bin").open("ab") as output:
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+        manifest["received"] = offset + len(payload)
+        _write_transfer_manifest(root, manifest)
+        result = {"transfer_id": transfer_id, "received": manifest["received"], "complete": manifest["received"] == manifest["bytes"], "chunk_sha256": sha256_bytes(payload)}
+        _log_simple(tool_name="structured_file_upload_chunk", request={"transfer_id": transfer_id, "offset": offset, "chunk_bytes": len(payload), "chunk_sha256": result["chunk_sha256"]}, result=result, tier="transfer")
+        return result
+    except Exception as error:
+        _audit_rejection("structured_file_upload_chunk", {"transfer_id": transfer_id, "offset": offset}, error)
+        raise
+
+
+@mcp.tool(annotations=LOCAL_WRITE)
+def structured_file_upload_commit(transfer_id: str, reason: str = "") -> dict[str, Any]:
+    """Verify a complete staged upload and atomically commit it with checkpoint and rollback."""
+    request = {"transfer_id": transfer_id, "reason": reason}
+    try:
+        root, manifest = _load_transfer(transfer_id, "upload")
+        if int(manifest["received"]) != int(manifest["bytes"]):
+            raise RuntimeError("upload is incomplete and cannot be committed")
+        payload = (root / "payload.bin").read_bytes()
+        if len(payload) != int(manifest["bytes"]) or sha256_bytes(payload) != manifest["sha256"]:
+            raise RuntimeError("staged upload does not match declared byte identity")
+
+        def apply(_: bytes) -> tuple[bytes, dict[str, Any]]:
+            return payload, {"execution_path": "transfer", "transfer_id": transfer_id, "format": infer_format(str(manifest["path"]))}
+
+        result = _atomic_binary_mutation(
+            tool_name="structured_file_upload_commit",
+            path=str(manifest["path"]),
+            expected_sha256=manifest.get("expected_sha256"),
+            reason=reason,
+            request_summary={"transfer_id": transfer_id, "declared_bytes": manifest["bytes"], "declared_sha256": manifest["sha256"]},
+            transform=apply,
+            allow_create=True,
+            require_expected_for_existing=True,
+        )
+        manifest["state"] = "committed"
+        _write_transfer_manifest(root, manifest)
+        return result
+    except Exception as error:
+        _audit_rejection("structured_file_upload_commit", request, error)
         raise
 
 

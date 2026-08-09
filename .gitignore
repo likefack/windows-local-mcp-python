@@ -10,3 +10,6 @@ config.*.local.toml
 .local-mcp/
 dist/
 build/
+windows-local-mcp-guide.docx
+windows-local-mcp-guide.xlsx
+~$windows-local-mcp-guide.xlsx

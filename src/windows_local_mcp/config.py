@@ -42,6 +42,13 @@ class Settings(BaseModel):
     retention_max_operations: int = Field(default=2000, ge=10, le=1_000_000)
     max_directory_entries: int = Field(default=3000, ge=1, le=100000)
     max_image_bytes: int = Field(default=10 * 1024 * 1024, ge=1024)
+    # Structured binary files are deliberately bounded separately from source-text writes.
+    max_structured_file_bytes: int = Field(default=64 * 1024 * 1024, ge=1024)
+    max_transfer_chunk_bytes: int = Field(default=512 * 1024, ge=4096, le=4 * 1024 * 1024)
+    max_zip_entries: int = Field(default=10000, ge=1, le=100000)
+    max_zip_expanded_bytes: int = Field(default=256 * 1024 * 1024, ge=1024)
+    max_structured_elements: int = Field(default=250000, ge=100, le=2000000)
+    max_image_pixels: int = Field(default=40_000_000, ge=1_000_000, le=500_000_000)
     output_preview_characters: int = Field(default=12000, ge=1000, le=200000)
     max_command_arguments: int = Field(default=64, ge=1, le=1000)
     max_command_argument_characters: int = Field(default=1024, ge=32, le=65536)
