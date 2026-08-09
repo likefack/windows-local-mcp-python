@@ -30,6 +30,7 @@ packages = ["src/windows_local_mcp"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+addopts = ["--basetemp=.pytest-tmp-default", "-p", "no:cacheprovider"]
 
 [tool.ruff]
 line-length = 100
