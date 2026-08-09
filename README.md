@@ -1,302 +1,137 @@
 # Windows Local MCP
 
-OpenAI Secure MCP Tunnelを介して、ChatGPTから1つのWindows開発workspaceを操作するためのローカルMCPサーバーです。ファイル編集、Git状態取得、静的解析、承認付きtest/build、限定ADB操作を、監査ログと容量制限付きで提供します。
+ChatGPT から、指定した 1 つの Windows 作業領域を安全に読み書きするためのローカル MCP サーバーです。ファイル編集、構造化ファイル処理、監査、承認付きコマンド、変更履歴、Undo／rollback を提供します。
 
-> Safe Tierは既定でWindows AppContainerによるOS強制network isolationを使用しますが、アプリ全体がWindows Sandbox/VMになるわけではありません。host承認commandは承認後に通常のWindows user tokenで動きます。1インスタンス1workspace、厳格な引数文法、snapshot、ローカル承認、process identity、監査も引き続き安全境界です。通常起動は管理者権限で行わないでください。
+通常起動は管理者権限で行わないでください。`workspace_root` はプロジェクト単位で指定し、ドライブ直下やユーザーフォルダー全体を指定しないでください。
 
-## まず選ぶ手順
+## 実行構成
 
-- GitやPowerShellに慣れていない場合: [非エンジニア向けセットアップ](#非エンジニア向けセットアップ)
-- Git/Python環境を自分で管理できる場合: [エンジニア向けセットアップ](#エンジニア向けセットアップ)
+処理は次の 4 種類に分かれます。安全性を安価に閉じられる処理まで Sandbox に送らず、作用範囲を閉じられない処理だけを隔離します。
 
-## 非エンジニア向けセットアップ
+1. **WLMCP Broker**
+   - 対象パス、入出力、容量、副作用を WLMCP が限定できる処理です。
+   - ファイル read/write、差分、固定文法の Git 読み取り、固定 ADB 読み取り、バイナリ転送、checkpoint、transaction、Undo／rollback を直接扱います。
+2. **構造化処理**
+   - DOCX、XLSX、CSV／TSV、ZIP、一般画像を宣言的な操作として処理します。
+   - 現在は WLMCP 管理処理を使用し、処理結果を artifact として検証してから Broker の transaction で反映します。将来の ChatGPT container 処理も同じバイナリ転送境界へ接続できます。
+3. **Codex Sandbox**
+   - 任意コード、project script／plugin、test／build、一般コマンドなど、WLMCP だけで副作用を閉じにくい処理を実行します。
+   - 利用にはローカル承認と、この PC での Sandbox 実機検証成功が必要です。失敗時に Host へ自動移行しません。
+4. **Approved Host**
+   - 実際の Windows ユーザー権限が必要な処理だけを、Sandbox とは別の承認で 1 回実行します。
+   - OS、ネットワーク、device、`.git`、外部サービス等への作用は workspace checkpoint だけでは戻せません。
 
-### 1. 用語
+旧 Safe Tier／AppContainer は現行の方針には存在しません。旧設定が残っている場合は、弱い互換動作へ移らず起動を拒否します。
 
-- **workspace**: ChatGPTに操作を許可するプロジェクトフォルダーです。PC全体や`C:\Users`を指定しないでください。
-- **仮想環境（venv）**: このソフト専用のPython部品置き場です。他のアプリへ影響しにくくします。
-- **MCP**: ChatGPTが外部ツールを呼び出すための仕組みです。
-- **Tunnel**: インターネットへサーバーを公開せず、ローカルMCPの標準入出力をChatGPTへ安全に中継するOpenAI側の接続機能です。
-- **承認**: test/build、一般shell、削除、端末状態変更などを実行する前に、Windows側の利用者が最終判断する操作です。
+## セットアップ
 
-### 2. 必要なもの
-
-1. Windows 10または11。
-2. Python 3.11以上。Pythonのインストーラーでは「Add Python to PATH」を有効にします。
-3. OpenAI Secure MCP Tunnelを利用できるChatGPT環境。
-4. Gitは任意です。Gitがない場合もZIP版でセットアップできます。
-
-Flutter、Dart、ADBを使わない場合、それらをインストールする必要はありません。対応機能を`false`のままにしてください。
-
-### 3. Gitを使わずに入手する
-
-1. GitHubのリポジトリ画面で緑色の「Code」ボタンを選びます。
-2. 「Download ZIP」を選びます。
-3. ダウンロードしたZIPを右クリックし、「すべて展開」を選びます。
-4. 展開先フォルダーを開きます。
-5. フォルダー内の何もない場所を右クリックし、「ターミナルで開く」を選びます。Windows 10ではエクスプローラーのアドレス欄へ`powershell`と入力してEnterでも構いません。
-
-### 4. Python環境を作る
-
-開いたPowerShellへ、次を1行ずつ貼り付けます。
+Python 3.11 以上を使用します。
 
 ```powershell
-py -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
-Copy-Item .\config.example.toml .\config.toml
-notepad .\config.toml
+Set-Location C:\dev\windows-local-mcp-python
+py -3.11 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e .
+Copy-Item config.example.toml config.local.toml
 ```
 
-`py`が見つからない場合、Pythonが正しくインストールされていません。Pythonを再インストールしてから、新しいPowerShellを開いてください。
-
-### 5. 設定ファイルを編集する
-
-メモ帳で最初の`workspace_root`を、ChatGPTに操作させたいプロジェクトへ変更します。`\`は2つ重ねます。
+`config.local.toml` で少なくとも次を設定します。このファイルと `data_dir` は workspace 外へ置いてください。
 
 ```toml
-workspace_root = "C:\\Projects\\my-app"
+workspace_root = "C:\\dev\\your-project"
+data_dir = "C:\\Users\\you\\AppData\\Local\\windows-local-mcp\\your-project"
+protect_data_dir_acl = true
 ```
 
-最初は次のままが安全です。
-
-```toml
-git_enabled = true
-flutter_enabled = false
-dart_enabled = false
-adb_enabled = false
-powershell_enabled = false
-http_enabled = false
-```
-
-Gitも入っていない場合は`git_enabled = false`へ変更します。保存してメモ帳を閉じます。`workspace_root`が未設定・存在しない・`data_dir`と重なる場合、サーバーは安全側に起動失敗します。
-
-### 6. ローカル承認画面を起動する
-
-1つ目のPowerShellで次を実行し、開いたままにします。
+起動は次のとおりです。設定が不正な場合は、workspace を操作する前に起動を拒否します。
 
 ```powershell
-.\run-approvals.ps1 -Config "$PWD\config.toml"
+.\run-server.ps1 -Config .\config.local.toml
 ```
 
-承認要求が来ると、コマンド、理由、risk、固定したファイル数/容量、hash、有効期限が表示されます。
+Secure MCP Tunnel には、Shell 文字列ではなく次の argv を登録します。
 
-- `y`: 内容を再検証し、その場で1回だけ実行
-- `n`またはEnter: 拒否
-- `s`: 今は判断せず次へ
-- `q`: 承認画面を終了
-
-`request_sandbox_command`と`request_host_command`は承認要求を作るだけで、その呼出し時点では要求されたコマンドを実行しません。危険な実行はWindows側で`y`を選んだときだけ1回開始されます。前者はCodex Windows sandbox、後者は通常Windows user tokenという別のsecurity decisionです。sandbox unavailable/failedからhostへ暗黙fallbackしません。ChatGPT側には`execute_approved`を公開せず、`poll_approval`または`poll_job`で結果だけ確認します。
-
-### 7. Secure MCP Tunnelへ登録する
-
-Tunnelの接続追加画面で、ローカルコマンドとして次を登録します。画面の名称はChatGPT/Tunnelのバージョンや契約で異なるため、利用中のOpenAI公式画面の案内を優先してください。
-
-- Program / executable: `powershell.exe`
-- Arguments:
-  - `-NoProfile`
-  - `-File`
-  - `C:\path\to\windows-local-mcp-python\run-server.ps1`
-  - `-Config`
-  - `C:\path\to\windows-local-mcp-python\config.toml`
-- Working directory: このリポジトリの展開先
-
-`run-server.ps1`はambientな`python`ではなく、このリポジトリの`.venv\Scripts\python.exe`だけを使います。Tunnel ID、API key、認証情報は設定ファイルやリポジトリへ保存しないでください。
-
-### 8. 動作確認
-
-ChatGPTへ順に依頼します。
-
-1. 「`session_info`でworkspaceと有効機能を表示して」
-2. 「workspace直下を一覧表示して」
-3. 「`mcp-test.txt`へ`hello`と書き、読み戻して」
-4. Gitを有効にした場合は「現在のbranch、HEAD、status、diff、staged diff、最近のcommitを`git_info`で表示して」
-5. Gitの安全なコマンド実行を確認する場合は「`execute_readonly`で`git status --short`を実行して」
-
-表示されたworkspaceが意図したフォルダーと違う場合は、操作を続けずTunnelと承認画面を終了し、`config.toml`を直してください。
-
-### 9. ZIP版を更新する
-
-新しいZIPを別フォルダーへ展開し、古い`config.toml`の設定内容だけを新しい`config.example.toml`へ手作業で反映してください。古い`.venv`をコピーせず、手順4を再実行します。監査データは既定では`%LOCALAPPDATA%\WindowsLocalMCP`にあるため、リポジトリ更新とは分離されています。
-
-## エンジニア向けセットアップ
-
-```powershell
-git clone <repository-url>
-cd windows-local-mcp-python
-py -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
-Copy-Item config.example.toml config.toml
-# config.toml: set an explicit workspace_root and enable only needed capabilities
-# Add machine-local toolchain roots to safe_network_readable_paths, then run once:
-.\setup-network-isolation.ps1 -Config "$PWD\config.toml"
-.\.venv\Scripts\python.exe -m pytest -q
-.\.venv\Scripts\ruff.exe check .
+```text
+powershell.exe -NoProfile -File C:\dev\windows-local-mcp-python\run-server.ps1 -Config C:\path\to\config.local.toml
 ```
 
-stdio起動:
+複数 workspace は別々の `config`、`data_dir`、Sandbox scratch を使用してください。namespace marker が workspace、data_dir、実体識別子の混在を拒否します。
 
-```powershell
-.\run-server.ps1 -Config "$PWD\config.toml"
-```
+## 主な機能
 
-承認UI:
-
-```powershell
-.\run-approvals.ps1 -Config "$PWD\config.toml"
-```
-
-Tunnelへは`powershell.exe -NoProfile -File <repo>\run-server.ps1 -Config <repo>\config.toml`をargv配列として登録します。shell文字列へ連結しないでください。
-
-複数プロジェクトでは、親フォルダーを巨大workspaceにせず、ignored対象の`config.work-a.local.toml`、`config.work-b.local.toml`または`.local-mcp\`配下へprofileを分け、`-Config`で明示選択し、1 MCPプロセスにつき1 workspaceを割り当てます。`LOCAL_MCP_CONFIG`と異なる`LOCAL_MCP_ROOT`が残っている場合は、意図しない上書きではなく起動失敗になります。
-
-## 能力と境界
-
-| 操作 | 既定 | MCP tool / 自動実行の条件 |
+| 用途 | 経路 | 主な tool |
 | --- | --- | --- |
-| workspace read/write/list/image | 有効 | `read_file` / `write_file`等。path broker、容量、秘密名、reparse/hardlink、競合検証を通る |
-| Git status/diff/staged/branch/HEAD/log/changed files | 有効 | `git_info`または`execute_readonly`。読取専用の固定文法。`.git`直接アクセスは不可 |
-| `flutter analyze` | 無効 | `execute_readonly`。有効化後、`--no-pub`、検証済みpath、固定snapshotとdependency closure |
-| `dart analyze` / 表示だけの`dart format` | 無効 | `execute_readonly`。有効化後、完全文法とsnapshot |
-| 書込みを行う制約付き`dart format` | 無効 | `execute_workspace_write`。実workspace全体を直前固定して実行 |
-| Flutter/Dart test/build | 承認 | `request_sandbox_command`で要求を作成し、Windows側承認後にApproved Sandboxで1回実行 |
-| ADB devices/固定read-only/screenshot | 無効 | `adb_read`。Emulator検証、serial allowlist、固定操作文法 |
-| ADB state change/general shell | 承認 | 原則`request_sandbox_command`。device/IPC等の実効能力とrollback不能範囲を承認UIに表示 |
-| Python/pytest/PowerShell/Node/npm/npx/project scripts | 承認 | `request_sandbox_command`。広いcommand grammarだがApproved Sandbox内で実行 |
-| network必須またはsandbox外host command | 承認 | `request_host_command`で別要求。real Windows user tokenで実行する最終経路 |
-| Streamable HTTP | 無効 | loopbackのみ。multi-principal modeは未実装のため起動拒否 |
+| テキスト／バイナリの読み書き | Broker | `read_file`, `write_file`, artifact transfer |
+| Git 状態、差分、履歴 | Broker | `git_info`, 固定文法の `execute_readonly` |
+| Emulator の限定読み取り | Broker | `adb_read`, `get_adb_screenshot` |
+| DOCX／XLSX／CSV／TSV／ZIP／画像 | 構造化処理 | `structured_file_inspect`, `structured_file_apply` 等 |
+| Python、PowerShell、Node、test、build、project script | Codex Sandbox | `request_sandbox_command` |
+| Sandbox 外の Windows 権限／network が必要な処理 | Approved Host | `request_host_command` |
+| 状態確認、停止、監査 | Broker | `poll_job`, `stop_job`, `activity_get`, `audit_get` |
+| 変更取消 | Broker | selective Undo、point-in-time rollback |
 
-自動コマンドはまず共通のdeny-by-default文法で検証し、その後に`execute_readonly`、`execute_workspace_write`、`adb_read`のどれへ属するかを判定します。別のtoolへ誤って送られた操作は実行せず拒否します。旧generic `execute` / `start_command`はMCPへ公開しません。
+`execute_workspace_write` は互換用の公開面を残していますが、Dart／Flutter 等の project-controlled 処理は拒否され、`request_sandbox_command` を案内します。
 
-Tool Annotation（MCPホストへ伝える操作性質）もtoolごとに分離しています。`execute_readonly`と`adb_read`はread-only/non-destructive、`execute_workspace_write`はdestructiveだがclosed-world、2つのrequest toolは「承認要求を作るだけ」なのでnon-destructive/closed-worldです。これはChatGPT側の不要な確認を減らすためのヒントであり、最終的な確認UIの有無はMCPホスト側の判断にも依存します。
+## 構造化ファイル
 
-## 承認snapshot
+- **DOCX**: paragraph／run、検索置換、表、header/footer、style、section、page 設定、metadata。未変更の関係、画像、hyperlink 等を保持し、追跡変更、macro、埋め込み object、データ連動 Custom XML など保持を保証できない機能は書き込みを拒否します。
+- **XLSX**: 値／数式、範囲、行列、sheet、copy/fill、書式、merge、freeze pane、filter、Table、入力規則、条件付き書式、基本 chart／page setup。macro、pivot、外部接続、未対応拡張等は書き込みを拒否します。
+- **CSV／TSV**: 範囲、cell／row／column、append／insert／delete。encoding、delimiter、quote、newline を識別して保持し、判定が曖昧なら拒否します。
+- **ZIP**: listing、read、create/update、複数展開。traversal、絶対 path、ADS、予約名、大小文字衝突、件数、展開後容量を検査し、複数 file は transaction で一括反映します。
+- **画像**: inspect、resize、thumbnail、crop、rotate、flip、変換、quality、metadata 除去。pixel／decoded memory を制限し、未対応の multi-frame は破壊的変換せず拒否します。
 
-`request_sandbox_command`と`request_host_command`は次を固定します。Approved SandboxではさらにCodex executableのpath/size/mtime/SHA-256、backend mode、permission profileもapproval hashへ結合します。
+変換中は workspace-wide lock を保持しません。commit 直前に source の raw bytes identity を再確認し、別処理による変更があれば conflict として拒否します。Office macro を含む bytes の転送・保存と、macro の実行は別の能力です。
 
-- 実行ファイルのbytes/identity
-- argv、cwd、reason、risk、network/workspace-write指定
-- 実効Settingsとコマンドへ影響する環境のdigest
-- MCPが変更可能な実行scopeの全regular file（追加・削除も検出）
-- Dart/Flutterの`package_config.json`から解決したcwd外/path dependency
-- Gitの場合はHEAD、status、working diff、staged diff
+## 承認と実行時 binding
 
-読取型code loaderは`cwd`と列挙済みdependencyを`data_dir`の不変領域へコピーし、検証後に別の使い捨てrun copyを作って実行します。元workspaceの兄弟フォルダーにある無関係な変更では失効しません。absolute/embedded workspace path、非file dependency、外部directory、symlink/junction/reparse、hardlink、上限超過など、closureを保証できない入力はfail-closedです。
+`request_sandbox_command` と `request_host_command` は要求を作るだけで、その呼び出し時にはコマンドを実行しません。ローカル承認 UI で承認された要求を 1 回だけ claim して実行します。
 
-元workspaceを変更する承認操作では`workspace_write=true`が必要です。この場合はworkspace全体を固定し、MCP writeとcommand executionをcross-process lockで直列化します。したがって承認後の無関係なworkspace変更も意図的に失効させます。
+承認には、argv、cwd、実行ファイルと入力の hash、checkpoint、workspace／data_dir の実体 identity、設定、WLMCP build と policy generation、Sandbox backend を結合します。更新や設定変更後の古い承認、二重 claim、replay は拒否します。
 
-test/buildはread-only安全Tierではありません。元workspaceを変更しない場合でも、任意コードを実行するためローカル承認済みsnapshot実行です。
+Approved Host は同一ユーザー権限で制御領域へ到達し得るため、実行中の audit、approval staging、CAS、journal、transfer、worker context を監視し、整合性を確認できない場合は fail closed marker を残して以後の処理を停止します。これは別 OS アカウントや service による完全な権限分離ではなく、改ざん検出境界です。
 
-## 3つのexecution tier
+## Codex Sandbox
 
-```text
-Safe Sandbox --明示的な承認 escalationのみ--> Approved Sandbox
-Approved Sandbox --別の明示的承認のみ-----> Approved Host
-```
-
-- **Safe Sandbox**: Git、`dart analyze/format`、`flutter analyze`、限定ADBのstrict grammar。原則AppContainerで自動実行し、Internet/LAN、filesystem、descendantをOS境界で制限します。
-- **Approved Sandbox**: Python、pytest、PowerShell、Node、npm、npx、build tool、project script等。人間承認後、installed Codex CLIの`sandbox`専用entrypointをcommand launcherとして使用します。Codex agentは起動せず、prompt/model inference/OpenAI API通信やOpenAI authenticationをcommand実行のために要求しません。
-- **Approved Host**: real Windows user token。sandbox外の実効能力が必要な場合だけ、別の承認要求で使用します。Approved Sandboxの未導入、setup失敗、timeout、command failureを理由に自動選択しません。
-
-Safe commandのAppContainer setup/startup/既知ACL互換性failureは`failure_class=sandbox_compatibility`として停止し、Approved Sandboxで再試行可能と表示します。test failure、compile error、lint error、application error、通常のnon-zero exitは`command_failure`であり、escalation理由にはなりません。request作成もapprovalも自動ではありません。補助Git snapshot/repository probeとADB emulator identity probeもSafe brokerを通るため、本体の前後だけreal user tokenでexternal executableを起動しません。
-
-## ファイル保護
-
-- `hidden_directories`: 一覧から除外するだけ
-- `read_denied_directories`: AIの直接読取を禁止
-- `write_denied_directories`: AIの直接書換えを禁止
-- `blocked_file_names`: 名前単位で直接read/writeを禁止
-
-既定では`.git`をread/write禁止、`.venv`、`node_modules`、`.dart_tool`、`build`、`__pycache__`を一覧非表示かつ直接write禁止にします。これらのソース参照が必要な場合、readは可能です。
-
-NTFS ADS、Windows予約デバイス名、末尾dot/space、workspace外、symlink/junction/reparse、複数hardlinkを拒否します。writeはcanonical target単位のthread lockとdata_dir上のcross-process lockを取り、親/target identityをreplace直前に再検証します。
-
-## Safe Tier network isolation
-
-方式選定では、Windows 8以降の安定APIであるAppContainerと、experimentalな`CreateProcessInSandbox`、OpenAI Codex Windows sandboxの専用低権限user + ACL + firewall/local policy方式を比較しました。本実装はexperimental APIへ依存せず、network capabilityを持たないAppContainer tokenとJob Objectを子孫へ継承させます。OpenAI方式と同等のmachine-wide sandboxを主張するものではありません。Windows 10/11を対象とし、profile/ACL作成は一度だけ、operationごとの追加承認は不要です。toolchain pathのACL互換性はmachine依存です。
-
-Git用workspace-read profile、Dart/Flutter用staged-read、Dart format用staged-write、ADB loopback profileは分離されています。Git AppContainer identityにはGit自身が`HEAD/index/refs/objects/config`を解釈するためのworkspace read ACLを与えますが、MCP/modelへ返す内容はsafe Git grammar、pathspec、no-textconv/no-external-diff、bounded output、protected-content規則で別に制限します。Dart/Flutter/ADBへworkspace全体のACLは付与しません。Safe Tier requestはeffective settings digestも保持するため、serverとworkerの間でnetwork isolation mode等が変われば実行を停止します。選択中のconfig fileはworkspace外に置く必要があります。
-
-既定の`safe_network_isolation_mode = "appcontainer"`では、Safe Tier processをnetwork capabilityなしのWindows AppContainerで起動します。descendantも同じAppContainer tokenを継承し、kill-on-close Job Objectへ入ります。childへ継承するHANDLEはstdin=NUL/stdout/stderrのallowlistだけです。ADBだけは別profileへloopback exemptionを付け、Internet/LAN capabilityは付けません。`ADB_SERVER_SOCKET=tcp:127.0.0.1:5037`は要求endpointですが、OS上の実効保証は5037限定ではなく一般loopback exemptionです。この差をTimeline/auditへ記録します。初回のみ次を実行します。
-
-```powershell
-.\setup-network-isolation.ps1 -Config "$PWD\config.toml"
-```
-
-AppContainerから必要なFlutter SDKやuser-local Git等は、private local configの`safe_network_readable_paths`へtoolchain rootを列挙してください。setup/ACL/profile/process launchのいずれかが失敗した場合、Safe Tierを通常user processとして再実行せずfail closedにします。
-
-setupはprofileごとのACL grant ledgerをreconcileします。設定から外したtoolchain pathの古いACEを除去し、workspace/data_dirまたはそれらとancestor/descendant関係になるreadable pathを拒否します。
-
-`safe_network_isolation_mode = "compatibility"`は明示的legacy modeです。proxy poisoning、Git protocol、package host、ADB socket、command grammarは維持しますが、direct socket APIをOSで拒否する保証はなく、TimelineにもOS isolationとして表示しません。
-
-## Approved Sandbox backend
-
-本releaseは **installed Codex dependency** を採用します。`codex sandbox -c windows.sandbox="elevated" -P :workspace -C <cwd> -- <command...>`をargvで直接起動し、agent mode/app-server/model APIを経由しません。`codex.exe`とsandbox-only経路の`codex-command-runner.exe` / `codex-windows-sandbox-setup.exe`は、OpenAI Authenticode signer、path、size、mtime、SHA-256を承認内容へ結合します。実行時には3 binaryを再検証し、write/deleteを許さないfile handleをcommand終了まで保持します。versionは承認後に確認してauditへ保存します。
-
-OpenAIの現行Windows sandboxは、preferredなelevated modeで一度だけAdministrator/UAC setupを行い、専用の低権限local user、ACL、firewall/local policy、restricted token、Job管理を使用します。Windows 11推奨で、Windows 10は更新済み環境でbest effortです。Codex未導入、helper/setup未完了、version/probe/policy/launch failureは`approved_sandbox_unavailable`または`sandbox_backend_failure`で停止します。
-
-OpenAI CodexはApache-2.0なのでstandalone同梱は法的には検討できますが、CLI、setup helper、command runner、policy/protocol version、署名とsecurity updateを一体で配布・追従する必要があります。本releaseでは独自再実装や一部binaryの切り出しを避け、installed CLIへ薄く接続する方式を選びました。Codex未導入PCでのUXとversion skewはこの方式の制約です。
-
-## ADB
-
-ADBはworkspace filesystemと別の権限境界です。既定は完全無効です。
+`config.local.toml` で installed Codex CLI を指定できます。
 
 ```toml
-adb_enabled = true
-adb_emulator_only = true
-adb_allowed_serials = ["emulator-5554"]
+approved_sandbox_enabled = true
+approved_sandbox_codex_path = "C:\\path\\to\\codex.exe"
+approved_sandbox_require_live_verification = true
+sandbox_dependency_readable_paths = []
 ```
 
-自動許可は`adb_read`経由の`devices`、target指定`get-state`、限定`getprop`、`wm size/density`、限定`dumpsys`、`exec-out screencap -p`だけです。実行直前に`adb emu avd name`でEmulatorであることも確認します。`input`、`am`、`pm`、install、push/pull、汎用shell等は承認経路です。screenshot jobの完了後は`get_adb_screenshot`で画像を取得できます。
+WLMCP は `codex sandbox` 専用 entrypoint を argv で起動し、agent／model API は使用しません。launcher と helper の path、署名、hash、file identity を承認と実行時に検証します。
 
-## Transportとprincipal
+設定されていること、機能が有効なこと、backend を解決できること、この PC で security boundary まで実機検証済みであることは別々に表示されます。実機検証は次を確認します。
 
-既定かつ推奨は`stdio + OpenAI Secure MCP Tunnel`です。認証済みprincipal ownershipが未実装のため、streamable HTTPは設定検証でfail-closedに停止します。
-
-この版は認証済みmulti-principal HTTPを実装していません。`http_multi_principal_enabled=true`は起動時に拒否されます。そのため、principal ownershipなしに他利用者のjob/approval/auditへアクセスできる構成は作れません。将来multi-principal HTTPを実装する場合は、operation所有者を認証principalへ永続化し、poll/claim/execute/cancel/auditの全照会にownership条件を必須化する必要があります。
-
-## data_dir、ACL、容量、保持
-
-`data_dir`はworkspaceと別の実効pathでなければなりません。通常のcontainmentと設定時のlexical containmentを両方検査するため、workspace内junctionを介して外へ向けたdata_dirも拒否します。data_dir自体のreparseも拒否します。
-
-Windowsでは`protect_data_dir_acl=true`が既定で、継承ACLを外し、現在のsecurity principalとSYSTEMへFull Controlを付与します。同一Windowsユーザー権限で動く任意プロセスからの改変まではACLで分離できません。MCPの通常ファイルツールからはdata_dirがworkspace外のため到達不能です。
-
-write、既存read、diff、backup、stdout/stderr、image、directory、approval manifest、data_dir全体に上限があります。stdout/stderrはpipeを常時drainし、bounded head/tailだけを保存するため、全量をメモリやdiskへ載せません。既定保持は14日/2000 terminal operationsで、active jobとpending approvalのartifactは削除しません。
-
-## checkpoint、point-in-time rollback、selective Undo
-
-checkpointは完全なworkspace manifestを保持しますが、内容は`workspace-history\blobs\<sha256>.blob`へ一度だけ保存します。同じbytesをoperationごとに複製しません。復元前には使用する全blobを再hashし、1件でも不一致ならworkspaceを書き換えません。
-
-- `request_workspace_rollback`: 指定operation終了時点へworkspace全体を戻すpoint-in-time rollback
-- `request_selective_undo`: 指定operationのdeltaだけを3状態比較で除去するselective Undo
-
-どちらもlocal one-shot承認が必要です。復元は事前検証・staging・durable journal・適用・最終hash検証を行い、途中失敗時は開始前状態への自動復旧を試します。`preflight/staged` crashは未適用を確認してterminal化、`applying/recovering`は開始前へ復旧、`applied_verified`はtarget到達を確認してaudit/journalを完了し、真に判断不能な場合だけ`recovery_required`を残します。単一fileの`write_file`も置換前にwrite-ahead recovery journalを永続化します。これは複数fileに対するfailure-atomic best effortであり、OS filesystem transactionを称するものではありません。Undo/rollback自身は自分に属するfresh before/after checkpointを持つため、古いoperationのretentionに不要に依存せず、競合がなければさらにUndoできます。
-
-完全checkpointでpolicy上除外したentryはreason付きでmanifestへ記録し、対象fileのsharing violation、I/O error、permission anomaly、traversal failureはcheckpoint failureとして停止します。不明fileを「存在しなかった」と扱ってrollbackで削除しません。CASによるblob deduplicationは維持しますが、完全性とexternal modification検出を弱める信頼できるchange journalがまだないため、manifest作成は引き続きO(workspace files)のfull scanです。
-
-`activity_timeline`/CLIの一覧は要約だけです。diff、stdout/stderr、events、全path、rollback/Undo preview、conflict技術情報は`activity_get(operation_id)`で確認します。
-
-## 監査
-
-SQLiteの`operations`と`events`へ、成功だけでなく拒否、path/command validation失敗、poll/stop、approval poll/claim、audit閲覧、stale job整理も記録します。contentやsecret-like fieldはbytes/hash/redactionに置き換え、巨大入力をそのまま保存しません。
-
-監査場所の既定:
-
-```text
-%LOCALAPPDATA%\WindowsLocalMCP\
-  audit.db
-  outputs\
-  diffs\
-  backups\
-  git-snapshots\
-  approval-staging\
+```powershell
+$env:LOCAL_MCP_CONFIG = 'C:\path\to\config.local.toml'
+.\.venv\Scripts\python.exe -m windows_local_mcp.cli verify-codex-sandbox
 ```
 
-## 制約
+検証対象は simple command、Python child、source read、scratch write、control-plane denial、network deny、child／grandchild containment、timeout／termination、filesystem resource admission です。1 項目でも失敗した marker は「検証済み」として受理されません。
 
-- Safe Tierのnetwork/process/file accessにはAppContainer境界を使いますが、MCP本体と承認済みhost commandを含むアプリ全体のVM/完全sandboxではありません。
-- AppContainer ACL/setupとGit/Dart/Flutter/ADBの実toolchain互換性はmachine依存です。本検証端末ではSafe Gitがancestor ACL互換性で停止し、ADB loopback setupもfail-closedになりました。成功していないtoolを検証済みとは扱いません。
-- 同一Windowsユーザーの別プロセスがdata_dirやtoolchainを悪意を持って改変する脅威は完全には隔離できません。
-- Flutter/Dart/ADBがない環境では、その実commandの成功は検証できません。機能を無効にすればインストールなしで起動できます。
-- Secure MCP Tunnelのアカウント側availability、認証、UIはOpenAI側機能です。このリポジトリへsecretを保存しません。
+## ファイルと制御領域の保護
 
-実装の詳細は[仕様](SPEC.md)、実行済み検証は[検証記録](VERIFICATION.md)を参照してください。
+- workspace path は canonical path、reparse point、hardlink、予約名、ADS、親／target identity を検査します。
+- optimistic concurrency には表示用文字列ではなく raw file bytes の SHA-256 を使います。CRLF も raw identity に含まれます。
+- 書き込みは checkpoint、durable journal、atomic replacement、post-write 検証を通します。第三者変更を復旧処理が上書きしません。
+- `data_dir`、Sandbox scratch、workspace は分離し、起動時に lock／atomic replacement／filesystem identity の前提を確認します。
+- `.env`、credential 等の保護対象は通常の read、diff、Git snapshot から返しません。audit、approval、Activity、argv、stdout／stderr preview は secret を伏せ字にします。
+- 同時 job、pending approval、出力、artifact、data_dir、Sandbox scratch、structured element／pixel／archive 展開量に上限があります。
+
+## Activity、Undo、rollback
+
+Live Activity と Timeline は Read／Edited／Running／Finished、実行境界、network policy、before／after、conflict、failure／recovery、bounded stdout／stderr preview、rollback 可否を記録します。詳細は `activity_get`／`audit_get` で確認します。
+
+checkpoint が戻せるのは、manifest に含まれる通常の workspace file bytes です。`.git`、ACL、device、network、外部サービス、別 process の副作用は戻せません。selective Undo は独立した text 変更を保持できますが、binary／曖昧な競合では停止します。
+
+## 検証範囲
+
+unit／integration test、Windows 上の Sandbox 実機検証、Secure MCP Tunnel／ChatGPT E2E は別の証拠です。テスト成功だけで OS 隔離や Tunnel E2E を検証済みとは表示しません。
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
+```
+
+Sandbox が利用不能、未検証、timeout、setup failure、command failure の場合は、その operation を unavailable／failed として表示します。Approved Host へ自動 fallback しません。
