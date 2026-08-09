@@ -8,6 +8,7 @@ from datetime import datetime
 from .approval import verify_approval_bundle
 from .audit import TERMINAL_STATUSES, AuditStore
 from .config import Settings, load_settings
+from .control_plane import assert_trusted_runtime, verify_control_plane_generation
 from .executor import Executor
 from .policy import NormalizedCommand, approved_request_hash
 from .resources import WorkspaceExecutionLock
@@ -239,6 +240,7 @@ def _activity_loop(audit: AuditStore, stop: threading.Event, paused: threading.E
 
 def run_approval_ui(settings: Settings | None = None) -> None:
     settings = settings or load_settings()
+    assert_trusted_runtime(settings)
     audit = AuditStore(settings)
     executor = Executor(settings, audit)
     print(f"Audit DB: {audit.db_path}")
@@ -288,6 +290,9 @@ def run_approval_ui(settings: Settings | None = None) -> None:
                     request = item["request"]
                     if not isinstance(request, dict):
                         raise TypeError("invalid approval request")
+                    verify_control_plane_generation(
+                        settings, request.get("control_plane_generation")
+                    )
                     if item.get("tool_name") in {
                         "request_workspace_rollback",
                         "request_selective_undo",
@@ -340,6 +345,15 @@ def run_approval_ui(settings: Settings | None = None) -> None:
                                     note=note,
                                     expected_request_hash=expected_hash,
                                 )
+                                if not audit.transition_operation(
+                                    operation_id,
+                                    from_statuses={"queued"},
+                                    status="running",
+                                    started_at=utc_now_iso(),
+                                ):
+                                    raise RuntimeError(
+                                        "workspace control operation is no longer executable"
+                                    )
                                 before = capture_workspace_state(settings, operation_id, "before")
                                 audit.update_operation(
                                     operation_id,
@@ -369,25 +383,30 @@ def run_approval_ui(settings: Settings | None = None) -> None:
                                 "rollback_state": "complete",
                                 "undo_can_be_undone": True,
                             }
-                            audit.update_operation(
+                            committing_result = {**result, "status": "committing"}
+                            if not audit.transition_operation(
                                 operation_id,
-                                status="succeeded",
-                                finished_at=utc_now_iso(),
+                                from_statuses={"running"},
+                                status="committing",
                                 pre_workspace_path=before.manifest_path,
                                 post_workspace_path=after.manifest_path,
                                 diff_path=change["diff_path"],
-                                rollback_state="complete",
-                                result_json=canonical_json(result),
-                            )
-                            audit.add_event(operation_id, "workspace_control_complete", result)
+                                rollback_state="applied_audit_pending",
+                                result_json=canonical_json(committing_result),
+                            ):
+                                raise RuntimeError(
+                                    "workspace control terminalization was superseded"
+                                )
                             try:
                                 finalize_workspace_transaction(settings, operation_id)
                             except Exception as finalize_error:  # noqa: BLE001 - journal retained
                                 result["status"] = "interrupted"
                                 result["rollback_state"] = "applied_audit_incomplete"
-                                audit.update_operation(
+                                audit.transition_operation(
                                     operation_id,
+                                    from_statuses={"committing"},
                                     status="interrupted",
+                                    finished_at=utc_now_iso(),
                                     rollback_state="applied_audit_incomplete",
                                     result_json=canonical_json(result),
                                     error=(
@@ -405,6 +424,17 @@ def run_approval_ui(settings: Settings | None = None) -> None:
                                     "startup reconciliation will finish the journal."
                                 )
                             else:
+                                audit.transition_operation(
+                                    operation_id,
+                                    from_statuses={"committing"},
+                                    status="succeeded",
+                                    finished_at=utc_now_iso(),
+                                    rollback_state="complete",
+                                    result_json=canonical_json(result),
+                                )
+                                audit.add_event(
+                                    operation_id, "workspace_control_complete", result
+                                )
                                 print(
                                     "Approved and completed. This operation can itself be undone."
                                 )
@@ -417,8 +447,9 @@ def run_approval_ui(settings: Settings | None = None) -> None:
                                 "rollback_state": mutation_error.recovery_state,
                                 "transaction_journal": mutation_error.journal_path,
                             }
-                            audit.update_operation(
+                            audit.transition_operation(
                                 operation_id,
+                                from_statuses={"queued", "running", "committing"},
                                 status="failed",
                                 finished_at=utc_now_iso(),
                                 pre_workspace_path=(
@@ -438,8 +469,9 @@ def run_approval_ui(settings: Settings | None = None) -> None:
                                 "target_operation_id": request["target_operation_id"],
                                 "rollback_state": "failed_preflight",
                             }
-                            audit.update_operation(
+                            audit.transition_operation(
                                 operation_id,
+                                from_statuses={"queued", "running", "committing"},
                                 status="failed",
                                 finished_at=utc_now_iso(),
                                 rollback_state="failed_preflight",
@@ -472,8 +504,15 @@ def run_approval_ui(settings: Settings | None = None) -> None:
                     executor.launch(operation_id, 0)
                     print("Approved and launched once. The MCP client can poll the result.")
                 except Exception as error:  # noqa: BLE001 - fail closed and persist any launch error
-                    audit.update_operation(
+                    audit.transition_operation(
                         operation_id,
+                        from_statuses={
+                            "pending_approval",
+                            "approved",
+                            "queued",
+                            "running",
+                            "committing",
+                        },
                         status="failed",
                         approval_status="rejected",
                         finished_at=utc_now_iso(),

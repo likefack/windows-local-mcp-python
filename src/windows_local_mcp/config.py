@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
+import json
 import os
 import stat
 import subprocess
 import tomllib
+import uuid
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
 from .child_env import normalize_extra_environment_names, sanitize_process_environment
 from .git_env import strip_git_ambient_environment
@@ -19,8 +22,11 @@ from .windows_system import windows_system_executable
 class Settings(BaseModel):
     """Validated, fail-closed configuration for one MCP instance/workspace."""
 
+    model_config = ConfigDict(extra="forbid")
+
     workspace_root: Path
     data_dir: Path
+    sandbox_scratch_dir: Path | None = None
 
     filesystem_enabled: bool = True
     git_enabled: bool = True
@@ -49,6 +55,9 @@ class Settings(BaseModel):
     max_zip_expanded_bytes: int = Field(default=256 * 1024 * 1024, ge=1024)
     max_structured_elements: int = Field(default=250000, ge=100, le=2000000)
     max_image_pixels: int = Field(default=40_000_000, ge=1_000_000, le=500_000_000)
+    max_image_decoded_bytes: int = Field(
+        default=256 * 1024 * 1024, ge=4 * 1024 * 1024, le=2 * 1024 * 1024 * 1024
+    )
     output_preview_characters: int = Field(default=12000, ge=1000, le=200000)
     max_command_arguments: int = Field(default=64, ge=1, le=1000)
     max_command_argument_characters: int = Field(default=1024, ge=32, le=65536)
@@ -63,6 +72,10 @@ class Settings(BaseModel):
     )
     default_foreground_timeout_seconds: int = Field(default=30, ge=0, le=600)
     default_max_runtime_seconds: int = Field(default=1800, ge=10, le=86400)
+    max_concurrent_jobs: int = Field(default=4, ge=1, le=64)
+    max_pending_approvals: int = Field(default=100, ge=1, le=10000)
+    max_open_transfers: int = Field(default=32, ge=1, le=1000)
+    max_sandbox_scratch_bytes: int = Field(default=512 * 1024 * 1024, ge=1024 * 1024)
 
     # Parent environment is not inherited wholesale. Add only project-specific variables that a
     # child genuinely needs; known injection/redirection variables are rejected even if listed.
@@ -108,14 +121,14 @@ class Settings(BaseModel):
     http_port: int = Field(default=8000, ge=1, le=65535)
     http_multi_principal_enabled: bool = False
     protect_data_dir_acl: bool = True
-    safe_network_isolation_mode: Literal["appcontainer", "compatibility"] = "appcontainer"
-    safe_network_profile_prefix: str = "WindowsLocalMCP.SafeTier"
-    safe_network_readable_paths: list[Path] = Field(default_factory=list)
+    sandbox_dependency_readable_paths: list[Path] = Field(default_factory=list)
     approved_sandbox_enabled: bool = True
     approved_sandbox_backend: Literal["codex_cli"] = "codex_cli"
     approved_sandbox_codex_path: Path | None = None
     approved_sandbox_windows_mode: Literal["elevated"] = "elevated"
     approved_sandbox_permission_profile: Literal[":workspace"] = ":workspace"
+    approved_sandbox_require_live_verification: bool = True
+    approved_host_enabled: bool = True
 
     _config_selection_source: str = PrivateAttr(default="direct_settings")
     _config_path: str | None = PrivateAttr(default=None)
@@ -129,11 +142,19 @@ class Settings(BaseModel):
             return payload
         root_value = payload.get("workspace_root")
         data_value = payload.get("data_dir")
+        scratch_value = payload.get("sandbox_scratch_dir")
         if root_value and data_value:
             root = Path(os.path.expandvars(os.path.expanduser(str(root_value)))).absolute()
             data = Path(os.path.expandvars(os.path.expanduser(str(data_value)))).absolute()
             if _is_relative_to(data, root) or _is_relative_to(root, data):
                 raise ValueError("data_dir and workspace_root lexically overlap")
+            if scratch_value:
+                scratch = Path(
+                    os.path.expandvars(os.path.expanduser(str(scratch_value)))
+                ).absolute()
+                for left, right in ((scratch, root), (scratch, data)):
+                    if _is_relative_to(left, right) or _is_relative_to(right, left):
+                        raise ValueError("sandbox_scratch_dir must not overlap trusted roots")
         return payload
 
     @field_validator("workspace_root", "data_dir", mode="before")
@@ -150,13 +171,20 @@ class Settings(BaseModel):
             return None
         return Path(os.path.expandvars(os.path.expanduser(str(value)))).resolve(strict=True)
 
-    @field_validator("safe_network_readable_paths", mode="before")
+    @field_validator("sandbox_scratch_dir", mode="before")
+    @classmethod
+    def expand_optional_directory(cls, value: object) -> Path | None:
+        if value is None or not str(value).strip():
+            return None
+        return Path(os.path.expandvars(os.path.expanduser(str(value)))).resolve()
+
+    @field_validator("sandbox_dependency_readable_paths", mode="before")
     @classmethod
     def expand_readable_paths(cls, value: object) -> list[Path]:
         if value is None:
             return []
         if not isinstance(value, list):
-            raise TypeError("safe_network_readable_paths must be a list")
+            raise TypeError("sandbox_dependency_readable_paths must be a list")
         return [
             Path(os.path.expandvars(os.path.expanduser(str(item)))).resolve()
             for item in value
@@ -173,15 +201,6 @@ class Settings(BaseModel):
             clean.append(serial)
         return clean
 
-    @field_validator("safe_network_profile_prefix")
-    @classmethod
-    def validate_appcontainer_prefix(cls, value: str) -> str:
-        prefix = value.strip()
-        allowed = set("-_. ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789")
-        if not prefix or len(prefix) > 24 or any(character not in allowed for character in prefix):
-            raise ValueError("safe_network_profile_prefix is invalid")
-        return prefix
-
     @field_validator("child_environment_allowlist")
     @classmethod
     def validate_child_environment_allowlist(cls, values: list[str]) -> list[str]:
@@ -191,8 +210,14 @@ class Settings(BaseModel):
     def validate_security_boundaries(self) -> Settings:
         root = self.workspace_root
         data = self.data_dir
+        if self.sandbox_scratch_dir is None:
+            self.sandbox_scratch_dir = data.parent / f"{data.name}-sandbox-scratch"
+        scratch = self.sandbox_scratch_dir.resolve()
         if _is_relative_to(data, root) or _is_relative_to(root, data):
             raise ValueError("data_dir and workspace_root must not overlap")
+        for left, right in ((scratch, root), (scratch, data)):
+            if _is_relative_to(left, right) or _is_relative_to(right, left):
+                raise ValueError("sandbox_scratch_dir must not overlap trusted roots")
         if self.http_enabled and self.http_multi_principal_enabled:
             raise ValueError(
                 "multi-principal HTTP is unsupported without authenticated principal ownership"
@@ -209,24 +234,27 @@ class Settings(BaseModel):
             )
         if self.safe_powershell_scripts and not self.powershell_enabled:
             raise ValueError("safe_powershell_scripts requires powershell_enabled=true")
-        for path in self.safe_network_readable_paths:
+        for path in self.sandbox_dependency_readable_paths:
             if path == Path(path.anchor):
-                raise ValueError("safe_network_readable_paths cannot include a drive root")
+                raise ValueError("sandbox_dependency_readable_paths cannot include a drive root")
             if any(
                 _is_relative_to(path, protected) or _is_relative_to(protected, path)
                 for protected in (root, data)
             ):
                 raise ValueError(
-                    "safe_network_readable_paths cannot overlap workspace_root, data_dir, "
+                    "sandbox_dependency_readable_paths cannot overlap workspace_root, data_dir, "
                     "or an ancestor of either"
                 )
         codex_path = self.approved_sandbox_codex_path
         if codex_path is not None:
             if not codex_path.is_file() or _is_reparse(codex_path):
                 raise ValueError("approved_sandbox_codex_path must be a regular non-reparse file")
-            if _is_relative_to(codex_path, root) or _is_relative_to(codex_path, data):
+            if any(
+                _is_relative_to(codex_path, protected)
+                for protected in (root, data, scratch)
+            ):
                 raise ValueError(
-                    "approved_sandbox_codex_path must be outside workspace_root and data_dir"
+                    "approved_sandbox_codex_path must be outside untrusted and control-plane roots"
                 )
         return self
 
@@ -238,6 +266,19 @@ class Settings(BaseModel):
         self.data_dir.mkdir(parents=True, exist_ok=True)
         if _is_reparse(self.data_dir):
             raise ValueError("data_dir must not be a symbolic link or reparse point")
+        assert self.sandbox_scratch_dir is not None
+        self.sandbox_scratch_dir.mkdir(parents=True, exist_ok=True)
+        if _is_reparse(self.sandbox_scratch_dir):
+            raise ValueError("sandbox_scratch_dir must not be a reparse point")
+        workspace_identity = self.workspace_root.stat()
+        data_identity = self.data_dir.stat()
+        if not workspace_identity.st_ino or not data_identity.st_ino:
+            raise RuntimeError("filesystem does not expose stable file identities")
+        if (workspace_identity.st_dev, workspace_identity.st_ino) == (
+            data_identity.st_dev,
+            data_identity.st_ino,
+        ):
+            raise ValueError("workspace_root and data_dir resolve to the same filesystem object")
         for name in (
             "logs",
             "outputs",
@@ -245,6 +286,9 @@ class Settings(BaseModel):
             "backups",
             "git-snapshots",
             "approval-staging",
+            "binary-transfers",
+            "worker-contexts",
+            "control-plane",
             "workspace-history",
         ):
             directory = self.data_dir / name
@@ -256,8 +300,13 @@ class Settings(BaseModel):
             directory.mkdir(parents=True, exist_ok=True)
             if _is_reparse(directory):
                 raise ValueError(f"workspace-history child must not be a reparse point: {directory}")
+        _ensure_control_plane_namespace(self)
         if self.protect_data_dir_acl and os.name == "nt":
             _protect_windows_acl(self.data_dir)
+        _probe_filesystem_semantics(self.data_dir)
+        _probe_filesystem_semantics(self.sandbox_scratch_dir)
+        if self.filesystem_enabled:
+            _probe_filesystem_semantics(self.workspace_root)
 
     def selection_info(self) -> dict[str, object]:
         return {
@@ -289,6 +338,98 @@ def _is_reparse(path: Path) -> bool:
     )
 
 
+def _probe_filesystem_semantics(directory: Path) -> None:
+    """Fail closed when stable identity, exclusion locking, or replacement is unavailable."""
+    token = uuid.uuid4().hex
+    first = directory / f".wlmcp-fs-probe-{token}.a"
+    second = directory / f".wlmcp-fs-probe-{token}.b"
+    try:
+        first.write_bytes(b"before")
+        initial = first.stat()
+        if not initial.st_ino or initial.st_nlink != 1 or _is_reparse(first):
+            raise RuntimeError("filesystem probe could not establish a unique file identity")
+        if os.name == "nt":
+            import msvcrt
+
+            with first.open("r+b") as owner, first.open("r+b") as contender:
+                owner.seek(0)
+                msvcrt.locking(owner.fileno(), msvcrt.LK_NBLCK, 1)
+                try:
+                    contender.seek(0)
+                    try:
+                        msvcrt.locking(contender.fileno(), msvcrt.LK_NBLCK, 1)
+                    except OSError:
+                        pass
+                    else:
+                        msvcrt.locking(contender.fileno(), msvcrt.LK_UNLCK, 1)
+                        raise RuntimeError("filesystem does not enforce exclusion locks")
+                finally:
+                    owner.seek(0)
+                    msvcrt.locking(owner.fileno(), msvcrt.LK_UNLCK, 1)
+        second.write_bytes(b"after")
+        replacement_identity = second.stat()
+        os.replace(second, first)
+        final = first.stat()
+        if first.read_bytes() != b"after" or (final.st_dev, final.st_ino) != (
+            replacement_identity.st_dev,
+            replacement_identity.st_ino,
+        ):
+            raise RuntimeError("filesystem does not provide verifiable atomic replacement")
+    except OSError as error:
+        raise RuntimeError(f"required filesystem semantics are unavailable: {directory}") from error
+    finally:
+        first.unlink(missing_ok=True)
+        second.unlink(missing_ok=True)
+
+
+def _ensure_control_plane_namespace(settings: Settings) -> None:
+    details = settings.workspace_root.stat()
+    data = settings.data_dir.stat()
+    assert settings.sandbox_scratch_dir is not None
+    scratch = settings.sandbox_scratch_dir.stat()
+    expected = {
+        "version": 2,
+        "workspace_path": str(settings.workspace_root.resolve(strict=True)),
+        "workspace_device": int(details.st_dev),
+        "workspace_inode": int(details.st_ino),
+        "data_dir_path": str(settings.data_dir.resolve(strict=True)),
+        "data_dir_device": int(data.st_dev),
+        "data_dir_inode": int(data.st_ino),
+        "config_path": settings._config_path,
+        "sandbox_scratch_path": str(settings.sandbox_scratch_dir.resolve(strict=True)),
+        "sandbox_scratch_device": int(scratch.st_dev),
+        "sandbox_scratch_inode": int(scratch.st_ino),
+    }
+    marker = settings.data_dir / "control-plane" / "namespace.json"
+    payload = json.dumps(expected, sort_keys=True, separators=(",", ":"))
+    try:
+        with marker.open("x", encoding="utf-8") as output:
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+    except FileExistsError:
+        try:
+            current = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise PermissionError("control-plane namespace marker is corrupt") from error
+        legacy = {
+            key: value
+            for key, value in expected.items()
+            if key not in {"version", "data_dir_path", "data_dir_device", "data_dir_inode"}
+        }
+        if current.get("version") == 1 and {
+            key: value for key, value in current.items() if key != "version"
+        } == legacy:
+            temporary = marker.with_suffix(".upgrade.tmp")
+            temporary.write_text(payload, encoding="utf-8")
+            os.replace(temporary, marker)
+            return
+        if current != expected:
+            raise PermissionError(
+                "data_dir belongs to a different workspace or configuration profile"
+            )
+
+
 def _protect_windows_acl(path: Path) -> None:
     identity = subprocess.run(
         [windows_system_executable("whoami.exe"), "/user", "/fo", "csv", "/nh"],
@@ -306,6 +447,38 @@ def _protect_windows_acl(path: Path) -> None:
     if not row or len(row) < 2 or not row[1].startswith("S-"):
         raise PermissionError("failed to parse the current Windows security principal SID")
     sid = row[1]
+    marker = path / ".acl-policy.json"
+    expected_marker: dict[str, object] | None = None
+    if marker.is_file():
+        try:
+            loaded = json.loads(marker.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                expected_marker = loaded
+        except (OSError, ValueError):
+            raise PermissionError("data_dir ACL policy marker is corrupt") from None
+    current = subprocess.run(
+        [windows_system_executable("icacls.exe"), str(path)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
+        shell=False,
+    )
+    if current.returncode != 0:
+        raise PermissionError(f"failed to inspect data_dir ACL: {current.stderr.strip()}")
+    current_digest = hashlib.sha256(current.stdout.encode("utf-8")).hexdigest()
+    if expected_marker is not None:
+        if (
+            expected_marker.get("version") != 1
+            or expected_marker.get("sid") != sid
+            or expected_marker.get("root_acl_sha256") != current_digest
+        ):
+            raise PermissionError(
+                "data_dir ACL changed after provisioning; run explicit ACL provisioning"
+            )
+        return
     reset = subprocess.run(
         [windows_system_executable("icacls.exe"), str(path), "/reset", "/T", "/C"],
         capture_output=True,
@@ -318,14 +491,33 @@ def _protect_windows_acl(path: Path) -> None:
     )
     if reset.returncode != 0:
         raise PermissionError(f"failed to reset data_dir ACL: {reset.stderr.strip()}")
-    result = subprocess.run(
+    isolation = subprocess.run(
         [
             windows_system_executable("icacls.exe"),
             str(path),
             "/inheritance:r",
+            "/T",
+            "/C",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
+        shell=False,
+    )
+    if isolation.returncode != 0:
+        raise PermissionError(
+            f"failed to isolate data_dir ACL inheritance: {isolation.stderr.strip()}"
+        )
+    result = subprocess.run(
+        [
+            windows_system_executable("icacls.exe"),
+            str(path),
             "/grant:r",
-            f"*{sid}:(OI)(CI)F",
-            "SYSTEM:(OI)(CI)F",
+            f"*{sid}:F",
+            "SYSTEM:F",
             "/T",
             "/C",
         ],
@@ -339,13 +531,86 @@ def _protect_windows_acl(path: Path) -> None:
     )
     if result.returncode != 0:
         raise PermissionError(f"failed to protect data_dir ACL: {result.stderr.strip()}")
+    inheritance = subprocess.run(
+        [
+            windows_system_executable("icacls.exe"),
+            str(path),
+            "/grant",
+            f"*{sid}:(OI)(CI)(IO)F",
+            "SYSTEM:(OI)(CI)(IO)F",
+            "/T",
+            "/C",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
+        shell=False,
+    )
+    if inheritance.returncode != 0:
+        raise PermissionError(
+            f"failed to provision inherited data_dir ACL: {inheritance.stderr.strip()}"
+        )
+    verified = subprocess.run(
+        [windows_system_executable("icacls.exe"), str(path)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
+        shell=False,
+    )
+    if verified.returncode != 0:
+        raise PermissionError("failed to verify protected data_dir ACL")
+    namespace_marker = path / "control-plane" / "namespace.json"
+    try:
+        namespace_marker.read_bytes()
+        probe = path / f".acl-write-probe-{os.getpid()}"
+        probe.write_bytes(b"acl-probe")
+        if probe.read_bytes() != b"acl-probe":
+            raise OSError("ACL write probe did not round-trip")
+        probe.unlink()
+    except OSError as error:
+        raise PermissionError(
+            "protected data_dir ACL denied the current WLMCP principal"
+        ) from error
+    marker.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "sid": sid,
+                "root_acl_sha256": hashlib.sha256(
+                    verified.stdout.encode("utf-8")
+                ).hexdigest(),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
 
 
-def _default_data_dir() -> Path:
+def _default_data_dir(workspace_root: Path, config_path: Path | None) -> Path:
     local_app_data = os.environ.get("LOCALAPPDATA")
     if local_app_data:
-        return Path(local_app_data) / "WindowsLocalMCP"
-    return Path.home() / ".windows-local-mcp"
+        base = Path(local_app_data) / "WindowsLocalMCP"
+    else:
+        base = Path.home() / ".windows-local-mcp"
+    workspace = workspace_root.resolve(strict=True)
+    details = workspace.stat()
+    namespace_payload = "|".join(
+        (
+            str(workspace).casefold(),
+            str(int(details.st_dev)),
+            str(int(details.st_ino)),
+            str(config_path).casefold() if config_path is not None else "environment-only",
+        )
+    )
+    namespace = hashlib.sha256(namespace_payload.encode("utf-8")).hexdigest()[:24]
+    return base / namespace
 
 
 def load_settings() -> Settings:
@@ -361,6 +626,23 @@ def load_settings() -> Settings:
         config_path = Path(config_path_value).expanduser().resolve(strict=True)
         with config_path.open("rb") as file:
             payload = tomllib.load(file)
+        if "safe_network_readable_paths" in payload:
+            if "sandbox_dependency_readable_paths" in payload:
+                raise ValueError(
+                    "use only sandbox_dependency_readable_paths; the legacy key is ambiguous"
+                )
+            payload["sandbox_dependency_readable_paths"] = payload.pop(
+                "safe_network_readable_paths"
+            )
+        obsolete = {
+            "safe_network_isolation_mode",
+            "safe_network_profile_prefix",
+        }.intersection(payload)
+        if obsolete:
+            raise ValueError(
+                "obsolete Safe Tier/AppContainer settings must be removed: "
+                + ", ".join(sorted(obsolete))
+            )
 
     env_root = os.environ.get("LOCAL_MCP_ROOT", "").strip()
     if config_path is not None and env_root:
@@ -382,7 +664,13 @@ def load_settings() -> Settings:
 
     data_dir = str(payload.get("data_dir", "")).strip()
     if not data_dir:
-        payload["data_dir"] = str(_default_data_dir())
+        configured_root = Path(str(payload["workspace_root"])).expanduser().resolve(strict=True)
+        payload["data_dir"] = str(_default_data_dir(configured_root, config_path))
+    if not str(payload.get("sandbox_scratch_dir", "")).strip():
+        configured_data = Path(str(payload["data_dir"])).expanduser().resolve()
+        payload["sandbox_scratch_dir"] = str(
+            configured_data.parent / f"{configured_data.name}-sandbox-scratch"
+        )
 
     settings = Settings.model_validate(payload)
     if config_path is not None and _is_relative_to(config_path, settings.workspace_root):

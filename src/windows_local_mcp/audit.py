@@ -5,10 +5,12 @@ import sqlite3
 import threading
 import uuid
 from datetime import UTC, datetime, timedelta
+from functools import wraps
 from typing import Any
 
 from .config import Settings
-from .resources import WorkspaceExecutionLock, prune_artifacts
+from .redaction import redact_text, redact_value
+from .resources import NamedControlPlaneLock, WorkspaceExecutionLock, prune_artifacts
 from .util import canonical_json, utc_now_iso
 from .workspace_history import (
     capture_workspace_state,
@@ -30,6 +32,15 @@ TERMINAL_STATUSES = {
     "interrupted",
     "conflict",
 }
+
+
+def _serialized_audit_mutation(function: Any) -> Any:
+    @wraps(function)
+    def locked(store: AuditStore, *args: Any, **kwargs: Any) -> Any:
+        with NamedControlPlaneLock(store.settings, "audit-state"):
+            return function(store, *args, **kwargs)
+
+    return locked
 
 
 class AuditStore:
@@ -308,6 +319,7 @@ class AuditStore:
             else:
                 mark_workspace_transaction_audit_reconciled(self.settings, operation_id)
 
+    @_serialized_audit_mutation
     def create_operation(
         self,
         *,
@@ -324,7 +336,7 @@ class AuditStore:
     ) -> str:
         operation_id = operation_id or str(uuid.uuid4())
         now = utc_now_iso()
-        request_json = canonical_json(request)
+        request_json = canonical_json(redact_value(request))
         if len(request_json.encode("utf-8")) > self.settings.max_audit_record_bytes:
             raise ValueError("audit request exceeds max_audit_record_bytes")
         self._ensure_audit_capacity(len(request_json.encode("utf-8")) + 8192)
@@ -361,10 +373,56 @@ class AuditStore:
             )
         return operation_id
 
+    @_serialized_audit_mutation
     def update_operation(self, operation_id: str, **fields: Any) -> None:
         if not fields:
             return
+        fields = self._prepare_update_fields(fields)
+        assignments = ", ".join(f"{key} = ?" for key in fields)
+        values = list(fields.values()) + [operation_id]
+        with self._lock, self._connect() as db:
+            cursor = db.execute(f"UPDATE operations SET {assignments} WHERE id = ?", values)
+            if cursor.rowcount != 1:
+                raise KeyError(f"operation not found: {operation_id}")
+
+    @_serialized_audit_mutation
+    def transition_operation(
+        self,
+        operation_id: str,
+        *,
+        from_statuses: set[str],
+        **fields: Any,
+    ) -> bool:
+        """Atomically move operation state without allowing terminal-state rollback."""
+        if "status" not in fields:
+            raise ValueError("transition_operation requires a target status")
+        if not from_statuses:
+            raise ValueError("transition_operation requires source statuses")
+        fields = self._prepare_update_fields(fields)
+        assignments = ", ".join(f"{key} = ?" for key in fields)
+        placeholders = ", ".join("?" for _ in from_statuses)
+        values = [*fields.values(), operation_id, *sorted(from_statuses)]
+        with self._lock, self._connect() as db:
+            cursor = db.execute(
+                f"UPDATE operations SET {assignments} WHERE id = ? AND status IN ({placeholders})",
+                values,
+            )
+            return cursor.rowcount == 1
+
+    def _prepare_update_fields(self, fields: dict[str, Any]) -> dict[str, Any]:
+        fields = dict(fields)
+        if isinstance(fields.get("error"), str):
+            fields["error"] = redact_text(str(fields["error"]))
         result_json = fields.get("result_json")
+        if isinstance(result_json, str):
+            try:
+                fields["result_json"] = canonical_json(
+                    redact_value(json.loads(result_json))
+                )
+                result_json = fields["result_json"]
+            except ValueError:
+                fields["result_json"] = redact_text(result_json)
+                result_json = fields["result_json"]
         if (
             isinstance(result_json, str)
             and len(result_json.encode("utf-8")) > self.settings.max_audit_record_bytes
@@ -375,20 +433,16 @@ class AuditStore:
             sum(len(str(value).encode("utf-8", errors="replace")) for value in fields.values())
             + 4096
         )
-        assignments = ", ".join(f"{key} = ?" for key in fields)
-        values = list(fields.values()) + [operation_id]
-        with self._lock, self._connect() as db:
-            cursor = db.execute(f"UPDATE operations SET {assignments} WHERE id = ?", values)
-            if cursor.rowcount != 1:
-                raise KeyError(f"operation not found: {operation_id}")
+        return fields
 
+    @_serialized_audit_mutation
     def add_event(
         self,
         operation_id: str,
         event_type: str,
         payload: dict[str, Any] | None = None,
     ) -> None:
-        payload_json = canonical_json(payload or {})
+        payload_json = canonical_json(redact_value(payload or {}))
         if len(payload_json.encode("utf-8")) > self.settings.max_audit_record_bytes:
             payload_json = canonical_json(
                 {"truncated": True, "original_bytes": len(payload_json.encode("utf-8"))}
@@ -560,6 +614,7 @@ class AuditStore:
             result.append(item)
         return result
 
+    @_serialized_audit_mutation
     def expire_pending(self) -> int:
         now = utc_now_iso()
         with self._lock, self._connect() as db:
@@ -587,6 +642,7 @@ class AuditStore:
                 )
         return len(ids)
 
+    @_serialized_audit_mutation
     def decide_approval(
         self,
         operation_id: str,
@@ -641,6 +697,7 @@ class AuditStore:
             )
         return self.get_operation(operation_id)
 
+    @_serialized_audit_mutation
     def approve_and_claim(
         self,
         operation_id: str,
@@ -690,6 +747,7 @@ class AuditStore:
             )
         return self.get_operation(operation_id)
 
+    @_serialized_audit_mutation
     def claim_approved(self, operation_id: str) -> dict[str, Any]:
         now = utc_now_iso()
         with self._lock, self._connect() as db:

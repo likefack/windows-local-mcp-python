@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import stat
+from functools import wraps
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -11,7 +12,12 @@ from urllib.parse import unquote, urlparse
 from .config import Settings
 from .paths import Workspace
 from .policy import NormalizedCommand
-from .resources import directory_size, enforce_data_quota, scan_directory_bounded
+from .resources import (
+    NamedControlPlaneLock,
+    directory_size,
+    enforce_data_quota,
+    scan_directory_bounded,
+)
 from .safe_process import run_safe_process
 from .util import canonical_json, sha256_bytes, sha256_text
 
@@ -33,6 +39,19 @@ _CODE_LOADERS = {
 }
 
 
+def _approval_staging_serialized(function: Any) -> Any:
+    @wraps(function)
+    def locked(*args: Any, **kwargs: Any) -> Any:
+        settings = kwargs.get("settings") or (args[0] if args else None)
+        if not isinstance(settings, Settings):
+            raise TypeError("approval staging operation has no Settings binding")
+        with NamedControlPlaneLock(settings, "approval-staging"):
+            return function(*args, **kwargs)
+
+    return locked
+
+
+@_approval_staging_serialized
 def prepare_approval_bundle(
     *,
     settings: Settings,
@@ -42,9 +61,17 @@ def prepare_approval_bundle(
     workspace_write: bool = False,
 ) -> tuple[NormalizedCommand, dict[str, Any], str]:
     """Bind approval to executable bytes and immutable copies of behavior inputs."""
-    stage_root = settings.data_dir / "approval-staging" / operation_id
-    if stage_root.exists():
+    manifest_root = settings.data_dir / "approval-staging" / operation_id
+    assert settings.sandbox_scratch_dir is not None
+    if directory_size(
+        settings.sandbox_scratch_dir,
+        stop_after=settings.max_sandbox_scratch_bytes,
+    ) >= settings.max_sandbox_scratch_bytes:
+        raise RuntimeError("sandbox scratch admission limit reached")
+    stage_root = settings.sandbox_scratch_dir / "approval-inputs" / operation_id
+    if manifest_root.exists() or stage_root.exists():
         raise RuntimeError("approval staging directory already exists")
+    manifest_root.mkdir(parents=True)
     stage_root.mkdir(parents=True)
 
     executable = Path(normalized.executable)
@@ -61,6 +88,7 @@ def prepare_approval_bundle(
         "environment_digest": _environment_digest(),
         "mode": "source-workspace",
         "inputs": [],
+        "execution_staging_root": str(stage_root),
     }
     execution = normalized.model_copy(deep=True)
 
@@ -130,16 +158,24 @@ def prepare_approval_bundle(
         manifest["execution"] = execution.model_dump()
         digest = sha256_text(canonical_json(manifest))
         manifest["digest"] = digest
-        manifest_path = stage_root / "manifest.json"
+        manifest_path = manifest_root / "manifest.json"
         manifest_path.write_text(canonical_json(manifest), encoding="utf-8")
         _make_read_only(stage_root)
+        _make_read_only(manifest_root)
         enforce_data_quota(settings)
+        if directory_size(
+            settings.sandbox_scratch_dir,
+            stop_after=settings.max_sandbox_scratch_bytes,
+        ) > settings.max_sandbox_scratch_bytes:
+            raise RuntimeError("approval staging exceeds max_sandbox_scratch_bytes")
         return execution, manifest, digest
     except Exception:
         shutil.rmtree(stage_root, ignore_errors=True)
+        shutil.rmtree(manifest_root, ignore_errors=True)
         raise
 
 
+@_approval_staging_serialized
 def verify_approval_bundle(
     *, settings: Settings, operation_id: str, expected_digest: str
 ) -> NormalizedCommand:
@@ -161,6 +197,12 @@ def verify_approval_bundle(
         raise RuntimeError("effective MCP settings changed after approval was requested")
     if manifest.get("environment_digest") != _environment_digest():
         raise RuntimeError("command-affecting environment changed after approval was requested")
+    assert settings.sandbox_scratch_dir is not None
+    expected_execution_root = (
+        settings.sandbox_scratch_dir / "approval-inputs" / operation_id
+    ).resolve(strict=True)
+    if Path(str(manifest.get("execution_staging_root"))).resolve(strict=True) != expected_execution_root:
+        raise RuntimeError("approval execution staging root changed after request creation")
 
     executable_record = manifest["executable"]
     if _file_record(
@@ -171,6 +213,7 @@ def verify_approval_bundle(
         raise RuntimeError("approved executable changed after approval was requested")
     for record in manifest.get("inputs", []):
         staged = Path(record["staged_path"])
+        staged.resolve(strict=True).relative_to(expected_execution_root)
         current = _file_record(staged)
         if current["sha256"] != record["sha256"] or current["size"] != record["size"]:
             raise RuntimeError("approved input changed after approval was requested")
@@ -215,19 +258,24 @@ def verify_approval_bundle(
     return NormalizedCommand.model_validate(manifest["execution"])
 
 
+@_approval_staging_serialized
 def materialize_execution_copy(
     *, settings: Settings, operation_id: str, normalized: NormalizedCommand
 ) -> NormalizedCommand:
     """Create a disposable writable run tree from a verified immutable cwd snapshot."""
-    stage_root = (settings.data_dir / "approval-staging" / operation_id).resolve(strict=True)
+    manifest_root = (settings.data_dir / "approval-staging" / operation_id).resolve(strict=True)
+    manifest = json.loads((manifest_root / "manifest.json").read_text(encoding="utf-8"))
+    stage_root = Path(str(manifest["execution_staging_root"])).resolve(strict=True)
+    assert settings.sandbox_scratch_dir is not None
+    stage_root.relative_to((settings.sandbox_scratch_dir / "approval-inputs").resolve(strict=True))
     immutable_cwd = Path(normalized.cwd).resolve(strict=True)
-    expected_cwd = stage_root / "cwd"
+    expected_cwd = Path(str(manifest.get("staged_cwd", stage_root / "cwd")))
     if immutable_cwd != expected_cwd.resolve(strict=True):
         return normalized
-    run_root = settings.data_dir / "outputs" / f"{operation_id}-runtime"
+    run_root = settings.sandbox_scratch_dir / "runs" / operation_id
     if run_root.exists():
         shutil.rmtree(run_root)
-    run_root.mkdir()
+    run_root.mkdir(parents=True)
     run_cwd = run_root / "cwd"
     shutil.copytree(immutable_cwd, run_cwd, symlinks=False)
     _make_writable(run_cwd)
@@ -266,29 +314,20 @@ def materialize_execution_copy(
     return result
 
 
-def collect_staged_workspace_write(
+def collect_staged_workspace_changes(
     *, settings: Settings, operation_id: str, normalized: NormalizedCommand
-) -> dict[str, bytes]:
-    """Accept only validated Dart-format target changes from its disposable run tree."""
+) -> tuple[dict[str, bytes], set[str]]:
+    """Validate a disposable run tree and return its closed-world workspace delta."""
     stage_root = (settings.data_dir / "approval-staging" / operation_id).resolve(strict=True)
     manifest = json.loads((stage_root / "manifest.json").read_text(encoding="utf-8"))
     if manifest.get("mode") != "staged-workspace-write":
-        return {}
-    if normalized.program_key != "dart" or not normalized.args or normalized.args[0] != "format":
-        raise RuntimeError("staged workspace write is not a validated Dart format operation")
+        return {}, set()
     run_cwd = Path(normalized.cwd).resolve(strict=True)
-    runtime_root = (settings.data_dir / "outputs" / f"{operation_id}-runtime").resolve(
-        strict=True
-    )
+    assert settings.sandbox_scratch_dir is not None
+    runtime_root = (settings.sandbox_scratch_dir / "runs" / operation_id).resolve(strict=True)
     run_cwd.relative_to(runtime_root)
     staged_cwd = Path(str(manifest["staged_cwd"])).resolve(strict=True)
     source_cwd = Path(str(manifest["source_cwd"])).resolve(strict=True)
-    original = NormalizedCommand.model_validate(manifest["execution"])
-    target_values = [value for value in original.args[1:] if not value.startswith("-")]
-    allowed_targets: list[Path] = []
-    for value in target_values:
-        staged_target = Path(value).resolve(strict=True)
-        allowed_targets.append(source_cwd / staged_target.relative_to(staged_cwd))
     records: dict[str, dict[str, Any]] = {}
     for record in manifest.get("inputs", []):
         staged_path = Path(str(record["staged_path"])).resolve(strict=True)
@@ -307,38 +346,39 @@ def collect_staged_workspace_write(
         reject_reparse_points=True,
     )
     if runtime_scan.entry_count > runtime_entry_limit:
-        raise RuntimeError("Dart formatter created too many runtime filesystem entries")
+        raise RuntimeError("sandbox processing created too many runtime filesystem entries")
     if runtime_scan.total_bytes > settings.approval_manifest_max_bytes:
-        raise RuntimeError("Dart formatter outputs exceed approval_manifest_max_bytes")
+        raise RuntimeError("sandbox outputs exceed approval_manifest_max_bytes")
     actual_files = {path.relative_to(run_cwd).as_posix() for path in runtime_scan.files}
-    if actual_files != set(records):
-        raise RuntimeError("Dart formatter created or deleted an unapproved file")
     changes: dict[str, bytes] = {}
+    deletions: set[str] = set()
     changed_bytes = 0
     workspace = Workspace(settings)
-    for relative, record in records.items():
+    for relative in sorted(actual_files):
         candidate = (run_cwd / Path(relative)).resolve(strict=True)
         candidate.relative_to(run_cwd)
         if candidate.is_symlink() or candidate.stat().st_nlink > 1:
-            raise PermissionError("Dart formatter output contains an unsafe file")
+            raise PermissionError("sandbox output contains an unsafe file")
         size = candidate.stat().st_size
         if size > settings.max_write_bytes:
-            raise ValueError(f"Dart formatter output exceeds max_write_bytes: {relative}")
+            raise ValueError(f"sandbox output exceeds max_write_bytes: {relative}")
         changed_bytes += size
         if changed_bytes > settings.approval_manifest_max_bytes:
-            raise ValueError("Dart formatter outputs exceed approval_manifest_max_bytes")
+            raise ValueError("sandbox outputs exceed approval_manifest_max_bytes")
         data = candidate.read_bytes()
-        if sha256_bytes(data) == record["sha256"] and len(data) == int(record["size"]):
+        record = records.get(relative)
+        if record is not None and sha256_bytes(data) == record["sha256"] and len(data) == int(record["size"]):
             continue
-        source = (source_cwd / Path(relative)).resolve(strict=True)
-        if not any(source == target or _is_inside(source, target) for target in allowed_targets):
-            raise PermissionError(
-                f"Dart formatter changed a file outside validated targets: {relative}"
-            )
+        source = source_cwd / Path(relative)
+        workspace_relative = source.relative_to(workspace.root).as_posix()
+        workspace.resolve_planned_write(workspace_relative)
+        changes[workspace_relative] = data
+    for relative in sorted(set(records) - actual_files):
+        source = source_cwd / Path(relative)
         workspace_relative = source.relative_to(workspace.root).as_posix()
         workspace.resolve_existing(workspace_relative, allow_directory=False, access="write")
-        changes[workspace_relative] = data
-    return changes
+        deletions.add(workspace_relative)
+    return changes, deletions
 
 
 def _copy_tree_bounded(
@@ -456,11 +496,11 @@ def _stage_dart_package_dependencies(
             else:
                 if not any(
                     _is_inside(dependency, allowed)
-                    for allowed in settings.safe_network_readable_paths
+                    for allowed in settings.sandbox_dependency_readable_paths
                 ):
                     raise PermissionError(
                         "external Dart package dependency is outside configured "
-                        f"safe_network_readable_paths: {dependency}"
+                        f"sandbox_dependency_readable_paths: {dependency}"
                     )
                 new_records = _copy_external_tree_bounded(
                     source=dependency,
@@ -729,10 +769,22 @@ def _make_writable(root: Path) -> None:
 def _capture_git_state(
     *, normalized: NormalizedCommand, settings: Settings
 ) -> dict[str, str]:
+    base = [
+        normalized.executable,
+        "--no-pager",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.untrackedCache=false",
+        "-c",
+        "diff.external=",
+        "-c",
+        "credential.helper=",
+    ]
     commands = {
-        "head": [normalized.executable, "-C", normalized.cwd, "rev-parse", "HEAD"],
+        "head": [*base, "-C", normalized.cwd, "rev-parse", "HEAD"],
         "status": [
-            normalized.executable,
+            *base,
             "-C",
             normalized.cwd,
             "status",
@@ -740,7 +792,7 @@ def _capture_git_state(
             "--untracked-files=all",
         ],
         "diff": [
-            normalized.executable,
+            *base,
             "-C",
             normalized.cwd,
             "diff",
@@ -749,7 +801,7 @@ def _capture_git_state(
             "--no-textconv",
         ],
         "staged": [
-            normalized.executable,
+            *base,
             "-C",
             normalized.cwd,
             "diff",

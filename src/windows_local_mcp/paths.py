@@ -151,6 +151,25 @@ class Workspace:
             self._reject_hardlink(target)
         return target
 
+    def resolve_planned_write(self, user_path: str) -> Path:
+        """Validate a future regular-file target without creating missing parents."""
+        self.validate_windows_syntax(user_path)
+        lexical = self.root / user_path
+        self._check_inside(lexical.resolve(strict=False))
+        self._check_access(lexical, access="write")
+        current = self.root
+        parts = lexical.relative_to(self.root).parts
+        for part in parts[:-1]:
+            current /= part
+            if current.exists():
+                self._reject_reparse_chain(current)
+                if not current.is_dir():
+                    raise NotADirectoryError(f"planned write parent is not a directory: {current}")
+                self._check_inside(current.resolve(strict=True))
+        if lexical.exists():
+            return self.resolve_for_write(user_path)
+        return lexical
+
     def ensure_directory_for_write(self, user_path: str) -> Path:
         """Create a workspace directory chain while rechecking every Windows path component."""
         self.validate_windows_syntax(user_path)

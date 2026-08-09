@@ -7,12 +7,13 @@ import shutil
 import tempfile
 import uuid
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from functools import wraps
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 from .config import Settings
 from .paths import Workspace
-from .resources import directory_size, enforce_data_quota
+from .resources import NamedControlPlaneLock, directory_size, enforce_data_quota
 from .util import canonical_json, sha256_bytes, utc_now_iso
 
 _MANIFEST_VERSION = 2
@@ -34,6 +35,16 @@ class WorkspaceMutationError(RuntimeError):
         self.journal_path = journal_path
 
 
+def _cas_serialized(function: Any) -> Any:
+    @wraps(function)
+    def locked(settings: Settings, *args: Any, **kwargs: Any) -> Any:
+        with NamedControlPlaneLock(settings, "workspace-cas"):
+            return function(settings, *args, **kwargs)
+
+    return locked
+
+
+@_cas_serialized
 def capture_workspace_state(settings: Settings, operation_id: str, stage: str) -> WorkspaceState:
     """Capture a full manifest while storing file content once by SHA-256.
 
@@ -318,7 +329,38 @@ def restore_workspace_state(
             if current is None:
                 raise RuntimeError("transaction start state is unavailable")
             verify_checkpoint_integrity(settings, current.manifest_path)
-            _apply_manifest(settings, current.manifest_path)
+            target_hashes = verify_checkpoint_integrity(settings, target_path)
+            current_hashes = verify_checkpoint_integrity(settings, current.manifest_path)
+            live_hashes = _scan_current_hashes(settings)
+            changed_paths = {str(item) for item in journal.get("changed_paths") or []}
+            conflicts = sorted(
+                relative
+                for relative in changed_paths
+                if live_hashes.get(relative)
+                not in {current_hashes.get(relative), target_hashes.get(relative)}
+            )
+            if conflicts:
+                raise RuntimeError(
+                    "automatic recovery refused concurrent changes: "
+                    + ", ".join(conflicts[:20])
+                )
+            _apply_manifest(
+                settings,
+                current.manifest_path,
+                only_paths=changed_paths,
+            )
+            recovered_hashes = _scan_current_hashes(settings)
+            recovery_mismatches = sorted(
+                relative
+                for relative in changed_paths
+                if recovered_hashes.get(relative) != current_hashes.get(relative)
+            )
+            if recovery_mismatches:
+                raise RuntimeError(
+                    "automatic recovery verification failed: "
+                    + ", ".join(recovery_mismatches[:20])
+                )
+            _remove_created_directories(settings, journal.get("created_directories", []))
             journal["state"] = "failed_recovered"
             journal["recovered_at"] = utc_now_iso()
             _write_json_atomic(journal_path, journal)
@@ -367,6 +409,70 @@ def finalize_workspace_transaction(settings: Settings, operation_id: str) -> Non
     _write_json_atomic(journal_path, journal)
 
 
+def rollback_applied_workspace_transaction(
+    settings: Settings, operation_id: str
+) -> dict[str, Any]:
+    """Undo an applied transaction without overwriting unattributed concurrent changes."""
+    journal_path = _transaction_root(settings, operation_id) / "journal.json"
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    if journal.get("state") != "applied_verified":
+        raise RuntimeError("workspace transaction is not in an applied state")
+    before_path = str(journal.get("before_manifest") or "")
+    target_path = str(journal.get("target_manifest") or "")
+    if not before_path or not target_path:
+        raise RuntimeError("workspace transaction has incomplete recovery bindings")
+    before = verify_checkpoint_integrity(settings, before_path)
+    target = verify_checkpoint_integrity(settings, target_path)
+    current = _scan_current_hashes(settings)
+    changed = {str(item) for item in journal.get("changed_paths") or []}
+    conflicts = sorted(
+        relative
+        for relative in changed
+        if current.get(relative) not in {before.get(relative), target.get(relative)}
+    )
+    if conflicts:
+        journal.update(
+            state="recovery_required",
+            recovery_error=(
+                "automatic rollback refused concurrent changes: "
+                + ", ".join(conflicts[:20])
+            ),
+            recovery_failed_at=utc_now_iso(),
+        )
+        _write_json_atomic(journal_path, journal)
+        raise WorkspaceMutationError(
+            "automatic rollback refused to overwrite concurrent changes: "
+            + ", ".join(conflicts[:20]),
+            recovery_state="recovery_required",
+            journal_path=str(journal_path),
+        )
+    _apply_manifest(settings, before_path, only_paths=changed)
+    recovered = _scan_current_hashes(settings)
+    mismatches = sorted(
+        relative for relative in changed if recovered.get(relative) != before.get(relative)
+    )
+    if mismatches:
+        journal.update(
+            state="recovery_required",
+            recovery_error="automatic rollback verification failed: "
+            + ", ".join(mismatches[:20]),
+            recovery_failed_at=utc_now_iso(),
+        )
+        _write_json_atomic(journal_path, journal)
+        raise WorkspaceMutationError(
+            "automatic rollback verification failed: " + ", ".join(mismatches[:20]),
+            recovery_state="recovery_required",
+            journal_path=str(journal_path),
+        )
+    journal.update(state="failed_recovered", recovered_at=utc_now_iso())
+    _write_json_atomic(journal_path, journal)
+    return {
+        "rollback_state": "failed_recovered",
+        "recovered_paths": sorted(changed),
+        "transaction_journal": str(journal_path),
+    }
+
+
 def mark_workspace_transaction_audit_reconciled(
     settings: Settings, operation_id: str
 ) -> None:
@@ -377,6 +483,7 @@ def mark_workspace_transaction_audit_reconciled(
     _write_json_atomic(journal_path, journal)
 
 
+@_cas_serialized
 def prepare_selective_undo(
     settings: Settings,
     operation_id: str,
@@ -431,24 +538,33 @@ def describe_workspace_restore(
     return result
 
 
+@_cas_serialized
 def build_workspace_target_from_bytes(
     settings: Settings,
     operation_id: str,
     expected_manifest_path: str,
     changes: dict[str, bytes],
+    deletions: set[str] | None = None,
 ) -> str:
     """Create a content-addressed target manifest for broker-validated file updates."""
     expected = _load_manifest(settings, expected_manifest_path)
     entries = dict(_entry_map(expected))
     workspace = Workspace(settings)
     initial_size = directory_size(settings.data_dir)
-    for relative, data in changes.items():
+    for relative in deletions or set():
         Workspace.validate_windows_syntax(relative)
         workspace.resolve_existing(relative, allow_directory=False, access="write")
+        entries.pop(PureWindowsPath(relative).as_posix(), None)
+    for relative, data in changes.items():
+        Workspace.validate_windows_syntax(relative)
+        destination = workspace.resolve_planned_write(relative)
+        if destination.exists():
+            workspace.resolve_existing(relative, allow_directory=False, access="write")
         digest = sha256_bytes(data)
         _store_blob(settings, digest, data, initial_size)
-        entries[relative] = {
-            "path": relative,
+        normalized = PureWindowsPath(relative).as_posix()
+        entries[normalized] = {
+            "path": normalized,
             "size": len(data),
             "sha256": digest,
             "blob": digest,
@@ -839,6 +955,19 @@ def _apply_manifest(
         _journal_applied(journal, journal_path, relative)
     for relative in sorted(set(target_map) & changed):
         parent_relative = str(PurePosixPath(relative).parent)
+        parent_path = workspace.root / Path(parent_relative)
+        missing_directories: list[str] = []
+        current_parent = parent_path
+        while current_parent != workspace.root and not current_parent.exists():
+            missing_directories.append(
+                current_parent.relative_to(workspace.root).as_posix()
+            )
+            current_parent = current_parent.parent
+        if missing_directories and journal is not None and journal_path is not None:
+            created = {str(item) for item in journal.get("created_directories", [])}
+            created.update(missing_directories)
+            journal["created_directories"] = sorted(created)
+            _write_json_atomic(journal_path, journal)
         workspace.ensure_directory_for_write(parent_relative)
         destination = workspace.resolve_for_write(relative)
         entry = target_map[relative]
@@ -871,6 +1000,22 @@ def _apply_manifest(
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
         _journal_applied(journal, journal_path, relative)
+
+
+def _remove_created_directories(settings: Settings, directories: object) -> None:
+    if not isinstance(directories, list):
+        return
+    workspace = Workspace(settings)
+    for relative in sorted((str(item) for item in directories), key=lambda item: item.count("/"), reverse=True):
+        try:
+            directory = workspace.resolve_directory(relative, access="write")
+            directory.rmdir()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise RuntimeError(
+                f"automatic recovery could not remove created directory: {relative}"
+            ) from error
 
 
 def _scan_current_hashes(settings: Settings) -> dict[str, str]:

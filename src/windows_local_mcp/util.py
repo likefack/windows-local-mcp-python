@@ -27,7 +27,8 @@ def read_text_limited(path: Path, max_bytes: int) -> str:
     size = path.stat().st_size
     if size > max_bytes:
         raise ValueError(f"ファイルが大きすぎます: {size} bytes > {max_bytes} bytes")
-    return path.read_text(encoding="utf-8")
+    with path.open("r", encoding="utf-8", newline="") as source:
+        return source.read()
 
 
 def truncate_middle(value: str, limit: int) -> str:

@@ -4,6 +4,7 @@ import shutil
 from pathlib import Path
 
 from .config import Settings
+from .redaction import redact_text
 from .resources import enforce_data_quota
 from .safe_process import run_safe_process
 from .tool_safety import ensure_external_tool_executable
@@ -30,10 +31,22 @@ def capture_git_snapshot(
         return None
 
     root = settings.workspace_root.resolve(strict=True)
+    git_base = [
+        git,
+        "--no-pager",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.untrackedCache=false",
+        "-c",
+        "diff.external=",
+        "-c",
+        "credential.helper=",
+    ]
     probe = run_safe_process(
         settings=settings,
         program_key="git",
-        command=[git, "-C", str(root), "rev-parse", "--show-toplevel"],
+        command=[*git_base, "-C", str(root), "rev-parse", "--show-toplevel"],
         cwd=str(root),
         timeout=15,
         output_limit=4096,
@@ -52,27 +65,26 @@ def capture_git_snapshot(
         return None
 
     commands = [
-        ("branch", [git, "-C", str(root), "symbolic-ref", "--short", "HEAD"]),
-        ("head", [git, "-C", str(root), "rev-parse", "HEAD"]),
+        ("branch", [*git_base, "-C", str(root), "symbolic-ref", "--short", "HEAD"]),
+        ("head", [*git_base, "-C", str(root), "rev-parse", "HEAD"]),
         (
             "status",
-            [git, "-C", str(root), "status", "--porcelain=v1", "--branch", "--untracked-files=all"],
+            [*git_base, "-C", str(root), "status", "--porcelain=v1", "--branch", "--untracked-files=all"],
         ),
         (
             "diff",
-            [git, "-C", str(root), "diff", "--stat", "--name-status", "--no-ext-diff", "--no-textconv"],
+            [*git_base, "-C", str(root), "diff", "--stat", "--name-status", "--no-ext-diff", "--no-textconv"],
         ),
         (
             "staged",
-            [git, "-C", str(root), "diff", "--cached", "--stat", "--name-status", "--no-ext-diff", "--no-textconv"],
+            [*git_base, "-C", str(root), "diff", "--cached", "--stat", "--name-status", "--no-ext-diff", "--no-textconv"],
         ),
         (
             "recent",
             [
-                git,
+                *git_base,
                 "-C",
                 str(root),
-                "--no-pager",
                 "log",
                 "-10",
                 "--oneline",
@@ -84,7 +96,7 @@ def capture_git_snapshot(
         (
             "changed-files",
             [
-                git,
+                *git_base,
                 "-C",
                 str(root),
                 "diff",
@@ -113,7 +125,7 @@ def capture_git_snapshot(
             f"{result.stderr.decode('utf-8', errors='replace')}\n"
         )
 
-    payload = "\n".join(parts).encode("utf-8")
+    payload = redact_text("\n".join(parts)).encode("utf-8")
     if len(payload) > settings.max_diff_bytes:
         payload = payload[: settings.max_diff_bytes]
     enforce_data_quota(settings, incoming_bytes=len(payload))

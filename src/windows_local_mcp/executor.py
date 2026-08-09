@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import subprocess
-import sys
 import time
 import uuid
 from typing import Any
@@ -10,6 +9,7 @@ from typing import Any
 from .audit import TERMINAL_STATUSES, AuditStore
 from .child_env import build_worker_environment
 from .config import Settings
+from .control_plane import create_worker_context, isolated_worker_argv
 from .process_utils import (
     ProcessIdentity,
     capture_process_identity,
@@ -27,20 +27,23 @@ class Executor:
         self._reconcile_stale_jobs()
 
     def launch(self, operation_id: str, foreground_timeout_seconds: int) -> dict[str, Any]:
+        # The operation being launched is already queued and therefore included in this count.
+        if len(self.audit.list_active_operations()) > self.settings.max_concurrent_jobs:
+            raise RuntimeError("concurrent job admission limit exceeded")
         nonce = uuid.uuid4().hex
         child_env = build_worker_environment(
             os.environ,
             extra_names=self.settings.child_environment_allowlist,
             nonce=nonce,
         )
+        context_path, context_sha256 = create_worker_context(self.settings, operation_id)
         process = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "windows_local_mcp.worker",
-                "--operation-id",
-                operation_id,
-            ],
+            isolated_worker_argv(
+                self.settings,
+                operation_id=operation_id,
+                context_path=context_path,
+                context_sha256=context_sha256,
+            ),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -60,7 +63,12 @@ class Executor:
         self.audit.add_event(
             operation_id,
             "worker_spawned",
-            {"worker_pid": process.pid, "identity_verified": True},
+            {
+                "worker_pid": process.pid,
+                "identity_verified": True,
+                "immutable_context_sha256": context_sha256,
+                "isolated_import_mode": True,
+            },
         )
 
         deadline = time.monotonic() + max(0, foreground_timeout_seconds)
@@ -96,24 +104,28 @@ class Executor:
             if terminate_process_tree(identity):
                 matched = True
         if not matched:
-            self.audit.update_operation(
+            transitioned = self.audit.transition_operation(
                 operation_id,
+                from_statuses={"queued", "running"},
                 status="interrupted",
                 finished_at=utc_now_iso(),
                 error="stale process identity; no process was terminated",
             )
-            self.audit.add_event(operation_id, "stale_identity", {})
+            if transitioned:
+                self.audit.add_event(operation_id, "stale_identity", {})
             return self._public_result(
                 self.audit.get_operation(operation_id, include_events=False)
             )
 
-        self.audit.update_operation(
+        transitioned = self.audit.transition_operation(
             operation_id,
+            from_statuses={"queued", "running"},
             status="cancelled",
             finished_at=utc_now_iso(),
             error="cancelled by local user or MCP host after identity verification",
         )
-        self.audit.add_event(operation_id, "cancelled", {"identity_verified": True})
+        if transitioned:
+            self.audit.add_event(operation_id, "cancelled", {"identity_verified": True})
         return self._public_result(self.audit.get_operation(operation_id, include_events=False))
 
     def _reconcile_stale_jobs(self) -> None:
@@ -122,13 +134,15 @@ class Executor:
             if identities and any(process_identity_matches(identity) for identity in identities):
                 continue
             now = utc_now_iso()
-            self.audit.update_operation(
+            transitioned = self.audit.transition_operation(
                 operation["id"],
+                from_statuses={"queued", "running"},
                 status="interrupted",
                 finished_at=now,
                 error="stale job reconciled at server startup; no PID-only termination attempted",
             )
-            self.audit.add_event(operation["id"], "stale_job_reconciled", {})
+            if transitioned:
+                self.audit.add_event(operation["id"], "stale_job_reconciled", {})
 
     @staticmethod
     def _identities(operation: dict[str, Any]) -> list[ProcessIdentity]:
