@@ -133,6 +133,12 @@ def _docx_has_unsupported_features(data: bytes) -> list[str]:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
             names = {name.casefold() for name in archive.namelist()}
             document = archive.read("word/document.xml")
+            word_xml = [
+                archive.read(name)
+                for name in archive.namelist()
+                if name.casefold().startswith("word/")
+                and name.casefold().endswith(".xml")
+            ]
     except (KeyError, zipfile.BadZipFile) as error:
         raise StructuredFileError("invalid DOCX package") from error
     found: list[str] = []
@@ -142,8 +148,24 @@ def _docx_has_unsupported_features(data: bytes) -> list[str]:
         found.append("ActiveX")
     if any("diagrams/" in name for name in names):
         found.append("SmartArt")
+    if any("embeddings/" in name for name in names):
+        found.append("embedded objects")
+    if any("afchunk" in name for name in names):
+        found.append("alternative-format chunks")
+    for marker, label in (
+        ("word/comments", "comments"),
+        ("word/footnotes.xml", "footnotes"),
+        ("word/endnotes.xml", "endnotes"),
+        ("word/glossary/", "glossary document"),
+    ):
+        if any(marker in name for name in names):
+            found.append(label)
+    if any("_xmlsignatures/" in name for name in names):
+        found.append("digital signatures")
     if b"<w:ins" in document or b"<w:del" in document or b"<w:move" in document:
         found.append("tracked changes")
+    if any(b":dataBinding" in xml for xml in word_xml):
+        found.append("custom XML data binding")
     return found
 
 
@@ -266,6 +288,105 @@ def _apply_docx_format(paragraph: Any, spec: dict[str, Any]) -> None:
             _apply_docx_run_format(run, run_spec)
 
 
+def _docx_paragraphs(document: Any) -> list[Any]:
+    paragraphs = list(document.paragraphs)
+    for table in document.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                paragraphs.extend(cell.paragraphs)
+    for section in document.sections:
+        paragraphs.extend(section.header.paragraphs)
+        paragraphs.extend(section.footer.paragraphs)
+    return paragraphs
+
+
+def _paragraph_has_complex_inline(paragraph: Any) -> bool:
+    xml = paragraph._p.xml
+    return any(marker in xml for marker in ("<w:hyperlink", "<w:drawing", "<w:object", "<w:fldChar", "<w:instrText"))
+
+
+def _cell_has_complex_inline(cell: Any) -> bool:
+    return any(_paragraph_has_complex_inline(paragraph) for paragraph in cell.paragraphs)
+
+
+def _require_docx_bounds(document: Any, settings: Settings) -> None:
+    paragraphs = _docx_paragraphs(document)
+    if len(paragraphs) > settings.max_structured_elements:
+        raise StructuredFileError("DOCX paragraphs exceed max_structured_elements")
+    cells = sum(len(row.cells) for table in document.tables for row in table.rows)
+    if cells > settings.max_structured_elements:
+        raise StructuredFileError("DOCX table cells exceed max_structured_elements")
+
+
+def _replace_text_preserving_runs(paragraph: Any, search: str, replacement: str) -> int:
+    runs = list(paragraph.runs)
+    joined = "".join(run.text for run in runs)
+    positions: list[int] = []
+    start = 0
+    while True:
+        found = joined.find(search, start)
+        if found < 0:
+            break
+        positions.append(found)
+        start = found + len(search)
+    for found in reversed(positions):
+        end = found + len(search)
+        cursor = 0
+        first_index = last_index = -1
+        first_offset = last_offset = 0
+        for index, run in enumerate(runs):
+            next_cursor = cursor + len(run.text)
+            if first_index < 0 and found < next_cursor:
+                first_index, first_offset = index, found - cursor
+            if end <= next_cursor:
+                last_index, last_offset = index, end - cursor
+                break
+            cursor = next_cursor
+        if first_index < 0 or last_index < 0:
+            continue
+        if first_index == last_index:
+            text = runs[first_index].text
+            runs[first_index].text = text[:first_offset] + replacement + text[last_offset:]
+        else:
+            first_text = runs[first_index].text
+            last_text = runs[last_index].text
+            runs[first_index].text = first_text[:first_offset] + replacement
+            for run in runs[first_index + 1 : last_index]:
+                run.text = ""
+            runs[last_index].text = last_text[last_offset:]
+    return len(positions)
+
+
+def _apply_docx_cell_format(cell: Any, spec: dict[str, Any]) -> None:
+    if not isinstance(spec, dict):
+        raise StructuredFileError("cell format must be an object")
+    from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    if "vertical_alignment" in spec:
+        name = _text(spec["vertical_alignment"], "vertical_alignment").upper()
+        if not hasattr(WD_CELL_VERTICAL_ALIGNMENT, name):
+            raise StructuredFileError("unsupported cell vertical alignment")
+        cell.vertical_alignment = getattr(WD_CELL_VERTICAL_ALIGNMENT, name)
+    if "shading" in spec:
+        color = _text(spec["shading"], "shading")
+        if not re.fullmatch(r"[0-9A-Fa-f]{6}", color):
+            raise StructuredFileError("cell shading must be six hexadecimal digits")
+        properties = cell._tc.get_or_add_tcPr()
+        for existing in properties.findall(qn("w:shd")):
+            properties.remove(existing)
+        shading = OxmlElement("w:shd")
+        shading.set(qn("w:fill"), color.upper())
+        properties.append(shading)
+    if "paragraph" in spec:
+        paragraph_spec = spec["paragraph"]
+        if not isinstance(paragraph_spec, dict):
+            raise StructuredFileError("cell paragraph format must be an object")
+        for paragraph in cell.paragraphs:
+            _apply_docx_format(paragraph, paragraph_spec)
+
+
 def _transform_docx(data: bytes, operations: list[Any], settings: Settings) -> bytes:
     unsupported = _docx_has_unsupported_features(data)
     if unsupported:
@@ -273,6 +394,7 @@ def _transform_docx(data: bytes, operations: list[Any], settings: Settings) -> b
     Document, WD_ORIENT, _, units = _docx_modules()
     Inches, _, _ = units
     document = Document(io.BytesIO(data))
+    _require_docx_bounds(document, settings)
     for raw in operations:
         op = _operation(raw)
         name = op["op"]
@@ -282,6 +404,11 @@ def _transform_docx(data: bytes, operations: list[Any], settings: Settings) -> b
         elif name == "paragraph_update":
             paragraph = document.paragraphs[_index(op.get("index"), "index")]
             if "text" in op:
+                if _paragraph_has_complex_inline(paragraph) and not op.get("allow_inline_loss", False):
+                    raise StructuredFileError(
+                        "paragraph contains a hyperlink, field, image, or embedded object; "
+                        "full-text replacement is unsupported without allow_inline_loss"
+                    )
                 # This explicit replacement intentionally replaces only the selected paragraph's runs.
                 paragraph.clear()
                 paragraph.add_run(_text(op["text"]))
@@ -305,17 +432,21 @@ def _transform_docx(data: bytes, operations: list[Any], settings: Settings) -> b
             if not search:
                 raise StructuredFileError("search must not be empty")
             count = 0
-            for paragraph in document.paragraphs:
-                for run in paragraph.runs:
-                    if search in run.text:
-                        run.text = run.text.replace(search, replacement)
-                        count += 1
+            for paragraph in _docx_paragraphs(document):
+                count += _replace_text_preserving_runs(paragraph, search, replacement)
             if op.get("require_match", False) and count == 0:
                 raise StructuredFileError("replace_text found no match")
         elif name == "table_cell_set":
             table = document.tables[_index(op.get("table"), "table")]
             cell = table.cell(_index(op.get("row"), "row"), _index(op.get("column"), "column"))
+            if _cell_has_complex_inline(cell) and not op.get("allow_inline_loss", False):
+                raise StructuredFileError(
+                    "table cell contains a hyperlink, field, image, or embedded object; "
+                    "full-text replacement is unsupported without allow_inline_loss"
+                )
             cell.text = _text(op.get("text", ""))
+            if "format" in op:
+                _apply_docx_cell_format(cell, op["format"])
         elif name == "table_row_add":
             table = document.tables[_index(op.get("table"), "table")]
             values = op.get("values", [])
@@ -324,12 +455,118 @@ def _transform_docx(data: bytes, operations: list[Any], settings: Settings) -> b
             row = table.add_row()
             for cell, value in zip(row.cells, values, strict=False):
                 cell.text = _text(value, "table value")
-        elif name == "header_footer_append":
+        elif name == "table_row_insert":
+            table = document.tables[_index(op.get("table"), "table")]
+            index = _index(op.get("row"), "row")
+            if index > len(table.rows):
+                raise StructuredFileError("table row index is outside the table")
+            values = op.get("values", [])
+            if not isinstance(values, list) or len(values) > len(table.columns):
+                raise StructuredFileError("values must fit in the table columns")
+            row = table.add_row()
+            if index < len(table.rows) - 1:
+                table.rows[index]._tr.addprevious(row._tr)
+            for cell, value in zip(row.cells, values, strict=False):
+                cell.text = _text(value, "table value")
+        elif name == "table_row_delete":
+            table = document.tables[_index(op.get("table"), "table")]
+            if len(table.rows) <= 1:
+                raise StructuredFileError("cannot delete the last table row")
+            row = table.rows[_index(op.get("row"), "row")]
+            row._tr.getparent().remove(row._tr)
+        elif name == "table_column_add":
+            table = document.tables[_index(op.get("table"), "table")]
+            width = op.get("width_inches", 1.0)
+            if not isinstance(width, (int, float)) or width <= 0:
+                raise StructuredFileError("width_inches must be positive")
+            column = table.add_column(Inches(width))
+            values = op.get("values", [])
+            if not isinstance(values, list) or len(values) > len(column.cells):
+                raise StructuredFileError("column values must fit in the table rows")
+            for index, cell in enumerate(column.cells):
+                if index < len(values):
+                    cell.text = _text(values[index], "table value")
+        elif name == "table_column_delete":
+            table = document.tables[_index(op.get("table"), "table")]
+            if len(table.columns) <= 1:
+                raise StructuredFileError("cannot delete the last table column")
+            column = _index(op.get("column"), "column")
+            if column >= len(table.columns):
+                raise StructuredFileError("table column index is outside the table")
+            for row in table.rows:
+                row._tr.remove(row.cells[column]._tc)
+            grid = table._tbl.tblGrid
+            grid.remove(grid.gridCol_lst[column])
+        elif name == "table_cell_format":
+            table = document.tables[_index(op.get("table"), "table")]
+            cell = table.cell(_index(op.get("row"), "row"), _index(op.get("column"), "column"))
+            _apply_docx_cell_format(cell, op.get("format", {}))
+        elif name == "table_add":
+            rows = _index(op.get("rows"), "rows", minimum=1)
+            columns = _index(op.get("columns"), "columns", minimum=1)
+            if rows * columns > settings.max_structured_elements:
+                raise StructuredFileError("new table exceeds max_structured_elements")
+            table = document.add_table(rows=rows, cols=columns)
+            if "style" in op:
+                table.style = _text(op["style"], "style")
+            values = op.get("values", [])
+            if not isinstance(values, list):
+                raise StructuredFileError("table values must be an array")
+            for row_index, values_row in enumerate(values):
+                if row_index >= rows or not isinstance(values_row, list) or len(values_row) > columns:
+                    raise StructuredFileError("table values must fit the requested shape")
+                for column_index, value in enumerate(values_row):
+                    table.cell(row_index, column_index).text = _text(value, "table value")
+        elif name in {"header_footer_append", "header_footer_set"}:
             section = document.sections[_index(op.get("section", 0), "section")]
             area = _text(op.get("area", "header"), "area")
             if area not in {"header", "footer"}:
                 raise StructuredFileError("area must be header or footer")
-            getattr(section, area).add_paragraph(_text(op.get("text", "")))
+            container = getattr(section, area)
+            if name == "header_footer_append":
+                container.add_paragraph(_text(op.get("text", "")))
+            else:
+                index = _index(op.get("paragraph", 0), "paragraph")
+                if index >= len(container.paragraphs):
+                    raise StructuredFileError("header/footer paragraph index is outside the section")
+                paragraph = container.paragraphs[index]
+                if _paragraph_has_complex_inline(paragraph) and not op.get("allow_inline_loss", False):
+                    raise StructuredFileError("header/footer paragraph contains unsupported inline content")
+                paragraph.clear()
+                paragraph.add_run(_text(op.get("text", "")))
+                if "format" in op:
+                    _apply_docx_format(paragraph, op["format"])
+        elif name == "style_update":
+            style = document.styles[_text(op.get("style"), "style")]
+            if "run" in op:
+                _apply_docx_run_format(style, op["run"])
+            paragraph_values = op.get("paragraph")
+            if paragraph_values is not None:
+                if not isinstance(paragraph_values, dict):
+                    raise StructuredFileError("style paragraph format must be an object")
+                _, _, alignments, _style_units = _docx_modules()
+                style_format = style.paragraph_format
+                if "alignment" in paragraph_values:
+                    value = _text(paragraph_values["alignment"], "alignment").upper()
+                    if not hasattr(alignments, value):
+                        raise StructuredFileError("unsupported paragraph alignment")
+                    style_format.alignment = getattr(alignments, value)
+                for key, attr in (
+                    ("left_indent_inches", "left_indent"),
+                    ("right_indent_inches", "right_indent"),
+                    ("first_line_indent_inches", "first_line_indent"),
+                    ("space_before_pt", "space_before"),
+                    ("space_after_pt", "space_after"),
+                ):
+                    if key in paragraph_values:
+                        value = paragraph_values[key]
+                        if not isinstance(value, (int, float)):
+                            raise StructuredFileError(f"{key} must be a number")
+                        setattr(
+                            style_format,
+                            attr,
+                            Inches(value) if "indent" in key else units[1](value),
+                        )
         elif name == "metadata_set":
             values = op.get("values")
             if not isinstance(values, dict):
@@ -355,6 +592,7 @@ def _transform_docx(data: bytes, operations: list[Any], settings: Settings) -> b
                     setattr(section, attr, Inches(value))
         else:
             raise StructuredFileError(f"unsupported DOCX operation: {name}")
+        _require_docx_bounds(document, settings)
     output = io.BytesIO()
     document.save(output)
     return output.getvalue()
@@ -363,18 +601,73 @@ def _transform_docx(data: bytes, operations: list[Any], settings: Settings) -> b
 def _xlsx_unsupported(data: bytes) -> list[str]:
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
-            names = {name.casefold() for name in archive.namelist()}
+            archive_names = archive.namelist()
+            names = {name.casefold() for name in archive_names}
     except zipfile.BadZipFile as error:
         raise StructuredFileError("invalid XLSX package") from error
     blocked = []
-    for marker, label in (("vbaproject.bin", "VBA/macros"), ("activex", "ActiveX"), ("connections.xml", "external data connections"), ("slicer", "slicers")):
+    for marker, label in (
+        ("vbaproject.bin", "VBA/macros"),
+        ("activex", "ActiveX"),
+        ("connections.xml", "external data connections"),
+        ("slicer", "slicers"),
+        ("threadedcomments", "threaded comments"),
+        ("persons/", "threaded-comment persons"),
+        ("richdata/", "rich data"),
+        ("ctrlprops/", "form controls"),
+        ("pivottable", "pivot tables"),
+        ("pivotcache", "pivot caches"),
+        ("embeddings/", "embedded objects"),
+        ("customxml/", "custom XML"),
+        ("_xmlsignatures/", "digital signatures"),
+    ):
         if any(marker in name for name in names):
             blocked.append(label)
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            for name in archive_names:
+                if not name.casefold().endswith(".xml"):
+                    continue
+                if re.search(
+                    rb"<(?:[A-Za-z0-9_]+:)?extLst\b", archive.read(name)
+                ):
+                    blocked.append("unsupported extension lists")
+                    break
+    except (KeyError, zipfile.BadZipFile) as error:
+        raise StructuredFileError("invalid XLSX package") from error
     return blocked
 
 
 def _sheet_cell_count(sheet: Any) -> int:
     return max(1, sheet.max_row) * max(1, sheet.max_column)
+
+
+def _xlsx_range_bounds(
+    value: Any, settings: Settings, label: str = "range"
+) -> tuple[str, tuple[int, int, int, int]]:
+    from openpyxl.utils.cell import range_boundaries
+
+    reference = _text(value, label)
+    try:
+        min_col, min_row, max_col, max_row = range_boundaries(reference)
+    except (TypeError, ValueError) as error:
+        raise StructuredFileError(f"invalid XLSX {label}") from error
+    if None in {min_col, min_row, max_col, max_row}:
+        raise StructuredFileError(f"XLSX {label} must be an explicit A1 range")
+    assert min_col is not None and min_row is not None
+    assert max_col is not None and max_row is not None
+    if min_col < 1 or min_row < 1 or max_col > 16384 or max_row > 1048576:
+        raise StructuredFileError(f"XLSX {label} is outside worksheet limits")
+    cells = (max_col - min_col + 1) * (max_row - min_row + 1)
+    if cells > settings.max_structured_elements:
+        raise StructuredFileError(f"XLSX {label} exceeds max_structured_elements")
+    return reference, (min_col, min_row, max_col, max_row)
+
+
+def _require_xlsx_extent(sheet: Any, bounds: tuple[int, int, int, int], settings: Settings) -> None:
+    _min_col, _min_row, max_col, max_row = bounds
+    if max(max_col, sheet.max_column) * max(max_row, sheet.max_row) > settings.max_structured_elements:
+        raise StructuredFileError("XLSX edit would exceed max_structured_elements")
 
 
 def _inspect_xlsx(data: bytes, settings: Settings, range_ref: str | None = None) -> dict[str, Any]:
@@ -390,6 +683,9 @@ def _inspect_xlsx(data: bytes, settings: Settings, range_ref: str | None = None)
                 raise StructuredFileError("XLSX cells exceed max_structured_elements")
             preview_range = range_ref if range_ref and sheet.title == book.active.title else f"A1:{sheet.cell(min(sheet.max_row, 20), min(sheet.max_column, 20)).coordinate}"
             try:
+                preview_range, _ = _xlsx_range_bounds(
+                    preview_range, settings, "preview range"
+                )
                 rows = [[cell.value for cell in row] for row in sheet[preview_range]]
             except ValueError as error:
                 raise StructuredFileError("invalid XLSX range") from error
@@ -453,15 +749,32 @@ def _transform_xlsx(data: bytes, operations: list[Any], settings: Settings) -> b
                 book.remove(sheet)
             elif name == "sheet_rename":
                 book[_text(op.get("sheet"), "sheet")].title = _text(op.get("title"), "title")
+            elif name == "sheet_copy":
+                copied = book.copy_worksheet(book[_text(op.get("sheet"), "sheet")])
+                if "title" in op:
+                    copied.title = _text(op["title"], "title")
+            elif name == "sheet_move":
+                sheet = book[_text(op.get("sheet"), "sheet")]
+                position = _index(op.get("position"), "position")
+                if position >= len(book.worksheets):
+                    raise StructuredFileError("sheet position is outside the workbook")
+                current = book.index(sheet)
+                book.move_sheet(sheet, offset=position - current)
             else:
                 sheet = book[_text(op.get("sheet"), "sheet")]
                 if name == "cell_set":
-                    cell = sheet[_text(op.get("cell"), "cell")]
+                    cell_ref, bounds = _xlsx_range_bounds(op.get("cell"), settings, "cell")
+                    if bounds[0] != bounds[2] or bounds[1] != bounds[3]:
+                        raise StructuredFileError("cell must identify exactly one XLSX cell")
+                    _require_xlsx_extent(sheet, bounds, settings)
+                    cell = sheet[cell_ref]
                     cell.value = op.get("value")
                     if "format" in op:
                         _xlsx_cell_format(cell, op["format"], styles)
                 elif name == "range_set":
-                    start = sheet[_text(op.get("range"), "range")]
+                    range_ref, bounds = _xlsx_range_bounds(op.get("range"), settings)
+                    _require_xlsx_extent(sheet, bounds, settings)
+                    start = sheet[range_ref]
                     values = op.get("values")
                     if not isinstance(values, list) or not all(isinstance(row, list) for row in values):
                         raise StructuredFileError("values must be a two-dimensional array")
@@ -472,22 +785,63 @@ def _transform_xlsx(data: bytes, operations: list[Any], settings: Settings) -> b
                         for value, cell in zip(value_row, cells, strict=False):
                             cell.value = value
                 elif name == "range_clear":
-                    for row in sheet[_text(op.get("range"), "range")]:
+                    range_ref, bounds = _xlsx_range_bounds(op.get("range"), settings)
+                    _require_xlsx_extent(sheet, bounds, settings)
+                    for row in sheet[range_ref]:
                         for cell in row:
                             cell.value = None
+                elif name in {"range_copy", "range_fill"}:
+                    from openpyxl.formula.translate import Translator
+                    _, source_bounds = _xlsx_range_bounds(op.get("source"), settings, "source")
+                    _, target_bounds = _xlsx_range_bounds(op.get("target"), settings, "target")
+                    source_min_col, source_min_row, source_max_col, source_max_row = source_bounds
+                    target_min_col, target_min_row, target_max_col, target_max_row = target_bounds
+                    _require_xlsx_extent(sheet, target_bounds, settings)
+                    source_rows = source_max_row - source_min_row + 1
+                    source_cols = source_max_col - source_min_col + 1
+                    target_rows = target_max_row - target_min_row + 1
+                    target_cols = target_max_col - target_min_col + 1
+                    if name == "range_copy" and (source_rows, source_cols) != (target_rows, target_cols):
+                        raise StructuredFileError("range_copy source and target shapes must match")
+                    copy_format = bool(op.get("copy_format", True))
+                    for row_offset in range(target_rows):
+                        for column_offset in range(target_cols):
+                            source_row = source_min_row + (row_offset % source_rows)
+                            source_column = source_min_col + (column_offset % source_cols)
+                            source_cell = sheet.cell(source_row, source_column)
+                            target_cell = sheet.cell(target_min_row + row_offset, target_min_col + column_offset)
+                            value = source_cell.value
+                            if isinstance(value, str) and value.startswith("="):
+                                value = Translator(value, origin=source_cell.coordinate).translate_formula(target_cell.coordinate)
+                            target_cell.value = value
+                            if copy_format:
+                                target_cell._style = copy(source_cell._style)
+                                target_cell.number_format = source_cell.number_format
+                                target_cell.protection = copy(source_cell.protection)
                 elif name in {"rows_insert", "rows_delete", "columns_insert", "columns_delete"}:
                     index = _index(op.get("index"), "index", minimum=1)
                     amount = _index(op.get("amount", 1), "amount", minimum=1)
+                    if amount > settings.max_structured_elements:
+                        raise StructuredFileError("row or column amount exceeds max_structured_elements")
+                    projected_rows = sheet.max_row + amount if name == "rows_insert" else sheet.max_row
+                    projected_columns = sheet.max_column + amount if name == "columns_insert" else sheet.max_column
+                    if projected_rows * projected_columns > settings.max_structured_elements:
+                        raise StructuredFileError("XLSX edit would exceed max_structured_elements")
                     getattr(sheet, name.replace("rows_", "").replace("columns_", "") + ("_rows" if name.startswith("rows") else "_cols"))(index, amount)
                 elif name == "merge":
-                    sheet.merge_cells(_text(op.get("range"), "range"))
+                    range_ref, bounds = _xlsx_range_bounds(op.get("range"), settings)
+                    _require_xlsx_extent(sheet, bounds, settings)
+                    sheet.merge_cells(range_ref)
                 elif name == "unmerge":
-                    sheet.unmerge_cells(_text(op.get("range"), "range"))
+                    range_ref, _ = _xlsx_range_bounds(op.get("range"), settings)
+                    sheet.unmerge_cells(range_ref)
                 elif name == "format_range":
                     spec = op.get("format")
                     if not isinstance(spec, dict):
                         raise StructuredFileError("format must be an object")
-                    for row in sheet[_text(op.get("range"), "range")]:
+                    range_ref, bounds = _xlsx_range_bounds(op.get("range"), settings)
+                    _require_xlsx_extent(sheet, bounds, settings)
+                    for row in sheet[range_ref]:
                         for cell in row:
                             _xlsx_cell_format(cell, spec, styles)
                 elif name == "dimensions_set":
@@ -507,30 +861,53 @@ def _transform_xlsx(data: bytes, operations: list[Any], settings: Settings) -> b
                             raise StructuredFileError("hidden must be boolean")
                         dimension.hidden = op["hidden"]
                 elif name == "freeze_panes_set":
-                    sheet.freeze_panes = _text(op.get("cell"), "cell")
+                    cell_ref, bounds = _xlsx_range_bounds(op.get("cell"), settings, "cell")
+                    if bounds[0] != bounds[2] or bounds[1] != bounds[3]:
+                        raise StructuredFileError("freeze pane must identify one cell")
+                    sheet.freeze_panes = cell_ref
                 elif name == "autofilter_set":
-                    sheet.auto_filter.ref = _text(op.get("range"), "range")
+                    range_ref, _ = _xlsx_range_bounds(op.get("range"), settings)
+                    sheet.auto_filter.ref = range_ref
                 elif name == "table_add":
                     from openpyxl.worksheet.table import Table, TableStyleInfo
-                    table = Table(displayName=_text(op.get("name"), "name"), ref=_text(op.get("range"), "range"))
+                    range_ref, bounds = _xlsx_range_bounds(op.get("range"), settings)
+                    _require_xlsx_extent(sheet, bounds, settings)
+                    table = Table(displayName=_text(op.get("name"), "name"), ref=range_ref)
                     table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True)
                     sheet.add_table(table)
                 elif name == "validation_add":
                     validation = DataValidation(type=_text(op.get("type", "list"), "type"), formula1=_text(op.get("formula1"), "formula1"), allow_blank=bool(op.get("allow_blank", True)))
                     sheet.add_data_validation(validation)
-                    validation.add(_text(op.get("range"), "range"))
+                    range_ref, _ = _xlsx_range_bounds(op.get("range"), settings)
+                    validation.add(range_ref)
                 elif name == "conditional_cell_is":
                     color = _text(op.get("fill"), "fill")
                     rule = CellIsRule(operator=_text(op.get("operator"), "operator"), formula=[_text(op.get("formula"), "formula")], fill=styles[3]("solid", fgColor=color))
-                    sheet.conditional_formatting.add(_text(op.get("range"), "range"), rule)
+                    range_ref, _ = _xlsx_range_bounds(op.get("range"), settings)
+                    sheet.conditional_formatting.add(range_ref, rule)
                 elif name == "chart_add":
                     chart_type = _text(op.get("type", "bar"), "type")
                     if chart_type not in {"bar", "line"}:
                         raise StructuredFileError("chart type must be bar or line")
                     chart = BarChart() if chart_type == "bar" else LineChart()
-                    data_ref = Reference(sheet, range_string=_text(op.get("data_range"), "data_range"))
+                    _data_range, bounds = _xlsx_range_bounds(
+                        op.get("data_range"), settings, "data range"
+                    )
+                    min_col, min_row, max_col, max_row = bounds
+                    data_ref = Reference(
+                        sheet,
+                        min_col=min_col,
+                        min_row=min_row,
+                        max_col=max_col,
+                        max_row=max_row,
+                    )
                     chart.add_data(data_ref, titles_from_data=bool(op.get("titles_from_data", True)))
-                    sheet.add_chart(chart, _text(op.get("anchor", "E2"), "anchor"))
+                    anchor, anchor_bounds = _xlsx_range_bounds(
+                        op.get("anchor", "E2"), settings, "anchor"
+                    )
+                    if anchor_bounds[0] != anchor_bounds[2] or anchor_bounds[1] != anchor_bounds[3]:
+                        raise StructuredFileError("chart anchor must identify one cell")
+                    sheet.add_chart(chart, anchor)
                 elif name == "page_setup_set":
                     values = op.get("values")
                     if not isinstance(values, dict):
@@ -540,6 +917,8 @@ def _transform_xlsx(data: bytes, operations: list[Any], settings: Settings) -> b
                             setattr(sheet.page_setup, key, values[key])
                 else:
                     raise StructuredFileError(f"unsupported XLSX operation: {name}")
+            if sum(_sheet_cell_count(item) for item in book.worksheets) > settings.max_structured_elements:
+                raise StructuredFileError("XLSX cells exceed max_structured_elements")
         output = io.BytesIO()
         book.save(output)
         return output.getvalue()
@@ -551,47 +930,76 @@ def _transform_xlsx(data: bytes, operations: list[Any], settings: Settings) -> b
 class CsvDocument:
     rows: list[list[str]]
     encoding: str
+    codec: str
+    bom: bytes
     dialect: csv.Dialect
     newline: str
+    final_newline: bool
 
 
 def _parse_csv(data: bytes, kind: str, settings: Settings) -> CsvDocument:
     if len(data) > settings.max_structured_file_bytes:
         _require_size(data, settings)
-    encoding = "utf-8-sig" if data.startswith(b"\xef\xbb\xbf") else "utf-8"
+    if data.startswith(b"\xef\xbb\xbf"):
+        encoding, codec, bom = "utf-8-sig", "utf-8", b"\xef\xbb\xbf"
+    elif data.startswith(b"\xff\xfe"):
+        encoding, codec, bom = "utf-16-le", "utf-16-le", b"\xff\xfe"
+    elif data.startswith(b"\xfe\xff"):
+        encoding, codec, bom = "utf-16-be", "utf-16-be", b"\xfe\xff"
+    else:
+        encoding, codec, bom = "utf-8", "utf-8", b""
     try:
-        text = data.decode(encoding)
+        text = data[len(bom) :].decode(codec)
     except UnicodeDecodeError as error:
-        raise StructuredFileError("CSV/TSV must be valid UTF-8 or UTF-8 with BOM") from error
+        raise StructuredFileError("CSV/TSV encoding is unsupported or invalid") from error
+    without_crlf = text.replace("\r\n", "")
+    if "\r" in without_crlf or ("\r\n" in text and "\n" in without_crlf):
+        raise StructuredFileError("CSV/TSV contains mixed or ambiguous newline sequences")
     sample = text[:8192]
     if kind == "tsv":
+        if "\t" not in sample and any(marker in sample for marker in (",", ";", "|")):
+            raise StructuredFileError("TSV delimiter identity is ambiguous")
         dialect = csv.excel_tab
     else:
         try:
             dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
-        except csv.Error:
-            dialect = csv.excel
+        except csv.Error as error:
+            if any(marker in sample for marker in (",", ";", "\t", "|")):
+                raise StructuredFileError("CSV delimiter identity is ambiguous") from error
+            dialect = csv.excel  # A delimiter-free document is an unambiguous single column.
     rows = list(csv.reader(io.StringIO(text, newline=""), dialect))
     _bounded(rows, settings, "CSV rows")
     if sum(len(row) for row in rows) > settings.max_structured_elements:
         raise StructuredFileError("CSV cells exceed max_structured_elements")
     newline = "\r\n" if "\r\n" in text else "\n"
-    return CsvDocument(rows, encoding, dialect, newline)
+    return CsvDocument(rows, encoding, codec, bom, dialect, newline, text.endswith(("\r\n", "\n")))
 
 
 def _inspect_csv(data: bytes, kind: str, settings: Settings) -> dict[str, Any]:
     document = _parse_csv(data, kind, settings)
-    return {"format": kind, "encoding": document.encoding, "delimiter": document.dialect.delimiter, "rows": len(document.rows), "columns": max((len(row) for row in document.rows), default=0), "preview": document.rows[:200], "truncated": len(document.rows) > 200}
+    return {"format": kind, "encoding": document.encoding, "delimiter": document.dialect.delimiter, "quotechar": document.dialect.quotechar, "doublequote": document.dialect.doublequote, "escapechar": document.dialect.escapechar, "newline": document.newline, "final_newline": document.final_newline, "rows": len(document.rows), "columns": max((len(row) for row in document.rows), default=0), "preview": document.rows[:200], "truncated": len(document.rows) > 200}
+
+
+def _require_csv_bounds(document: CsvDocument, settings: Settings) -> None:
+    _bounded(document.rows, settings, "CSV rows")
+    if sum(len(row) for row in document.rows) > settings.max_structured_elements:
+        raise StructuredFileError("CSV cells exceed max_structured_elements")
 
 
 def _transform_csv(data: bytes, kind: str, operations: list[Any], settings: Settings) -> bytes:
-    document = _parse_csv(data, kind, settings) if data else CsvDocument([], "utf-8", csv.excel_tab if kind == "tsv" else csv.excel, "\n")
+    document = _parse_csv(data, kind, settings) if data else CsvDocument([], "utf-8", "utf-8", b"", csv.excel_tab if kind == "tsv" else csv.excel, "\n", True)
     for raw in operations:
         op = _operation(raw)
         name = op["op"]
         if name == "cell_set":
             row = _index(op.get("row"), "row")
             column = _index(op.get("column"), "column")
+            if row >= settings.max_structured_elements or column >= settings.max_structured_elements:
+                raise StructuredFileError("CSV cell index exceeds max_structured_elements")
+            existing_length = len(document.rows[row]) if row < len(document.rows) else 0
+            current_cells = sum(len(item) for item in document.rows)
+            if current_cells - existing_length + max(existing_length, column + 1) > settings.max_structured_elements:
+                raise StructuredFileError("CSV edit would exceed max_structured_elements")
             while len(document.rows) <= row:
                 document.rows.append([])
             while len(document.rows[row]) <= column:
@@ -601,26 +1009,74 @@ def _transform_csv(data: bytes, kind: str, operations: list[Any], settings: Sett
             values = op.get("values")
             if not isinstance(values, list):
                 raise StructuredFileError("values must be an array")
+            if len(values) > settings.max_structured_elements:
+                raise StructuredFileError("CSV row exceeds max_structured_elements")
+            if sum(len(row) for row in document.rows) + len(values) > settings.max_structured_elements:
+                raise StructuredFileError("CSV edit would exceed max_structured_elements")
             document.rows.append([_text(value, "value") for value in values])
+        elif name == "row_insert":
+            row = _index(op.get("row"), "row")
+            if row > len(document.rows):
+                raise StructuredFileError("row_insert index is outside the document")
+            values = op.get("values", [])
+            if not isinstance(values, list):
+                raise StructuredFileError("values must be an array")
+            if len(values) > settings.max_structured_elements:
+                raise StructuredFileError("CSV row exceeds max_structured_elements")
+            if sum(len(item) for item in document.rows) + len(values) > settings.max_structured_elements:
+                raise StructuredFileError("CSV edit would exceed max_structured_elements")
+            document.rows.insert(row, [_text(value, "value") for value in values])
+        elif name == "row_set":
+            row = _index(op.get("row"), "row")
+            values = op.get("values")
+            if not isinstance(values, list):
+                raise StructuredFileError("values must be an array")
+            if len(values) > settings.max_structured_elements:
+                raise StructuredFileError("CSV row exceeds max_structured_elements")
+            if (
+                sum(len(item) for item in document.rows)
+                - len(document.rows[row])
+                + len(values)
+                > settings.max_structured_elements
+            ):
+                raise StructuredFileError("CSV edit would exceed max_structured_elements")
+            document.rows[row] = [_text(value, "value") for value in values]
         elif name == "row_delete":
             del document.rows[_index(op.get("row"), "row")]
         elif name == "column_insert":
             column = _index(op.get("column"), "column")
+            if column >= settings.max_structured_elements:
+                raise StructuredFileError("CSV column index exceeds max_structured_elements")
+            if sum(len(row) for row in document.rows) + len(document.rows) > settings.max_structured_elements:
+                raise StructuredFileError("CSV edit would exceed max_structured_elements")
             value = _text(op.get("default", ""), "default")
             for row in document.rows:
                 row.insert(min(column, len(row)), value)
         elif name == "column_delete":
             column = _index(op.get("column"), "column")
+            if column >= settings.max_structured_elements:
+                raise StructuredFileError("CSV column index exceeds max_structured_elements")
             for row in document.rows:
                 if column < len(row):
                     del row[column]
+        elif name == "column_append":
+            values = op.get("values", [])
+            if not isinstance(values, list) or len(values) > len(document.rows):
+                raise StructuredFileError("column values must fit the existing rows")
+            if sum(len(row) for row in document.rows) + len(document.rows) > settings.max_structured_elements:
+                raise StructuredFileError("CSV edit would exceed max_structured_elements")
+            for index, row in enumerate(document.rows):
+                row.append(_text(values[index], "value") if index < len(values) else "")
         else:
             raise StructuredFileError(f"unsupported CSV operation: {name}")
-    _bounded(document.rows, settings, "CSV rows")
+        _require_csv_bounds(document, settings)
     stream = io.StringIO(newline="")
     writer = csv.writer(stream, document.dialect, lineterminator=document.newline)
     writer.writerows(document.rows)
-    output = stream.getvalue().encode(document.encoding)
+    rendered = stream.getvalue()
+    if not document.final_newline and rendered.endswith(document.newline):
+        rendered = rendered[: -len(document.newline)]
+    output = document.bom + rendered.encode(document.codec)
     _require_size(output, settings)
     return output
 
@@ -639,15 +1095,17 @@ def _safe_zip_name(name: str) -> str:
 
 
 def _validate_zip_paths(paths: list[tuple[str, bool]]) -> None:
-    seen: set[str] = set()
+    seen: dict[str, bool] = {}
     files: set[str] = set()
     normalized: list[tuple[str, bool]] = []
     for name, is_directory in paths:
         safe = _safe_zip_name(name)
         folded = safe.casefold()
+        if folded in seen and seen[folded] != is_directory:
+            raise StructuredFileError("ZIP contains a file/directory path collision")
         if folded in seen:
             raise StructuredFileError("ZIP contains duplicate or colliding entry names")
-        seen.add(folded)
+        seen[folded] = is_directory
         normalized.append((safe, is_directory))
         if not is_directory:
             files.add(folded)
@@ -679,6 +1137,9 @@ def _zip_entries(data: bytes, settings: Settings) -> tuple[zipfile.ZipFile, list
     if any(info.file_size > settings.max_zip_expanded_bytes for info in entries):
         archive.close()
         raise StructuredFileError("ZIP entry expanded size exceeds max_zip_expanded_bytes")
+    if any(info.flag_bits & 0x1 for info in entries):
+        archive.close()
+        raise StructuredFileError("encrypted ZIP entries are unsupported")
     return archive, entries
 
 
@@ -702,6 +1163,31 @@ def read_zip_entry(data: bytes, name: str, settings: Settings) -> bytes:
         if len(payload) != matches[0].file_size:
             raise StructuredFileError("ZIP entry size verification failed")
         return payload
+    finally:
+        archive.close()
+
+
+def read_zip_entries(
+    data: bytes, names: list[str] | None, settings: Settings
+) -> dict[str, bytes]:
+    """Return a fully validated, bounded set of files for transactional extraction."""
+    archive, entries = _zip_entries(data, settings)
+    try:
+        requested = None if names is None else {_safe_zip_name(name).casefold() for name in names}
+        result: dict[str, bytes] = {}
+        for info in entries:
+            if info.is_dir():
+                continue
+            safe = _safe_zip_name(info.filename)
+            if requested is not None and safe.casefold() not in requested:
+                continue
+            payload = archive.read(info)
+            if len(payload) != info.file_size:
+                raise StructuredFileError("ZIP entry size verification failed")
+            result[safe] = payload
+        if requested is not None and {name.casefold() for name in result} != requested:
+            raise StructuredFileError("one or more ZIP entries were not found")
+        return result
     finally:
         archive.close()
 
@@ -792,8 +1278,10 @@ def _inspect_image(data: bytes, settings: Settings) -> dict[str, Any]:
             pixels = image.width * image.height
             if pixels > settings.max_image_pixels:
                 raise StructuredFileError("image pixel count exceeds max_image_pixels")
+            if pixels * 8 > settings.max_image_decoded_bytes:
+                raise StructuredFileError("decoded image exceeds max_image_decoded_bytes")
             metadata = {str(key): str(value)[:500] for key, value in image.info.items() if key.casefold() not in {"exif", "icc_profile"}}
-            return {"format": "image", "image_format": image.format, "width": image.width, "height": image.height, "mode": image.mode, "frame_count": getattr(image, "n_frames", 1), "metadata": metadata}
+            return {"format": "image", "image_format": image.format, "width": image.width, "height": image.height, "mode": image.mode, "frame_count": getattr(image, "n_frames", 1), "metadata": metadata, "metadata_policy": {"default": "preserve EXIF, ICC, and DPI when the destination encoder supports them", "metadata_remove": "remove EXIF; ICC and DPI are also omitted"}}
     except UnidentifiedImageError as error:
         raise StructuredFileError("unsupported or corrupt image") from error
 
@@ -801,6 +1289,8 @@ def _inspect_image(data: bytes, settings: Settings) -> dict[str, Any]:
 def _require_image_pixels(width: int, height: int, settings: Settings) -> None:
     if width <= 0 or height <= 0 or width * height > settings.max_image_pixels:
         raise StructuredFileError("image pixel count exceeds max_image_pixels")
+    if width * height * 8 > settings.max_image_decoded_bytes:
+        raise StructuredFileError("decoded image exceeds max_image_decoded_bytes")
 
 
 def _transform_image(data: bytes, operations: list[Any], settings: Settings) -> tuple[bytes, str | None]:
@@ -904,6 +1394,8 @@ def inspect(data: bytes, path: str, settings: Settings, *, format: str | None = 
 def transform(data: bytes, path: str, operations: list[Any], settings: Settings, *, format: str | None = None) -> tuple[bytes, dict[str, Any]]:
     if not isinstance(operations, list) or not operations:
         raise StructuredFileError("operations must be a non-empty array")
+    if len(operations) > min(settings.max_structured_elements, 1000):
+        raise StructuredFileError("operations exceed the bounded processing limit")
     _require_size(data, settings)
     kind = infer_format(path, format)
     if kind == "docx": output, extra = _transform_docx(data, operations, settings), {}
