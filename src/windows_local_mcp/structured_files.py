@@ -159,6 +159,10 @@ def _paragraph_info(paragraph: Any, index: int) -> dict[str, Any]:
     }
 
 
+def _length_inches(value: Any) -> float | None:
+    return None if value is None else float(value.inches)
+
+
 def _inspect_docx(data: bytes, settings: Settings) -> dict[str, Any]:
     Document, _, _, _ = _docx_modules()
     unsupported = _docx_has_unsupported_features(data)
@@ -177,6 +181,24 @@ def _inspect_docx(data: bytes, settings: Settings) -> dict[str, Any]:
                 "preview": [[cell.text for cell in row.cells] for row in table.rows[:20]],
             }
         )
+    sections = []
+    for section_index, section in enumerate(document.sections):
+        sections.append(
+            {
+                "index": section_index,
+                "orientation": str(section.orientation),
+                "page_width_inches": _length_inches(section.page_width),
+                "page_height_inches": _length_inches(section.page_height),
+                "margins_inches": {
+                    "top": _length_inches(section.top_margin),
+                    "bottom": _length_inches(section.bottom_margin),
+                    "left": _length_inches(section.left_margin),
+                    "right": _length_inches(section.right_margin),
+                },
+                "header": [paragraph.text for paragraph in section.header.paragraphs[:50]],
+                "footer": [paragraph.text for paragraph in section.footer.paragraphs[:50]],
+            }
+        )
     props = document.core_properties
     return {
         "format": "docx",
@@ -184,16 +206,41 @@ def _inspect_docx(data: bytes, settings: Settings) -> dict[str, Any]:
         "paragraphs": [_paragraph_info(p, i) for i, p in enumerate(document.paragraphs[:200])],
         "table_count": len(document.tables),
         "tables": tables[:50],
-        "sections": len(document.sections),
+        "section_count": len(document.sections),
+        "sections": sections,
         "metadata": {key: getattr(props, key) for key in ("title", "subject", "author", "keywords", "comments")},
         "write_rejected_features": unsupported,
         "truncated": len(document.paragraphs) > 200 or len(document.tables) > 50,
     }
 
 
+def _apply_docx_run_format(run: Any, spec: dict[str, Any]) -> None:
+    if not isinstance(spec, dict):
+        raise StructuredFileError("run formatting must be an object")
+    _, _, _, units = _docx_modules()
+    _, Pt, RGBColor = units
+    if "font_name" in spec:
+        run.font.name = _text(spec["font_name"], "font_name")
+    if "font_size_pt" in spec:
+        size = spec["font_size_pt"]
+        if not isinstance(size, (int, float)) or size <= 0:
+            raise StructuredFileError("font_size_pt must be a positive number")
+        run.font.size = Pt(size)
+    for key, attr in (("bold", "bold"), ("italic", "italic"), ("underline", "underline")):
+        if key in spec:
+            if not isinstance(spec[key], bool):
+                raise StructuredFileError(f"{key} must be boolean")
+            setattr(run.font, attr, spec[key])
+    if "color" in spec:
+        color = _text(spec["color"], "color")
+        if not re.fullmatch(r"[0-9A-Fa-f]{6}", color):
+            raise StructuredFileError("color must be six hexadecimal digits")
+        run.font.color.rgb = RGBColor.from_string(color.upper())
+
+
 def _apply_docx_format(paragraph: Any, spec: dict[str, Any]) -> None:
     _, _, WD_ALIGN_PARAGRAPH, units = _docx_modules()
-    Inches, Pt, RGBColor = units
+    Inches, Pt, _ = units
     if "style" in spec:
         paragraph.style = _text(spec["style"], "style")
     fmt = paragraph.paragraph_format
@@ -215,26 +262,8 @@ def _apply_docx_format(paragraph: Any, spec: dict[str, Any]) -> None:
         fmt.line_spacing = value
     run_spec = spec.get("run")
     if run_spec is not None:
-        if not isinstance(run_spec, dict):
-            raise StructuredFileError("run formatting must be an object")
         for run in paragraph.runs:
-            if "font_name" in run_spec:
-                run.font.name = _text(run_spec["font_name"], "font_name")
-            if "font_size_pt" in run_spec:
-                size = run_spec["font_size_pt"]
-                if not isinstance(size, (int, float)) or size <= 0:
-                    raise StructuredFileError("font_size_pt must be a positive number")
-                run.font.size = Pt(size)
-            for key, attr in (("bold", "bold"), ("italic", "italic"), ("underline", "underline")):
-                if key in run_spec:
-                    if not isinstance(run_spec[key], bool):
-                        raise StructuredFileError(f"{key} must be boolean")
-                    setattr(run.font, attr, run_spec[key])
-            if "color" in run_spec:
-                color = _text(run_spec["color"], "color")
-                if not re.fullmatch(r"[0-9A-Fa-f]{6}", color):
-                    raise StructuredFileError("color must be six hexadecimal digits")
-                run.font.color.rgb = RGBColor.from_string(color.upper())
+            _apply_docx_run_format(run, run_spec)
 
 
 def _transform_docx(data: bytes, operations: list[Any], settings: Settings) -> bytes:
@@ -268,7 +297,8 @@ def _transform_docx(data: bytes, operations: list[Any], settings: Settings) -> b
             run = paragraph.runs[_index(op.get("run"), "run")]
             if "text" in op:
                 run.text = _text(op["text"])
-            _apply_docx_format(paragraph, {"run": op.get("format", {})})
+            if "format" in op:
+                _apply_docx_run_format(run, op["format"])
         elif name == "replace_text":
             search = _text(op.get("search"), "search")
             replacement = _text(op.get("replace"), "replace")
@@ -317,7 +347,7 @@ def _transform_docx(data: bytes, operations: list[Any], settings: Settings) -> b
                     raise StructuredFileError("orientation must be portrait or landscape")
                 section.orientation = getattr(WD_ORIENT, orientation)
                 section.page_width, section.page_height = section.page_height, section.page_width
-            for key, attr in (("top_margin_inches", "top_margin"), ("bottom_margin_inches", "bottom_margin"), ("left_margin_inches", "left_margin"), ("right_margin_inches", "right_margin")):
+            for key, attr in (("page_width_inches", "page_width"), ("page_height_inches", "page_height"), ("top_margin_inches", "top_margin"), ("bottom_margin_inches", "bottom_margin"), ("left_margin_inches", "left_margin"), ("right_margin_inches", "right_margin")):
                 if key in op:
                     value = op[key]
                     if not isinstance(value, (int, float)) or value < 0:
@@ -349,21 +379,24 @@ def _sheet_cell_count(sheet: Any) -> int:
 
 def _inspect_xlsx(data: bytes, settings: Settings, range_ref: str | None = None) -> dict[str, Any]:
     _, load_workbook, *_ = _xlsx_modules()
-    book = load_workbook(io.BytesIO(data), read_only=True, data_only=False, keep_links=False)
-    sheets = []
-    total = 0
-    for sheet in book.worksheets:
-        cells = _sheet_cell_count(sheet)
-        total += cells
-        if total > settings.max_structured_elements:
-            raise StructuredFileError("XLSX cells exceed max_structured_elements")
-        preview_range = range_ref if range_ref and sheet.title == book.active.title else f"A1:{sheet.cell(min(sheet.max_row, 20), min(sheet.max_column, 20)).coordinate}"
-        try:
-            rows = [[cell.value for cell in row] for row in sheet[preview_range]]
-        except ValueError as error:
-            raise StructuredFileError("invalid XLSX range") from error
-        sheets.append({"name": sheet.title, "state": sheet.sheet_state, "max_row": sheet.max_row, "max_column": sheet.max_column, "preview_range": preview_range, "values": rows})
-    return {"format": "xlsx", "sheets": sheets, "write_rejected_features": _xlsx_unsupported(data)}
+    book = load_workbook(io.BytesIO(data), read_only=True, data_only=False, keep_links=True)
+    try:
+        sheets = []
+        total = 0
+        for sheet in book.worksheets:
+            cells = _sheet_cell_count(sheet)
+            total += cells
+            if total > settings.max_structured_elements:
+                raise StructuredFileError("XLSX cells exceed max_structured_elements")
+            preview_range = range_ref if range_ref and sheet.title == book.active.title else f"A1:{sheet.cell(min(sheet.max_row, 20), min(sheet.max_column, 20)).coordinate}"
+            try:
+                rows = [[cell.value for cell in row] for row in sheet[preview_range]]
+            except ValueError as error:
+                raise StructuredFileError("invalid XLSX range") from error
+            sheets.append({"name": sheet.title, "state": sheet.sheet_state, "max_row": sheet.max_row, "max_column": sheet.max_column, "preview_range": preview_range, "values": rows})
+        return {"format": "xlsx", "sheets": sheets, "write_rejected_features": _xlsx_unsupported(data)}
+    finally:
+        book.close()
 
 
 def _xlsx_cell_format(cell: Any, spec: dict[str, Any], styles: Any) -> None:
@@ -403,112 +436,115 @@ def _transform_xlsx(data: bytes, operations: list[Any], settings: Settings) -> b
         raise StructuredFileError("XLSX write is unsupported with: " + ", ".join(unsupported))
     Workbook, load_workbook, BarChart, LineChart, Reference, CellIsRule, styles, DataValidation, _ = _xlsx_modules()
     del Workbook
-    book = load_workbook(io.BytesIO(data), data_only=False, keep_links=False)
-    if sum(_sheet_cell_count(sheet) for sheet in book.worksheets) > settings.max_structured_elements:
-        raise StructuredFileError("XLSX cells exceed max_structured_elements")
-    for raw in operations:
-        op = _operation(raw)
-        name = op["op"]
-        if name == "sheet_add":
-            title = _text(op.get("title"), "title")
-            book.create_sheet(title)
-        elif name == "sheet_remove":
-            sheet = book[_text(op.get("sheet"), "sheet")]
-            if len(book.worksheets) == 1:
-                raise StructuredFileError("cannot remove the last worksheet")
-            book.remove(sheet)
-        elif name == "sheet_rename":
-            book[_text(op.get("sheet"), "sheet")].title = _text(op.get("title"), "title")
-        else:
-            sheet = book[_text(op.get("sheet"), "sheet")]
-            if name == "cell_set":
-                cell = sheet[_text(op.get("cell"), "cell")]
-                cell.value = op.get("value")
-                if "format" in op:
-                    _xlsx_cell_format(cell, op["format"], styles)
-            elif name == "range_set":
-                start = sheet[_text(op.get("range"), "range")]
-                values = op.get("values")
-                if not isinstance(values, list) or not all(isinstance(row, list) for row in values):
-                    raise StructuredFileError("values must be a two-dimensional array")
-                rows = list(start) if isinstance(start, tuple) else ((start,),)
-                if len(values) != len(rows) or any(len(value_row) != len(cells) for value_row, cells in zip(values, rows, strict=False)):
-                    raise StructuredFileError("values shape must match range")
-                for value_row, cells in zip(values, rows, strict=False):
-                    for value, cell in zip(value_row, cells, strict=False):
-                        cell.value = value
-            elif name == "range_clear":
-                for row in sheet[_text(op.get("range"), "range")]:
-                    for cell in row:
-                        cell.value = None
-            elif name in {"rows_insert", "rows_delete", "columns_insert", "columns_delete"}:
-                index = _index(op.get("index"), "index", minimum=1)
-                amount = _index(op.get("amount", 1), "amount", minimum=1)
-                getattr(sheet, name.replace("rows_", "").replace("columns_", "") + ("_rows" if name.startswith("rows") else "_cols"))(index, amount)
-            elif name == "merge":
-                sheet.merge_cells(_text(op.get("range"), "range"))
-            elif name == "unmerge":
-                sheet.unmerge_cells(_text(op.get("range"), "range"))
-            elif name == "format_range":
-                spec = op.get("format")
-                if not isinstance(spec, dict):
-                    raise StructuredFileError("format must be an object")
-                for row in sheet[_text(op.get("range"), "range")]:
-                    for cell in row:
-                        _xlsx_cell_format(cell, spec, styles)
-            elif name == "dimensions_set":
-                if "row" in op:
-                    dimension = sheet.row_dimensions[_index(op["row"], "row", minimum=1)]
-                elif "column" in op:
-                    dimension = sheet.column_dimensions[_text(op["column"], "column")]
-                else:
-                    raise StructuredFileError("dimensions_set needs row or column")
-                if "size" in op:
-                    if not isinstance(op["size"], (int, float)) or op["size"] <= 0:
-                        raise StructuredFileError("size must be positive")
-                    dimension.height = op["size"] if "row" in op else None
-                    dimension.width = op["size"] if "column" in op else None
-                if "hidden" in op:
-                    if not isinstance(op["hidden"], bool):
-                        raise StructuredFileError("hidden must be boolean")
-                    dimension.hidden = op["hidden"]
-            elif name == "freeze_panes_set":
-                sheet.freeze_panes = _text(op.get("cell"), "cell")
-            elif name == "autofilter_set":
-                sheet.auto_filter.ref = _text(op.get("range"), "range")
-            elif name == "table_add":
-                from openpyxl.worksheet.table import Table, TableStyleInfo
-                table = Table(displayName=_text(op.get("name"), "name"), ref=_text(op.get("range"), "range"))
-                table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True)
-                sheet.add_table(table)
-            elif name == "validation_add":
-                validation = DataValidation(type=_text(op.get("type", "list"), "type"), formula1=_text(op.get("formula1"), "formula1"), allow_blank=bool(op.get("allow_blank", True)))
-                sheet.add_data_validation(validation)
-                validation.add(_text(op.get("range"), "range"))
-            elif name == "conditional_cell_is":
-                color = _text(op.get("fill"), "fill")
-                rule = CellIsRule(operator=_text(op.get("operator"), "operator"), formula=[_text(op.get("formula"), "formula")], fill=styles[3]("solid", fgColor=color))
-                sheet.conditional_formatting.add(_text(op.get("range"), "range"), rule)
-            elif name == "chart_add":
-                chart_type = _text(op.get("type", "bar"), "type")
-                if chart_type not in {"bar", "line"}:
-                    raise StructuredFileError("chart type must be bar or line")
-                chart = BarChart() if chart_type == "bar" else LineChart()
-                data_ref = Reference(sheet, range_string=_text(op.get("data_range"), "data_range"))
-                chart.add_data(data_ref, titles_from_data=bool(op.get("titles_from_data", True)))
-                sheet.add_chart(chart, _text(op.get("anchor", "E2"), "anchor"))
-            elif name == "page_setup_set":
-                values = op.get("values")
-                if not isinstance(values, dict):
-                    raise StructuredFileError("page setup values must be an object")
-                for key in ("orientation", "paperSize", "fitToWidth", "fitToHeight"):
-                    if key in values:
-                        setattr(sheet.page_setup, key, values[key])
+    book = load_workbook(io.BytesIO(data), data_only=False, keep_links=True)
+    try:
+        if sum(_sheet_cell_count(sheet) for sheet in book.worksheets) > settings.max_structured_elements:
+            raise StructuredFileError("XLSX cells exceed max_structured_elements")
+        for raw in operations:
+            op = _operation(raw)
+            name = op["op"]
+            if name == "sheet_add":
+                title = _text(op.get("title"), "title")
+                book.create_sheet(title)
+            elif name == "sheet_remove":
+                sheet = book[_text(op.get("sheet"), "sheet")]
+                if len(book.worksheets) == 1:
+                    raise StructuredFileError("cannot remove the last worksheet")
+                book.remove(sheet)
+            elif name == "sheet_rename":
+                book[_text(op.get("sheet"), "sheet")].title = _text(op.get("title"), "title")
             else:
-                raise StructuredFileError(f"unsupported XLSX operation: {name}")
-    output = io.BytesIO()
-    book.save(output)
-    return output.getvalue()
+                sheet = book[_text(op.get("sheet"), "sheet")]
+                if name == "cell_set":
+                    cell = sheet[_text(op.get("cell"), "cell")]
+                    cell.value = op.get("value")
+                    if "format" in op:
+                        _xlsx_cell_format(cell, op["format"], styles)
+                elif name == "range_set":
+                    start = sheet[_text(op.get("range"), "range")]
+                    values = op.get("values")
+                    if not isinstance(values, list) or not all(isinstance(row, list) for row in values):
+                        raise StructuredFileError("values must be a two-dimensional array")
+                    rows = list(start) if isinstance(start, tuple) else ((start,),)
+                    if len(values) != len(rows) or any(len(value_row) != len(cells) for value_row, cells in zip(values, rows, strict=False)):
+                        raise StructuredFileError("values shape must match range")
+                    for value_row, cells in zip(values, rows, strict=False):
+                        for value, cell in zip(value_row, cells, strict=False):
+                            cell.value = value
+                elif name == "range_clear":
+                    for row in sheet[_text(op.get("range"), "range")]:
+                        for cell in row:
+                            cell.value = None
+                elif name in {"rows_insert", "rows_delete", "columns_insert", "columns_delete"}:
+                    index = _index(op.get("index"), "index", minimum=1)
+                    amount = _index(op.get("amount", 1), "amount", minimum=1)
+                    getattr(sheet, name.replace("rows_", "").replace("columns_", "") + ("_rows" if name.startswith("rows") else "_cols"))(index, amount)
+                elif name == "merge":
+                    sheet.merge_cells(_text(op.get("range"), "range"))
+                elif name == "unmerge":
+                    sheet.unmerge_cells(_text(op.get("range"), "range"))
+                elif name == "format_range":
+                    spec = op.get("format")
+                    if not isinstance(spec, dict):
+                        raise StructuredFileError("format must be an object")
+                    for row in sheet[_text(op.get("range"), "range")]:
+                        for cell in row:
+                            _xlsx_cell_format(cell, spec, styles)
+                elif name == "dimensions_set":
+                    if "row" in op:
+                        dimension = sheet.row_dimensions[_index(op["row"], "row", minimum=1)]
+                    elif "column" in op:
+                        dimension = sheet.column_dimensions[_text(op["column"], "column")]
+                    else:
+                        raise StructuredFileError("dimensions_set needs row or column")
+                    if "size" in op:
+                        if not isinstance(op["size"], (int, float)) or op["size"] <= 0:
+                            raise StructuredFileError("size must be positive")
+                        dimension.height = op["size"] if "row" in op else None
+                        dimension.width = op["size"] if "column" in op else None
+                    if "hidden" in op:
+                        if not isinstance(op["hidden"], bool):
+                            raise StructuredFileError("hidden must be boolean")
+                        dimension.hidden = op["hidden"]
+                elif name == "freeze_panes_set":
+                    sheet.freeze_panes = _text(op.get("cell"), "cell")
+                elif name == "autofilter_set":
+                    sheet.auto_filter.ref = _text(op.get("range"), "range")
+                elif name == "table_add":
+                    from openpyxl.worksheet.table import Table, TableStyleInfo
+                    table = Table(displayName=_text(op.get("name"), "name"), ref=_text(op.get("range"), "range"))
+                    table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True)
+                    sheet.add_table(table)
+                elif name == "validation_add":
+                    validation = DataValidation(type=_text(op.get("type", "list"), "type"), formula1=_text(op.get("formula1"), "formula1"), allow_blank=bool(op.get("allow_blank", True)))
+                    sheet.add_data_validation(validation)
+                    validation.add(_text(op.get("range"), "range"))
+                elif name == "conditional_cell_is":
+                    color = _text(op.get("fill"), "fill")
+                    rule = CellIsRule(operator=_text(op.get("operator"), "operator"), formula=[_text(op.get("formula"), "formula")], fill=styles[3]("solid", fgColor=color))
+                    sheet.conditional_formatting.add(_text(op.get("range"), "range"), rule)
+                elif name == "chart_add":
+                    chart_type = _text(op.get("type", "bar"), "type")
+                    if chart_type not in {"bar", "line"}:
+                        raise StructuredFileError("chart type must be bar or line")
+                    chart = BarChart() if chart_type == "bar" else LineChart()
+                    data_ref = Reference(sheet, range_string=_text(op.get("data_range"), "data_range"))
+                    chart.add_data(data_ref, titles_from_data=bool(op.get("titles_from_data", True)))
+                    sheet.add_chart(chart, _text(op.get("anchor", "E2"), "anchor"))
+                elif name == "page_setup_set":
+                    values = op.get("values")
+                    if not isinstance(values, dict):
+                        raise StructuredFileError("page setup values must be an object")
+                    for key in ("orientation", "paperSize", "fitToWidth", "fitToHeight"):
+                        if key in values:
+                            setattr(sheet.page_setup, key, values[key])
+                else:
+                    raise StructuredFileError(f"unsupported XLSX operation: {name}")
+        output = io.BytesIO()
+        book.save(output)
+        return output.getvalue()
+    finally:
+        book.close()
 
 
 @dataclass
@@ -602,6 +638,26 @@ def _safe_zip_name(name: str) -> str:
     return "/".join(parts)
 
 
+def _validate_zip_paths(paths: list[tuple[str, bool]]) -> None:
+    seen: set[str] = set()
+    files: set[str] = set()
+    normalized: list[tuple[str, bool]] = []
+    for name, is_directory in paths:
+        safe = _safe_zip_name(name)
+        folded = safe.casefold()
+        if folded in seen:
+            raise StructuredFileError("ZIP contains duplicate or colliding entry names")
+        seen.add(folded)
+        normalized.append((safe, is_directory))
+        if not is_directory:
+            files.add(folded)
+    for name, _ in normalized:
+        parts = name.casefold().split("/")
+        for end in range(1, len(parts)):
+            if "/".join(parts[:end]) in files:
+                raise StructuredFileError("ZIP contains a file/directory path collision")
+
+
 def _zip_entries(data: bytes, settings: Settings) -> tuple[zipfile.ZipFile, list[zipfile.ZipInfo]]:
     try:
         archive = zipfile.ZipFile(io.BytesIO(data))
@@ -611,10 +667,11 @@ def _zip_entries(data: bytes, settings: Settings) -> tuple[zipfile.ZipFile, list
     if len(entries) > settings.max_zip_entries:
         archive.close()
         raise StructuredFileError("ZIP entry count exceeds max_zip_entries")
-    names = [_safe_zip_name(info.filename) for info in entries if not info.is_dir()]
-    if len(names) != len({name.casefold() for name in names}):
+    try:
+        _validate_zip_paths([(info.filename, info.is_dir()) for info in entries])
+    except Exception:
         archive.close()
-        raise StructuredFileError("ZIP contains duplicate or colliding entry names")
+        raise
     expanded = sum(info.file_size for info in entries)
     if expanded > settings.max_zip_expanded_bytes:
         archive.close()
@@ -638,7 +695,7 @@ def read_zip_entry(data: bytes, name: str, settings: Settings) -> bytes:
     safe_name = _safe_zip_name(name)
     archive, entries = _zip_entries(data, settings)
     try:
-        matches = [info for info in entries if not info.is_dir() and _safe_zip_name(info.filename) == safe_name]
+        matches = [info for info in entries if not info.is_dir() and _safe_zip_name(info.filename).casefold() == safe_name.casefold()]
         if len(matches) != 1:
             raise StructuredFileError("ZIP entry was not found")
         payload = archive.read(matches[0])
@@ -660,13 +717,24 @@ def _zip_payload(op: dict[str, Any]) -> bytes:
     raise StructuredFileError("ZIP entry operation needs text or base64")
 
 
+def _matching_zip_key(entries: dict[str, tuple[zipfile.ZipInfo | None, bytes]], name: str) -> str | None:
+    folded = name.casefold()
+    for existing in entries:
+        if existing.casefold() == folded:
+            return existing
+    return None
+
+
 def _transform_zip(data: bytes, operations: list[Any], settings: Settings) -> bytes:
     entries: dict[str, tuple[zipfile.ZipInfo | None, bytes]] = {}
+    directories: list[zipfile.ZipInfo] = []
     if data:
         archive, infos = _zip_entries(data, settings)
         try:
             for info in infos:
-                if not info.is_dir():
+                if info.is_dir():
+                    directories.append(copy(info))
+                else:
                     entries[_safe_zip_name(info.filename)] = (info, archive.read(info))
         finally:
             archive.close()
@@ -675,20 +743,32 @@ def _transform_zip(data: bytes, operations: list[Any], settings: Settings) -> by
         name = op["op"]
         if name in {"entry_add", "entry_replace"}:
             entry = _safe_zip_name(_text(op.get("name"), "name"))
-            if name == "entry_add" and entry in entries:
-                raise StructuredFileError("ZIP entry already exists")
-            entries[entry] = (None, _zip_payload(op))
+            existing = _matching_zip_key(entries, entry)
+            if name == "entry_add":
+                if existing is not None:
+                    raise StructuredFileError("ZIP entry already exists")
+                entries[entry] = (None, _zip_payload(op))
+            else:
+                if existing is None:
+                    raise StructuredFileError("ZIP entry does not exist")
+                entries[existing] = (None, _zip_payload(op))
         elif name == "entry_delete":
             entry = _safe_zip_name(_text(op.get("name"), "name"))
-            if entry not in entries:
+            existing = _matching_zip_key(entries, entry)
+            if existing is None:
                 raise StructuredFileError("ZIP entry does not exist")
-            del entries[entry]
+            del entries[existing]
         else:
             raise StructuredFileError(f"unsupported ZIP operation: {name}")
-    if len(entries) > settings.max_zip_entries or sum(len(value[1]) for value in entries.values()) > settings.max_zip_expanded_bytes:
+    _validate_zip_paths(
+        [(info.filename, True) for info in directories] + [(name, False) for name in entries]
+    )
+    if len(entries) + len(directories) > settings.max_zip_entries or sum(len(value[1]) for value in entries.values()) > settings.max_zip_expanded_bytes:
         raise StructuredFileError("resulting ZIP exceeds configured limits")
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=False) as archive:
+        for info in directories:
+            archive.writestr(copy(info), b"")
         for name, (info, payload) in sorted(entries.items()):
             if info is not None:
                 clone = copy(info)
@@ -696,7 +776,10 @@ def _transform_zip(data: bytes, operations: list[Any], settings: Settings) -> by
                 archive.writestr(clone, payload)
             else:
                 archive.writestr(name, payload)
-    return output.getvalue()
+    result = output.getvalue()
+    verified, _ = _zip_entries(result, settings)
+    verified.close()
+    return result
 
 
 def _inspect_image(data: bytes, settings: Settings) -> dict[str, Any]:
@@ -715,6 +798,11 @@ def _inspect_image(data: bytes, settings: Settings) -> dict[str, Any]:
         raise StructuredFileError("unsupported or corrupt image") from error
 
 
+def _require_image_pixels(width: int, height: int, settings: Settings) -> None:
+    if width <= 0 or height <= 0 or width * height > settings.max_image_pixels:
+        raise StructuredFileError("image pixel count exceeds max_image_pixels")
+
+
 def _transform_image(data: bytes, operations: list[Any], settings: Settings) -> tuple[bytes, str | None]:
     Image, UnidentifiedImageError = _image_module()
     Image.MAX_IMAGE_PIXELS = settings.max_image_pixels
@@ -723,9 +811,15 @@ def _transform_image(data: bytes, operations: list[Any], settings: Settings) -> 
     except UnidentifiedImageError as error:
         raise StructuredFileError("unsupported or corrupt image") from error
     try:
-        if image.width * image.height > settings.max_image_pixels:
-            raise StructuredFileError("image pixel count exceeds max_image_pixels")
+        _require_image_pixels(image.width, image.height, settings)
+        if getattr(image, "n_frames", 1) != 1:
+            raise StructuredFileError(
+                "multi-frame image transformation is unsupported; use the container processing path"
+            )
         source_format = image.format
+        source_exif = image.info.get("exif")
+        source_icc = image.info.get("icc_profile")
+        source_dpi = image.info.get("dpi")
         output_format: str | None = None
         quality: int | None = None
         strip_metadata = False
@@ -734,6 +828,7 @@ def _transform_image(data: bytes, operations: list[Any], settings: Settings) -> 
             name = op["op"]
             if name == "resize":
                 width, height = _index(op.get("width"), "width", minimum=1), _index(op.get("height"), "height", minimum=1)
+                _require_image_pixels(width, height, settings)
                 image = image.resize((width, height))
             elif name == "thumbnail":
                 width, height = _index(op.get("max_width"), "max_width", minimum=1), _index(op.get("max_height"), "max_height", minimum=1)
@@ -742,7 +837,10 @@ def _transform_image(data: bytes, operations: list[Any], settings: Settings) -> 
                 box = op.get("box")
                 if not isinstance(box, list) or len(box) != 4:
                     raise StructuredFileError("crop box must be [left, top, right, bottom]")
-                image = image.crop(tuple(_index(value, "crop coordinate") for value in box))
+                left, top, right, bottom = tuple(_index(value, "crop coordinate") for value in box)
+                if not (left < right <= image.width and top < bottom <= image.height):
+                    raise StructuredFileError("crop box must stay within the source image")
+                image = image.crop((left, top, right, bottom))
             elif name == "rotate":
                 angle = op.get("degrees")
                 if not isinstance(angle, (int, float)):
@@ -768,6 +866,7 @@ def _transform_image(data: bytes, operations: list[Any], settings: Settings) -> 
                 strip_metadata = True
             else:
                 raise StructuredFileError(f"unsupported image operation: {name}")
+            _require_image_pixels(image.width, image.height, settings)
         output_format = output_format or source_format or "PNG"
         if output_format == "JPEG" and image.mode not in {"RGB", "L"}:
             image = image.convert("RGB")
@@ -777,6 +876,13 @@ def _transform_image(data: bytes, operations: list[Any], settings: Settings) -> 
             kwargs["quality"] = quality
         if strip_metadata:
             kwargs["exif"] = b""
+        else:
+            if isinstance(source_exif, bytes):
+                kwargs["exif"] = source_exif
+            if isinstance(source_icc, bytes):
+                kwargs["icc_profile"] = source_icc
+            if isinstance(source_dpi, tuple) and len(source_dpi) == 2:
+                kwargs["dpi"] = source_dpi
         image.save(output, format=output_format, **kwargs)
         return output.getvalue(), output_format
     finally:
