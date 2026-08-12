@@ -21,7 +21,11 @@ from windows_local_mcp.sandbox_backend import (
     require_codex_sandbox_live_verification,
     resolve_codex_sandbox_backend,
 )
-from windows_local_mcp.sandbox_live_verify import _property_results
+from windows_local_mcp.sandbox_live_verify import (
+    _host_endpoint_reachable,
+    _property_results,
+    _protected_information_canary_path,
+)
 from windows_local_mcp.sandbox_live_verify import _run as run_live_probe
 from windows_local_mcp.util import canonical_json, sha256_text
 from windows_local_mcp.windows_system import windows_system_executable
@@ -132,6 +136,51 @@ def test_live_verification_properties_distinguish_failed_from_unverified() -> No
     assert properties["resource_bound"]["status"] == "unverified"
     assert properties["resource_bound"]["failed"] == []
     assert "process_limit_enforced" in properties["resource_bound"]["unverified"]
+    assert properties["internet"]["status"] == "unverified"
+    assert properties["internet"]["unverified"] == ["internet_denied"]
+    assert properties["lan"]["status"] == "unverified"
+    assert properties["lan"]["unverified"] == ["lan_denied"]
+
+    failed_network = _property_results(
+        {"internet_denied": False, "lan_denied": False}
+    )
+    assert failed_network["internet"]["status"] == "failed"
+    assert failed_network["lan"]["status"] == "failed"
+
+
+def test_protected_information_canary_uses_exact_blocked_filename(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    first = _protected_information_canary_path(workspace)
+    second = _protected_information_canary_path(workspace)
+
+    assert first.name == ".env"
+    assert first.parent.parent == workspace
+    assert first.parent.name.startswith(".wlmcp-live-protected-")
+    assert second.parent != first.parent
+
+
+def test_host_endpoint_control_distinguishes_reachable_from_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[tuple[str, int], float]] = []
+
+    class Connection:
+        def close(self) -> None:
+            return None
+
+    def connect(endpoint: tuple[str, int], *, timeout: float) -> Connection:
+        calls.append((endpoint, timeout))
+        return Connection()
+
+    monkeypatch.setattr("socket.create_connection", connect)
+    assert _host_endpoint_reachable("1.1.1.1", 443, timeout=3) is True
+    assert calls == [(("1.1.1.1", 443), 3)]
+
+    def unavailable(_endpoint: tuple[str, int], *, timeout: float) -> Connection:
+        raise OSError(f"unreachable after {timeout}")
+
+    monkeypatch.setattr("socket.create_connection", unavailable)
+    assert _host_endpoint_reachable("1.1.1.1", 443) is False
 
 
 def test_sandbox_live_verification_is_property_scoped_and_fails_closed(

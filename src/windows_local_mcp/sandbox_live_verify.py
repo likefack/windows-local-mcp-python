@@ -51,6 +51,19 @@ def _write_evidence(marker: Path, result: dict[str, Any]) -> None:
         temporary_marker.unlink(missing_ok=True)
 
 
+def _protected_information_canary_path(workspace_root: Path) -> Path:
+    return workspace_root / f".wlmcp-live-protected-{uuid.uuid4().hex}" / ".env"
+
+
+def _host_endpoint_reachable(host: str, port: int, *, timeout: float = 2) -> bool:
+    try:
+        connection = socket.create_connection((host, port), timeout=timeout)
+    except OSError:
+        return False
+    connection.close()
+    return True
+
+
 def _property_results(checks: dict[str, bool]) -> dict[str, dict[str, Any]]:
     """Translate concrete probes into contract-level properties without overclaiming."""
     requirements = {
@@ -224,7 +237,7 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
     marker = settings.data_dir / "control-plane" / "sandbox-live-verification.json"
     source_canary = settings.workspace_root / f".wlmcp-live-source-{uuid.uuid4().hex}.txt"
     source_write_target = settings.workspace_root / f".wlmcp-live-write-{uuid.uuid4().hex}.txt"
-    protected_canary = settings.workspace_root / f".wlmcp-live-secret-{uuid.uuid4().hex}.env"
+    protected_canary = _protected_information_canary_path(settings.workspace_root)
     outside_canary = Path.home() / f".wlmcp-live-outside-{uuid.uuid4().hex}.txt"
     outside_write_target = Path.home() / f".wlmcp-live-write-{uuid.uuid4().hex}.txt"
     control_write_target = settings.data_dir / "control-plane" / f"live-write-{uuid.uuid4().hex}.txt"
@@ -234,6 +247,7 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
     )
     try:
         source_canary.write_text("source-readable-canary", encoding="utf-8")
+        protected_canary.parent.mkdir()
         protected_canary.write_text("WLMCP_LIVE_SECRET=canary-only", encoding="utf-8")
         outside_canary.write_text("outside-readable-canary", encoding="utf-8")
         with hold_codex_sandbox_backend(backend):
@@ -337,25 +351,46 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
                 "control_plane_write_denied", control_write_target, "write"
             )
 
-            network_result = _run(
-                settings,
-                backend,
-                root,
-                [
-                    python,
-                    "-I",
-                    "-c",
-                    (
-                        "import socket,sys;s=socket.socket();s.settimeout(2);"
-                        "\ntry:s.connect(('1.1.1.1',443))"
-                        "\nexcept OSError:sys.exit(0)"
-                        "\nelse:sys.exit(9)"
-                    ),
-                ],
-                probe_name="internet_denied",
-                probe_diagnostics=probe_diagnostics,
+            internet_host = "1.1.1.1"
+            internet_port = 443
+            control_started = time.monotonic()
+            internet_control_reachable = _host_endpoint_reachable(
+                internet_host, internet_port
             )
-            checks["internet_denied"] = network_result.returncode == 0
+            checks["internet_control_reachable"] = internet_control_reachable
+            probe_diagnostics.append(
+                {
+                    "probe": "internet_control_reachable",
+                    "endpoint": f"{internet_host}:{internet_port}",
+                    "elapsed_seconds": round(time.monotonic() - control_started, 3),
+                    "reachable": internet_control_reachable,
+                }
+            )
+            if internet_control_reachable:
+                network_result = _run(
+                    settings,
+                    backend,
+                    root,
+                    [
+                        python,
+                        "-I",
+                        "-c",
+                        (
+                            "import socket,sys;s=socket.socket();s.settimeout(2);"
+                            f"\ntry:s.connect(({internet_host!r},{internet_port}))"
+                            "\nexcept OSError:sys.exit(0)"
+                            "\nelse:sys.exit(9)"
+                        ),
+                    ],
+                    probe_name="internet_denied",
+                    probe_diagnostics=probe_diagnostics,
+                )
+                checks["internet_denied"] = network_result.returncode == 0
+            else:
+                diagnostics["internet_denied"] = (
+                    "probe unavailable: host control could not connect to "
+                    f"{internet_host}:{internet_port}"
+                )
 
             def listener_probe(name: str, host: str) -> bool:
                 listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -397,7 +432,6 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
                     raise OSError("no non-loopback IPv4 address is available")
                 checks["lan_denied"] = listener_probe("lan_denied", lan_address)
             except OSError as error:
-                checks["lan_denied"] = False
                 diagnostics["lan_denied"] = f"probe unavailable: {type(error).__name__}"
 
             def descendant_boundary_code(write_target: Path) -> str:
@@ -704,4 +738,8 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
                 path.unlink(missing_ok=True)
             except OSError:
                 pass
+        try:
+            protected_canary.parent.rmdir()
+        except OSError:
+            pass
         shutil.rmtree(root, ignore_errors=True)
