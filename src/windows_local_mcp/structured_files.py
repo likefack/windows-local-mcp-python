@@ -138,6 +138,22 @@ def _bounded(items: list[Any], settings: Settings, label: str) -> None:
         raise StructuredFileError(f"{label} exceeds max_structured_elements")
 
 
+def _require_package_bounds(
+    archive: zipfile.ZipFile, settings: Settings, label: str
+) -> list[zipfile.ZipInfo]:
+    infos = archive.infolist()
+    if len(infos) > settings.max_zip_entries:
+        raise StructuredFileError(f"{label} package exceeds max_zip_entries")
+    expanded = 0
+    for info in infos:
+        if info.flag_bits & 0x1:
+            raise StructuredFileError(f"encrypted {label} package parts are unsupported")
+        expanded += info.file_size
+        if expanded > settings.max_zip_expanded_bytes:
+            raise StructuredFileError(f"{label} package exceeds max_zip_expanded_bytes")
+    return infos
+
+
 def _parse_package_xml(data: bytes, label: str) -> ElementTree.Element:
     try:
         return ElementTree.fromstring(data)
@@ -314,14 +330,16 @@ def _transform_docx_package_preserving(
     }
 
 
-def _docx_has_unsupported_features(data: bytes) -> list[str]:
+def _docx_has_unsupported_features(data: bytes, settings: Settings) -> list[str]:
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
-            names = {name.casefold() for name in archive.namelist()}
+            infos = _require_package_bounds(archive, settings, "DOCX")
+            archive_names = [info.filename for info in infos]
+            names = {name.casefold() for name in archive_names}
             document = archive.read("word/document.xml")
             word_xml = [
                 archive.read(name)
-                for name in archive.namelist()
+                for name in archive_names
                 if name.casefold().startswith("word/")
                 and name.casefold().endswith(".xml")
             ]
@@ -373,7 +391,7 @@ def _length_inches(value: Any) -> float | None:
 
 def _inspect_docx(data: bytes, settings: Settings) -> dict[str, Any]:
     Document, _, _, _ = _docx_modules()
-    unsupported = _docx_has_unsupported_features(data)
+    unsupported = _docx_has_unsupported_features(data, settings)
     document = Document(io.BytesIO(data))
     _bounded(document.paragraphs, settings, "DOCX paragraphs")
     tables: list[dict[str, Any]] = []
@@ -579,7 +597,7 @@ def _apply_docx_cell_format(cell: Any, spec: dict[str, Any]) -> None:
 def _transform_docx(
     data: bytes, operations: list[Any], settings: Settings
 ) -> tuple[bytes, dict[str, Any]]:
-    unsupported = _docx_has_unsupported_features(data)
+    unsupported = _docx_has_unsupported_features(data, settings)
     if unsupported:
         return _transform_docx_package_preserving(data, operations, unsupported)
     Document, WD_ORIENT, _, units = _docx_modules()
@@ -789,10 +807,11 @@ def _transform_docx(
     return output.getvalue(), {"preservation_mode": "library_rewrite"}
 
 
-def _xlsx_unsupported(data: bytes) -> list[str]:
+def _xlsx_unsupported(data: bytes, settings: Settings) -> list[str]:
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
-            archive_names = archive.namelist()
+            infos = _require_package_bounds(archive, settings, "XLSX")
+            archive_names = [info.filename for info in infos]
             names = {name.casefold() for name in archive_names}
             xml_parts = [
                 archive.read(name)
@@ -1174,36 +1193,49 @@ def _inspect_xlsx(data: bytes, settings: Settings, range_ref: str | None = None)
             category=UserWarning,
         )
         book = load_workbook(io.BytesIO(data), read_only=True, data_only=False, keep_links=True)
-    try:
-        sheets = []
-        total = 0
-        for sheet in book.worksheets:
-            cells = _sheet_cell_count(sheet)
-            total += cells
-            if total > settings.max_structured_elements:
-                raise StructuredFileError("XLSX cells exceed max_structured_elements")
-            preview_range = range_ref if range_ref and sheet.title == book.active.title else f"A1:{sheet.cell(min(sheet.max_row, 20), min(sheet.max_column, 20)).coordinate}"
-            try:
-                preview_range, _ = _xlsx_range_bounds(
-                    preview_range, settings, "preview range"
+        try:
+            sheets = []
+            total = 0
+            for sheet in book.worksheets:
+                cells = _sheet_cell_count(sheet)
+                total += cells
+                if total > settings.max_structured_elements:
+                    raise StructuredFileError("XLSX cells exceed max_structured_elements")
+                preview_range = (
+                    range_ref
+                    if range_ref and sheet.title == book.active.title
+                    else f"A1:{sheet.cell(min(sheet.max_row, 20), min(sheet.max_column, 20)).coordinate}"
                 )
-                rows = [[cell.value for cell in row] for row in sheet[preview_range]]
-            except ValueError as error:
-                raise StructuredFileError("invalid XLSX range") from error
-            sheets.append({"name": sheet.title, "state": sheet.sheet_state, "max_row": sheet.max_row, "max_column": sheet.max_column, "preview_range": preview_range, "values": rows})
-        unsupported = _xlsx_unsupported(data)
-        return {
-            "format": "xlsx",
-            "sheets": sheets,
-            "write_rejected_features": unsupported,
-            "package_patch_supported_operations": (
-                []
-                if "digital signatures" in unsupported
-                else ["cell_set", "range_set", "range_clear"]
-            ),
-        }
-    finally:
-        book.close()
+                try:
+                    preview_range, _ = _xlsx_range_bounds(
+                        preview_range, settings, "preview range"
+                    )
+                    rows = [[cell.value for cell in row] for row in sheet[preview_range]]
+                except ValueError as error:
+                    raise StructuredFileError("invalid XLSX range") from error
+                sheets.append(
+                    {
+                        "name": sheet.title,
+                        "state": sheet.sheet_state,
+                        "max_row": sheet.max_row,
+                        "max_column": sheet.max_column,
+                        "preview_range": preview_range,
+                        "values": rows,
+                    }
+                )
+            unsupported = _xlsx_unsupported(data, settings)
+            return {
+                "format": "xlsx",
+                "sheets": sheets,
+                "write_rejected_features": unsupported,
+                "package_patch_supported_operations": (
+                    []
+                    if "digital signatures" in unsupported
+                    else ["cell_set", "range_set", "range_clear"]
+                ),
+            }
+        finally:
+            book.close()
 
 
 def _xlsx_cell_format(cell: Any, spec: dict[str, Any], styles: Any) -> None:
@@ -1249,7 +1281,7 @@ def _xlsx_selected_rows(sheet: Any, range_ref: str) -> tuple[tuple[Any, ...], ..
 def _transform_xlsx(
     data: bytes, operations: list[Any], settings: Settings
 ) -> tuple[bytes, dict[str, Any]]:
-    unsupported = _xlsx_unsupported(data)
+    unsupported = _xlsx_unsupported(data, settings)
     if unsupported:
         return _transform_xlsx_package_preserving(data, operations, settings, unsupported)
     Workbook, load_workbook, BarChart, LineChart, Reference, CellIsRule, styles, DataValidation, _ = _xlsx_modules()

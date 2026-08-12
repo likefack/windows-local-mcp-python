@@ -348,6 +348,20 @@ def test_structured_edits_reject_oversized_ranges_before_materialization(
         )
 
 
+def test_office_packages_apply_expanded_size_bounds_before_parsing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, root = load_server(tmp_path, monkeypatch)
+    server.runtime.settings.max_zip_expanded_bytes = 1024
+    (root / "expanded.docx").write_bytes(docx_bytes())
+    (root / "expanded.xlsx").write_bytes(xlsx_bytes())
+
+    with pytest.raises(ValueError, match="DOCX package exceeds max_zip_expanded_bytes"):
+        server.structured_file_inspect("expanded.docx")
+    with pytest.raises(ValueError, match="XLSX package exceeds max_zip_expanded_bytes"):
+        server.structured_file_inspect("expanded.xlsx")
+
+
 def test_zip_multi_extract_is_one_checkpointed_transaction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
