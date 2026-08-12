@@ -5,7 +5,7 @@
 食い違う場合、契約を弱めて実装へ合わせるのではなく、実装修正、安全な fail-closed、
 能力縮小、または表現の訂正によって解消します。
 
-この契約は 2026-08-12 時点の `broker-centered-sandboxed-processing-v1` を前提に固定します。
+この契約は 2026-08-13 時点の `broker-centered-sandboxed-processing-v1` を前提に固定します。
 今回のリリース候補レビュー中に許される変更は、曖昧さの除去、矛盾の解消、保証の強化です。
 保証を弱める変更が必要になった場合は、自動採用せず、現行契約、変更案、理由、保証への
 影響、既知問題の判定への影響を別途提示します。
@@ -27,6 +27,9 @@
 
 - Windows kernel と Windows security model
 - 事前に侵害されていない WLMCP runtime、Python runtime、検証済み依存 package
+- Broker が自動実行する Git／ADB 等の installed external helper と通常の trusted OS／toolchain dependency。
+  少なくとも primary executable は、署名等の provenance または trusted operator が固定した絶対 path と
+  content hash／file identity を trust anchor とし、ambient PATH で名前が一致しただけでは信頼しません。
 - provenance と必要な Windows live verification を通過した Codex Sandbox 実装
 - 明示承認を行う local user と trusted operator
 - Windows user authority が既に完全奪取されていないこと
@@ -82,6 +85,11 @@ real Windows user authority が本当に必要な処理だけを、Codex Sandbox
 - Broker operation から未許可の workspace 外 filesystem、control-plane、network、device、
   external service へ副作用を拡大できません。
 - external process を使うこと自体ではなく、作用を閉じて事後検証できるかで経路を決めます。
+- Broker が自動実行する external helper は、workspace／`data_dir`／scratch その他 MCP が書き換え可能な
+  root から解決しません。primary executable の path、content hash、file identity 等の
+  security-relevant identity を固定し、実行直前の差し替え、PATH shadowing、stale identity を検出したら
+  fail closed します。署名等の provenance が利用できない場合は、trusted operator が固定した executable
+  identity を明示的な trust anchor とします。
 - Broker が作用を閉じられない場合は、承認済み Codex Sandbox へ送るか fail closed します。
 
 ### C. Open-ended execution
@@ -226,6 +234,8 @@ admission／runtime bound を設けます。
 - v1 は single-user local MCP を前提とします。
 - 認証された principal ownership のない remote HTTP／multi-user transport は起動時に fail closed します。
 - loopback であることだけを multi-principal authentication の代替にしません。
+- transport の説明と capability 表示は、実際の startup validation と一致させます。設定上必ず拒否される
+  transport を「optional」「available」「利用可能」と表示しません。
 
 ### O. Capability／verification truthfulness
 
@@ -243,6 +253,10 @@ protected-information read、Internet、LAN、loopback、descendant containment�
 必要に応じて個別に `verified`／`unverified`／`not-applicable` と記録します。一部だけ通過した状態を、
 capability 全体の `Windows live-verified=true` へ丸めません。
 
+transport も capability truthfulness の対象です。stdio／HTTP 等の各 transport について、`configured`、
+`enabled`、`available` と実効 authentication／principal 前提を区別し、startup validation が拒否する状態を
+利用可能であるかのように session／UI／documentation へ表示しません。
+
 過去の結果、mock、static test、direct ADB、stdio integration を、現在の commit に対する Windows live、
 MCP ADB E2E、Tunnel、deployment の代替にしません。
 
@@ -257,6 +271,7 @@ MCP ADB E2E、Tunnel、deployment の代替にしません。
 - workspace、`data_dir`、control-plane、scratch の境界違反
 - stale approval、replay、double execution、cancel race、ordinary TOCTOU
 - crash／timeout／cancellation、stale source／destination、path／filesystem race
+- Broker helper の PATH shadowing、差し替え、stale executable identity
 - Codex Sandbox の read／write／protected-information／network／descendant boundary 不足
 - ordinary non-admin Windows user 権限で成立する現実的な攻撃
 - common project layout で起こる機能破綻、通常操作での重大 UX 破綻
@@ -286,6 +301,7 @@ MCP ADB E2E、Tunnel、deployment の代替にしません。
 
 | 重点確認項目 | 主な契約項目 |
 | --- | --- |
+| Broker helper executable の provenance／path／hash／file identity と差し替え耐性 | A, B, O |
 | legacy `:workspace` と `workspace_write=false` の実効 filesystem boundary | C, D, O |
 | Sandbox runtime から `.env`／credential／secret を直接読める可能性 | D, K, O |
 | `.env`／dependency tree を含む過剰 staging | K, L |
@@ -304,6 +320,7 @@ MCP ADB E2E、Tunnel、deployment の代替にしません。
 | resource admission、protected information leakage | K, L |
 | Live Activity／Timeline／preview／conflict／recovery 表示 | M, O |
 | ADB emulator 固定 read integration | B, D, K, O |
+| transport の実効 startup 可用性と session／UI／documentation 表示 | N, O |
 | 古い README／SPEC／VERIFICATION | O |
 
 ## 7. リリース判定
