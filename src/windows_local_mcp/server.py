@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import base64
 import difflib
+import hashlib
 import json
 import os
 import re
 import shutil
+import stat
 import tempfile
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -46,7 +48,14 @@ from .structured_files import infer_format, read_zip_entries, read_zip_entry
 from .structured_files import inspect as inspect_structured
 from .structured_files import transform as transform_structured
 from .timeline import timeline_entry, timeline_list
-from .util import canonical_json, read_text_limited, sha256_bytes, sha256_text, utc_now_iso
+from .util import (
+    canonical_json,
+    read_text_limited,
+    sha256_bytes,
+    sha256_file,
+    sha256_text,
+    utc_now_iso,
+)
 from .workspace_history import (
     WorkspaceMutationError,
     begin_single_file_write_transaction,
@@ -147,6 +156,7 @@ def _log_simple(
     result: Any,
     status: str = "succeeded",
     tier: str = "broker",
+    operation_id: str | None = None,
 ) -> str:
     operation_id = runtime.audit.create_operation(
         tool_name=tool_name,
@@ -154,6 +164,7 @@ def _log_simple(
         status=status,
         cwd=str(runtime.settings.workspace_root),
         request=_safe_request(request),
+        operation_id=operation_id,
     )
     summary = _safe_request(result)
     runtime.audit.update_operation(
@@ -163,6 +174,24 @@ def _log_simple(
     )
     runtime.audit.add_event(operation_id, status, summary if isinstance(summary, dict) else {})
     return operation_id
+
+
+def _log_transfer_event(
+    *,
+    manifest: dict[str, Any],
+    tool_name: str,
+    request: dict[str, Any],
+    result: dict[str, Any],
+) -> None:
+    operation_id = manifest.get("operation_id")
+    if isinstance(operation_id, str):
+        runtime.audit.add_event(
+            operation_id,
+            tool_name,
+            {"request": _safe_request(request), "result": _safe_request(result)},
+        )
+        return
+    _log_simple(tool_name=tool_name, request=request, result=result)
 
 
 def _audit_rejection(tool_name: str, request: dict[str, Any], error: Exception) -> None:
@@ -958,6 +987,59 @@ def _transfer_root(transfer_id: str) -> Path:
     return runtime.settings.data_dir / "binary-transfers" / transfer_id
 
 
+def _is_reparse(path: Path) -> bool:
+    details = path.lstat()
+    attributes = int(getattr(details, "st_file_attributes", 0))
+    return path.is_symlink() or bool(
+        attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    )
+
+
+def _transfer_file_identity(path: Path) -> dict[str, int]:
+    details = path.stat()
+    return {
+        "device": details.st_dev,
+        "inode": details.st_ino,
+        "size": details.st_size,
+        "modified_ns": details.st_mtime_ns,
+    }
+
+
+def _validated_transfer_payload(
+    root: Path,
+    manifest: dict[str, Any],
+    *,
+    immutable: bool,
+) -> Path:
+    payload = root / "payload.bin"
+    if not payload.exists() or _is_reparse(payload) or not payload.is_file():
+        raise RuntimeError("transfer payload has an unsafe file identity")
+    details = payload.stat()
+    if details.st_nlink > 1 or details.st_size != int(manifest["bytes"]):
+        raise RuntimeError("transfer payload does not match its declared byte identity")
+    if immutable and _transfer_file_identity(payload) != manifest.get("payload_identity"):
+        raise RuntimeError("download snapshot changed after transfer begin")
+    return payload
+
+
+def _copy_source_to_reserved_snapshot(source: Path, destination: Path) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    total = 0
+    limit = runtime.settings.max_structured_file_bytes
+    with source.open("rb") as input_file, destination.open("r+b") as output_file:
+        output_file.seek(0)
+        while chunk := input_file.read(1024 * 1024):
+            total += len(chunk)
+            if total > limit:
+                raise ValueError("structured file exceeds max_structured_file_bytes")
+            output_file.write(chunk)
+            digest.update(chunk)
+        output_file.truncate(total)
+        output_file.flush()
+        os.fsync(output_file.fileno())
+    return digest.hexdigest(), total
+
+
 def _admit_transfer() -> None:
     root = runtime.settings.data_dir / "binary-transfers"
     open_count = 0
@@ -967,7 +1049,7 @@ def _admit_transfer() -> None:
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 continue
-            if manifest.get("state") == "open":
+            if manifest.get("state") in {"preparing", "open"}:
                 try:
                     created = datetime.fromisoformat(str(manifest["created_at"]))
                 except (KeyError, TypeError, ValueError):
@@ -975,8 +1057,20 @@ def _admit_transfer() -> None:
                 if datetime.now(UTC) - created > timedelta(
                     seconds=runtime.settings.approval_request_ttl_seconds
                 ):
-                    manifest["state"] = "expired"
-                    _write_transfer_manifest(manifest_path.parent, manifest)
+                    with NamedControlPlaneLock(
+                        runtime.settings, f"transfer-{manifest_path.parent.name}"
+                    ):
+                        current = json.loads(manifest_path.read_text(encoding="utf-8"))
+                        if current.get("state") not in {"preparing", "open"}:
+                            continue
+                        current_created = datetime.fromisoformat(str(current["created_at"]))
+                        if datetime.now(UTC) - current_created <= timedelta(
+                            seconds=runtime.settings.approval_request_ttl_seconds
+                        ):
+                            open_count += 1
+                            continue
+                        current["state"] = "expired"
+                        _write_transfer_manifest(manifest_path.parent, current)
                     continue
                 open_count += 1
                 if open_count >= runtime.settings.max_open_transfers:
@@ -984,18 +1078,38 @@ def _admit_transfer() -> None:
 
 
 def _write_transfer_manifest(root: Path, manifest: dict[str, Any]) -> None:
-    temporary = root / "manifest.tmp"
-    temporary.write_text(canonical_json(manifest), encoding="utf-8")
-    os.replace(temporary, root / "manifest.json")
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="wb", delete=False, dir=root) as output:
+            output.write(canonical_json(manifest).encode("utf-8"))
+            output.flush()
+            temporary = Path(output.name)
+        os.replace(temporary, root / "manifest.json")
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def _load_transfer(transfer_id: str, expected_direction: str) -> tuple[Path, dict[str, Any]]:
     root = _transfer_root(transfer_id)
+    transfer_root = runtime.settings.data_dir / "binary-transfers"
+    if _is_reparse(transfer_root) or not transfer_root.is_dir():
+        raise RuntimeError("binary transfer root has an unsafe directory identity")
+    transfers = transfer_root.resolve(strict=True)
+    if not root.exists() or _is_reparse(root) or not root.is_dir():
+        raise FileNotFoundError("transfer session was not found")
+    root.resolve(strict=True).relative_to(transfers)
     manifest_path = root / "manifest.json"
-    if not manifest_path.is_file():
+    if (
+        not manifest_path.exists()
+        or _is_reparse(manifest_path)
+        or not manifest_path.is_file()
+        or manifest_path.stat().st_nlink > 1
+    ):
         raise FileNotFoundError("transfer session was not found")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("version") not in {1, 2}:
+    if manifest.get("version") not in {1, 2, 3, 4}:
         raise RuntimeError("transfer session version is unsupported")
     if manifest.get("direction") != expected_direction or manifest.get("state") != "open":
         raise RuntimeError("transfer session is not open for this operation")
@@ -1007,6 +1121,36 @@ def _load_transfer(transfer_id: str, expected_direction: str) -> tuple[Path, dic
     return root, manifest
 
 
+def _write_upload_chunk_locked(
+    root: Path,
+    manifest: dict[str, Any],
+    *,
+    offset: int,
+    payload: bytes,
+) -> dict[str, Any]:
+    if offset != int(manifest["received"]):
+        raise RuntimeError("upload chunk offset is not the next expected offset")
+    if offset + len(payload) > int(manifest["bytes"]):
+        raise ValueError("upload exceeds declared total_bytes")
+    if manifest["version"] >= 4:
+        payload_path = _validated_transfer_payload(root, manifest, immutable=False)
+        with payload_path.open("r+b") as output:
+            output.seek(offset)
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+        _validated_transfer_payload(root, manifest, immutable=False)
+    else:
+        enforce_data_quota(runtime.settings, incoming_bytes=len(payload))
+        with (root / "payload.bin").open("ab") as output:
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+    manifest["received"] = offset + len(payload)
+    _write_transfer_manifest(root, manifest)
+    return manifest
+
+
 @mcp.tool(annotations=READ_ONLY)
 def artifact_download_begin(path: str, chunk_bytes: int | None = None) -> dict[str, Any]:
     """Begin a hash-bound, byte-exact download of any bounded regular file."""
@@ -1014,23 +1158,97 @@ def artifact_download_begin(path: str, chunk_bytes: int | None = None) -> dict[s
     try:
         _require_filesystem()
         source = runtime.workspace.resolve_existing(path, allow_directory=False)
-        size = source.stat().st_size
+        source_identity = runtime.workspace.identity(source)
+        if source_identity is None:
+            raise FileNotFoundError(path)
+        size = source_identity.size
         if size > runtime.settings.max_structured_file_bytes:
             raise ValueError("structured file exceeds max_structured_file_bytes")
         chunk = runtime.settings.max_transfer_chunk_bytes if chunk_bytes is None else chunk_bytes
         if not isinstance(chunk, int) or chunk < 4096 or chunk > runtime.settings.max_transfer_chunk_bytes:
             raise ValueError("chunk_bytes is outside the configured bound")
-        data = source.read_bytes()
+        transfer_id: str | None = None
+        root: Path | None = None
+        transfer_operation_id = str(uuid.uuid4())
         with NamedControlPlaneLock(runtime.settings, "binary-transfer"):
             _admit_transfer()
-            enforce_data_quota(runtime.settings, incoming_bytes=4096)
+            enforce_data_quota(runtime.settings, incoming_bytes=size + 4096)
             transfer_id = str(uuid.uuid4())
             root = _transfer_root(transfer_id)
-            root.mkdir(parents=True, exist_ok=False)
-            manifest = {"version": 1, "direction": "download", "state": "open", "created_at": utc_now_iso(), "path": runtime.workspace.relative(source), "sha256": sha256_bytes(data), "bytes": len(data), "chunk_bytes": chunk}
-            _write_transfer_manifest(root, manifest)
-        result = {"transfer_id": transfer_id, "path": manifest["path"], "bytes": len(data), "sha256": manifest["sha256"], "chunk_bytes": chunk, "chunk_count": (len(data) + chunk - 1) // chunk, "execution_path": "transfer"}
-        result["operation_id"] = _log_simple(tool_name="artifact_download_begin", request=request, result=result)
+            try:
+                root.mkdir(parents=True, exist_ok=False)
+                with (root / "payload.bin").open("xb") as payload:
+                    payload.truncate(size)
+                    payload.flush()
+                    os.fsync(payload.fileno())
+                manifest = {
+                    "version": 3,
+                    "direction": "download",
+                    "state": "preparing",
+                    "created_at": utc_now_iso(),
+                    "path": runtime.workspace.relative(source),
+                    "bytes": size,
+                    "chunk_bytes": chunk,
+                    "operation_id": transfer_operation_id,
+                }
+                _write_transfer_manifest(root, manifest)
+            except Exception:
+                if root.exists():
+                    shutil.rmtree(root)
+                raise
+        try:
+            snapshot = root / "payload.bin"
+            snapshot_sha, snapshot_bytes = _copy_source_to_reserved_snapshot(source, snapshot)
+            current = runtime.workspace.resolve_existing(path, allow_directory=False)
+            if current != source or runtime.workspace.identity(current) != source_identity:
+                raise RuntimeError("source changed while preparing download snapshot")
+            current_sha, current_bytes = sha256_file(
+                current, max_bytes=runtime.settings.max_structured_file_bytes
+            )
+            if (
+                runtime.workspace.identity(current) != source_identity
+                or current_bytes != snapshot_bytes
+                or current_sha != snapshot_sha
+            ):
+                raise RuntimeError("source changed while preparing download snapshot")
+            persisted_sha, persisted_bytes = sha256_file(
+                snapshot, max_bytes=runtime.settings.max_structured_file_bytes
+            )
+            if persisted_bytes != snapshot_bytes or persisted_sha != snapshot_sha:
+                raise RuntimeError("download snapshot verification failed")
+            manifest.update(
+                {
+                    "state": "open",
+                    "bytes": snapshot_bytes,
+                    "sha256": snapshot_sha,
+                    "payload_identity": _transfer_file_identity(snapshot),
+                }
+            )
+            with NamedControlPlaneLock(runtime.settings, f"transfer-{transfer_id}"):
+                current_manifest = json.loads(
+                    (root / "manifest.json").read_text(encoding="utf-8")
+                )
+                if current_manifest.get("state") != "preparing":
+                    raise RuntimeError("download transfer expired while preparing snapshot")
+                _write_transfer_manifest(root, manifest)
+        except Exception:
+            with NamedControlPlaneLock(runtime.settings, "binary-transfer"):
+                if root.exists():
+                    shutil.rmtree(root)
+            raise
+        result = {"transfer_id": transfer_id, "path": manifest["path"], "bytes": snapshot_bytes, "sha256": manifest["sha256"], "chunk_bytes": chunk, "chunk_count": (snapshot_bytes + chunk - 1) // chunk, "execution_path": "transfer"}
+        try:
+            result["operation_id"] = _log_simple(
+                tool_name="artifact_download_begin",
+                request=request,
+                result=result,
+                operation_id=transfer_operation_id,
+            )
+        except Exception:
+            with NamedControlPlaneLock(runtime.settings, "binary-transfer"):
+                if root.exists():
+                    shutil.rmtree(root)
+            raise
         return result
     except Exception as error:
         _audit_rejection("artifact_download_begin", request, error)
@@ -1039,24 +1257,40 @@ def artifact_download_begin(path: str, chunk_bytes: int | None = None) -> dict[s
 
 @mcp.tool(annotations=READ_ONLY)
 def artifact_download_chunk(transfer_id: str, offset: int) -> dict[str, Any]:
-    """Read one base64 chunk; it fails if the source changed after download_begin."""
+    """Read one base64 chunk from the immutable, hash-bound download snapshot."""
     request = {"transfer_id": transfer_id, "offset": offset}
     try:
-        _root, manifest = _load_transfer(transfer_id, "download")
+        root, manifest = _load_transfer(transfer_id, "download")
         if not isinstance(offset, int) or offset < 0 or offset % int(manifest["chunk_bytes"]) != 0:
             raise ValueError("offset must be a non-negative chunk boundary")
-        source = runtime.workspace.resolve_existing(str(manifest["path"]), allow_directory=False)
-        size = source.stat().st_size
-        if size != int(manifest["bytes"]) or size > runtime.settings.max_structured_file_bytes:
-            raise RuntimeError("source changed during transfer; begin a new download")
-        data = source.read_bytes()
-        if len(data) != int(manifest["bytes"]) or sha256_bytes(data) != manifest["sha256"]:
-            raise RuntimeError("source changed during transfer; begin a new download")
-        if offset >= len(data):
+        size = int(manifest["bytes"])
+        if offset >= size:
             raise ValueError("offset is outside the source file")
-        payload = data[offset : offset + int(manifest["chunk_bytes"])]
-        result = {"transfer_id": transfer_id, "offset": offset, "bytes": len(payload), "base64": base64.b64encode(payload).decode("ascii"), "next_offset": offset + len(payload), "complete": offset + len(payload) == len(data), "sha256": sha256_bytes(payload)}
-        _log_simple(tool_name="artifact_download_chunk", request=request, result={key: value for key, value in result.items() if key != "base64"})
+        if manifest["version"] >= 3:
+            snapshot = _validated_transfer_payload(root, manifest, immutable=True)
+            with snapshot.open("rb") as input_file:
+                input_file.seek(offset)
+                payload = input_file.read(int(manifest["chunk_bytes"]))
+            expected_bytes = min(int(manifest["chunk_bytes"]), size - offset)
+            if len(payload) != expected_bytes:
+                raise RuntimeError("download snapshot changed during chunk read")
+        else:
+            source = runtime.workspace.resolve_existing(
+                str(manifest["path"]), allow_directory=False
+            )
+            if source.stat().st_size != size or size > runtime.settings.max_structured_file_bytes:
+                raise RuntimeError("source changed during transfer; begin a new download")
+            data = source.read_bytes()
+            if len(data) != size or sha256_bytes(data) != manifest["sha256"]:
+                raise RuntimeError("source changed during transfer; begin a new download")
+            payload = data[offset : offset + int(manifest["chunk_bytes"])]
+        result = {"transfer_id": transfer_id, "offset": offset, "bytes": len(payload), "base64": base64.b64encode(payload).decode("ascii"), "next_offset": offset + len(payload), "complete": offset + len(payload) == size, "sha256": sha256_bytes(payload)}
+        _log_transfer_event(
+            manifest=manifest,
+            tool_name="artifact_download_chunk",
+            request=request,
+            result={key: value for key, value in result.items() if key != "base64"},
+        )
         return result
     except Exception as error:
         _audit_rejection("artifact_download_chunk", request, error)
@@ -1095,17 +1329,38 @@ def artifact_upload_begin(
                 "sha256": source_manifest["sha256"],
                 "bytes": source_manifest["bytes"],
             }
+        transfer_operation_id = str(uuid.uuid4())
         with NamedControlPlaneLock(runtime.settings, "binary-transfer"):
             _admit_transfer()
             enforce_data_quota(runtime.settings, incoming_bytes=total_bytes + 4096)
             transfer_id = str(uuid.uuid4())
             root = _transfer_root(transfer_id)
-            root.mkdir(parents=True, exist_ok=False)
-            (root / "payload.bin").touch()
-            manifest = {"version": 2, "direction": "upload", "state": "open", "created_at": utc_now_iso(), "path": runtime.workspace.relative(target), "bytes": total_bytes, "sha256": sha256, "expected_sha256": expected_sha256, "received": 0, "source_binding": source_binding}
-            _write_transfer_manifest(root, manifest)
+            try:
+                root.mkdir(parents=True, exist_ok=False)
+                with (root / "payload.bin").open("xb") as payload:
+                    payload.truncate(total_bytes)
+                    payload.flush()
+                    os.fsync(payload.fileno())
+                manifest = {"version": 4, "direction": "upload", "state": "open", "created_at": utc_now_iso(), "path": runtime.workspace.relative(target), "bytes": total_bytes, "sha256": sha256, "expected_sha256": expected_sha256, "received": 0, "source_binding": source_binding, "operation_id": transfer_operation_id}
+                _write_transfer_manifest(root, manifest)
+            except Exception:
+                if root.exists():
+                    shutil.rmtree(root)
+                raise
         result = {"transfer_id": transfer_id, "path": manifest["path"], "total_bytes": total_bytes, "chunk_bytes_max": runtime.settings.max_transfer_chunk_bytes, "execution_path": "transfer"}
-        result["operation_id"] = _log_simple(tool_name="artifact_upload_begin", request=request, result=result, tier="broker")
+        try:
+            result["operation_id"] = _log_simple(
+                tool_name="artifact_upload_begin",
+                request=request,
+                result=result,
+                tier="broker",
+                operation_id=transfer_operation_id,
+            )
+        except Exception:
+            with NamedControlPlaneLock(runtime.settings, "binary-transfer"):
+                if root.exists():
+                    shutil.rmtree(root)
+            raise
         return result
     except Exception as error:
         _audit_rejection("artifact_upload_begin", request, error)
@@ -1123,22 +1378,34 @@ def artifact_upload_chunk(transfer_id: str, offset: int, base64_chunk: str) -> d
             raise ValueError("base64_chunk must be valid base64") from error
         if not payload or len(payload) > runtime.settings.max_transfer_chunk_bytes:
             raise ValueError("upload chunk is outside the configured bound")
-        with NamedControlPlaneLock(runtime.settings, f"transfer-{transfer_id}"):
-            root, manifest = _load_transfer(transfer_id, "upload")
-            if offset != int(manifest["received"]):
-                raise RuntimeError("upload chunk offset is not the next expected offset")
-            if offset + len(payload) > int(manifest["bytes"]):
-                raise ValueError("upload exceeds declared total_bytes")
-            with NamedControlPlaneLock(runtime.settings, "binary-transfer"):
-                enforce_data_quota(runtime.settings, incoming_bytes=len(payload))
-                with (root / "payload.bin").open("ab") as output:
-                    output.write(payload)
-                    output.flush()
-                    os.fsync(output.fileno())
-            manifest["received"] = offset + len(payload)
-            _write_transfer_manifest(root, manifest)
+        root, initial_manifest = _load_transfer(transfer_id, "upload")
+        if initial_manifest["version"] >= 4:
+            with NamedControlPlaneLock(runtime.settings, f"transfer-{transfer_id}"):
+                root, manifest = _load_transfer(transfer_id, "upload")
+                manifest = _write_upload_chunk_locked(
+                    root, manifest, offset=offset, payload=payload
+                )
+        else:
+            with (
+                NamedControlPlaneLock(runtime.settings, "binary-transfer"),
+                NamedControlPlaneLock(runtime.settings, f"transfer-{transfer_id}"),
+            ):
+                root, manifest = _load_transfer(transfer_id, "upload")
+                manifest = _write_upload_chunk_locked(
+                    root, manifest, offset=offset, payload=payload
+                )
         result = {"transfer_id": transfer_id, "received": manifest["received"], "complete": manifest["received"] == manifest["bytes"], "chunk_sha256": sha256_bytes(payload)}
-        _log_simple(tool_name="artifact_upload_chunk", request={"transfer_id": transfer_id, "offset": offset, "chunk_bytes": len(payload), "chunk_sha256": result["chunk_sha256"]}, result=result, tier="broker")
+        _log_transfer_event(
+            manifest=manifest,
+            tool_name="artifact_upload_chunk",
+            request={
+                "transfer_id": transfer_id,
+                "offset": offset,
+                "chunk_bytes": len(payload),
+                "chunk_sha256": result["chunk_sha256"],
+            },
+            result=result,
+        )
         return result
     except Exception as error:
         _audit_rejection("artifact_upload_chunk", {"transfer_id": transfer_id, "offset": offset}, error)
@@ -1154,9 +1421,7 @@ def artifact_upload_commit(transfer_id: str, reason: str = "") -> dict[str, Any]
             root, manifest = _load_transfer(transfer_id, "upload")
             if int(manifest["received"]) != int(manifest["bytes"]):
                 raise RuntimeError("upload is incomplete and cannot be committed")
-            payload_path = root / "payload.bin"
-            if payload_path.stat().st_size != int(manifest["bytes"]):
-                raise RuntimeError("staged upload does not match declared byte identity")
+            payload_path = _validated_transfer_payload(root, manifest, immutable=False)
             payload = payload_path.read_bytes()
             if len(payload) != int(manifest["bytes"]) or sha256_bytes(payload) != manifest["sha256"]:
                 raise RuntimeError("staged upload does not match declared byte identity")

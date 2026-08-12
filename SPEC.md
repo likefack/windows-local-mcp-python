@@ -57,7 +57,7 @@ Ordinary file reads do not take a mutation lock.
 
 DOCX and XLSX use two preservation modes. Documents without detected unsupported package features use the normal document library path. When unsupported package features are present, a narrow package-patch path permits only operations whose effects are confined to known XML parts: DOCX `replace_text` and `metadata_set`; XLSX `cell_set`, `range_set`, and `range_clear`. Every unmodified ZIP member payload and metadata is carried into the output. Digitally signed packages and any operation outside the narrow set fail closed instead of silently discarding features.
 
-CSV/TSV dialect and byte-identity properties are preserved where determinable. ZIP paths, collisions, entry count, and expanded size are bounded. Image decoded pixels/memory are bounded, metadata is preserved unless explicitly removed, and unsupported multi-frame transformations fail closed. Generic artifact transfer is byte-exact, chunked, hash-bound, and committed through the same broker mutation path; transfer does not authorize execution.
+CSV/TSV dialect and byte-identity properties are preserved where determinable. ZIP paths, collisions, entry count, and expanded size are bounded. Image decoded pixels/memory are bounded, metadata is preserved unless explicitly removed, and unsupported multi-frame transformations fail closed. Generic artifact transfer is byte-exact, chunked, and whole-artifact hash-bound. Downloads read chunks from a verified immutable control-plane snapshot; uploads reserve their full declared size before accepting chunks. Commits use the same broker mutation path, and transfer does not authorize execution.
 
 ## 4. Broker-fixed command operations
 

@@ -209,18 +209,45 @@ def test_zip_image_and_transfer_boundaries(tmp_path: Path, monkeypatch: pytest.M
     assert (root / "download.csv").read_bytes() == payload
 
 
-def test_transfer_rejects_stale_and_incomplete_uploads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_transfer_uses_stable_snapshot_and_rejects_incomplete_uploads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     server, root = load_server(tmp_path, monkeypatch)
     (root / "source.csv").write_bytes(b"a\n")
     stale = server.structured_file_download_begin("source.csv")
     (root / "source.csv").write_bytes(b"changed\n")
-    with pytest.raises(RuntimeError, match="source changed during transfer"):
-        server.structured_file_download_chunk(stale["transfer_id"], 0)
+    snapshot = server.structured_file_download_chunk(stale["transfer_id"], 0)
+    assert base64.b64decode(snapshot["base64"]) == b"a\n"
+    assert sha256_bytes(base64.b64decode(snapshot["base64"])) == snapshot["sha256"]
+    audit = server.runtime.audit.get_operation(stale["operation_id"])
+    assert any(event["event_type"] == "artifact_download_chunk" for event in audit["events"])
+    assert not any(
+        operation["tool_name"] == "artifact_download_chunk"
+        for operation in server.runtime.audit.list_operations(limit=100)
+    )
 
     payload = b"complete\n"
     upload = server.structured_file_upload_begin("new.tsv", len(payload), sha256_bytes(payload))
     with pytest.raises(RuntimeError, match="incomplete"):
         server.structured_file_upload_commit(upload["transfer_id"])
+
+
+def test_download_snapshot_tampering_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, root = load_server(tmp_path, monkeypatch)
+    (root / "source.bin").write_bytes(b"trusted snapshot")
+    download = server.artifact_download_begin("source.bin")
+    snapshot = (
+        server.runtime.settings.data_dir
+        / "binary-transfers"
+        / download["transfer_id"]
+        / "payload.bin"
+    )
+    snapshot.write_bytes(b"tampered bytes!!")
+
+    with pytest.raises(RuntimeError, match="snapshot changed"):
+        server.artifact_download_chunk(download["transfer_id"], 0)
 
 
 def test_generic_artifact_transfer_binds_distinct_source_until_commit(
@@ -285,6 +312,38 @@ def test_artifact_upload_reserves_data_quota_before_accepting_session(
         server.artifact_upload_begin(
             "result.pdf", len(payload), sha256_bytes(payload)
         )
+
+
+def test_artifact_upload_reserves_payload_once_and_chunks_without_quota_rescan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, _root = load_server(tmp_path, monkeypatch)
+    payload = b"x" * 8192
+    upload = server.artifact_upload_begin("result.pdf", len(payload), sha256_bytes(payload))
+    transfer_root = server.runtime.settings.data_dir / "binary-transfers" / upload["transfer_id"]
+    assert (transfer_root / "payload.bin").stat().st_size == len(payload)
+
+    monkeypatch.setattr(
+        server,
+        "enforce_data_quota",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("upload chunk rescanned data_dir quota")
+        ),
+    )
+    server.artifact_upload_chunk(
+        upload["transfer_id"], 0, base64.b64encode(payload[:4096]).decode("ascii")
+    )
+    server.artifact_upload_chunk(
+        upload["transfer_id"], 4096, base64.b64encode(payload[4096:]).decode("ascii")
+    )
+    audit = server.runtime.audit.get_operation(upload["operation_id"])
+    assert sum(
+        event["event_type"] == "artifact_upload_chunk" for event in audit["events"]
+    ) == 2
+    assert not any(
+        operation["tool_name"] == "artifact_upload_chunk"
+        for operation in server.runtime.audit.list_operations(limit=100)
+    )
 
 
 def test_csv_preserves_bom_delimiter_quotes_crlf_and_final_newline_identity(

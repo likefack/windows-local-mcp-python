@@ -19,6 +19,19 @@ def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def sha256_file(path: Path, *, max_bytes: int | None = None) -> tuple[str, int]:
+    """Hash a regular file with bounded memory and an optional byte limit."""
+    digest = hashlib.sha256()
+    total = 0
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            total += len(chunk)
+            if max_bytes is not None and total > max_bytes:
+                raise ValueError(f"file exceeds byte limit: {total} > {max_bytes}")
+            digest.update(chunk)
+    return digest.hexdigest(), total
+
+
 def sha256_text(text: str) -> str:
     return sha256_bytes(text.encode("utf-8"))
 
