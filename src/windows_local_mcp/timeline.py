@@ -3,11 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from .audit import AuditStore, TERMINAL_STATUSES
+from .audit import TERMINAL_STATUSES, AuditStore
 from .config import Settings
 from .util import read_text_limited
-from .workspace_history import describe_workspace_restore, verify_checkpoint_integrity
-
+from .workspace_history import (
+    describe_current_workspace_restore,
+    verify_checkpoint_integrity,
+)
 
 _TRANSFER_CHUNK_EVENTS = {
     "artifact_download_begin": "artifact_download_chunk",
@@ -155,16 +157,18 @@ def timeline_entry(settings: Settings, audit: AuditStore, operation_id: str) -> 
         "result": result,
     }
     if post_available:
-        latest = audit.latest_workspace_checkpoint()
-        if latest and latest.get("post_workspace_path"):
+        try:
             entry["point_in_time_rollback_preview"] = {
                 "target_operation_id": operation_id,
-                "current_checkpoint_operation_id": latest["id"],
-                **describe_workspace_restore(
-                    settings,
-                    str(latest["post_workspace_path"]),
-                    str(operation["post_workspace_path"]),
+                **describe_current_workspace_restore(
+                    settings, str(operation["post_workspace_path"])
                 ),
+            }
+        except Exception:  # noqa: BLE001 - Timeline detail must survive preview-only failures
+            entry["point_in_time_rollback_preview"] = {
+                "target_operation_id": operation_id,
+                "available": False,
+                "reason": "current_scope_preview_unavailable",
             }
     return entry
 

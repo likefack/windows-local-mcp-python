@@ -124,6 +124,38 @@ def test_denied_command_is_audited(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     )
 
 
+def test_git_info_failure_terminalizes_its_operation_without_duplicate_rejection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, _ = load_server(tmp_path, monkeypatch)
+    server.runtime.settings.git_enabled = True
+    monkeypatch.setattr(
+        server,
+        "capture_git_snapshot",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("snapshot failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="snapshot failed"):
+        server.git_info()
+
+    records = [
+        record
+        for record in server.runtime.audit.list_operations(limit=20)
+        if record["tool_name"] == "git_info"
+    ]
+    assert len(records) == 1
+    assert records[0]["status"] == "failed"
+    assert records[0]["id"] not in {
+        operation["id"] for operation in server.runtime.audit.list_active_operations()
+    }
+    timeline_record = next(
+        item
+        for item in server.activity_timeline()
+        if item["operation_id"] == records[0]["id"]
+    )
+    assert timeline_record["status"] == "failed"
+
+
 def test_approved_sandbox_and_host_are_distinct_requests(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -665,6 +665,34 @@ def describe_workspace_restore(
     return result
 
 
+def describe_current_workspace_restore(
+    settings: Settings, target_path: str
+) -> dict[str, Any]:
+    """Describe a restore against the live workspace within the target checkpoint scope."""
+    target = _load_manifest(settings, target_path)
+    scope = _manifest_scope(target)
+    current_hashes = _scan_current_hashes(settings, _scope_paths(scope))
+    current = {
+        "scope": scope,
+        "files": [
+            {"path": relative, "sha256": digest}
+            for relative, digest in sorted(current_hashes.items())
+        ],
+    }
+    result = _restore_summary(current, target)
+    result.update(
+        {
+            "available": True,
+            "conflict_check": "current workspace must match the approval preview",
+            "automatic_merge": False,
+            "conflicts": [],
+            "fully_reversible": True,
+            "undo_can_be_undone": True,
+        }
+    )
+    return result
+
+
 @_cas_serialized
 def build_workspace_target_from_bytes(
     settings: Settings,

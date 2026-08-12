@@ -2070,6 +2070,7 @@ def adb_read(
 def git_info() -> dict[str, Any]:
     """Return a bounded Git branch/HEAD/status/diff/staged/log/changed-files snapshot."""
     request: dict[str, Any] = {}
+    operation_id: str | None = None
     try:
         if not runtime.settings.git_enabled:
             raise PermissionError("git capability is disabled")
@@ -2097,7 +2098,18 @@ def git_info() -> dict[str, Any]:
         runtime.audit.add_event(operation_id, "git_snapshot_read", {})
         return result
     except Exception as error:
-        _audit_rejection("git_info", request, error)
+        if operation_id is None:
+            _audit_rejection("git_info", request, error)
+        else:
+            message = f"{type(error).__name__}: {error}"
+            if runtime.audit.transition_operation(
+                operation_id,
+                from_statuses={"running"},
+                status="failed",
+                finished_at=utc_now_iso(),
+                error=message,
+            ):
+                runtime.audit.add_event(operation_id, "failed", {"error": message[:1000]})
         raise
 
 

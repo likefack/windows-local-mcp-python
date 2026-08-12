@@ -148,6 +148,61 @@ def test_timeline_exposes_diff_result_and_network_policy(tmp_path: Path) -> None
     assert "changed_files" not in summary
 
 
+def test_timeline_rollback_preview_uses_live_state_in_target_scope(tmp_path: Path) -> None:
+    settings = settings_for(tmp_path)
+    audit = AuditStore(settings)
+    target = settings.workspace_root / "target.txt"
+    unrelated = settings.workspace_root / "unrelated.txt"
+    target.write_text("target checkpoint", encoding="utf-8")
+    unrelated.write_text("unrelated checkpoint", encoding="utf-8")
+
+    target_operation = audit.create_operation(
+        tool_name="write_file",
+        tier="broker",
+        status="running",
+        cwd=str(settings.workspace_root),
+        request={"path": "target.txt"},
+    )
+    target_state = capture_workspace_state(
+        settings, target_operation, "after", paths={"target.txt"}
+    )
+    audit.update_operation(
+        target_operation,
+        status="succeeded",
+        finished_at=utc_now_iso(),
+        post_workspace_path=target_state.manifest_path,
+    )
+
+    unrelated_operation = audit.create_operation(
+        tool_name="write_file",
+        tier="broker",
+        status="running",
+        cwd=str(settings.workspace_root),
+        request={"path": "unrelated.txt"},
+    )
+    unrelated_state = capture_workspace_state(
+        settings, unrelated_operation, "after", paths={"unrelated.txt"}
+    )
+    audit.update_operation(
+        unrelated_operation,
+        status="succeeded",
+        finished_at=utc_now_iso(),
+        post_workspace_path=unrelated_state.manifest_path,
+    )
+    target.write_text("live state", encoding="utf-8")
+
+    entry = timeline_entry(settings, audit, target_operation)
+
+    assert entry["point_in_time_rollback_preview"]["available"] is True
+    assert entry["point_in_time_rollback_preview"]["files_that_would_change"] == [
+        "target.txt"
+    ]
+    assert entry["point_in_time_rollback_preview"]["rollback_scope"] == {
+        "kind": "paths",
+        "paths": ["target.txt"],
+    }
+
+
 def test_state_comparison_records_multifile_diff(tmp_path: Path) -> None:
     settings = settings_for(tmp_path)
     (settings.workspace_root / "a.txt").write_text("old\n", encoding="utf-8")
