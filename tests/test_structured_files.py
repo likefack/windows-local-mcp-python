@@ -65,6 +65,26 @@ def xlsx_bytes() -> bytes:
     return output.getvalue()
 
 
+def add_package_part(data: bytes, name: str, payload: bytes) -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(data)) as source, zipfile.ZipFile(output, "w") as target:
+        target.comment = source.comment
+        for info in source.infolist():
+            target.writestr(info, source.read(info))
+        target.writestr(name, payload)
+    return output.getvalue()
+
+
+def replace_package_part(data: bytes, name: str, update) -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(data)) as source, zipfile.ZipFile(output, "w") as target:
+        target.comment = source.comment
+        for info in source.infolist():
+            payload = source.read(info)
+            target.writestr(info, update(payload) if info.filename == name else payload)
+    return output.getvalue()
+
+
 def add_hyperlink(paragraph, text: str, url: str) -> None:
     relationship = paragraph.part.relate_to(
         url, RELATIONSHIP_TYPE.HYPERLINK, is_external=True
@@ -585,6 +605,136 @@ def test_xlsx_copy_fill_and_common_features_preserve_untouched_sheet_state(
     assert len(sheet.data_validations.dataValidation) == 1
     assert len(sheet._charts) == 1
     assert sheet.page_setup.orientation == "landscape"
+    updated.close()
+
+
+def test_docx_package_patch_edits_text_without_dropping_unsupported_parts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, root = load_server(tmp_path, monkeypatch)
+    document = Document()
+    paragraph = document.add_paragraph()
+    paragraph.add_run("hello ").bold = True
+    paragraph.add_run("world").italic = True
+    output = io.BytesIO()
+    document.save(output)
+    unsupported_part = b"bounded-placeholder"
+    original = add_package_part(
+        output.getvalue(), "word/vbaProject.bin", unsupported_part
+    )
+    path = root / "macro-carrier.docx"
+    path.write_bytes(original)
+
+    inspected = server.structured_file_inspect("macro-carrier.docx")
+    assert inspected["write_rejected_features"] == ["VBA/macros"]
+    assert inspected["package_patch_supported_operations"] == [
+        "replace_text",
+        "metadata_set",
+    ]
+    result = server.structured_file_apply(
+        "macro-carrier.docx",
+        [{"op": "replace_text", "search": "hello world", "replace": "updated"}],
+        expected_sha256=sha256_bytes(original),
+    )
+
+    assert result["preservation_mode"] == "package_patch"
+    assert Document(path).paragraphs[0].text == "updated"
+    with zipfile.ZipFile(path) as package:
+        assert package.read("word/vbaProject.bin") == unsupported_part
+
+
+def test_xlsx_package_patch_updates_values_without_dropping_unsupported_parts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, root = load_server(tmp_path, monkeypatch)
+    marker = b'<ext uri="urn:wlmcp-test"><feature xmlns="urn:wlmcp-test"/></ext>'
+    original = replace_package_part(
+        xlsx_bytes(),
+        "xl/worksheets/sheet1.xml",
+        lambda payload: payload.replace(
+            b"</worksheet>", b"<extLst>" + marker + b"</extLst></worksheet>"
+        ),
+    )
+    path = root / "pivot-carrier.xlsx"
+    path.write_bytes(original)
+
+    inspected = server.structured_file_inspect("pivot-carrier.xlsx")
+    assert "unsupported extension lists" in inspected["write_rejected_features"]
+    assert inspected["package_patch_supported_operations"] == [
+        "cell_set",
+        "range_set",
+        "range_clear",
+    ]
+    result = server.structured_file_apply(
+        "pivot-carrier.xlsx",
+        [
+            {"op": "cell_set", "sheet": "Data", "cell": "B2", "value": 7},
+            {
+                "op": "range_set",
+                "sheet": "Data",
+                "range": "C1:C2",
+                "values": [["Double"], ["=B2*2"]],
+            },
+        ],
+        expected_sha256=sha256_bytes(original),
+    )
+
+    assert result["preservation_mode"] == "package_patch"
+    with pytest.warns(UserWarning, match="Unknown extension is not supported"):
+        book = load_workbook(path, data_only=False)
+    assert book["Data"]["B2"].value == 7
+    assert book["Data"]["C1"].value == "Double"
+    assert book["Data"]["C2"].value == "=B2*2"
+    book.close()
+    with zipfile.ZipFile(path) as package:
+        assert b"urn:wlmcp-test" in package.read("xl/worksheets/sheet1.xml")
+
+    signed = add_package_part(
+        xlsx_bytes(), "_xmlsignatures/sig1.xml", b"<Signature/>"
+    )
+    signed_path = root / "signed.xlsx"
+    signed_path.write_bytes(signed)
+    with pytest.raises(ValueError, match="invalidate digital signatures"):
+        server.structured_file_apply(
+            "signed.xlsx",
+            [{"op": "cell_set", "sheet": "Data", "cell": "B2", "value": 9}],
+            expected_sha256=sha256_bytes(signed),
+        )
+
+
+def test_xlsx_single_cell_ranges_and_overlapping_copy_are_practical(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, root = load_server(tmp_path, monkeypatch)
+    book = Workbook()
+    sheet = book.active
+    sheet.title = "Data"
+    for row, value in enumerate((1, 2, 3), start=1):
+        sheet.cell(row, 1).value = value
+    output = io.BytesIO()
+    book.save(output)
+    path = root / "ranges.xlsx"
+    path.write_bytes(output.getvalue())
+
+    server.structured_file_apply(
+        "ranges.xlsx",
+        [
+            {"op": "range_copy", "sheet": "Data", "source": "A1:A2", "target": "A2:A3"},
+            {"op": "range_clear", "sheet": "Data", "range": "A1"},
+            {
+                "op": "format_range",
+                "sheet": "Data",
+                "range": "A2",
+                "format": {"font": {"bold": True}},
+            },
+        ],
+        expected_sha256=sha256_bytes(path.read_bytes()),
+    )
+
+    updated = load_workbook(path)
+    sheet = updated["Data"]
+    assert [sheet[f"A{row}"].value for row in range(1, 4)] == [None, 1, 2]
+    assert sheet["A2"].font.bold is True
     updated.close()
 
 

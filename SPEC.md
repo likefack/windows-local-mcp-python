@@ -51,14 +51,22 @@ Target slots are selected from the canonical target path. Different slots can pr
 
 Ordinary file reads do not take a mutation lock.
 
-## 4. Automatic command tier
+### Structured file processing
 
-Automatic execution uses complete subcommand grammars, not a first-token allowlist. Unknown flags, positional forms, config/output paths, or unsafe ambiguity are rejected and can be resubmitted through approval.
+`structured_file_inspect` and `structured_file_apply` accept only bounded declarative operations. Parsing and transformation happen outside the workspace-wide mutation lock; commit rechecks the raw source hash and applies the artifact through the normal checkpoint, journal, atomic replacement, audit, and recovery path.
+
+DOCX and XLSX use two preservation modes. Documents without detected unsupported package features use the normal document library path. When unsupported package features are present, a narrow package-patch path permits only operations whose effects are confined to known XML parts: DOCX `replace_text` and `metadata_set`; XLSX `cell_set`, `range_set`, and `range_clear`. Every unmodified ZIP member payload and metadata is carried into the output. Digitally signed packages and any operation outside the narrow set fail closed instead of silently discarding features.
+
+CSV/TSV dialect and byte-identity properties are preserved where determinable. ZIP paths, collisions, entry count, and expanded size are bounded. Image decoded pixels/memory are bounded, metadata is preserved unless explicitly removed, and unsupported multi-frame transformations fail closed. Generic artifact transfer is byte-exact, chunked, hash-bound, and committed through the same broker mutation path; transfer does not authorize execution.
+
+## 4. Broker-fixed command operations
+
+Automatic broker execution uses complete subcommand grammars, not a first-token allowlist. Unknown flags, positional forms, config/output paths, or unsafe ambiguity are rejected. Open-ended execution and project-controlled code are routed to Codex Sandbox; they are not expanded into another broker policy tier.
 
 The MCP surface is split after the deny-by-default grammar succeeds:
 
-- `execute_readonly`: safe Git reads, `flutter analyze`, `dart analyze`, and non-writing `dart format`.
-- `execute_workspace_write`: automatic commands intentionally modifying workspace source; currently writing `dart format`.
+- `execute_readonly`: fixed Git reads only.
+- `execute_workspace_write`: retained as a compatibility tool surface, but project-controlled formatting is rejected and directed to Codex Sandbox.
 - `adb_read`: only the fixed read-only ADB grammar.
 
 The split is presentation and host-policy metadata, not a second authorization system. All three call the same `CommandPolicy.normalize_safe()` and the same queue/executor path. A command routed to the wrong surface is rejected and directed to the matching tool.
@@ -73,12 +81,11 @@ Automatic subcommands: `status`, `diff`, `log`, `show`, restricted `rev-parse`, 
 - Git repository/config override environment variables are removed before Git subprocesses run.
 - `git_info` returns branch, HEAD, status, working diff, staged diff, recent log, and changed files through bounded subprocess capture.
 
-### Flutter and Dart
+### Project-controlled tools
 
-- `flutter analyze` only; force `--no-pub` and validate every explicit path.
-- `dart analyze` and constrained `dart format` only.
-- `flutter test/build/run` and `dart test/run/compile` are never automatic.
-- analyze is executed from a fixed snapshot; format that writes uses full source manifest plus the execution lock.
+- Python, Node, PowerShell, Dart, Flutter, project scripts, plugins, tests, builds, and formatting can load project-controlled code or configuration.
+- These operations are never broker commands. They require a separately approved Codex Sandbox request.
+- An operation that needs real Windows user authority beyond Codex Sandbox requires a new, separately approved Host request; Sandbox failure does not create or approve it.
 
 ### ADB
 
@@ -95,9 +102,9 @@ Targeted calls require serial validation. `adb_emulator_only=true` requires an `
 
 The workspace-wide mutation lock is no longer held for every command for the full child-process lifetime.
 
-- Safe Git reads, safe ADB reads, `flutter analyze`, `dart analyze`, and non-writing `dart format` execute without the workspace-wide mutation lock.
+- Fixed Git and ADB reads execute without the workspace-wide mutation lock.
 - Approved code-loading commands in immutable `staged-cwd` snapshot mode, including test/build-style execution, run without the workspace-wide mutation lock because they execute from `data_dir`, not the original workspace.
-- A writing `dart format`, an approved command marked `workspace_write=true`, and approved commands that still execute against the original workspace keep the exclusive workspace-wide mutation lock through verification and child execution.
+- A Codex Sandbox or Approved Host command marked `workspace_write=true`, and approved commands that still execute against the original workspace, keep the exclusive workspace-wide mutation lock through verification and child execution.
 - Snapshot/manifest creation may still take the workspace-wide lock briefly so the captured input set is coherent.
 - `write_file` uses one target slot rather than all slots, so unrelated file writes can proceed concurrently while still conflicting with workspace-wide writers.
 - Old approval rows that do not contain explicit snapshot metadata fail conservatively and keep the workspace-wide lock.
@@ -116,9 +123,9 @@ request_sandbox_command | request_host_command
   -> ChatGPT poll_approval / poll_job
 ```
 
-`request_sandbox_command` selects Approved Sandbox; `request_host_command` selects Approved Host. Both only stage local approval state and immutable inputs. There is no implicit Approved Sandbox to Approved Host fallback and no model-facing `execute_approved` tool.
+`request_sandbox_command` selects Codex Sandbox; `request_host_command` selects Approved Host. Both only stage local approval state and immutable inputs. There is no implicit Codex Sandbox to Approved Host fallback and no model-facing `execute_approved` tool.
 
-Approval binding version 2 hashes the complete canonical security-sensitive request, including execution tier, normalized command/cwd, workspace-write and runtime limits, escalation facts, risk, immutable manifest fields, effective policy, and Approved Sandbox backend identity. The manifest covers:
+Approval binding version 2 hashes the complete canonical security-sensitive request, including execution boundary, normalized command/cwd, workspace-write and runtime limits, escalation facts, risk, immutable manifest fields, effective policy, and Codex Sandbox backend identity. The manifest covers:
 
 - main executable bytes and filesystem identity;
 - complete argv;
@@ -149,12 +156,12 @@ Installed OS/toolchains are the trusted computing base. Their primary executable
 
 Commands intended to mutate the original workspace require `workspace_write=true`. The complete workspace (excluding direct `.git` bytes) is manifested, all source files are revalidated, and execution occurs while holding the workspace-wide form of the same mutation-lock family used by target writes. Any workspace addition, deletion, or content change after request invalidates approval.
 
-Git approved operations additionally bind Git state obtained through the Safe Sandbox Git broker. Direct `.git` MCP access remains prohibited.
+Git Host operations additionally bind Git state obtained through the fixed broker Git reader. Direct `.git` MCP access remains prohibited.
 
 ### Expiry and one-shot semantics
 
 - Pending request expiry is stored in `request_expires_at` and enforced by SQL predicates.
-- Separately approved compatibility grants have `approval_expires_at`.
+- Claimed one-shot execution grants have `approval_expires_at`.
 - Local approve-and-run performs approval and `claimed_at` assignment in one transaction.
 - Claim predicates require the correct status, future expiry, and `claimed_at IS NULL`.
 - The worker rechecks `approval_expires_at` immediately before `subprocess.Popen()`; an expired grant never starts the child process.
@@ -174,7 +181,7 @@ On Windows, processes use a new process group and no window. On other platforms 
 - stdout/stderr pipes drained by bounded head/tail collectors;
 - bounded Git snapshots;
 - total `data_dir` quota;
-- Safe Tier runtime byte and filesystem-entry quotas, with reparse points, non-regular entries, and NTFS alternate data streams rejected;
+- Codex Sandbox staging/runtime byte and filesystem-entry quotas, with reparse points, non-regular entries, and NTFS alternate data streams rejected;
 - age and terminal-operation-count retention.
 
 Retention deletes only known artifact roots and skips artifacts whose operation is nonterminal.
@@ -197,33 +204,26 @@ Before either mutation writes the workspace, every referenced blob is re-hashed,
 
 Selective Undo compares operation-before, operation-after, and current content. Exact unchanged results are reverted directly. UTF-8 text uses bounded-context reverse hunks so independent later edits can remain. Ambiguous/overlapping text, changed binary content, and ambiguous file-lifecycle changes stop as conflicts before approval; no guessed overwrite is performed.
 
-### Safe-tier network policy
+### Broker helper network policy
 
-Every safe command receives an explicit per-command network policy in audit and Timeline. Git/Dart/Flutter safe grammars receive an offline policy; ADB receives a separate loopback-only profile and a fixed loopback server socket. Proxy, package-host, and Git transport environment values remain defense in depth.
+Every fixed broker helper receives an explicit per-command network policy in audit and Timeline. Git receives an offline policy. ADB receives a loopback-only requested profile and the fixed `ADB_SERVER_SOCKET=tcp:127.0.0.1:5037` environment. These broker restrictions and sanitized environment are not represented as a fifth OS sandbox or policy tier.
 
-The default `appcontainer` mode launches the Safe Tier root with the stable AppContainer `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` mechanism and no Internet/LAN capability SIDs. Descendants inherit the AppContainer token and are placed in a per-operation Job Object with kill-on-close. `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` restricts inherited handles to NUL stdin and the two output pipes. Offline and ADB-loopback profiles are separate. One-time local setup creates the profiles and reconciles an ACL grant ledger for the workspace and explicitly configured toolchain paths; removed paths lose stale profile ACEs. Each disposable runtime tree receives its ACL only when launched. Dart workspace formatting runs in that disposable tree and only broker-validated target changes are applied to the real workspace. If profile creation, ACL setup, loopback exemption, Job assignment, or AppContainer process creation fails, Safe Tier fails closed and is not relaunched as a normal user process.
+### Execution boundary policy
 
-The implementation deliberately retains AppContainer for narrowly-grammatical automatic commands. Git receives OS read access to its `.git` metadata, while model-visible output remains constrained by Git grammar/pathspec/no-textconv/no-external-diff/output policy. All automatic executable probes around a Safe operation, including Git snapshot/state and ADB emulator identity checks, use the same Safe broker.
+1. `broker`: closed-world file, fixed Git-read, fixed ADB-read, checkpoint, transaction, rollback, and audit operations.
+2. `structured_processing`: declarative DOCX/XLSX/CSV/TSV/ZIP/image processing and hash-bound artifact commit.
+3. `codex_sandbox`: open-ended or project-controlled execution after one-shot local approval.
+4. `approved_host`: real Windows user authority after a separate one-shot local approval.
 
-The ADB profile has an AppContainer loopback exemption. `ADB_SERVER_SOCKET=tcp:127.0.0.1:5037` constrains normal tool configuration, but the effective OS capability is general loopback access, not a per-port 5037 firewall rule. Internet/LAN capability SIDs remain absent. Audit must report both requested endpoint and effective capability.
+Legacy Safe Tier, AppContainer, and compatibility-mode configuration is obsolete and fails startup. Codex Sandbox failure never falls back to Approved Host. Ordinary non-zero exit, test failure, compile/lint failure, and application error remain failures in the selected boundary.
 
-### Execution tier policy
-
-1. `safe_sandbox`: strict Git/Dart/Flutter/ADB grammar, automatic, normally AppContainer.
-2. `approved_sandbox`: broad developer command, one-shot human approval, installed Codex Windows sandbox.
-3. `approved_host`: real Windows user token, separate one-shot human approval, explicit last resort.
-
-Safe compatibility failures are restricted to setup, ACL/access incompatibility, unsupported OS mechanism, known sandbox compatibility diagnostics, or process startup failure. Ordinary non-zero exit, test failure, compile/lint failure, and application error remain command failures. The system may offer an Approved Sandbox retry, but it neither creates nor approves that request automatically. Unknown failures do not change tiers.
-
-Approved Sandbox uses the installed Codex CLI sandbox-only entrypoint with `windows.sandbox="elevated"` and the `:workspace` permission profile. The launcher plus adjacent command-runner and sandbox-setup helper form the minimum executable dependency closure: each must be validly Authenticode-signed by OpenAI, is path/hash/stat/signer-bound, revalidated after approval, and held against replacement through the child lifetime. The bound helper directory is first in the launcher PATH. Then `codex --version` is recorded and the fixed command is launched through `codex sandbox`. This does not start a Codex agent, send a prompt, authenticate with OpenAI, or perform model/API inference. The MCP's cwd/path/protected-file/environment/executable/approval/checkpoint/audit policies remain in force. Read-only code-loading commands operate on an immutable staged copy; source-write commands require `workspace_write=true`, a full manifest, and the workspace mutation lock.
+Codex Sandbox uses the installed Codex CLI sandbox-only entrypoint with `windows.sandbox="elevated"` and the `:workspace` permission profile. The launcher plus adjacent command-runner and sandbox-setup helper form the minimum executable dependency closure: each must be validly Authenticode-signed by OpenAI, is path/hash/stat/signer-bound, revalidated after approval, and held against replacement through the child lifetime. The bound helper directory is first in the launcher PATH. Then `codex --version` is recorded and the fixed command is launched through `codex sandbox`. This does not start a Codex agent, send a prompt, authenticate with OpenAI, or perform model/API inference. The MCP's cwd/path/protected-file/environment/executable/approval/checkpoint/audit policies remain in force. Read-only code-loading commands operate on an immutable staged copy; source-write commands require `workspace_write=true`, a full manifest, and the workspace mutation lock.
 
 The selected distribution mode is installed-Codex dependency. It reuses upstream's CLI/setup helper/command runner/security update chain without copying Windows sandbox internals into this repository. Apache-2.0 permits a future standalone distribution, but safely redistributing the coordinated binaries, versioned policy/protocol, setup behavior, signing, notices, and update channel is deferred. Missing CLI, incomplete UAC setup, incompatible backend, initialization/policy/launch failure, or timeout fails closed. Host execution requires a new `approved_host` request.
 
-`compatibility` is an explicit legacy Safe mode. It retains grammar/environment controls but is labelled `compatibility-command-and-environment-only`; it is never reported as OS isolation and is not an implicit fallback.
-
 ### Configuration selection and local profiles
 
-An explicit `LOCAL_MCP_CONFIG` must contain `workspace_root` and the selected config file itself must be outside that workspace, so MCP writes cannot downgrade a later worker's security settings. Every queued Safe Tier request also binds the canonical effective-settings digest and the worker rechecks it before launch. A simultaneous `LOCAL_MCP_ROOT` is accepted only when it resolves to the same path; a mismatch fails startup instead of overriding the chosen config. Missing config/workspace paths never fall back. `session_info` reports the effective workspace, capabilities, config selection source, workspace source, and whether an ambient root was present without dumping secret values.
+An explicit `LOCAL_MCP_CONFIG` must contain `workspace_root` and the selected config file itself must be outside that workspace, so MCP writes cannot downgrade a later worker's security settings. Every queued command request binds the canonical effective-settings digest and the worker rechecks it before launch. A simultaneous `LOCAL_MCP_ROOT` is accepted only when it resolves to the same path; a mismatch fails startup instead of overriding the chosen config. Missing config/workspace paths never fall back. `session_info` reports the effective workspace, capabilities, config selection source, workspace source, and whether an ambient root was present without dumping secret values.
 
 Public code and `config.example.toml` remain generic. Machine/private values belong in ignored `config.toml`, `config.local.toml`, `config.*.local.toml`, or `.local-mcp/`. Launchers keep explicit `-Config` selection; there is no private-project schema switch or private branch requirement.
 

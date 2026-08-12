@@ -73,8 +73,8 @@ powershell.exe -NoProfile -File C:\dev\windows-local-mcp-python\run-server.ps1 -
 
 ## 構造化ファイル
 
-- **DOCX**: paragraph／run、検索置換、表、header/footer、style、section、page 設定、metadata。未変更の関係、画像、hyperlink 等を保持し、追跡変更、macro、埋め込み object、データ連動 Custom XML など保持を保証できない機能は書き込みを拒否します。
-- **XLSX**: 値／数式、範囲、行列、sheet、copy/fill、書式、merge、freeze pane、filter、Table、入力規則、条件付き書式、基本 chart／page setup。macro、pivot、外部接続、未対応拡張等は書き込みを拒否します。
+- **DOCX**: paragraph／run、検索置換、表、header/footer、style、section、page 設定、metadata。通常文書は文書ライブラリで処理します。追跡変更、コメント、macro、埋め込み object、データ連動 Custom XML などがある文書でも、電子署名がなく、操作が `replace_text` または `metadata_set` に限定される場合は、対象 XML 部分だけを書き換えて未対応部分を保持します。それ以外の操作は拒否します。
+- **XLSX**: 値／数式、範囲、行列、sheet、copy/fill、書式、merge、freeze pane、filter、Table、入力規則、条件付き書式、基本 chart／page setup。macro、pivot、外部接続、未対応拡張等がある workbook でも、電子署名がなく、操作が `cell_set`、`range_set`、`range_clear` に限定される場合は、対象 worksheet XML だけを書き換えて未対応部分を保持します。それ以外の操作は拒否します。
 - **CSV／TSV**: 範囲、cell／row／column、append／insert／delete。encoding、delimiter、quote、newline を識別して保持し、判定が曖昧なら拒否します。
 - **ZIP**: listing、read、create/update、複数展開。traversal、絶対 path、ADS、予約名、大小文字衝突、件数、展開後容量を検査し、複数 file は transaction で一括反映します。
 - **画像**: inspect、resize、thumbnail、crop、rotate、flip、変換、quality、metadata 除去。pixel／decoded memory を制限し、未対応の multi-frame は破壊的変換せず拒否します。

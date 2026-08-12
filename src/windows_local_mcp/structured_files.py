@@ -12,12 +12,16 @@ from __future__ import annotations
 import base64
 import csv
 import io
+import math
+import posixpath
 import re
+import warnings
 import zipfile
 from copy import copy
 from dataclasses import dataclass
-from pathlib import PureWindowsPath
+from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any
+from xml.etree import ElementTree
 
 from .config import Settings
 from .util import sha256_bytes
@@ -32,6 +36,12 @@ _EXTENSIONS = {
     "image": {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"},
 }
 _ZIP_RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f"LPT{i}" for i in range(1, 10))}
+
+_WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_XML_NS = "http://www.w3.org/XML/1998/namespace"
+_SHEET_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+_OFFICE_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 
 
 class StructuredFileError(ValueError):
@@ -126,6 +136,182 @@ def _index(value: Any, name: str, *, minimum: int = 0) -> int:
 def _bounded(items: list[Any], settings: Settings, label: str) -> None:
     if len(items) > settings.max_structured_elements:
         raise StructuredFileError(f"{label} exceeds max_structured_elements")
+
+
+def _parse_package_xml(data: bytes, label: str) -> ElementTree.Element:
+    try:
+        return ElementTree.fromstring(data)
+    except ElementTree.ParseError as error:
+        raise StructuredFileError(f"invalid {label} XML") from error
+
+
+def _serialize_package_xml(root: ElementTree.Element) -> bytes:
+    return ElementTree.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def _rewrite_package(data: bytes, replacements: dict[str, bytes]) -> bytes:
+    """Rewrite selected OPC parts while preserving every other ZIP member payload and metadata."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as source:
+            infos = source.infolist()
+            names = [info.filename for info in infos]
+            for name in replacements:
+                if names.count(name) != 1:
+                    raise StructuredFileError(f"structured package part is missing or duplicated: {name}")
+            output = io.BytesIO()
+            with zipfile.ZipFile(output, "w") as destination:
+                destination.comment = source.comment
+                for info in infos:
+                    destination.writestr(info, replacements.get(info.filename, source.read(info)))
+            return output.getvalue()
+    except zipfile.BadZipFile as error:
+        raise StructuredFileError("invalid structured ZIP package") from error
+
+
+def _replace_xml_text_nodes(
+    paragraph: ElementTree.Element, search: str, replacement: str
+) -> int:
+    blocked = {"ins", "del", "moveFrom", "moveTo", "fldSimple", "sdt"}
+    nodes: list[ElementTree.Element] = []
+
+    def collect(element: ElementTree.Element, blocked_ancestor: bool = False) -> None:
+        local_name = element.tag.rsplit("}", 1)[-1]
+        blocked_here = blocked_ancestor or local_name in blocked
+        if element.tag == f"{{{_WORD_NS}}}t" and not blocked_here:
+            nodes.append(element)
+            return
+        for child in element:
+            collect(child, blocked_here)
+
+    collect(paragraph)
+    joined = "".join(node.text or "" for node in nodes)
+    positions: list[int] = []
+    start = 0
+    while True:
+        found = joined.find(search, start)
+        if found < 0:
+            break
+        positions.append(found)
+        start = found + len(search)
+    for found in reversed(positions):
+        end = found + len(search)
+        cursor = 0
+        first_index = last_index = -1
+        first_offset = last_offset = 0
+        for index, node in enumerate(nodes):
+            text = node.text or ""
+            next_cursor = cursor + len(text)
+            if first_index < 0 and found < next_cursor:
+                first_index, first_offset = index, found - cursor
+            if end <= next_cursor:
+                last_index, last_offset = index, end - cursor
+                break
+            cursor = next_cursor
+        if first_index < 0 or last_index < 0:
+            continue
+        if first_index == last_index:
+            text = nodes[first_index].text or ""
+            nodes[first_index].text = text[:first_offset] + replacement + text[last_offset:]
+        else:
+            first_text = nodes[first_index].text or ""
+            last_text = nodes[last_index].text or ""
+            nodes[first_index].text = first_text[:first_offset] + replacement
+            for node in nodes[first_index + 1 : last_index]:
+                node.text = ""
+            nodes[last_index].text = last_text[last_offset:]
+        for node in nodes[first_index : last_index + 1]:
+            if (node.text or "").startswith(" ") or (node.text or "").endswith(" "):
+                node.set(f"{{{_XML_NS}}}space", "preserve")
+    return len(positions)
+
+
+def _transform_docx_package_preserving(
+    data: bytes, operations: list[Any], unsupported: list[str]
+) -> tuple[bytes, dict[str, Any]]:
+    if "digital signatures" in unsupported:
+        raise StructuredFileError("DOCX write would invalidate digital signatures")
+    parsed_operations = [_operation(raw) for raw in operations]
+    allowed = {"replace_text", "metadata_set"}
+    rejected = sorted({op["op"] for op in parsed_operations} - allowed)
+    if rejected:
+        raise StructuredFileError(
+            "DOCX contains features that require package-preserving edits; supported operations are "
+            "replace_text and metadata_set (rejected: " + ", ".join(rejected) + ")"
+        )
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            names = archive.namelist()
+            text_parts = [
+                name
+                for name in names
+                if name.casefold() == "word/document.xml"
+                or re.fullmatch(r"word/(?:header|footer)\d+\.xml", name, flags=re.IGNORECASE)
+            ]
+            replacements: dict[str, bytes] = {}
+            text_roots = {
+                name: _parse_package_xml(archive.read(name), f"DOCX part {name}")
+                for name in text_parts
+            }
+            core_name = next(
+                (name for name in names if name.casefold() == "docprops/core.xml"), None
+            )
+            core_root = (
+                _parse_package_xml(archive.read(core_name), "DOCX core properties")
+                if core_name is not None
+                else None
+            )
+    except zipfile.BadZipFile as error:
+        raise StructuredFileError("invalid DOCX package") from error
+
+    core_namespaces = {
+        "title": "{http://purl.org/dc/elements/1.1/}title",
+        "subject": "{http://purl.org/dc/elements/1.1/}subject",
+        "author": "{http://purl.org/dc/elements/1.1/}creator",
+        "keywords": "{http://schemas.openxmlformats.org/package/2006/metadata/core-properties}keywords",
+        "comments": "{http://purl.org/dc/elements/1.1/}description",
+        "category": "{http://schemas.openxmlformats.org/package/2006/metadata/core-properties}category",
+    }
+    text_changed = False
+    core_changed = False
+    for op in parsed_operations:
+        if op["op"] == "replace_text":
+            search = _text(op.get("search"), "search")
+            replacement = _text(op.get("replace"), "replace")
+            if not search:
+                raise StructuredFileError("search must not be empty")
+            count = 0
+            for root in text_roots.values():
+                for paragraph in root.iter(f"{{{_WORD_NS}}}p"):
+                    count += _replace_xml_text_nodes(paragraph, search, replacement)
+            text_changed = text_changed or count > 0
+            if op.get("require_match", False) and count == 0:
+                raise StructuredFileError("replace_text found no safe package-preserving match")
+        else:
+            if core_name is None or core_root is None:
+                raise StructuredFileError("DOCX core properties part is unavailable")
+            values = op.get("values")
+            if not isinstance(values, dict):
+                raise StructuredFileError("metadata values must be an object")
+            for key, value in values.items():
+                tag = core_namespaces.get(key)
+                if tag is None:
+                    raise StructuredFileError(f"unsupported metadata field: {key}")
+                element = core_root.find(tag)
+                if element is None:
+                    element = ElementTree.SubElement(core_root, tag)
+                element.text = _text(value, key)
+                core_changed = True
+    if text_changed:
+        replacements.update(
+            {name: _serialize_package_xml(root) for name, root in text_roots.items()}
+        )
+    if core_changed and core_name is not None and core_root is not None:
+        replacements[core_name] = _serialize_package_xml(core_root)
+    output = _rewrite_package(data, replacements) if replacements else data
+    return output, {
+        "preservation_mode": "package_patch",
+        "preserved_unsupported_features": unsupported,
+    }
 
 
 def _docx_has_unsupported_features(data: bytes) -> list[str]:
@@ -232,6 +418,9 @@ def _inspect_docx(data: bytes, settings: Settings) -> dict[str, Any]:
         "sections": sections,
         "metadata": {key: getattr(props, key) for key in ("title", "subject", "author", "keywords", "comments")},
         "write_rejected_features": unsupported,
+        "package_patch_supported_operations": (
+            [] if "digital signatures" in unsupported else ["replace_text", "metadata_set"]
+        ),
         "truncated": len(document.paragraphs) > 200 or len(document.tables) > 50,
     }
 
@@ -387,10 +576,12 @@ def _apply_docx_cell_format(cell: Any, spec: dict[str, Any]) -> None:
             _apply_docx_format(paragraph, paragraph_spec)
 
 
-def _transform_docx(data: bytes, operations: list[Any], settings: Settings) -> bytes:
+def _transform_docx(
+    data: bytes, operations: list[Any], settings: Settings
+) -> tuple[bytes, dict[str, Any]]:
     unsupported = _docx_has_unsupported_features(data)
     if unsupported:
-        raise StructuredFileError("DOCX write is unsupported with: " + ", ".join(unsupported))
+        return _transform_docx_package_preserving(data, operations, unsupported)
     Document, WD_ORIENT, _, units = _docx_modules()
     Inches, _, _ = units
     document = Document(io.BytesIO(data))
@@ -595,7 +786,7 @@ def _transform_docx(data: bytes, operations: list[Any], settings: Settings) -> b
         _require_docx_bounds(document, settings)
     output = io.BytesIO()
     document.save(output)
-    return output.getvalue()
+    return output.getvalue(), {"preservation_mode": "library_rewrite"}
 
 
 def _xlsx_unsupported(data: bytes) -> list[str]:
@@ -603,6 +794,11 @@ def _xlsx_unsupported(data: bytes) -> list[str]:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
             archive_names = archive.namelist()
             names = {name.casefold() for name in archive_names}
+            xml_parts = [
+                archive.read(name)
+                for name in archive_names
+                if name.casefold().endswith(".xml")
+            ]
     except zipfile.BadZipFile as error:
         raise StructuredFileError("invalid XLSX package") from error
     blocked = []
@@ -623,19 +819,318 @@ def _xlsx_unsupported(data: bytes) -> list[str]:
     ):
         if any(marker in name for name in names):
             blocked.append(label)
+    if any(re.search(rb"<(?:[A-Za-z0-9_]+:)?extLst\b", part) for part in xml_parts):
+        blocked.append("unsupported extension lists")
+    return blocked
+
+
+def _xlsx_sheet_part(
+    workbook: ElementTree.Element,
+    relationships: ElementTree.Element,
+    sheet_name: str,
+    package_names: dict[str, str],
+) -> str:
+    relation_id: str | None = None
+    for sheet in workbook.iter(f"{{{_SHEET_NS}}}sheet"):
+        if sheet.get("name") == sheet_name:
+            relation_id = sheet.get(f"{{{_OFFICE_REL_NS}}}id")
+            break
+    if relation_id is None:
+        raise StructuredFileError(f"XLSX worksheet does not exist: {sheet_name}")
+    target: str | None = None
+    for relation in relationships.iter(f"{{{_PACKAGE_REL_NS}}}Relationship"):
+        if relation.get("Id") == relation_id:
+            if str(relation.get("TargetMode", "")).casefold() == "external":
+                raise StructuredFileError("XLSX worksheet relationship is external")
+            target = relation.get("Target")
+            break
+    if not target:
+        raise StructuredFileError("XLSX worksheet relationship is missing")
+    normalized = (
+        posixpath.normpath(target.lstrip("/"))
+        if target.startswith("/")
+        else posixpath.normpath(posixpath.join("xl", target))
+    )
+    if PurePosixPath(normalized).is_absolute() or not normalized.casefold().startswith("xl/"):
+        raise StructuredFileError("XLSX worksheet relationship escapes the package")
+    actual = package_names.get(normalized.casefold())
+    if actual is None:
+        raise StructuredFileError("XLSX worksheet part is missing")
+    return actual
+
+
+def _xlsx_cell_payload(cell: ElementTree.Element, value: Any) -> None:
+    formula = cell.find(f"{{{_SHEET_NS}}}f")
+    if formula is not None and formula.get("t") in {"shared", "array", "dataTable"}:
+        raise StructuredFileError("cell belongs to a grouped formula and cannot be patched locally")
+    removable = {
+        f"{{{_SHEET_NS}}}f",
+        f"{{{_SHEET_NS}}}v",
+        f"{{{_SHEET_NS}}}is",
+    }
+    for child in list(cell):
+        if child.tag in removable:
+            cell.remove(child)
+
+    cell.attrib.pop("t", None)
+    payload: ElementTree.Element | None = None
+    if value is None:
+        return
+    if isinstance(value, bool):
+        cell.set("t", "b")
+        payload = ElementTree.Element(f"{{{_SHEET_NS}}}v")
+        payload.text = "1" if value else "0"
+    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        if isinstance(value, float) and not math.isfinite(value):
+            raise StructuredFileError("XLSX numeric values must be finite")
+        payload = ElementTree.Element(f"{{{_SHEET_NS}}}v")
+        payload.text = str(value)
+    elif isinstance(value, str) and value.startswith("="):
+        if len(value) > 8193:
+            raise StructuredFileError("XLSX formula exceeds the supported length")
+        payload = ElementTree.Element(f"{{{_SHEET_NS}}}f")
+        payload.text = value[1:]
+    elif isinstance(value, str):
+        if len(value) > 32767:
+            raise StructuredFileError("XLSX text exceeds the cell length limit")
+        cell.set("t", "inlineStr")
+        inline = ElementTree.Element(f"{{{_SHEET_NS}}}is")
+        payload = ElementTree.SubElement(inline, f"{{{_SHEET_NS}}}t")
+        payload.text = value
+        if value.startswith(" ") or value.endswith(" "):
+            payload.set(f"{{{_XML_NS}}}space", "preserve")
+        payload = inline
+    else:
+        raise StructuredFileError("XLSX cell values must be string, number, boolean, or null")
+
+    extension = cell.find(f"{{{_SHEET_NS}}}extLst")
+    if extension is None:
+        cell.append(payload)
+    else:
+        cell.insert(list(cell).index(extension), payload)
+
+
+def _xlsx_dimension_bounds(root: ElementTree.Element) -> tuple[int, int, int, int]:
+    dimension = root.find(f"{{{_SHEET_NS}}}dimension")
+    if dimension is None or not dimension.get("ref"):
+        return 1, 1, 1, 1
+    try:
+        from openpyxl.utils.cell import range_boundaries
+
+        bounds = range_boundaries(str(dimension.get("ref")))
+    except (TypeError, ValueError) as error:
+        raise StructuredFileError("invalid XLSX worksheet dimension") from error
+    if None in bounds:
+        raise StructuredFileError("invalid XLSX worksheet dimension")
+    return tuple(int(item) for item in bounds)  # type: ignore[return-value]
+
+
+def _xlsx_patch_state(root: ElementTree.Element) -> dict[str, Any]:
+    sheet_data = root.find(f"{{{_SHEET_NS}}}sheetData")
+    if sheet_data is None:
+        raise StructuredFileError("XLSX worksheet has no sheetData")
+    from openpyxl.utils.cell import range_boundaries
+
+    rows: dict[int, ElementTree.Element] = {}
+    cells: dict[int, dict[int, ElementTree.Element]] = {}
+    for row_element in sheet_data.findall(f"{{{_SHEET_NS}}}row"):
+        try:
+            row_number = int(str(row_element.get("r")))
+        except (TypeError, ValueError) as error:
+            raise StructuredFileError("XLSX worksheet row has an invalid index") from error
+        if row_number in rows:
+            raise StructuredFileError("XLSX worksheet contains duplicate rows")
+        rows[row_number] = row_element
+        row_cells: dict[int, ElementTree.Element] = {}
+        for cell in row_element.findall(f"{{{_SHEET_NS}}}c"):
+            reference = cell.get("r")
+            if not reference:
+                raise StructuredFileError("XLSX worksheet cell has no reference")
+            try:
+                column = range_boundaries(reference)[0]
+            except (TypeError, ValueError) as error:
+                raise StructuredFileError("XLSX worksheet cell has an invalid reference") from error
+            if column in row_cells:
+                raise StructuredFileError("XLSX worksheet contains duplicate cells")
+            row_cells[column] = cell
+        cells[row_number] = row_cells
+    merged = []
+    for item in root.iter(f"{{{_SHEET_NS}}}mergeCell"):
+        reference = item.get("ref")
+        if reference:
+            merged.append(range_boundaries(reference))
+    return {
+        "root": root,
+        "sheet_data": sheet_data,
+        "rows": rows,
+        "cells": cells,
+        "merged": merged,
+        "bounds": list(_xlsx_dimension_bounds(root)),
+        "cell_count": sum(len(items) for items in cells.values()),
+    }
+
+
+def _xlsx_finalize_patch_state(state: dict[str, Any]) -> None:
+    from openpyxl.utils.cell import get_column_letter
+
+    sheet_data = state["sheet_data"]
+    for row_number, row_element in state["rows"].items():
+        cells = state["cells"][row_number]
+        non_cells = [
+            child for child in row_element if child.tag != f"{{{_SHEET_NS}}}c"
+        ]
+        row_element[:] = [cells[column] for column in sorted(cells)] + non_cells
+    sheet_data[:] = sorted(sheet_data, key=lambda item: int(str(item.get("r", "0"))))
+    min_column, min_row, max_column, max_row = state["bounds"]
+    dimension = state["root"].find(f"{{{_SHEET_NS}}}dimension")
+    if dimension is not None:
+        dimension.set(
+            "ref",
+            f"{get_column_letter(min_column)}{min_row}:"
+            f"{get_column_letter(max_column)}{max_row}",
+        )
+
+
+def _xlsx_patch_cell(
+    state: dict[str, Any],
+    bounds: tuple[int, int, int, int],
+    value: Any,
+    settings: Settings,
+) -> None:
+    column, row, max_column, max_row = bounds
+    if column != max_column or row != max_row:
+        raise StructuredFileError("cell must identify exactly one XLSX cell")
+    current_min_column, current_min_row, current_max_column, current_max_row = state["bounds"]
+    projected_max_column = max(current_max_column, column)
+    projected_max_row = max(current_max_row, row)
+    if projected_max_column * projected_max_row > settings.max_structured_elements:
+        raise StructuredFileError("XLSX edit would exceed max_structured_elements")
+
+    for merged_bounds in state["merged"]:
+        min_col, min_row, max_col, merged_max_row = merged_bounds
+        if (
+            min_col <= column <= max_col
+            and min_row <= row <= merged_max_row
+            and (column, row) != (min_col, min_row)
+        ):
+            raise StructuredFileError("cannot patch a non-anchor cell inside a merged range")
+
+    sheet_data = state["sheet_data"]
+    row_element = state["rows"].get(row)
+    if row_element is None:
+        row_element = ElementTree.Element(f"{{{_SHEET_NS}}}row", {"r": str(row)})
+        sheet_data.append(row_element)
+        state["rows"][row] = row_element
+        state["cells"][row] = {}
+    from openpyxl.utils.cell import get_column_letter
+
+    canonical_reference = f"{get_column_letter(column)}{row}"
+    cell = state["cells"][row].get(column)
+    if cell is None:
+        cell = ElementTree.Element(f"{{{_SHEET_NS}}}c", {"r": canonical_reference})
+        row_element.append(cell)
+        state["cells"][row][column] = cell
+        state["cell_count"] += 1
+        if state["cell_count"] > settings.max_structured_elements:
+            raise StructuredFileError("XLSX cells exceed max_structured_elements")
+    _xlsx_cell_payload(cell, value)
+    state["bounds"] = [
+        min(current_min_column, column),
+        min(current_min_row, row),
+        projected_max_column,
+        projected_max_row,
+    ]
+
+
+def _transform_xlsx_package_preserving(
+    data: bytes,
+    operations: list[Any],
+    settings: Settings,
+    unsupported: list[str],
+) -> tuple[bytes, dict[str, Any]]:
+    if "digital signatures" in unsupported:
+        raise StructuredFileError("XLSX write would invalidate digital signatures")
+    parsed_operations = [_operation(raw) for raw in operations]
+    allowed = {"cell_set", "range_set", "range_clear"}
+    rejected = sorted({op["op"] for op in parsed_operations} - allowed)
+    if rejected:
+        raise StructuredFileError(
+            "XLSX contains features that require package-preserving edits; supported operations are "
+            "cell_set, range_set, and range_clear (rejected: " + ", ".join(rejected) + ")"
+        )
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
-            for name in archive_names:
-                if not name.casefold().endswith(".xml"):
-                    continue
-                if re.search(
-                    rb"<(?:[A-Za-z0-9_]+:)?extLst\b", archive.read(name)
-                ):
-                    blocked.append("unsupported extension lists")
-                    break
-    except (KeyError, zipfile.BadZipFile) as error:
+            names: dict[str, str] = {}
+            for name in archive.namelist():
+                folded = name.casefold()
+                if folded in names:
+                    raise StructuredFileError("XLSX package contains duplicate part names")
+                names[folded] = name
+            workbook_name = names.get("xl/workbook.xml")
+            relationships_name = names.get("xl/_rels/workbook.xml.rels")
+            if workbook_name is None or relationships_name is None:
+                raise StructuredFileError("XLSX workbook relationships are missing")
+            workbook = _parse_package_xml(archive.read(workbook_name), "XLSX workbook")
+            relationships = _parse_package_xml(
+                archive.read(relationships_name), "XLSX workbook relationships"
+            )
+            roots: dict[str, ElementTree.Element] = {}
+            all_sheet_names = [
+                str(sheet.get("name"))
+                for sheet in workbook.iter(f"{{{_SHEET_NS}}}sheet")
+                if sheet.get("name") is not None
+            ]
+            for sheet_name in all_sheet_names:
+                part_name = _xlsx_sheet_part(workbook, relationships, sheet_name, names)
+                if part_name not in roots:
+                    roots[part_name] = _parse_package_xml(
+                        archive.read(part_name), f"XLSX worksheet {sheet_name}"
+                    )
+    except zipfile.BadZipFile as error:
         raise StructuredFileError("invalid XLSX package") from error
-    return blocked
+
+    states = {name: _xlsx_patch_state(root) for name, root in roots.items()}
+    if sum(int(state["cell_count"]) for state in states.values()) > settings.max_structured_elements:
+        raise StructuredFileError("XLSX cells exceed max_structured_elements")
+    changed_parts: set[str] = set()
+    for op in parsed_operations:
+        sheet_name = _text(op.get("sheet"), "sheet")
+        part_name = _xlsx_sheet_part(workbook, relationships, sheet_name, names)
+        state = states[part_name]
+        changed_parts.add(part_name)
+        if op["op"] == "cell_set":
+            _reference, bounds = _xlsx_range_bounds(op.get("cell"), settings, "cell")
+            _xlsx_patch_cell(state, bounds, op.get("value"), settings)
+            continue
+        _reference, bounds = _xlsx_range_bounds(op.get("range"), settings)
+        min_column, min_row, max_column, max_row = bounds
+        values = op.get("values")
+        if op["op"] == "range_set":
+            if not isinstance(values, list) or not all(isinstance(row, list) for row in values):
+                raise StructuredFileError("values must be a two-dimensional array")
+            if len(values) != max_row - min_row + 1 or any(
+                len(value_row) != max_column - min_column + 1 for value_row in values
+            ):
+                raise StructuredFileError("values shape must match range")
+        for row_offset, row in enumerate(range(min_row, max_row + 1)):
+            for column_offset, column in enumerate(range(min_column, max_column + 1)):
+                cell_value = (
+                    values[row_offset][column_offset] if op["op"] == "range_set" else None
+                )
+                _xlsx_patch_cell(
+                    state, (column, row, column, row), cell_value, settings
+                )
+    if sum(int(state["cell_count"]) for state in states.values()) > settings.max_structured_elements:
+        raise StructuredFileError("XLSX cells exceed max_structured_elements")
+    for part_name in changed_parts:
+        _xlsx_finalize_patch_state(states[part_name])
+    replacements = {
+        name: _serialize_package_xml(roots[name]) for name in changed_parts
+    }
+    return _rewrite_package(data, replacements), {
+        "preservation_mode": "package_patch",
+        "preserved_unsupported_features": unsupported,
+    }
 
 
 def _sheet_cell_count(sheet: Any) -> int:
@@ -672,7 +1167,13 @@ def _require_xlsx_extent(sheet: Any, bounds: tuple[int, int, int, int], settings
 
 def _inspect_xlsx(data: bytes, settings: Settings, range_ref: str | None = None) -> dict[str, Any]:
     _, load_workbook, *_ = _xlsx_modules()
-    book = load_workbook(io.BytesIO(data), read_only=True, data_only=False, keep_links=True)
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message="Unknown extension is not supported and will be removed",
+            category=UserWarning,
+        )
+        book = load_workbook(io.BytesIO(data), read_only=True, data_only=False, keep_links=True)
     try:
         sheets = []
         total = 0
@@ -690,7 +1191,17 @@ def _inspect_xlsx(data: bytes, settings: Settings, range_ref: str | None = None)
             except ValueError as error:
                 raise StructuredFileError("invalid XLSX range") from error
             sheets.append({"name": sheet.title, "state": sheet.sheet_state, "max_row": sheet.max_row, "max_column": sheet.max_column, "preview_range": preview_range, "values": rows})
-        return {"format": "xlsx", "sheets": sheets, "write_rejected_features": _xlsx_unsupported(data)}
+        unsupported = _xlsx_unsupported(data)
+        return {
+            "format": "xlsx",
+            "sheets": sheets,
+            "write_rejected_features": unsupported,
+            "package_patch_supported_operations": (
+                []
+                if "digital signatures" in unsupported
+                else ["cell_set", "range_set", "range_clear"]
+            ),
+        }
     finally:
         book.close()
 
@@ -726,10 +1237,21 @@ def _xlsx_cell_format(cell: Any, spec: dict[str, Any], styles: Any) -> None:
         cell.border = Border(left=side, right=side, top=side, bottom=side)
 
 
-def _transform_xlsx(data: bytes, operations: list[Any], settings: Settings) -> bytes:
+def _xlsx_selected_rows(sheet: Any, range_ref: str) -> tuple[tuple[Any, ...], ...]:
+    selected = sheet[range_ref]
+    if isinstance(selected, tuple):
+        if not selected or isinstance(selected[0], tuple):
+            return selected
+        return (selected,)
+    return ((selected,),)
+
+
+def _transform_xlsx(
+    data: bytes, operations: list[Any], settings: Settings
+) -> tuple[bytes, dict[str, Any]]:
     unsupported = _xlsx_unsupported(data)
     if unsupported:
-        raise StructuredFileError("XLSX write is unsupported with: " + ", ".join(unsupported))
+        return _transform_xlsx_package_preserving(data, operations, settings, unsupported)
     Workbook, load_workbook, BarChart, LineChart, Reference, CellIsRule, styles, DataValidation, _ = _xlsx_modules()
     del Workbook
     book = load_workbook(io.BytesIO(data), data_only=False, keep_links=True)
@@ -774,11 +1296,10 @@ def _transform_xlsx(data: bytes, operations: list[Any], settings: Settings) -> b
                 elif name == "range_set":
                     range_ref, bounds = _xlsx_range_bounds(op.get("range"), settings)
                     _require_xlsx_extent(sheet, bounds, settings)
-                    start = sheet[range_ref]
                     values = op.get("values")
                     if not isinstance(values, list) or not all(isinstance(row, list) for row in values):
                         raise StructuredFileError("values must be a two-dimensional array")
-                    rows = list(start) if isinstance(start, tuple) else ((start,),)
+                    rows = _xlsx_selected_rows(sheet, range_ref)
                     if len(values) != len(rows) or any(len(value_row) != len(cells) for value_row, cells in zip(values, rows, strict=False)):
                         raise StructuredFileError("values shape must match range")
                     for value_row, cells in zip(values, rows, strict=False):
@@ -787,7 +1308,7 @@ def _transform_xlsx(data: bytes, operations: list[Any], settings: Settings) -> b
                 elif name == "range_clear":
                     range_ref, bounds = _xlsx_range_bounds(op.get("range"), settings)
                     _require_xlsx_extent(sheet, bounds, settings)
-                    for row in sheet[range_ref]:
+                    for row in _xlsx_selected_rows(sheet, range_ref):
                         for cell in row:
                             cell.value = None
                 elif name in {"range_copy", "range_fill"}:
@@ -804,20 +1325,40 @@ def _transform_xlsx(data: bytes, operations: list[Any], settings: Settings) -> b
                     if name == "range_copy" and (source_rows, source_cols) != (target_rows, target_cols):
                         raise StructuredFileError("range_copy source and target shapes must match")
                     copy_format = bool(op.get("copy_format", True))
+                    source_snapshot = []
+                    for row_offset in range(source_rows):
+                        snapshot_row = []
+                        for column_offset in range(source_cols):
+                            source_cell = sheet.cell(
+                                source_min_row + row_offset,
+                                source_min_col + column_offset,
+                            )
+                            snapshot_row.append(
+                                {
+                                    "coordinate": source_cell.coordinate,
+                                    "value": source_cell.value,
+                                    "style": copy(source_cell._style),
+                                    "number_format": source_cell.number_format,
+                                    "protection": copy(source_cell.protection),
+                                }
+                            )
+                        source_snapshot.append(snapshot_row)
                     for row_offset in range(target_rows):
                         for column_offset in range(target_cols):
-                            source_row = source_min_row + (row_offset % source_rows)
-                            source_column = source_min_col + (column_offset % source_cols)
-                            source_cell = sheet.cell(source_row, source_column)
+                            source_cell = source_snapshot[row_offset % source_rows][
+                                column_offset % source_cols
+                            ]
                             target_cell = sheet.cell(target_min_row + row_offset, target_min_col + column_offset)
-                            value = source_cell.value
+                            value = source_cell["value"]
                             if isinstance(value, str) and value.startswith("="):
-                                value = Translator(value, origin=source_cell.coordinate).translate_formula(target_cell.coordinate)
+                                value = Translator(
+                                    value, origin=source_cell["coordinate"]
+                                ).translate_formula(target_cell.coordinate)
                             target_cell.value = value
                             if copy_format:
-                                target_cell._style = copy(source_cell._style)
-                                target_cell.number_format = source_cell.number_format
-                                target_cell.protection = copy(source_cell.protection)
+                                target_cell._style = copy(source_cell["style"])
+                                target_cell.number_format = source_cell["number_format"]
+                                target_cell.protection = copy(source_cell["protection"])
                 elif name in {"rows_insert", "rows_delete", "columns_insert", "columns_delete"}:
                     index = _index(op.get("index"), "index", minimum=1)
                     amount = _index(op.get("amount", 1), "amount", minimum=1)
@@ -841,7 +1382,7 @@ def _transform_xlsx(data: bytes, operations: list[Any], settings: Settings) -> b
                         raise StructuredFileError("format must be an object")
                     range_ref, bounds = _xlsx_range_bounds(op.get("range"), settings)
                     _require_xlsx_extent(sheet, bounds, settings)
-                    for row in sheet[range_ref]:
+                    for row in _xlsx_selected_rows(sheet, range_ref):
                         for cell in row:
                             _xlsx_cell_format(cell, spec, styles)
                 elif name == "dimensions_set":
@@ -921,7 +1462,7 @@ def _transform_xlsx(data: bytes, operations: list[Any], settings: Settings) -> b
                 raise StructuredFileError("XLSX cells exceed max_structured_elements")
         output = io.BytesIO()
         book.save(output)
-        return output.getvalue()
+        return output.getvalue(), {"preservation_mode": "library_rewrite"}
     finally:
         book.close()
 
@@ -1398,8 +1939,8 @@ def transform(data: bytes, path: str, operations: list[Any], settings: Settings,
         raise StructuredFileError("operations exceed the bounded processing limit")
     _require_size(data, settings)
     kind = infer_format(path, format)
-    if kind == "docx": output, extra = _transform_docx(data, operations, settings), {}
-    elif kind == "xlsx": output, extra = _transform_xlsx(data, operations, settings), {}
+    if kind == "docx": output, extra = _transform_docx(data, operations, settings)
+    elif kind == "xlsx": output, extra = _transform_xlsx(data, operations, settings)
     elif kind in {"csv", "tsv"}: output, extra = _transform_csv(data, kind, operations, settings), {}
     elif kind == "zip": output, extra = _transform_zip(data, operations, settings), {}
     else:
