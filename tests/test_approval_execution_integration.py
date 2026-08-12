@@ -11,6 +11,7 @@ from windows_local_mcp.executor import Executor
 from windows_local_mcp.paths import Workspace
 from windows_local_mcp.policy import NormalizedCommand, approved_request_hash
 from windows_local_mcp.resources import WorkspaceExecutionLock
+from windows_local_mcp.tool_safety import capture_executable_identity
 
 
 def _write_config(workspace: Path, data: Path, config: Path) -> None:
@@ -51,6 +52,9 @@ def _prepare_operation(
         cwd=str(workspace),
         display_command=[sys.executable, "main.py"],
         program_key="python",
+        executable_identity=capture_executable_identity(
+            sys.executable, provenance="integration-test"
+        ),
     )
     _, manifest, digest = prepare_approval_bundle(
         settings=settings,

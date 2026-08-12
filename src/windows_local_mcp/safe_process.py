@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 import uuid
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from .config import Settings
 from .network_isolation import apply_safe_network_environment
 from .process_utils import capture_process_identity, creation_flags, terminate_process_tree
 from .resources import BoundedStreamCapture
+from .tool_safety import hold_executable_identity, trusted_helper_identity
 
 
 @dataclass(frozen=True)
@@ -30,6 +32,8 @@ def run_safe_process(
     cwd: str,
     timeout: float,
     output_limit: int,
+    executable_identity: dict[str, object] | None = None,
+    executable_already_held: bool = False,
 ) -> SafeProcessResult:
     """Run a trusted, fixed-grammar helper as a bounded broker subprocess.
 
@@ -38,6 +42,15 @@ def run_safe_process(
     """
     if not command:
         raise ValueError("safe subprocess command cannot be empty")
+    if executable_already_held and executable_identity is None:
+        raise ValueError("an already-held executable requires its bound identity")
+    executable_identity = executable_identity or trusted_helper_identity(
+        settings, program_key
+    )
+    if Path(command[0]).resolve(strict=True) != Path(
+        str(executable_identity["path"])
+    ).resolve(strict=True):
+        raise RuntimeError("broker helper command does not match its configured executable")
     token = uuid.uuid4().hex
     stdout_path = settings.data_dir / "outputs" / f"safe-probe-{token}.out"
     stderr_path = settings.data_dir / "outputs" / f"safe-probe-{token}.err"
@@ -59,40 +72,46 @@ def run_safe_process(
     stdout_capture: BoundedStreamCapture | None = None
     stderr_capture: BoundedStreamCapture | None = None
     try:
-        process = subprocess.Popen(
-            command,
-            cwd=effective_cwd,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            shell=False,
-            creationflags=creation_flags(),
-            start_new_session=(os.name != "nt"),
-            env=environment,
+        hold = (
+            nullcontext(Path(str(executable_identity["path"])))
+            if executable_already_held
+            else hold_executable_identity(executable_identity)
         )
-        identity = capture_process_identity(process.pid, token)
-        if process.stdout is None or process.stderr is None:
-            raise RuntimeError("broker helper did not create output pipes")
-        stdout_capture = BoundedStreamCapture(process.stdout, stdout_path, output_limit)
-        stderr_capture = BoundedStreamCapture(process.stderr, stderr_path, output_limit)
-        stdout_capture.start()
-        stderr_capture.start()
-        try:
-            returncode = process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired as error:
-            terminate_process_tree(identity)
-            raise TimeoutError("broker helper timed out") from error
-        stdout_capture.join()
-        stderr_capture.join()
-        stdout_bytes = stdout_path.read_bytes()
-        stderr_bytes = stderr_path.read_bytes()
-        return SafeProcessResult(
-            returncode=returncode,
-            stdout=stdout_bytes,
-            stderr=stderr_bytes,
-            stdout_truncated=stdout_capture.truncated,
-            stderr_truncated=stderr_capture.truncated,
-        )
+        with hold:
+            process = subprocess.Popen(
+                command,
+                cwd=effective_cwd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                shell=False,
+                creationflags=creation_flags(),
+                start_new_session=(os.name != "nt"),
+                env=environment,
+            )
+            identity = capture_process_identity(process.pid, token)
+            if process.stdout is None or process.stderr is None:
+                raise RuntimeError("broker helper did not create output pipes")
+            stdout_capture = BoundedStreamCapture(process.stdout, stdout_path, output_limit)
+            stderr_capture = BoundedStreamCapture(process.stderr, stderr_path, output_limit)
+            stdout_capture.start()
+            stderr_capture.start()
+            try:
+                returncode = process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired as error:
+                terminate_process_tree(identity)
+                raise TimeoutError("broker helper timed out") from error
+            stdout_capture.join()
+            stderr_capture.join()
+            stdout_bytes = stdout_path.read_bytes()
+            stderr_bytes = stderr_path.read_bytes()
+            return SafeProcessResult(
+                returncode=returncode,
+                stdout=stdout_bytes,
+                stderr=stderr_bytes,
+                stdout_truncated=stdout_capture.truncated,
+                stderr_truncated=stderr_capture.truncated,
+            )
     finally:
         if stdout_capture is not None:
             stdout_capture.join()
@@ -106,3 +125,44 @@ def run_safe_process(
             import shutil
 
             shutil.rmtree(runtime_root, ignore_errors=True)
+
+
+def run_safe_process_batch(
+    *,
+    settings: Settings,
+    program_key: str,
+    commands: list[list[str]],
+    cwd: str,
+    timeout: float,
+    output_limit: int,
+    executable_identity: dict[str, object] | None = None,
+    executable_already_held: bool = False,
+) -> list[SafeProcessResult]:
+    """Run a fixed helper batch under one executable replacement-denial hold."""
+    if not commands:
+        return []
+    if executable_already_held and executable_identity is None:
+        raise ValueError("an already-held batch executable requires its bound identity")
+    identity = executable_identity or trusted_helper_identity(settings, program_key)
+    expected_path = Path(str(identity["path"])).resolve(strict=True)
+    if any(Path(command[0]).resolve(strict=True) != expected_path for command in commands):
+        raise RuntimeError("broker helper batch contains an unbound executable")
+    hold = (
+        nullcontext(expected_path)
+        if executable_already_held
+        else hold_executable_identity(identity)
+    )
+    with hold:
+        return [
+            run_safe_process(
+                settings=settings,
+                program_key=program_key,
+                command=command,
+                cwd=cwd,
+                timeout=timeout,
+                output_limit=output_limit,
+                executable_identity=identity,
+                executable_already_held=True,
+            )
+            for command in commands
+        ]

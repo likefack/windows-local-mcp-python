@@ -18,7 +18,7 @@ from .resources import (
     enforce_data_quota,
     scan_directory_bounded,
 )
-from .safe_process import run_safe_process
+from .safe_process import run_safe_process_batch
 from .util import canonical_json, sha256_bytes, sha256_text
 
 _CODE_LOADERS = {
@@ -393,6 +393,12 @@ def _copy_tree_bounded(
     initial_data_bytes = directory_size(
         settings.data_dir, stop_after=settings.max_data_dir_bytes
     )
+    blocked_files = {name.casefold() for name in settings.blocked_file_names}
+    excluded_directories = {
+        name.casefold()
+        for name in settings.hidden_directories
+        if name.casefold() != ".dart_tool"
+    }
     for root, directories, files in os.walk(source, followlinks=False):
         root_path = Path(root)
         relative_root = root_path.relative_to(source)
@@ -401,12 +407,17 @@ def _copy_tree_bounded(
             candidate = root_path / name
             if _is_reparse(candidate):
                 raise PermissionError(f"approval input contains a reparse point: {candidate}")
-            if name.casefold() == ".git":
+            if name.casefold() == ".git" or name.casefold() in excluded_directories:
                 continue
             filtered.append(name)
         directories[:] = filtered
         (destination / relative_root).mkdir(parents=True, exist_ok=True)
         for name in files:
+            folded = name.casefold()
+            if folded in blocked_files or (
+                folded.startswith(".env.") and folded != ".env.example"
+            ):
+                continue
             source_file = root_path / name
             relative_workspace = source_file.relative_to(workspace.root)
             checked = workspace.resolve_existing(
@@ -692,13 +703,28 @@ def _source_inventory(
     inventory: dict[str, tuple[str, int]] = {}
     total = 0
     count = 0
+    excluded_directories = {
+        name.casefold()
+        for name in settings.hidden_directories
+        if name.casefold() != ".dart_tool"
+    }
+    blocked_files = {name.casefold() for name in settings.blocked_file_names}
     for root, directories, files in os.walk(source, followlinks=False):
         root_path = Path(root)
-        directories[:] = [name for name in directories if name.casefold() != ".git"]
+        directories[:] = [
+            name
+            for name in directories
+            if name.casefold() != ".git" and name.casefold() not in excluded_directories
+        ]
         for name in directories:
             if (root_path / name).is_symlink():
                 raise PermissionError("workspace inventory contains a reparse point")
         for name in files:
+            folded = name.casefold()
+            if folded in blocked_files or (
+                folded.startswith(".env.") and folded != ".env.example"
+            ):
+                continue
             source_file = root_path / name
             relative_workspace = source_file.relative_to(workspace.root)
             checked = workspace.resolve_existing(
@@ -813,15 +839,17 @@ def _capture_git_state(
     }
     per_stream = max(4096, settings.approval_manifest_max_bytes // (len(commands) * 2))
     result: dict[str, str] = {}
-    for name, command in commands.items():
-        captured = run_safe_process(
-            settings=settings,
-            program_key="git",
-            command=command,
-            cwd=normalized.cwd,
-            timeout=30,
-            output_limit=per_stream,
-        )
+    captures = run_safe_process_batch(
+        settings=settings,
+        program_key="git",
+        commands=list(commands.values()),
+        cwd=normalized.cwd,
+        timeout=30,
+        output_limit=per_stream,
+    )
+    for (name, _command), captured in zip(
+        commands.items(), captures, strict=True
+    ):
         if captured.returncode != 0:
             raise RuntimeError(
                 "Git approval-state capture failed: "

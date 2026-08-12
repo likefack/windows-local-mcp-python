@@ -141,6 +141,55 @@ def test_disabled_optional_capabilities_do_not_resolve_tools(tmp_path: Path) -> 
     assert not settings.powershell_enabled
 
 
+def test_helper_path_and_hash_must_be_configured_together(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    executable = tmp_path / "git.exe"
+    executable.write_bytes(b"git")
+    with pytest.raises(ValueError, match="must be configured together"):
+        Settings(
+            workspace_root=root,
+            data_dir=tmp_path / "data",
+            protect_data_dir_acl=False,
+            git_executable_path=executable,
+        )
+
+
+def test_enabled_sandbox_cannot_disable_live_verification(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    with pytest.raises(ValueError, match="cannot be disabled"):
+        Settings(
+            workspace_root=root,
+            data_dir=tmp_path / "data",
+            protect_data_dir_acl=False,
+            approved_sandbox_enabled=True,
+            approved_sandbox_require_live_verification=False,
+        )
+
+
+def test_physical_alias_overlap_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    settings = Settings(
+        workspace_root=root,
+        data_dir=tmp_path / "data",
+        sandbox_scratch_dir=tmp_path / "scratch",
+        protect_data_dir_acl=False,
+    )
+
+    def aliased(path: Path) -> str:
+        if path.name in {"data", "scratch"}:
+            return r"\\?\Volume{test}\shared"
+        return r"\\?\Volume{test}\workspace"
+
+    monkeypatch.setattr("windows_local_mcp.config.physical_filesystem_path", aliased)
+    with pytest.raises(ValueError, match="physically overlap"):
+        settings.ensure_directories()
+
+
 def test_obsolete_appcontainer_configuration_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

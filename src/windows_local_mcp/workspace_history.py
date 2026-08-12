@@ -45,12 +45,20 @@ def _cas_serialized(function: Any) -> Any:
 
 
 @_cas_serialized
-def capture_workspace_state(settings: Settings, operation_id: str, stage: str) -> WorkspaceState:
+def capture_workspace_state(
+    settings: Settings,
+    operation_id: str,
+    stage: str,
+    *,
+    paths: set[str] | None = None,
+) -> WorkspaceState:
     """Capture a full manifest while storing file content once by SHA-256.
 
     A manifest remains a complete point-in-time view. The content-addressed blob store makes
     repeated checkpoints cheap without weakening untracked-file or deletion recovery.
     """
+    if paths is not None:
+        return _capture_scoped_workspace_state(settings, operation_id, stage, paths)
     base = _operation_root(settings, operation_id) / stage
     base.mkdir(parents=True, exist_ok=False)
     try:
@@ -146,6 +154,7 @@ def capture_workspace_state(settings: Settings, operation_id: str, stage: str) -
             "files": entries,
             "excluded": excluded,
             "capture_complete": True,
+            "scope": {"kind": "workspace"},
         }
         manifest_path = base / "manifest.json"
         _write_json_atomic(manifest_path, payload)
@@ -156,11 +165,102 @@ def capture_workspace_state(settings: Settings, operation_id: str, stage: str) -
         raise
 
 
+def _capture_scoped_workspace_state(
+    settings: Settings,
+    operation_id: str,
+    stage: str,
+    paths: set[str],
+) -> WorkspaceState:
+    if not paths:
+        raise ValueError("scoped workspace checkpoint requires at least one path")
+    normalized_paths = sorted(
+        {PureWindowsPath(_validated_relative_path(path)).as_posix() for path in paths}
+    )
+    base = _operation_root(settings, operation_id) / stage
+    base.mkdir(parents=True, exist_ok=False)
+    try:
+        entries: list[dict[str, Any]] = []
+        total = 0
+        initial_data_bytes = directory_size(
+            settings.data_dir, stop_after=settings.max_data_dir_bytes
+        )
+        workspace = Workspace(settings)
+        for relative in normalized_paths:
+            destination = workspace.resolve_planned_write(relative)
+            if not destination.exists():
+                continue
+            verified = workspace.resolve_existing(
+                relative, allow_directory=False, access="write"
+            )
+            parent_identity = workspace.identity(verified.parent)
+            target_identity = workspace.identity(verified)
+            if parent_identity is None or target_identity is None:
+                raise RuntimeError(f"scoped checkpoint target disappeared: {relative}")
+            details = verified.stat()
+            if not verified.is_file() or details.st_nlink > 1:
+                raise PermissionError(
+                    f"scoped checkpoint target must be a unique regular file: {relative}"
+                )
+            data = verified.read_bytes()
+            workspace.revalidate_for_replace(
+                verified,
+                parent_identity=parent_identity,
+                target_identity=target_identity,
+            )
+            if verified.stat().st_size != len(data) or verified.read_bytes() != data:
+                raise RuntimeError(f"scoped checkpoint target changed while read: {relative}")
+            total += len(data)
+            if len(entries) + 1 > settings.approval_manifest_max_files:
+                raise ValueError("workspace history exceeds approval_manifest_max_files")
+            if total > settings.approval_manifest_max_bytes:
+                raise ValueError("workspace history exceeds approval_manifest_max_bytes")
+            digest = sha256_bytes(data)
+            _store_blob(settings, digest, data, initial_data_bytes)
+            entries.append(
+                {
+                    "path": relative,
+                    "size": len(data),
+                    "sha256": digest,
+                    "blob": digest,
+                }
+            )
+        payload = {
+            "version": _MANIFEST_VERSION,
+            "operation_id": operation_id,
+            "stage": stage,
+            "files": entries,
+            "excluded": [],
+            "capture_complete": True,
+            "scope": {"kind": "paths", "paths": normalized_paths},
+        }
+        manifest_path = base / "manifest.json"
+        _write_json_atomic(manifest_path, payload)
+        enforce_data_quota(settings)
+        return WorkspaceState(
+            str(manifest_path), str(_blob_root(settings)), len(entries), total
+        )
+    except Exception:
+        shutil.rmtree(base, ignore_errors=True)
+        raise
+
+
+def _validated_relative_path(value: str) -> str:
+    Workspace.validate_windows_syntax(value)
+    pure = PureWindowsPath(value)
+    if pure.is_absolute() or ".." in pure.parts:
+        raise ValueError(f"workspace checkpoint path must be relative: {value}")
+    normalized = pure.as_posix()
+    if not normalized or normalized == ".":
+        raise ValueError("workspace checkpoint path must identify a file")
+    return normalized
+
+
 def compare_workspace_states(
     settings: Settings, before_path: str, after_path: str, operation_id: str
 ) -> dict[str, Any]:
     before = _load_manifest(settings, before_path)
     after = _load_manifest(settings, after_path)
+    scope = _require_matching_scope(before, after)
     before_map = _entry_map(before)
     after_map = _entry_map(after)
     changed = sorted(
@@ -215,6 +315,7 @@ def compare_workspace_states(
         "added_lines": added_lines,
         "removed_lines": removed_lines,
         "diff_path": str(diff_path),
+        "checkpoint_scope": scope,
     }
 
 
@@ -237,6 +338,11 @@ def checkpoint_manifest_digest(settings: Settings, manifest_path: str) -> str:
     manifest = _load_manifest(settings, manifest_path)
     resolved = Path(str(manifest["_manifest_path"]))
     return sha256_bytes(resolved.read_bytes())
+
+
+def checkpoint_scope(settings: Settings, manifest_path: str) -> dict[str, Any]:
+    """Return the validated rollback boundary recorded by a checkpoint."""
+    return _manifest_scope(_load_manifest(settings, manifest_path))
 
 
 def restore_workspace_state(
@@ -269,9 +375,18 @@ def restore_workspace_state(
     _write_json_atomic(journal_path, journal)
     current: WorkspaceState | None = None
     try:
+        expected_manifest = _load_manifest(settings, expected_path)
+        target_manifest = _load_manifest(settings, target_path)
+        scope = _require_matching_scope(expected_manifest, target_manifest)
+        scope_paths = _scope_paths(scope)
         expected_map = verify_checkpoint_integrity(settings, expected_path)
         target_map = verify_checkpoint_integrity(settings, target_path)
-        current = capture_workspace_state(settings, transaction_id, "transaction-before")
+        current = capture_workspace_state(
+            settings,
+            transaction_id,
+            "transaction-before",
+            paths=scope_paths,
+        )
         current_map = verify_checkpoint_integrity(settings, current.manifest_path)
         if expected_map != current_map:
             conflicts = sorted(
@@ -285,7 +400,6 @@ def restore_workspace_state(
                 "workspace changed after approval preview; rollback conflicts: "
                 + ", ".join(conflicts[:20])
             )
-        target_manifest = _load_manifest(settings, target_path)
         current_manifest = _load_manifest(settings, current.manifest_path)
         changed = _changed_paths(current_manifest, target_manifest)
         _stage_manifest_files(settings, target_path, changed, transaction / "staged-target")
@@ -315,8 +429,8 @@ def restore_workspace_state(
             journal_path=journal_path,
             expected_hashes=expected_map,
         )
-        final_map = _scan_current_hashes(settings)
-        intended_map = _hash_map(_load_manifest(settings, target_path))
+        final_map = _scan_current_hashes(settings, scope_paths)
+        intended_map = _hash_map(target_manifest)
         if final_map != intended_map:
             raise RuntimeError("post-restore workspace verification did not match target")
     except BaseException as apply_error:  # noqa: BLE001 - journal abrupt Python interruption too
@@ -331,7 +445,7 @@ def restore_workspace_state(
             verify_checkpoint_integrity(settings, current.manifest_path)
             target_hashes = verify_checkpoint_integrity(settings, target_path)
             current_hashes = verify_checkpoint_integrity(settings, current.manifest_path)
-            live_hashes = _scan_current_hashes(settings)
+            live_hashes = _scan_current_hashes(settings, scope_paths)
             changed_paths = {str(item) for item in journal.get("changed_paths") or []}
             conflicts = sorted(
                 relative
@@ -349,7 +463,7 @@ def restore_workspace_state(
                 current.manifest_path,
                 only_paths=changed_paths,
             )
-            recovered_hashes = _scan_current_hashes(settings)
+            recovered_hashes = _scan_current_hashes(settings, scope_paths)
             recovery_mismatches = sorted(
                 relative
                 for relative in changed_paths
@@ -388,6 +502,7 @@ def restore_workspace_state(
     _write_json_atomic(journal_path, journal)
     target_manifest = _load_manifest(settings, target_path)
     current_manifest = _load_manifest(settings, expected_path)
+    scope = _require_matching_scope(current_manifest, target_manifest)
     target_map = _entry_map(target_manifest)
     current_map = _entry_map(current_manifest)
     return {
@@ -395,6 +510,7 @@ def restore_workspace_state(
         "removed_files": sorted(current_map.keys() - target_map.keys()),
         "transaction_journal": str(journal_path),
         "failure_atomicity": "best_effort_with_automatic_recovery",
+        "rollback_scope": scope,
     }
 
 
@@ -423,7 +539,11 @@ def rollback_applied_workspace_transaction(
         raise RuntimeError("workspace transaction has incomplete recovery bindings")
     before = verify_checkpoint_integrity(settings, before_path)
     target = verify_checkpoint_integrity(settings, target_path)
-    current = _scan_current_hashes(settings)
+    before_manifest = _load_manifest(settings, before_path)
+    target_manifest = _load_manifest(settings, target_path)
+    scope = _require_matching_scope(before_manifest, target_manifest)
+    scope_paths = _scope_paths(scope)
+    current = _scan_current_hashes(settings, scope_paths)
     changed = {str(item) for item in journal.get("changed_paths") or []}
     conflicts = sorted(
         relative
@@ -447,7 +567,7 @@ def rollback_applied_workspace_transaction(
             journal_path=str(journal_path),
         )
     _apply_manifest(settings, before_path, only_paths=changed)
-    recovered = _scan_current_hashes(settings)
+    recovered = _scan_current_hashes(settings, scope_paths)
     mismatches = sorted(
         relative for relative in changed if recovered.get(relative) != before.get(relative)
     )
@@ -470,6 +590,7 @@ def rollback_applied_workspace_transaction(
         "rollback_state": "failed_recovered",
         "recovered_paths": sorted(changed),
         "transaction_journal": str(journal_path),
+        "rollback_scope": scope,
     }
 
 
@@ -493,16 +614,22 @@ def prepare_selective_undo(
     """Build and persist an approval-bound three-state selective undo plan."""
     verify_checkpoint_integrity(settings, before_path)
     verify_checkpoint_integrity(settings, after_path)
-    current = capture_workspace_state(settings, operation_id, "undo-preview-current")
-    verify_checkpoint_integrity(settings, current.manifest_path)
     before = _load_manifest(settings, before_path)
     after = _load_manifest(settings, after_path)
+    scope = _require_matching_scope(before, after)
+    current = capture_workspace_state(
+        settings,
+        operation_id,
+        "undo-preview-current",
+        paths=_scope_paths(scope),
+    )
+    verify_checkpoint_integrity(settings, current.manifest_path)
     current_manifest = _load_manifest(settings, current.manifest_path)
     desired, conflicts, automatic_merges = _selective_target(
         settings, Path(before_path), before, Path(after_path), after, current_manifest
     )
     target_path = _write_generated_manifest(
-        settings, operation_id, "undo-preview-target", desired
+        settings, operation_id, "undo-preview-target", desired, scope=scope
     )
     preview = _restore_summary(current_manifest, _load_manifest(settings, target_path))
     preview.update(
@@ -548,13 +675,18 @@ def build_workspace_target_from_bytes(
 ) -> str:
     """Create a content-addressed target manifest for broker-validated file updates."""
     expected = _load_manifest(settings, expected_manifest_path)
+    scope = _manifest_scope(expected)
+    scope_paths = _scope_paths(scope)
     entries = dict(_entry_map(expected))
     workspace = Workspace(settings)
     initial_size = directory_size(settings.data_dir)
     for relative in deletions or set():
         Workspace.validate_windows_syntax(relative)
         workspace.resolve_existing(relative, allow_directory=False, access="write")
-        entries.pop(PureWindowsPath(relative).as_posix(), None)
+        normalized = PureWindowsPath(relative).as_posix()
+        if scope_paths is not None and normalized not in scope_paths:
+            raise ValueError("workspace deletion falls outside checkpoint scope")
+        entries.pop(normalized, None)
     for relative, data in changes.items():
         Workspace.validate_windows_syntax(relative)
         destination = workspace.resolve_planned_write(relative)
@@ -563,6 +695,8 @@ def build_workspace_target_from_bytes(
         digest = sha256_bytes(data)
         _store_blob(settings, digest, data, initial_size)
         normalized = PureWindowsPath(relative).as_posix()
+        if scope_paths is not None and normalized not in scope_paths:
+            raise ValueError("workspace change falls outside checkpoint scope")
         entries[normalized] = {
             "path": normalized,
             "size": len(data),
@@ -570,7 +704,11 @@ def build_workspace_target_from_bytes(
             "blob": digest,
         }
     return _write_generated_manifest(
-        settings, operation_id, "staged-workspace-write-target", entries
+        settings,
+        operation_id,
+        "staged-workspace-write-target",
+        entries,
+        scope=scope,
     )
 
 
@@ -622,7 +760,8 @@ def recover_incomplete_workspace_transaction(
         if not before_path:
             raise RuntimeError("staged journal has no before checkpoint")
         verify_checkpoint_integrity(settings, before_path)
-        _scan_current_hashes(settings)
+        before_scope = _manifest_scope(_load_manifest(settings, before_path))
+        _scan_current_hashes(settings, _scope_paths(before_scope))
         journal.update(state="failed_preflight", reconciled_at=utc_now_iso())
         _write_json_atomic(journal_path, journal)
         return journal
@@ -631,7 +770,8 @@ def recover_incomplete_workspace_transaction(
         if not target_path:
             raise RuntimeError("applied journal has no target checkpoint")
         target = verify_checkpoint_integrity(settings, target_path)
-        if _scan_current_hashes(settings) != target:
+        target_scope = _manifest_scope(_load_manifest(settings, target_path))
+        if _scan_current_hashes(settings, _scope_paths(target_scope)) != target:
             raise RuntimeError("applied workspace no longer matches its verified target")
         return journal
     if state not in {"applying", "recovering"}:
@@ -642,7 +782,9 @@ def recover_incomplete_workspace_transaction(
         if not before_path:
             raise RuntimeError("interrupted write transaction has no recovery manifest")
         before = verify_checkpoint_integrity(settings, before_path)
-        current = _scan_current_hashes(settings)
+        before_scope = _manifest_scope(_load_manifest(settings, before_path))
+        scope_paths = _scope_paths(before_scope)
+        current = _scan_current_hashes(settings, scope_paths)
         changed = set(journal.get("changed_paths") or [])
         if len(changed) != 1:
             raise RuntimeError("interrupted write transaction has an invalid target set")
@@ -665,8 +807,8 @@ def recover_incomplete_workspace_transaction(
                 + ", ".join(unexpected[:20])
             )
         if current != before:
-            _apply_manifest(settings, before_path)
-            if _scan_current_hashes(settings) != before:
+            _apply_manifest(settings, before_path, only_paths=changed)
+            if _scan_current_hashes(settings, scope_paths) != before:
                 raise RuntimeError("automatic interrupted-write recovery verification failed")
         journal.update(state="failed_recovered", recovered_at=utc_now_iso())
         _write_json_atomic(journal_path, journal)
@@ -675,7 +817,11 @@ def recover_incomplete_workspace_transaction(
         raise RuntimeError("interrupted workspace transaction has no recovery manifests")
     before = verify_checkpoint_integrity(settings, before_path)
     target = verify_checkpoint_integrity(settings, target_path)
-    current = _scan_current_hashes(settings)
+    before_manifest = _load_manifest(settings, before_path)
+    target_manifest = _load_manifest(settings, target_path)
+    scope = _require_matching_scope(before_manifest, target_manifest)
+    scope_paths = _scope_paths(scope)
+    current = _scan_current_hashes(settings, scope_paths)
     changed = set(journal.get("changed_paths") or [])
     all_paths = before.keys() | target.keys() | current.keys()
     unexpected = [
@@ -693,8 +839,8 @@ def recover_incomplete_workspace_transaction(
             + ", ".join(unexpected[:20])
         )
     verify_checkpoint_integrity(settings, before_path)
-    _apply_manifest(settings, before_path)
-    if _scan_current_hashes(settings) != before:
+    _apply_manifest(settings, before_path, only_paths=changed)
+    if _scan_current_hashes(settings, scope_paths) != before:
         raise RuntimeError("automatic interrupted-transaction recovery verification failed")
     journal.update(state="failed_recovered", recovered_at=utc_now_iso())
     _write_json_atomic(journal_path, journal)
@@ -906,6 +1052,7 @@ def _reverse_text_change(before: str, after: str, current: str) -> str | None:
 
 
 def _restore_summary(expected: dict[str, Any], target: dict[str, Any]) -> dict[str, Any]:
+    scope = _require_matching_scope(expected, target)
     expected_map = _entry_map(expected)
     target_map = _entry_map(target)
     changed = _changed_paths(expected, target)
@@ -921,6 +1068,7 @@ def _restore_summary(expected: dict[str, Any], target: dict[str, Any]) -> dict[s
         "creates_files": bool(created),
         "restores_files": bool(restored),
         "deletes_files": bool(deleted),
+        "rollback_scope": scope,
     }
 
 
@@ -936,10 +1084,15 @@ def _apply_manifest(
 ) -> None:
     manifest = _load_manifest(settings, manifest_path)
     target_map = _entry_map(manifest)
-    current = _scan_current_hashes(settings)
+    scope_paths = _scope_paths(_manifest_scope(manifest))
+    current = _scan_current_hashes(settings, scope_paths)
     if expected_hashes is not None and current != expected_hashes:
         raise RuntimeError("workspace changed during restore staging")
-    changed = only_paths or set(current.keys()) | set(target_map.keys())
+    changed = (
+        only_paths
+        if only_paths is not None
+        else set(current.keys()) | set(target_map.keys())
+    )
     workspace = Workspace(settings)
     for relative in sorted((set(current) - set(target_map)) & changed, reverse=True):
         destination = workspace.resolve_for_write(relative)
@@ -1018,8 +1171,43 @@ def _remove_created_directories(settings: Settings, directories: object) -> None
             ) from error
 
 
-def _scan_current_hashes(settings: Settings) -> dict[str, str]:
+def _scan_current_hashes(
+    settings: Settings, paths: set[str] | None = None
+) -> dict[str, str]:
     workspace = Workspace(settings)
+    if paths is not None:
+        result: dict[str, str] = {}
+        for relative in sorted(paths):
+            normalized = _validated_relative_path(relative)
+            candidate = workspace.resolve_planned_write(normalized)
+            if not candidate.exists():
+                continue
+            verified = workspace.resolve_existing(
+                normalized, allow_directory=False, access="write"
+            )
+            details = verified.stat()
+            if not verified.is_file() or details.st_nlink > 1:
+                raise PermissionError(
+                    f"scoped workspace verification requires a unique regular file: {normalized}"
+                )
+            before_identity = workspace.identity(verified)
+            parent_identity = workspace.identity(verified.parent)
+            if before_identity is None or parent_identity is None:
+                raise RuntimeError(
+                    f"scoped workspace verification target disappeared: {normalized}"
+                )
+            data = verified.read_bytes()
+            workspace.revalidate_for_replace(
+                verified,
+                parent_identity=parent_identity,
+                target_identity=before_identity,
+            )
+            if verified.read_bytes() != data:
+                raise RuntimeError(
+                    f"scoped workspace verification target changed while read: {normalized}"
+                )
+            result[normalized] = sha256_bytes(data)
+        return result
     denied = {name.casefold() for name in settings.write_denied_directories}
     blocked = {name.casefold() for name in settings.blocked_file_names}
     result: dict[str, str] = {}
@@ -1131,8 +1319,41 @@ def _load_manifest(settings: Settings, path: str) -> dict[str, Any]:
         ):
             raise ValueError(f"invalid workspace history entry: {relative}")
         seen.add(relative)
+    scope = _manifest_scope(manifest)
+    scoped_paths = _scope_paths(scope)
+    if scoped_paths is not None and not seen.issubset(scoped_paths):
+        raise ValueError("workspace history entry falls outside its declared checkpoint scope")
+    manifest["scope"] = scope
     manifest["_manifest_path"] = str(resolved)
     return manifest
+
+
+def _manifest_scope(manifest: dict[str, Any]) -> dict[str, Any]:
+    raw = manifest.get("scope", {"kind": "workspace"})
+    if not isinstance(raw, dict):
+        raise TypeError("invalid workspace checkpoint scope")
+    kind = raw.get("kind")
+    if kind == "workspace":
+        return {"kind": "workspace"}
+    if kind != "paths" or not isinstance(raw.get("paths"), list) or not raw["paths"]:
+        raise ValueError("invalid scoped workspace checkpoint")
+    paths = sorted({_validated_relative_path(str(value)) for value in raw["paths"]})
+    if len(paths) != len(raw["paths"]):
+        raise ValueError("scoped workspace checkpoint contains duplicate paths")
+    return {"kind": "paths", "paths": paths}
+
+
+def _scope_paths(scope: dict[str, Any]) -> set[str] | None:
+    if scope["kind"] == "workspace":
+        return None
+    return {str(path) for path in scope["paths"]}
+
+
+def _require_matching_scope(*manifests: dict[str, Any]) -> dict[str, Any]:
+    scopes = [_manifest_scope(manifest) for manifest in manifests]
+    if any(scope != scopes[0] for scope in scopes[1:]):
+        raise RuntimeError("workspace checkpoint scopes do not match")
+    return scopes[0]
 
 
 def _entry_map(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -1182,6 +1403,8 @@ def _write_generated_manifest(
     operation_id: str,
     stage: str,
     entries: dict[str, dict[str, Any]],
+    *,
+    scope: dict[str, Any] | None = None,
 ) -> str:
     base = _operation_root(settings, operation_id) / stage
     base.mkdir(parents=True, exist_ok=False)
@@ -1195,6 +1418,7 @@ def _write_generated_manifest(
             "files": [entries[key] for key in sorted(entries)],
             "excluded": [],
             "capture_complete": True,
+            "scope": scope or {"kind": "workspace"},
         },
     )
     return str(path)

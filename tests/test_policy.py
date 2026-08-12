@@ -1,3 +1,4 @@
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -25,10 +26,19 @@ def make_settings(tmp_path: Path, **overrides: object) -> Settings:
 def fake_tools(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     executable = tmp_path / "tool.exe"
     executable.write_bytes(b"MZ fake")
+    details = executable.stat()
+    identity = {
+        "path": str(executable.resolve()),
+        "sha256": sha256(executable.read_bytes()).hexdigest(),
+        "size": details.st_size,
+        "device": details.st_dev,
+        "inode": details.st_ino,
+        "mtime_ns": details.st_mtime_ns,
+        "provenance": "test-config",
+    }
     monkeypatch.setattr(
-        CommandPolicy,
-        "_resolve_executable",
-        staticmethod(lambda _candidates: str(executable)),
+        "windows_local_mcp.policy.trusted_helper_identity",
+        lambda _settings, _program_key: identity,
     )
     return executable
 
@@ -264,3 +274,18 @@ def test_adb_physical_and_unlisted_serial_are_rejected(
         policy.normalize_safe(
             program="adb", args=["-s", "emulator-5556", "get-state"], cwd="."
         )
+
+
+def test_adb_device_enumeration_is_not_an_automatic_read(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path, adb_enabled=True)
+    policy = CommandPolicy(settings, Workspace(settings))
+    with pytest.raises(PermissionError, match="device enumeration"):
+        policy.normalize_safe(program="adb", args=["devices", "-l"], cwd=".")
+
+
+def test_enabled_git_without_trust_anchor_is_unavailable(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    (settings.workspace_root / ".git").mkdir()
+    policy = CommandPolicy(settings, Workspace(settings))
+    with pytest.raises(PermissionError, match="git_executable_path"):
+        policy.normalize_safe(program="git", args=["status", "--short"], cwd=".")

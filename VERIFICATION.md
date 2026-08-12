@@ -1,77 +1,103 @@
-# Verification
+# 検証記録
 
-## 2026-08-13 バイナリ転送の性能・安全性確認
+## 2026-08-13 既知セキュリティ問題の再検証と修正
 
-- 全回帰: `python -m pytest -q` は 194 passed、2 skipped。
-- 静的検査: `ruff check .`、`python -m compileall -q src tests`、`git diff --check` は成功。
-- 16 MiB、512 KiB × 32 チャンクのローカル比較では、チャンク処理は約 1.93 秒から約 0.62 秒、開始処理を含む全体は約 2.01 秒から約 0.87 秒へ短縮した。単発測定であり、実環境の保証値ではない。
-- ダウンロード開始時に元ファイルを前後で識別・全体 SHA-256 検証し、制御領域の固定スナップショットも再ハッシュした。チャンクは固定スナップショットの必要範囲だけを読む。
-- アップロードは開始時に申告全容量を予約し、チャンクごとの `data_dir` 全走査を除去した。チャンクの順序、fsync、完了時の全体 SHA-256、commit 時の元ファイル・出力先再検証は維持した。
-- 32 チャンクすべてが親転送操作の SHA-256 付き監査イベントとして永続化されることを確認した。スナップショット改変、容量超過、不完全アップロード、元ファイル変更後の結果 commit は拒否される。
-- これはローカル Python 回帰とローカル性能測定であり、Secure MCP Tunnel／ChatGPT E2E、実運用負荷、停電相当の永続性試験を確認したものではない。
+### 対象と基準
 
-最終確認日: 2026-08-09
+- 最終確認対象: `main` / `30cd90f709793088621f5fbc2224077d5b0c374b`
+- 作業開始時は `81c8e86d39900d9ca0fcf4bb75ea1bc91b7dba31` だったが、作業中に別プロセスの `git pull origin main` が `0bcac0e` と `30cd90f` を fast-forward した。巻き戻さず、追加された Timeline 実装と回帰も含む現在の `main` で再検証した。
+- 基準: `SECURITY_CONTRACT.md`、SHA-256 `abc0c0bf47dd2952d97dbbc52b01f65e8b091fd8ce1f49cb98d955dc4e54c0e1`
+- `SECURITY_CONTRACT.md` 自体は変更していない。
+- 作業開始時の working tree は clean で、既存 user changes はなかった。commit／push は実施していない。
 
-## Automated regression
+### Section 6 の判定
 
-- `python -m pytest -q`: 161 passed, 2 skipped
-- `python -m ruff check .`: pass
-- `python -m compileall -q src tests`: pass
-- `git diff --check`: pass（Gitの将来のLF/CRLF変換warningのみ）
+判定は修正前の現行コードを基準にし、右端にこの作業後の扱いを記録する。
 
-追加した主な回帰は、Approved Sandbox request全体のhash binding、Codex signer/helper closure、不完全checkpoint拒否、journalのlegacy `complete` recovery、operation-owned rollback checkpoint、Timeline artifact integrity、外部Dart dependency境界、AppContainer HANDLE signature/profile identity/ACL write-aheadです。
+| # | 重点確認項目 | 判定 | この作業後の扱い |
+| --- | --- | --- | --- |
+| 1 | Broker helper executable の provenance／path／hash／file identity と差し替え耐性 | still valid | Git／ADB を明示 path・SHA-256・file identity に固定し、Windows では実行中の差し替えを拒否 |
+| 2 | legacy `:workspace` と `workspace_write=false` の実効 filesystem boundary | reformulated | profile 名や staging 表示を OS 境界の証拠にせず、必要 property 未検証時は実行経路を unavailable にする |
+| 3 | Sandbox runtime から protected information を直接読める可能性 | reformulated | staging 漏えいを除去し、process／descendant の直接 read denial が実機未検証なら実行不可 |
+| 4 | `.env`／dependency tree を含む過剰 staging | still valid | 保護 file と `.venv`／`node_modules`／`build`／`__pycache__` 等を除外 |
+| 5 | known-path operation の full workspace checkpoint | still valid | 単一・複数の既知 path scope と source／destination の決定順 lock へ局所化 |
+| 6 | artifact chunk ごとの全 file 再hash | already fixed | 不変 snapshot と開始／完了／commit 境界の検証を維持し、回帰なし |
+| 7 | ChatGPT container source→result binding | already fixed | 既存拘束を維持し、派生出力の置換後 source 再検証と復旧を追加 |
+| 8 | Sandbox launcher の host-side cwd／DLL／search-path | still valid | host cwd を信頼済み install directory に固定し、相対・workspace・data・scratch・利用不能 PATH entry を除外 |
+| 9 | Internet／LAN／loopback と child／grandchild containment | partially fixed | property を分離し、現在の実機で未確認のためすべて unverified、実行不可 |
+| 10 | Sandbox property ごとの live verification と aggregate 表示 | still valid | marker v2、9 property、backend digest 拘束、旧／部分 marker 拒否、`available`／`windows_live_verified`／`execution_route_available` 分離 |
+| 11 | DOCX／XLSX の過剰な file-wide rejection と保存能力表示 | already fixed | package patch と既存保存回帰を確認、変更なし |
+| 12 | 画像 format conversion の実用性と capability 表示 | still valid | extension が一致する別 `output_path` と source／既存 destination hash を導入 |
+| 13 | CSV／TSV preservation 表示 | reformulated | semantic preservation と lexical quoting／byte identity 非保証を明示 |
+| 14 | workspace／data／scratch の Windows physical identity | partially fixed | 3 root を安定 identity と handle-resolved physical path で比較し、SUBST 別名を実機拒否 |
+| 15 | control-plane tamper、worker／approval／process lifecycle | partially fixed | 既存 one-shot／TTL／claim／tamper guard を維持し、承認後 executable identity と実行中 hold を追加 |
+| 16 | checkpoint／CAS／GC concurrency と rollback／Undo | already fixed | 既存 journal／CAS／GC／Undo 整合性を維持し、checkpoint scope を全経路へ伝播 |
+| 17 | resource admission、protected information leakage | partially fixed | 既存上限・redaction を維持。Sandbox の process／memory 等は未検証なので resource property と経路を fail closed |
+| 18 | Live Activity／Timeline／preview／conflict／recovery 表示 | already fixed | 作業中に更新された現在の main の binary transfer lifecycle 修正と既存 Activity 回帰を含め全回帰通過 |
+| 19 | ADB emulator 固定 read integration | partially fixed | 固定 target 文法・emulator policy を維持し、helper trust anchor を追加、未許可 device 列挙を自動文法から除外 |
+| 20 | transport の startup 可用性と session／UI／documentation 表示 | still valid | stdio／HTTP の configured・enabled・available・startup validation を分離し、拒否される HTTP を available としない |
+| 21 | 古い README／SPEC／VERIFICATION | still valid | README／SPEC／この検証記録を現行実装と現在の検証限界へ更新 |
 
-## Windows environment
+内訳は `already fixed` 5、`obsolete` 0、`partially fixed` 5、`still valid` 8、`reformulated` 3、合計 21 項目。
 
-- Windows kernel build: `10.0.26200.0`、DisplayVersion `25H2`
-- Python: 3.14
-- Git: `C:\Program Files\Git\cmd\git.exe`
-- Dart/Flutter: `C:\flutter\bin`
-- Codex CLI: `0.147.0-alpha.6.5`
-- Node/npm/npx、Windows PowerShell: installed
-- ADB、`pwsh`: not installed
+### 自動回帰と静的検査
 
-## Safe Sandbox / AppContainer live results
+- 全回帰: `.venv\Scripts\python.exe -m pytest -q --basetemp .pytest-tmp-task3-final` は 215 passed、2 skipped。skip はこの権限で symlink／junction を作成できない 2 件で、hardlink 回帰と Windows 固有回帰は通過した。
+- 対象回帰: helper trust／実行中差し替え、実 Git stdio、approval TTL／one-shot／tamper、Sandbox marker／PATH／timeout、scoped checkpoint／lock／rollback、artifact source binding、image／CSV／ZIP、transport 表示を実行し通過した。
+- 変更 file に対する Ruff: pass。
+- `python -m compileall -q src tests`: pass。
+- `git diff --check`: pass。LF／CRLF の将来変換 warning のみ。
+- repository-wide `ruff check .` は、作業中に現在の main へ追加された `src/windows_local_mcp/timeline.py` の import order 1 件で failure。この独立した非 security 変更は本作業で書き換えていない。
 
-確認済み:
+### Windows 実機確認
 
-- profile作成、ACL付与、AppContainer process launch
-- stdout/stderr pipe、exit code
-- timeout/explicit terminationとJob Objectによるdescendant終了
-- data_dir read denial
-- offline profileでInternet (`1.1.1.1:443`)、LAN (`192.168.1.1:80`)、loopback denial
-- `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`によるstdin/stdout/stderr allowlistとpointer-sized HANDLE contract（static/regression）
-- Git/AppContainer互換性failureが`SafeSandboxCompatibilityError`となり、host fallbackせずApproved Sandbox再試行案内になること
+- 実 Git を明示 path／SHA-256 で固定した stdio MCP から `git_info` と固定文法 `git status --short` を実行した。
+- Win32 file sharing を使い、保持中の helper file replacement と親 directory rename が拒否され、解放後だけ成功することを確認した。
+- subprocess timeout 時に identity-bound parent と descendant を終了し、grandchild heartbeat が停止することを Windows process-tree probe で確認した。これは Codex Sandbox 内の descendant containment の証拠ではない。
+- `SUBST W:` で workspace の別名を data path として構成し、physical overlap として設定拒否されることを確認した。割り当ては試験内で解除した。
+- installed Codex CLI `0.147.0-alpha.6.6` の backend identity／version 解決を確認した。最小 `codex sandbox` command は 20 秒で timeout したため、次の全 property は `unverified`、`passed=false`、実行経路 unavailable と記録した。
+  - `filesystem_read`
+  - `filesystem_write`
+  - `protected_information_read`
+  - `internet`
+  - `lan`
+  - `loopback`
+  - `descendant_containment`
+  - `termination`
+  - `resource_bound`
+- Sandbox live verifier の初回実行で、アクセス不能な Windows App Execution Alias が host PATH sanitization を停止させる問題を再現した。信頼済み root の解決失敗は fail closed のまま、ambient PATH の利用不能 entry だけを除外する修正後に backend version 解決まで進むことを確認した。
 
-実機結果ではGit for Windowsが狭いancestor traverse/read-attributes権限でcwdを利用できず、`git status/diff/log/show`はいずれもSafe成功には至りませんでした。workspace ancestorへ広いRXを与える変更はsecurity boundaryを広げるため採用していません。Dart analyze/formatとFlutter analyzeもtoolchain/runtime ACL setup時間・互換性のため成功確認に至っていません。
+### unit／mock／integration のみで確認した範囲
 
-ADB profileの通常設定は`127.0.0.1:5037`ですが、設計上のOS capabilityはport限定ではなく一般loopback exemptionです。この端末では最新setup時の`CheckNetIsolation LoopbackExempt`追加が失敗し、一覧にもexemptionが残らなかったため、ADB loopbackは利用可能・検証済みとは扱いません。Internet/LAN denyはoffline profileで確認済みですが、ADB profileとしてのdenyは未検証です。
+- Sandbox property marker の旧版／部分成功／backend mismatch 拒否と、全 property 成功時だけの経路許可。
+- Sandbox 失敗／未検証から Approved Host へ自動 fallback しない control flow。
+- protected file／dependency tree の staging 除外。ただし Sandbox process 自身の OS read denial の代替証拠ではない。
+- approval request hash、argv／cwd／executable／input／settings binding、stale／double claim／expiry／cancel terminal race。
+- Approved Host 後の control-plane tamper detection と後続 fail closed。
+- scoped checkpoint／CAS／journal／rollback／selective Undo、source・destination concurrent modification、ZIP transaction recovery。
+- DOCX／XLSX／CSV／TSV／ZIP／image の malformed／preservation／resource 回帰。
+- stdio transport と HTTP startup rejection の表示整合性。
 
-不要なinheritable handleが実childへ存在しないことは、allowlist実装とWin32 signature testまでです。child側のhandle tableを列挙する独立実機probeは未実施です。
+### 未検証
 
-## Approved Sandbox live results
+- 上記 9 つの Codex Sandbox OS property と、Sandbox 内での simple command／developer command 成功経路。
+- Codex Sandbox の process 数、memory、filesystem entry を含む完全な resource bound。
+- real ADB server／emulator／device identity／5037／screenshot と MCP ADB E2E。この端末では `adb` が見つからなかった。
+- Secure MCP Tunnel／ChatGPT E2E、deployment、外部 service、実運用負荷。
+- hardware power loss の全 fsync／SQLite timing に対する永続性。
+- Section 7 の release 用 repository-wide 2 回連続独立 review pass。本作業は既知問題と修正箇所の回帰に限定した。
 
-確認済み:
+### 性能・実用性への影響
 
-- installed Codex discovery
-- `codex.exe`、`codex-command-runner.exe`、`codex-windows-sandbox-setup.exe`のOpenAI Authenticode identity、hash/stat/path binding
-- 3 binaryをwrite/delete replacementからlockした状態で`codex --version`
-- backend missing/changed/unsigned requestのfail-closed unit path
-- Approved SandboxからApproved Hostへfallbackしないcontrol flow
+- known-path mutation は full workspace scan／checkpoint から対象 path scope へ縮小した。ZIP 複数展開も source と既知出力 path の lock／checkpoint だけを使う。
+- 別 target slot の mutation は並行可能で、同一 source／destination と workspace-wide writer は引き続き競合する。
+- Git snapshot の固定コマンド群は helper identity hold を共有し、Windows での helper 全体 hash は一連の snapshot 当たり trust capture と hold 開始の 2 回へ集約した。
+- `.venv`／`node_modules`／`build` 等の不要な staging copy を除去した。
+- artifact chunk は開始時の不変 snapshot を読み、chunk ごとの全 file rehash／data_dir 全走査を行わない既存実装を維持した。
+- 定量 benchmark は実施していないため、速度向上率は保証しない。
 
-この端末では`codex sandbox`のsimple commandが`CreateRestrictedToken failed: 87`または長時間停止となり、停止したprocessはPID identity確認後に終了しました。したがってApproved Sandbox内のsimple command、Python、pytest、PowerShell、Node/npm、child process、workspace write、network/filesystem boundaryは実行成功未検証です。Codex helper discoveryだけでOpenAI authentication、prompt、model inference、API通信は発生しません。
+### 次の新規セキュリティ監査への引き継ぎ
 
-## Checkpoint performance
-
-100 files・約102 KBの一時workspaceで、初回full checkpointは0.946秒、1 fileだけ変更した2回目も0.186秒でした。CASはblob storageをdeduplicateしますが、manifest完全性と外部/manual変更検出を維持するため現在もO(files + bytes)のfull scanです。信頼できる変更journalなしに既知pathだけへ縮小する最適化は採用していません。1000-file probeは30秒以内に完了しなかったため、大規模workspaceではI/O costが重要な残存制約です。
-
-## Not verified
-
-- real ADB server/emulator/device identity、screenshot、5037接続
-- Safe Dart/Flutterの成功経路
-- Approved Sandbox内のdeveloper command成功経路と実効filesystem/network/child境界
-- AppContainer child側からのhandle table enumeration
-- power-lossを各fsync/SQLite境界で強制するhardware-level test
-- Secure MCP Tunnel / ChatGPT接続
-
-mock/unit/static evidenceを、上記のWindows実機未検証項目の代替とは扱いません。
+- 本作業中に、既知問題と独立した新規脆弱性は確認していない。
+- 次タスクでは未知問題の探索と、本記録の未検証項目を区別する。特に Codex Sandbox の 9 property を実測できる backend／setup が得られた場合は、property ごとの probe を再実行する。
+- repository-wide Ruff の `timeline.py` import order は独立した非 security 品質事項であり、新規脆弱性としては扱わない。

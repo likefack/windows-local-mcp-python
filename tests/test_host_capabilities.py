@@ -95,6 +95,8 @@ def test_enabled_capability_remains_available_through_host_approval(
     )
 
     assert normalized.program_key == expected_key
+    assert normalized.executable_identity is not None
+    assert normalized.executable_identity["sha256"]
 
 
 def test_unrelated_approved_program_is_not_blocked_by_disabled_capabilities(
@@ -112,3 +114,4 @@ def test_unrelated_approved_program_is_not_blocked_by_disabled_capabilities(
     )
 
     assert normalized.program_key == "python"
+    assert normalized.executable_identity is not None

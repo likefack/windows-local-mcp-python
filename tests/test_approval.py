@@ -77,6 +77,39 @@ def test_code_loader_runs_immutable_cwd_copy_and_ignores_unrelated_changes(
     assert len(manifest["inputs"]) == 1
 
 
+def test_staging_excludes_protected_files_and_generated_dependency_trees(
+    tmp_path: Path,
+) -> None:
+    settings = make_settings(tmp_path)
+    project = settings.workspace_root / "project"
+    project.mkdir()
+    (project / "main.py").write_text("print('ok')", encoding="utf-8")
+    (project / ".env").write_text("TOKEN=secret", encoding="utf-8")
+    for directory in (".venv", "node_modules", "build", "__pycache__"):
+        generated = project / directory
+        generated.mkdir()
+        (generated / "payload.bin").write_bytes(b"generated")
+    command = make_command(make_executable(tmp_path), project, ["main.py"])
+
+    _, manifest, _digest = prepare_approval_bundle(
+        settings=settings,
+        workspace=Workspace(settings),
+        operation_id="bounded-staging",
+        normalized=command,
+    )
+
+    staged = Path(str(manifest["staged_cwd"]))
+    assert (staged / "main.py").is_file()
+    assert not (staged / ".env").exists()
+    assert not (staged / ".venv").exists()
+    assert not (staged / "node_modules").exists()
+    assert not (staged / "build").exists()
+    assert not (staged / "__pycache__").exists()
+    assert [Path(record["source_path"]).name for record in manifest["inputs"]] == [
+        "main.py"
+    ]
+
+
 def test_tampering_with_immutable_approved_copy_is_rejected(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
     script = settings.workspace_root / "main.py"

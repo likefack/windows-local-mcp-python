@@ -17,10 +17,13 @@ Security objectives:
 
 `filesystem_enabled`, `git_enabled`, `flutter_enabled`, `dart_enabled`, `adb_enabled`, and `powershell_enabled` are independent. A disabled capability is disabled in both the automatic and approval paths; approval does not override an explicit `false`. Disabled optional tools are not resolved at startup. `workspace_root` is mandatory; there is no current-directory fallback.
 
+`git_enabled` and `adb_enabled` do not make their broker helpers available by themselves. Automatic helper execution requires an explicit absolute executable path and operator-pinned SHA-256. PATH discovery is not a trust source. Session capability data reports configured, enabled, and available separately.
+
 Dangerous configuration combinations fail startup validation:
 
 - lexical or resolved overlap between `workspace_root` and `data_dir`
 - workspace/data root reparse points
+- physical overlap among workspace, data, and Sandbox scratch after Windows handle/volume identity resolution
 - non-loopback unauthenticated HTTP
 - multi-principal HTTP without authenticated ownership enforcement
 - PowerShell safe-script configuration while PowerShell is disabled
@@ -40,14 +43,14 @@ All MCP file paths pass through `Workspace`.
 
 1. takes a target-scoped cross-process mutation slot plus the canonical-target thread lock;
 2. re-resolves target and reads/checks expected SHA inside the locks;
-3. captures the before checkpoint and fsyncs a write-ahead recovery journal before replacement;
+3. captures a before checkpoint scoped to the known target path and fsyncs a write-ahead recovery journal before replacement;
 4. enforces old/new/diff/backup/data quotas before replacement;
 5. writes and fsyncs a same-directory temporary file;
 6. revalidates parent `(device,inode)` and target full identity immediately before `os.replace`;
-7. verifies and journals the after checkpoint, and restores the before checkpoint after a detected failure. Interrupted writes are reconciled on startup and unresolved recovery checkpoints are retention-protected.
+7. verifies and journals the target-scoped after checkpoint, and restores only that declared scope after a detected failure. Interrupted writes are reconciled on startup and unresolved recovery checkpoints are retention-protected.
 6. verifies resulting SHA.
 
-Target slots are selected from the canonical target path. Different slots can proceed concurrently; the same target always maps to the same slot, while a hash collision only causes extra serialization. A workspace-wide writer acquires every slot, so it still excludes all target writes.
+Target slots are selected from canonical paths. Known source→destination mutations acquire the deduplicated source and destination slots in deterministic order. Different slots can proceed concurrently; the same path always maps to the same slot, while a hash collision only causes extra serialization. A workspace-wide writer acquires every slot, so it still excludes all target writes.
 
 Ordinary file reads do not take a mutation lock.
 
@@ -57,7 +60,7 @@ Ordinary file reads do not take a mutation lock.
 
 DOCX and XLSX use two preservation modes. Documents without detected unsupported package features use the normal document library path. When unsupported package features are present, a narrow package-patch path permits only operations whose effects are confined to known XML parts: DOCX `replace_text` and `metadata_set`; XLSX `cell_set`, `range_set`, and `range_clear`. Every unmodified ZIP member payload and metadata is carried into the output. Digitally signed packages and any operation outside the narrow set fail closed instead of silently discarding features.
 
-CSV/TSV dialect and byte-identity properties are preserved where determinable. ZIP paths, collisions, entry count, and expanded size are bounded. Image decoded pixels/memory are bounded, metadata is preserved unless explicitly removed, and unsupported multi-frame transformations fail closed. Generic artifact transfer is byte-exact, chunked, and whole-artifact hash-bound. Downloads read chunks from a verified immutable control-plane snapshot; uploads reserve their full declared size before accepting chunks. Commits use the same broker mutation path, and transfer does not authorize execution.
+CSV/TSV semantic cells plus encoding/BOM/delimiter/newline properties are preserved where determinable. Editing uses a whole-document writer, so original lexical quoting and byte identity are explicitly reported as not preserved after an edit. ZIP paths, collisions, entry count, and expanded size are bounded. Image decoded pixels/memory are bounded, metadata is preserved unless explicitly removed, and unsupported multi-frame transformations fail closed. Image format conversion uses a distinct extension-matched output path with separate source and existing-destination hashes. Generic artifact transfer is byte-exact, chunked, and whole-artifact hash-bound. Downloads read chunks from a verified immutable control-plane snapshot; uploads reserve their full declared size before accepting chunks. Commits use the same broker mutation path, and transfer does not authorize execution.
 
 ## 4. Broker-fixed command operations
 
@@ -79,6 +82,7 @@ Automatic subcommands: `status`, `diff`, `log`, `show`, restricted `rev-parse`, 
 - Disallow `-C`, `--git-dir`, `--work-tree`, `--output`, config injection, pager/external helpers, and unknown flags.
 - Pathspec is accepted only after `--` and resolved inside workspace.
 - Git repository/config override environment variables are removed before Git subprocesses run.
+- Git is resolved only from the explicitly configured path/hash identity. The worker revalidates it and holds a Windows read-only-share handle against writes/replacement through process completion.
 - `git_info` returns branch, HEAD, status, working diff, staged diff, recent log, and changed files through bounded subprocess capture.
 
 ### Project-controlled tools
@@ -91,12 +95,13 @@ Automatic subcommands: `status`, `diff`, `log`, `show`, restricted `rev-parse`, 
 
 ADB is separately disabled by default. Automatic forms are exact:
 
-- `adb devices [-l]`
 - `adb -s SERIAL get-state`
 - fixed read-only `getprop`, `wm`, and `dumpsys` forms
 - `adb -s SERIAL exec-out screencap -p`
 
 Targeted calls require serial validation. `adb_emulator_only=true` requires an `emulator-*` serial and a successful `adb emu avd name` preflight. Optional `adb_allowed_serials` further narrows targets. General shell and state changes require approval.
+
+Automatic device enumeration is rejected because its raw output can disclose or expand attention to non-allowlisted physical devices. ADB uses the same explicit executable path/hash/identity/hold boundary as Git.
 
 ### Execution lock policy
 
@@ -125,7 +130,7 @@ request_sandbox_command | request_host_command
 
 `request_sandbox_command` selects Codex Sandbox; `request_host_command` selects Approved Host. Both only stage local approval state and immutable inputs. There is no implicit Codex Sandbox to Approved Host fallback and no model-facing `execute_approved` tool.
 
-Approval binding version 2 hashes the complete canonical security-sensitive request, including execution boundary, normalized command/cwd, workspace-write and runtime limits, escalation facts, risk, immutable manifest fields, effective policy, and Codex Sandbox backend identity. The manifest covers:
+Approval binding version 3 hashes the complete canonical security-sensitive request, including execution boundary, normalized command/cwd, executable identity, workspace-write and runtime limits, escalation facts, risk, immutable manifest fields, effective policy, and Codex Sandbox backend identity. The manifest covers:
 
 - main executable bytes and filesystem identity;
 - complete argv;
@@ -147,6 +152,8 @@ Code-loading commands that do not need to mutate the source run from an immutabl
 - HOME/USERPROFILE/APPDATA/LOCALAPPDATA/TEMP/PUB_CACHE point to an operation-local runtime directory;
 - file-based Dart/Flutter package dependencies outside `cwd` are copied and `package_config.json` is rewritten;
 - non-file or non-enumerable dependencies fail closed.
+
+Protected file names and generated/dependency trees such as `.venv`, `node_modules`, `build`, and `__pycache__` are excluded from ordinary staging. An exclusion is not treated as an OS read-denial property: execution remains unavailable unless current-backend live evidence independently verifies direct protected-information denial and source/outside-user filesystem boundaries for descendants as well as the initial process.
 
 The immutable copy is verified after local approval. The worker then creates a separate writable disposable run copy, so build artifacts cannot mutate the approved input copy. Unrelated workspace changes outside the approved `cwd` do not invalidate snapshot execution. Snapshot-backed child execution does not hold the workspace-wide mutation lock.
 
@@ -172,6 +179,8 @@ Executor creates a random nonce inherited by worker and child. Durable identity 
 
 On Windows, processes use a new process group and no window. On other platforms they use a new session. This is lifecycle control, not an OS sandbox.
 
+Every normalized Approved Host or Sandbox target executable is identity-bound. Immediately before launch, the worker verifies path/hash/device/inode/size/mtime and, on Windows, keeps a FILE_SHARE_READ-only handle open through child completion so same-user replacement or in-place writes fail.
+
 ## 7. Resource limits and retention
 
 - file read/write/image/directory entry limits;
@@ -196,7 +205,7 @@ All important MCP boundary actions create operations/events, including rejection
 
 The same projection is available locally with `windows-local-mcp timeline --limit 20` or `windows-local-mcp timeline --operation OPERATION_ID`.
 
-Workspace-mutating operations capture complete pre/post manifests outside the workspace while the existing workspace-wide mutation lock is held. File bytes are stored by SHA-256 in a content-addressed blob store, so unchanged content is not copied for each operation. Manifests still cover created, modified, deleted, untracked, and Git-ignored MCP-writable files. Retention removes operation manifests before garbage-collecting unreferenced blobs.
+Workspace-mutating operations record an explicit checkpoint scope. Known-target broker operations capture only the declared target paths; arbitrary or not-yet-closed output sets retain a complete workspace scope. Restore, conflict detection, post-apply verification, recovery, Timeline, and Undo use the same recorded scope. This preserves unrelated concurrent changes without weakening race detection for any in-scope path. File bytes are stored by SHA-256 in a content-addressed blob store, and retention removes operation manifests before garbage-collecting unreferenced blobs.
 
 `request_workspace_rollback` means point-in-time rollback. `request_selective_undo` means remove only one operation's delta. Both create local approval requests, bind an exact preview/current manifest into the request hash, and are recorded as normal mutation operations with before/after state so the rollback or Undo can itself be selectively undone.
 
@@ -217,7 +226,9 @@ Every fixed broker helper receives an explicit per-command network policy in aud
 
 Legacy Safe Tier, AppContainer, and compatibility-mode configuration is obsolete and fails startup. Codex Sandbox failure never falls back to Approved Host. Ordinary non-zero exit, test failure, compile/lint failure, and application error remain failures in the selected boundary.
 
-Codex Sandbox uses the installed Codex CLI sandbox-only entrypoint with `windows.sandbox="elevated"` and the `:workspace` permission profile. The launcher plus adjacent command-runner and sandbox-setup helper form the minimum executable dependency closure: each must be validly Authenticode-signed by OpenAI, is path/hash/stat/signer-bound, revalidated after approval, and held against replacement through the child lifetime. The bound helper directory is first in the launcher PATH. Then `codex --version` is recorded and the fixed command is launched through `codex sandbox`. This does not start a Codex agent, send a prompt, authenticate with OpenAI, or perform model/API inference. The MCP's cwd/path/protected-file/environment/executable/approval/checkpoint/audit policies remain in force. Read-only code-loading commands operate on an immutable staged copy; source-write commands require `workspace_write=true`, a full manifest, and the workspace mutation lock.
+Codex Sandbox uses the installed Codex CLI sandbox-only entrypoint with `windows.sandbox="elevated"` and the legacy `:workspace` permission profile. The launcher plus adjacent command-runner and sandbox-setup helper form the minimum executable dependency closure: each must be validly Authenticode-signed by OpenAI, is path/hash/stat/signer-bound, revalidated after approval, and held against replacement through the child lifetime. Host-side launcher cwd is the trusted install directory, and relative, workspace, data, and scratch PATH entries are removed before launch. Then `codex --version` is recorded and the fixed command is launched through `codex sandbox`. This does not start a Codex agent, send a prompt, authenticate with OpenAI, or perform model/API inference. Read-only code-loading commands operate on an immutable staged copy; source-write commands require `workspace_write=true`, a full manifest, and the workspace mutation lock.
+
+Legacy `:workspace` availability is not equivalent to a verified boundary. Live evidence version 2 records `filesystem_read`, `filesystem_write`, `protected_information_read`, `internet`, `lan`, `loopback`, `descendant_containment`, `termination`, and `resource_bound` separately. Old evidence and partially verified property sets are rejected. Session status keeps dependency/startup `available`, aggregate `windows_live_verified`, and policy-gated `execution_route_available` separate. The latter two become true only when every required property is verified for the exact backend digest. Local configuration cannot disable this requirement, and failure never creates an Approved Host fallback.
 
 The selected distribution mode is installed-Codex dependency. It reuses upstream's CLI/setup helper/command runner/security update chain without copying Windows sandbox internals into this repository. Apache-2.0 permits a future standalone distribution, but safely redistributing the coordinated binaries, versioned policy/protocol, setup behavior, signing, notices, and update channel is deferred. Missing CLI, incomplete UAC setup, incompatible backend, initialization/policy/launch failure, or timeout fails closed. Host execution requires a new `approved_host` request.
 
@@ -229,13 +240,15 @@ Public code and `config.example.toml` remain generic. Machine/private values bel
 
 ## 9. data_dir protection
 
-`data_dir` is resolved independently and must not lexically or effectively overlap workspace. Both roots must not be reparse points. On Windows, `protect_data_dir_acl=true` removes inherited ACLs and grants Full Control only to the current token SID and SYSTEM.
+`data_dir` and Sandbox scratch are resolved independently and must not lexically or effectively overlap workspace or each other. Roots must not be reparse points. On Windows, handle-resolved volume-GUID paths and stable file identities also reject aliases such as SUBST that identify the same or nested physical namespace. `protect_data_dir_acl=true` removes inherited ACLs and grants Full Control only to the current token SID and SYSTEM.
 
 ACL cannot distinguish two processes running as the same Windows user. MCP filesystem tools still cannot reach `data_dir` because it is outside workspace, and artifact paths are validated before special retrieval such as ADB screenshots.
 
 ## 10. Transport and ownership
 
 Default transport is stdio. Streamable HTTP currently fails closed even when requested because authenticated principal ownership is not yet implemented.
+
+`session_info.transport` reports stdio and HTTP independently with configured/enabled/available and startup-validation state; it does not describe rejected HTTP as optional or available.
 
 Authenticated multi-principal HTTP is not implemented. Setting `http_multi_principal_enabled=true` fails startup. Therefore no supported configuration exposes globally shared job/approval/audit identifiers to distinct authenticated principals. A future implementation must persist `principal_id` on every operation and include it in every create/get/list/poll/claim/execute/cancel/audit SQL predicate.
 

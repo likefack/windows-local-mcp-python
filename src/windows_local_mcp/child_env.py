@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Iterable, Mapping, MutableMapping
+from pathlib import Path
 
 from .git_env import is_git_ambient_override, sanitized_git_environment
 
@@ -147,6 +148,53 @@ def build_command_environment(
         result = sanitized_git_environment(result)
     result["WINDOWS_LOCAL_MCP_JOB_NONCE"] = nonce
     return result
+
+
+def sanitize_executable_search_path(
+    environment: MutableMapping[str, str],
+    *,
+    forbidden_roots: Iterable[Path],
+    prepend: Iterable[Path] = (),
+) -> None:
+    """Remove relative and untrusted PATH entries before launching a trusted boundary."""
+    # Configured boundary roots and explicitly prepended directories are trusted inputs. If
+    # either cannot be resolved, launching without that boundary would be unsafe, so fail.
+    roots = [root.resolve(strict=True) for root in forbidden_roots]
+    candidates = [str(path.resolve(strict=True)) for path in prepend]
+    candidates.extend(environment.get("PATH", "").split(os.pathsep))
+    retained: list[str] = []
+    seen: set[str] = set()
+    for value in candidates:
+        value = value.strip().strip('"')
+        if not value:
+            continue
+        candidate = Path(value)
+        if not candidate.is_absolute():
+            continue
+        try:
+            resolved = candidate.resolve(strict=True)
+            if not resolved.is_dir():
+                continue
+        except (OSError, RuntimeError):
+            # Ambient PATH commonly contains unavailable App Execution Alias or stale
+            # directories. They are not required dependencies and must not make a trusted
+            # launch use an unsanitized fallback PATH.
+            continue
+        if any(_is_relative_to(resolved, root) for root in roots):
+            continue
+        folded = os.path.normcase(str(resolved))
+        if folded not in seen:
+            seen.add(folded)
+            retained.append(str(resolved))
+    environment["PATH"] = os.pathsep.join(retained)
+
+
+def _is_relative_to(candidate: Path, parent: Path) -> bool:
+    try:
+        candidate.relative_to(parent)
+        return True
+    except ValueError:
+        return False
 
 
 def sanitize_process_environment(

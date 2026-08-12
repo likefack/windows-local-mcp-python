@@ -40,6 +40,7 @@ from .redaction import redact_command_args, redact_text
 from .resources import NamedControlPlaneLock, WorkspaceExecutionLock, enforce_data_quota
 from .risk import command_risk_facts
 from .sandbox_backend import (
+    SANDBOX_SECURITY_PROPERTIES,
     codex_sandbox_effective_policy,
     require_codex_sandbox_live_verification,
     resolve_codex_sandbox_backend,
@@ -48,6 +49,7 @@ from .structured_files import infer_format, read_zip_entries, read_zip_entry
 from .structured_files import inspect as inspect_structured
 from .structured_files import transform as transform_structured
 from .timeline import timeline_entry, timeline_list
+from .tool_safety import trusted_helper_identity
 from .util import (
     canonical_json,
     read_text_limited,
@@ -62,6 +64,7 @@ from .workspace_history import (
     build_workspace_target_from_bytes,
     capture_workspace_state,
     checkpoint_manifest_digest,
+    checkpoint_scope,
     compare_workspace_states,
     describe_workspace_restore,
     finalize_workspace_transaction,
@@ -222,16 +225,24 @@ def _require_workspace_mutation_ready() -> None:
 
 def _codex_sandbox_capability() -> dict[str, Any]:
     status: dict[str, Any] = {
-        "configured": runtime.settings.approved_sandbox_codex_path is not None,
+        "configured": True,
         "enabled": runtime.settings.approved_sandbox_enabled,
         "available": False,
+        "execution_route_available": False,
+        "dependency_available": False,
         "live_verified": False,
+        "windows_live_verified": False,
+        "properties": {
+            name: {"status": "unverified"} for name in SANDBOX_SECURITY_PROPERTIES
+        },
     }
     if not runtime.settings.approved_sandbox_enabled:
         status["unavailable_reason"] = "disabled by configuration"
         return status
     try:
-        backend = resolve_codex_sandbox_backend(runtime.settings).as_dict()
+        resolved = resolve_codex_sandbox_backend(runtime.settings)
+        backend = resolved.as_dict()
+        status["dependency_available"] = True
         status["available"] = True
         status["backend"] = {
             key: backend[key]
@@ -241,22 +252,61 @@ def _codex_sandbox_capability() -> dict[str, Any]:
         if marker.is_file():
             evidence = json.loads(marker.read_text(encoding="utf-8"))
             if (
-                evidence.get("backend_digest") == sha256_text(canonical_json(backend))
-                and evidence.get("passed") is True
+                evidence.get("version") == 2
+                and evidence.get("backend_digest") == sha256_text(canonical_json(backend))
+                and isinstance(evidence.get("properties"), dict)
             ):
-                status["live_verified"] = True
+                status["properties"] = evidence["properties"]
                 status["live_verified_at"] = evidence.get("verified_at")
             else:
                 status["live_verification_stale"] = True
     except Exception as error:  # noqa: BLE001 - availability must never break session_info
         status["unavailable_reason"] = redact_text(f"{type(error).__name__}: {error}")
+        return status
+    try:
+        require_codex_sandbox_live_verification(runtime.settings, resolved)
+        status["execution_route_available"] = True
+        status["live_verified"] = True
+        status["windows_live_verified"] = True
+    except Exception as error:  # noqa: BLE001 - route status must remain independently visible
+        status["execution_unavailable_reason"] = redact_text(
+            f"{type(error).__name__}: {error}"
+        )
     return status
+
+
+def _broker_helper_capability(program_key: str, enabled: bool) -> dict[str, Any]:
+    configured = bool(
+        getattr(runtime.settings, f"{program_key}_executable_path")
+        and getattr(runtime.settings, f"{program_key}_executable_sha256")
+    )
+    result: dict[str, Any] = {
+        "configured": configured,
+        "enabled": enabled,
+        "available": False,
+        "windows_live_verified": False,
+    }
+    if not enabled:
+        result["unavailable_reason"] = "disabled by configuration"
+        return result
+    try:
+        identity = trusted_helper_identity(runtime.settings, program_key)
+        result.update(
+            available=True,
+            provenance=identity["provenance"],
+            executable_sha256=identity["sha256"],
+        )
+    except Exception as error:  # noqa: BLE001 - capability display must remain available
+        result["unavailable_reason"] = redact_text(f"{type(error).__name__}: {error}")
+    return result
 
 
 @mcp.tool(annotations=READ_ONLY)
 def session_info() -> dict[str, Any]:
     """Show workspace, capability switches, limits, and approval model."""
     codex_sandbox = _codex_sandbox_capability()
+    git_helper = _broker_helper_capability("git", runtime.settings.git_enabled)
+    adb_helper = _broker_helper_capability("adb", runtime.settings.adb_enabled)
     result = {
         "workspace_root": str(runtime.settings.workspace_root),
         "data_dir": str(runtime.settings.data_dir),
@@ -275,8 +325,15 @@ def session_info() -> dict[str, Any]:
                     "configured": True,
                     "enabled": runtime.settings.filesystem_enabled,
                     "available": True,
-                    "live_verified": True,
-                    "evidence": "startup filesystem identity/lock/replace probe",
+                    "live_verified": False,
+                    "windows_live_verified": False,
+                    "properties": {
+                        "filesystem_identity_lock_replace": {
+                            "status": "verified",
+                            "evidence": "startup filesystem identity/lock/replace probe",
+                        },
+                        "complete_broker_boundary": {"status": "unverified"},
+                    },
                 },
                 "structured_processing": {
                     "configured": True,
@@ -291,6 +348,8 @@ def session_info() -> dict[str, Any]:
                     "live_verified": False,
                 },
                 "codex_sandbox": codex_sandbox,
+                "git_broker_helper": git_helper,
+                "adb_broker_helper": adb_helper,
                 "approved_host": {
                     "configured": runtime.settings.approved_host_enabled,
                     "enabled": runtime.settings.approved_host_enabled,
@@ -322,7 +381,22 @@ def session_info() -> dict[str, Any]:
             "approved_host": "separate approval; never an automatic fallback",
         },
         "configuration_selection": runtime.settings.selection_info(),
-        "transport": "stdio by default; optional loopback-only streamable-http",
+        "transport": {
+            "stdio": {
+                "configured": True,
+                "enabled": True,
+                "available": True,
+                "principal_model": "single local user",
+                "startup_validation": "accepted",
+            },
+            "http": {
+                "configured": runtime.settings.http_enabled,
+                "enabled": False,
+                "available": False,
+                "principal_model": "unsupported without authenticated ownership",
+                "startup_validation": "rejected when configured",
+            },
+        },
         "structured_file_processing": {
             "chatgpt_container": (
                 "a first-class path via hash-bound transfer when container capabilities, format "
@@ -465,7 +539,17 @@ def _atomic_binary_mutation(
     _require_filesystem()
     _require_workspace_mutation_ready()
     operation_id: str | None = None
-    with WorkspaceExecutionLock(runtime.settings):
+    target = runtime.workspace.resolve_for_write(path)
+    bound_sources = [
+        runtime.workspace.resolve_existing(source_path, allow_directory=False)
+        for source_path, _expected_sha256 in source_bindings
+    ]
+    independent_source_bindings = tuple(
+        binding
+        for binding, source in zip(source_bindings, bound_sources, strict=True)
+        if source != target
+    )
+    with WorkspaceExecutionLock(runtime.settings, targets=(target, *bound_sources)):
         target = runtime.workspace.resolve_for_write(path)
         if not target.exists() and not allow_create:
             raise FileNotFoundError("structured editing requires an existing file")
@@ -523,7 +607,13 @@ def _atomic_binary_mutation(
                 cwd=str(runtime.settings.workspace_root),
                 request=_safe_request(request),
             )
-            pre_workspace = capture_workspace_state(runtime.settings, operation_id, "before")
+            checkpoint_paths = {runtime.workspace.relative(target)}
+            pre_workspace = capture_workspace_state(
+                runtime.settings,
+                operation_id,
+                "before",
+                paths=checkpoint_paths,
+            )
             runtime.audit.update_operation(operation_id, pre_workspace_path=pre_workspace.manifest_path)
             begin_single_file_write_transaction(
                 runtime.settings,
@@ -557,7 +647,13 @@ def _atomic_binary_mutation(
                 workspace_changed = True
                 if target.read_bytes() != after:
                     raise RuntimeError("post-write content verification failed")
-                post_workspace = capture_workspace_state(runtime.settings, operation_id, "after")
+                _verify_binary_source_bindings(independent_source_bindings)
+                post_workspace = capture_workspace_state(
+                    runtime.settings,
+                    operation_id,
+                    "after",
+                    paths=checkpoint_paths,
+                )
                 workspace_change = compare_workspace_states(
                     runtime.settings, pre_workspace.manifest_path, post_workspace.manifest_path, operation_id
                 )
@@ -724,12 +820,30 @@ def structured_file_apply(
     expected_sha256: str | None = None,
     reason: str = "",
     format: str | None = None,
+    output_path: str | None = None,
+    expected_output_sha256: str | None = None,
 ) -> dict[str, Any]:
-    """Apply declarative format-specific operations through the broker; existing files require expected_sha256."""
-    request = {"path": path, "operations": operations, "expected_sha256": expected_sha256, "reason": reason, "format": format}
+    """Apply a declarative transform with separately bound source and destination identities."""
+    request = {
+        "path": path,
+        "operations": operations,
+        "expected_sha256": expected_sha256,
+        "reason": reason,
+        "format": format,
+        "output_path": output_path,
+        "expected_output_sha256": expected_output_sha256,
+    }
     try:
         kind = infer_format(path, format)
-        allow_create = kind in {"csv", "tsv", "zip"}
+        target_path = output_path or path
+        distinct_output = PureWindowsPath(target_path).as_posix().casefold() != PureWindowsPath(
+            path
+        ).as_posix().casefold()
+        if distinct_output and kind != "image":
+            raise ValueError("output_path is currently supported only for image transformations")
+        if not distinct_output and expected_output_sha256 is not None:
+            raise ValueError("expected_output_sha256 is only valid for a distinct output_path")
+        allow_create = kind in {"csv", "tsv", "zip"} and not distinct_output
         _target, prepared_source, source_exists = _read_bounded_binary(
             path, allow_missing=allow_create
         )
@@ -738,24 +852,52 @@ def structured_file_apply(
             raise ValueError("expected_sha256 is required when replacing an existing file")
         if expected_sha256 is not None and expected_sha256 != prepared_sha:
             raise RuntimeError("expected_sha256 mismatch; source is stale or concurrently modified")
+        if distinct_output:
+            _output_target, prepared_output, output_exists = _read_bounded_binary(
+                target_path, allow_missing=True
+            )
+            if output_exists and expected_output_sha256 is None:
+                raise ValueError(
+                    "expected_output_sha256 is required when replacing an existing output file"
+                )
+            if (
+                expected_output_sha256 is not None
+                and expected_output_sha256 != sha256_bytes(prepared_output)
+            ):
+                raise RuntimeError(
+                    "expected_output_sha256 mismatch; output is stale or concurrently modified"
+                )
         output, semantic = transform_structured(
-            prepared_source, path, operations, runtime.settings, format=format
+            prepared_source,
+            path,
+            operations,
+            runtime.settings,
+            format=format,
+            output_path=target_path,
         )
 
-        def apply(source: bytes) -> tuple[bytes, dict[str, Any]]:
-            if source != prepared_source:
+        def apply(target_before: bytes) -> tuple[bytes, dict[str, Any]]:
+            if not distinct_output and target_before != prepared_source:
                 raise RuntimeError("source changed while the structured artifact was processed")
             return output, semantic
 
         return _atomic_binary_mutation(
             tool_name="structured_file_apply",
-            path=path,
-            expected_sha256=expected_sha256,
+            path=target_path,
+            expected_sha256=(expected_output_sha256 if distinct_output else expected_sha256),
             reason=reason,
-            request_summary={"format": kind, "operations": [item.get("op") for item in operations]},
+            request_summary={
+                "format": kind,
+                "source_path": path,
+                "output_path": target_path,
+                "operations": [item.get("op") for item in operations],
+            },
             transform=apply,
-            allow_create=allow_create,
+            allow_create=allow_create or distinct_output,
             require_expected_for_existing=True,
+            source_bindings=(
+                ((path, prepared_sha),) if distinct_output else ()
+            ),
         )
     except Exception as error:
         _audit_rejection("structured_file_apply", request, error)
@@ -880,6 +1022,7 @@ def zip_extract_many(
             raise RuntimeError("expected_archive_sha256 mismatch; archive is stale or concurrently modified")
         extracted = read_zip_entries(archive_data, entries, runtime.settings)
         changes: dict[str, bytes] = {}
+        mutation_targets = [archive]
         base = PureWindowsPath(output_directory)
         for entry, payload in extracted.items():
             relative = str(base / PureWindowsPath(entry.replace("/", "\\")))
@@ -888,6 +1031,7 @@ def zip_extract_many(
             if normalized.casefold() == archive_relative.casefold():
                 raise ValueError("ZIP extraction cannot overwrite its source archive")
             changes[normalized] = payload
+            mutation_targets.append(target)
         operation_id = runtime.audit.create_operation(
             tool_name="zip_extract_many",
             tier="structured_processing",
@@ -895,10 +1039,16 @@ def zip_extract_many(
             cwd=str(runtime.settings.workspace_root),
             request=_safe_request(request),
         )
-        with WorkspaceExecutionLock(runtime.settings):
+        with WorkspaceExecutionLock(runtime.settings, targets=mutation_targets):
             _require_workspace_mutation_ready()
             _verify_binary_source_bindings(((archive_relative, expected_archive_sha256),))
-            before = capture_workspace_state(runtime.settings, operation_id, "before")
+            checkpoint_paths = set(changes)
+            before = capture_workspace_state(
+                runtime.settings,
+                operation_id,
+                "before",
+                paths=checkpoint_paths,
+            )
             target_manifest = build_workspace_target_from_bytes(
                 runtime.settings,
                 operation_id,
@@ -929,7 +1079,12 @@ def zip_extract_many(
                         journal_path=str(recovered["transaction_journal"]),
                     ) from operation_error
                 raise
-            after = capture_workspace_state(runtime.settings, operation_id, "after")
+            after = capture_workspace_state(
+                runtime.settings,
+                operation_id,
+                "after",
+                paths=checkpoint_paths,
+            )
             workspace_change = compare_workspace_states(
                 runtime.settings, before.manifest_path, after.manifest_path, operation_id
             )
@@ -1513,7 +1668,9 @@ def write_file(
         if len(content_bytes) > runtime.settings.max_write_bytes:
             raise ValueError("write exceeds max_write_bytes")
         target = runtime.workspace.resolve_for_write(path)
-        with WorkspaceExecutionLock(runtime.settings), runtime.workspace.lock_target(target):
+        with WorkspaceExecutionLock(
+            runtime.settings, target=target
+        ), runtime.workspace.lock_target(target):
             _require_workspace_mutation_ready()
             target = runtime.workspace.resolve_for_write(path)
             parent_identity = runtime.workspace.identity(target.parent)
@@ -1549,7 +1706,13 @@ def write_file(
                 cwd=str(runtime.settings.workspace_root),
                 request=request,
             )
-            pre_workspace = capture_workspace_state(runtime.settings, operation_id, "before")
+            checkpoint_paths = {runtime.workspace.relative(target)}
+            pre_workspace = capture_workspace_state(
+                runtime.settings,
+                operation_id,
+                "before",
+                paths=checkpoint_paths,
+            )
             runtime.audit.update_operation(
                 operation_id, pre_workspace_path=pre_workspace.manifest_path
             )
@@ -1628,7 +1791,12 @@ def write_file(
                     "added_lines": added,
                     "removed_lines": removed,
                 }
-                post_workspace = capture_workspace_state(runtime.settings, operation_id, "after")
+                post_workspace = capture_workspace_state(
+                    runtime.settings,
+                    operation_id,
+                    "after",
+                    paths=checkpoint_paths,
+                )
                 workspace_change = compare_workspace_states(
                     runtime.settings,
                     pre_workspace.manifest_path,
@@ -2256,8 +2424,18 @@ def request_workspace_rollback(operation_id: str, reason: str = "") -> dict[str,
             verify_checkpoint_integrity(
                 runtime.settings, str(target["post_workspace_path"])
             )
+            rollback_scope = checkpoint_scope(
+                runtime.settings, str(target["post_workspace_path"])
+            )
             current = capture_workspace_state(
-                runtime.settings, rollback_id, "rollback-preview-current"
+                runtime.settings,
+                rollback_id,
+                "rollback-preview-current",
+                paths=(
+                    None
+                    if rollback_scope["kind"] == "workspace"
+                    else set(rollback_scope["paths"])
+                ),
             )
             preview = describe_workspace_restore(
                 runtime.settings,

@@ -7,6 +7,7 @@ import shutil
 import threading
 import time
 from collections import deque
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from functools import wraps
@@ -32,8 +33,9 @@ class WorkspaceExecutionLock:
     """Cross-process mutation lock with workspace-wide and target-specific scopes.
 
     With no target, all lock slots are acquired and the caller has exclusive workspace-write
-    access. With a target, only the deterministic slot for that canonical path is acquired.
-    Hash collisions merely serialize unrelated target writes; they never weaken exclusion.
+    access. One or more known paths acquire only their deterministic canonical-path slots in
+    sorted order. Hash collisions merely serialize unrelated writes; they never weaken
+    exclusion or create a multi-lock deadlock.
     """
 
     def __init__(
@@ -42,13 +44,21 @@ class WorkspaceExecutionLock:
         timeout: float = 30.0,
         *,
         target: Path | None = None,
+        targets: Iterable[Path] | None = None,
     ) -> None:
+        if target is not None and targets is not None:
+            raise ValueError("target and targets are mutually exclusive")
         self.lock_dir = settings.data_dir / "locks"
         self.timeout = timeout
         self.target = target
         self._held: list[tuple[BinaryIO, threading.RLock]] = []
+        selected = tuple(targets) if targets is not None else ((target,) if target else None)
+        if selected is not None and not selected:
+            raise ValueError("targets must identify at least one path")
         self._slots = (
-            [self._target_slot(target)] if target is not None else list(range(_LOCK_SLOT_COUNT))
+            sorted({self._target_slot(item) for item in selected})
+            if selected is not None
+            else list(range(_LOCK_SLOT_COUNT))
         )
 
     def __enter__(self) -> Self:

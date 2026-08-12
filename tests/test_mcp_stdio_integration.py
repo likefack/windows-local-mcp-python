@@ -1,3 +1,4 @@
+import hashlib
 import os
 import shutil
 import subprocess
@@ -24,6 +25,8 @@ def test_real_stdio_tools_list_and_file_round_trip(tmp_path: Path) -> None:
     config = tmp_path / "config.toml"
     root_text = str(workspace).replace("\\", "\\\\")
     data_text = str(data).replace("\\", "\\\\")
+    git_text = str(Path(git).resolve()).replace("\\", "\\\\")
+    git_sha256 = hashlib.sha256(Path(git).read_bytes()).hexdigest()
     config.write_text(
         "\n".join(
             [
@@ -31,6 +34,8 @@ def test_real_stdio_tools_list_and_file_round_trip(tmp_path: Path) -> None:
                 f'data_dir = "{data_text}"',
                 "protect_data_dir_acl = false",
                 "git_enabled = true",
+                f'git_executable_path = "{git_text}"',
+                f'git_executable_sha256 = "{git_sha256}"',
             ]
         ),
         encoding="utf-8",

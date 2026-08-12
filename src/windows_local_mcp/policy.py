@@ -10,7 +10,7 @@ from pydantic import BaseModel
 
 from .config import Settings
 from .paths import Workspace
-from .tool_safety import ensure_external_tool_executable
+from .tool_safety import capture_executable_identity, trusted_helper_identity
 from .util import canonical_json, sha256_text
 
 
@@ -21,6 +21,7 @@ class NormalizedCommand(BaseModel):
     display_command: list[str]
     program_key: str
     network_expected: bool = False
+    executable_identity: dict[str, object] | None = None
 
 
 class CommandPolicy:
@@ -73,13 +74,8 @@ class CommandPolicy:
                 return str(Path(resolved).resolve())
         raise FileNotFoundError(f"executable was not found on PATH: {', '.join(candidates)}")
 
-    def _resolve_safe_executable(self, candidates: Sequence[str]) -> str:
-        executable = self._resolve_executable(candidates)
-        return ensure_external_tool_executable(
-            executable,
-            workspace_root=self.workspace.root,
-            data_dir=self.settings.data_dir,
-        )
+    def _resolve_safe_executable(self, program_key: str) -> dict[str, object]:
+        return trusted_helper_identity(self.settings, program_key)
 
     def _require_workspace_git_root(self) -> None:
         """Prevent automatic Git from discovering and reading a repository above workspace_root."""
@@ -107,8 +103,8 @@ class CommandPolicy:
             self._require_enabled("git", self.settings.git_enabled)
             self._require_workspace_git_root()
             normalized_args = self._normalize_git(args)
-            executable = self._resolve_safe_executable(("git.exe", "git"))
-            return self._result(executable, normalized_args, cwd_path, "git")
+            identity = self._resolve_safe_executable("git")
+            return self._result(identity, normalized_args, cwd_path, "git")
 
         if key in {"flutter", "dart"}:
             raise PermissionError(
@@ -119,8 +115,8 @@ class CommandPolicy:
         if key == "adb":
             self._require_enabled("adb", self.settings.adb_enabled)
             normalized_args = self._normalize_adb(args)
-            executable = self._resolve_safe_executable(("adb.exe", "adb"))
-            return self._result(executable, normalized_args, cwd_path, "adb")
+            identity = self._resolve_safe_executable("adb")
+            return self._result(identity, normalized_args, cwd_path, "adb")
 
         raise PermissionError(
             f"{program} is not eligible for automatic execution; use request_sandbox_command"
@@ -147,13 +143,17 @@ class CommandPolicy:
                 raise FileNotFoundError(f"executable was not found: {command[0]}")
         key = self._program_key(executable)
         self._require_host_capability(key)
+        identity = capture_executable_identity(
+            executable, provenance="approval-request"
+        )
         return NormalizedCommand(
-            executable=str(Path(executable).resolve()),
+            executable=str(identity["path"]),
             args=list(command[1:]),
             cwd=str(cwd_path),
             display_command=list(command),
             program_key=key,
             network_expected=network_expected,
+            executable_identity=identity,
         )
 
     def _require_host_capability(self, key: str) -> None:
@@ -331,7 +331,10 @@ class CommandPolicy:
 
     def _normalize_adb(self, args: list[str]) -> list[str]:
         if args in (["devices"], ["devices", "-l"]):
-            return list(args)
+            raise PermissionError(
+                "automatic ADB device enumeration is disabled because it can disclose or "
+                "broaden access to non-allowlisted devices; use a targeted '-s SERIAL' read"
+            )
         if len(args) < 3 or args[0] != "-s":
             raise PermissionError("targeted ADB operations require '-s SERIAL'")
         serial = args[1]
@@ -377,18 +380,19 @@ class CommandPolicy:
 
     @staticmethod
     def _result(
-        executable: str,
+        executable_identity: dict[str, object],
         args: list[str],
         cwd: Path,
         program_key: str,
     ) -> NormalizedCommand:
         return NormalizedCommand(
-            executable=executable,
+            executable=str(executable_identity["path"]),
             args=args,
             cwd=str(cwd),
-            display_command=[executable, *args],
+            display_command=[str(executable_identity["path"]), *args],
             program_key=program_key,
             network_expected=False,
+            executable_identity=executable_identity,
         )
 
 
@@ -411,6 +415,7 @@ def approval_hash(
         "manifest_digest": manifest_digest,
         "execution_tier": execution_tier,
         "backend_digest": backend_digest,
+        "executable_identity": normalized.executable_identity,
     }
     return sha256_text(canonical_json(payload))
 

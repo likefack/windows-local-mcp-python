@@ -148,12 +148,31 @@ def test_docx_xlsx_and_csv_use_the_checkpointed_local_path(
     assert created["before_bytes"] == 0
     inspected = server.structured_file_inspect("new.csv")
     assert inspected["preview"] == [["name", "value"], ["A", "1"]]
-    processing = server.session_info()["structured_file_processing"]
+    session = server.session_info()
+    processing = session["structured_file_processing"]
     assert "chatgpt_container" in processing
     assert "broker_direct" in processing
     assert "external-process use alone does not require Codex Sandbox" in processing[
         "external_processing_policy"
     ]
+    assert session["transport"]["stdio"]["available"] is True
+    assert session["transport"]["http"]["available"] is False
+    assert session["transport"]["http"]["startup_validation"] == "rejected when configured"
+    sandbox = session["capabilities"]["status"]["codex_sandbox"]
+    assert "available" in sandbox
+    assert "execution_route_available" in sandbox
+    assert "windows_live_verified" in sandbox
+    assert set(sandbox["properties"]) == {
+        "filesystem_read",
+        "filesystem_write",
+        "protected_information_read",
+        "internet",
+        "lan",
+        "loopback",
+        "descendant_containment",
+        "termination",
+        "resource_bound",
+    }
 
 
 def test_zip_image_and_transfer_boundaries(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -273,6 +292,44 @@ def test_generic_artifact_transfer_binds_distinct_source_until_commit(
     assert not (root / "result.pdf").exists()
 
 
+def test_distinct_source_change_during_result_commit_rolls_back_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, root = load_server(tmp_path, monkeypatch)
+    source = root / "source.pdf"
+    source.write_bytes(b"bound-source")
+    download = server.artifact_download_begin("source.pdf")
+    payload = b"derived-result"
+    upload = server.artifact_upload_begin(
+        "result.pdf",
+        len(payload),
+        sha256_bytes(payload),
+        source_transfer_id=download["transfer_id"],
+    )
+    server.artifact_upload_chunk(
+        upload["transfer_id"], 0, base64.b64encode(payload).decode("ascii")
+    )
+    real_verify = server._verify_binary_source_bindings
+    calls = 0
+
+    def change_source_on_postflight(bindings):
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            source.write_bytes(b"third-party-change")
+        return real_verify(bindings)
+
+    monkeypatch.setattr(
+        server, "_verify_binary_source_bindings", change_source_on_postflight
+    )
+
+    with pytest.raises(RuntimeError, match="bound source changed"):
+        server.artifact_upload_commit(upload["transfer_id"])
+
+    assert source.read_bytes() == b"third-party-change"
+    assert not (root / "result.pdf").exists()
+
+
 def test_generic_artifact_transfer_commits_unknown_structured_format_as_opaque_bytes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -369,6 +426,67 @@ def test_csv_preserves_bom_delimiter_quotes_crlf_and_final_newline_identity(
     assert updated.startswith(b"\xef\xbb\xbf")
     assert b";" in updated and b"\r\n" in updated
     assert not updated.endswith(b"\r\n")
+    capabilities = inspected["preservation_capabilities"]
+    assert capabilities["semantic_cells"] == "preserved_except_declared_edits"
+    assert capabilities["lexical_quoting"] == "not_preserved_writer_rewrite"
+    assert capabilities["byte_identity"] == "not_preserved_after_edit"
+
+
+def test_image_conversion_uses_distinct_hash_bound_output_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, root = load_server(tmp_path, monkeypatch)
+    source = root / "source.png"
+    Image.new("RGBA", (12, 8), color=(255, 0, 0, 128)).save(source)
+    original = source.read_bytes()
+    real_lock = server.WorkspaceExecutionLock
+    locked_targets: list[tuple[Path, ...] | None] = []
+
+    class RecordingLock:
+        def __init__(self, settings, timeout=30.0, *, target=None, targets=None):
+            selected = tuple(targets) if targets is not None else ((target,) if target else None)
+            locked_targets.append(selected)
+            self._lock = real_lock(settings, timeout, target=target, targets=targets)
+
+        def __enter__(self):
+            return self._lock.__enter__()
+
+        def __exit__(self, *args):
+            return self._lock.__exit__(*args)
+
+    monkeypatch.setattr(server, "WorkspaceExecutionLock", RecordingLock)
+
+    result = server.structured_file_apply(
+        "source.png",
+        [{"op": "convert", "format": "JPEG"}],
+        expected_sha256=sha256_bytes(original),
+        output_path="result.jpg",
+    )
+
+    output = root / "result.jpg"
+    assert source.read_bytes() == original
+    with Image.open(output) as converted:
+        assert converted.format == "JPEG"
+        assert converted.size == (12, 8)
+    assert result["path"] == "result.jpg"
+    assert result["checkpoint_scope"] == {
+        "kind": "paths",
+        "paths": ["result.jpg"],
+    }
+    assert locked_targets == [
+        (source.resolve(),),
+        (output.resolve(),),
+        (output.resolve(), source.resolve()),
+    ]
+
+    with pytest.raises(RuntimeError, match="expected_output_sha256 mismatch"):
+        server.structured_file_apply(
+            "source.png",
+            [{"op": "convert", "format": "JPEG"}],
+            expected_sha256=sha256_bytes(original),
+            output_path="result.jpg",
+            expected_output_sha256="0" * 64,
+        )
 
 
 def test_structured_edits_reject_oversized_ranges_before_materialization(
@@ -431,6 +549,22 @@ def test_zip_multi_extract_is_one_checkpointed_transaction(
         archive.writestr("nested/two.txt", b"two")
     source = root / "bundle.zip"
     source.write_bytes(package.getvalue())
+    real_lock = server.WorkspaceExecutionLock
+    locked_targets: list[tuple[Path, ...] | None] = []
+
+    class RecordingLock:
+        def __init__(self, settings, timeout=30.0, *, target=None, targets=None):
+            selected = tuple(targets) if targets is not None else ((target,) if target else None)
+            locked_targets.append(selected)
+            self._lock = real_lock(settings, timeout, target=target, targets=targets)
+
+        def __enter__(self):
+            return self._lock.__enter__()
+
+        def __exit__(self, *args):
+            return self._lock.__exit__(*args)
+
+    monkeypatch.setattr(server, "WorkspaceExecutionLock", RecordingLock)
 
     result = server.zip_extract_many(
         "bundle.zip",
@@ -441,6 +575,14 @@ def test_zip_multi_extract_is_one_checkpointed_transaction(
     assert result["rollback_state"] == "complete"
     assert (root / "expanded" / "one.txt").read_bytes() == b"one"
     assert (root / "expanded" / "nested" / "two.txt").read_bytes() == b"two"
+    assert locked_targets == [
+        (source.resolve(),),
+        (
+            source.resolve(),
+            root / "expanded" / "one.txt",
+            root / "expanded" / "nested" / "two.txt",
+        ),
+    ]
 
 
 def test_zip_multi_extract_rolls_back_outputs_when_source_changes_after_apply(

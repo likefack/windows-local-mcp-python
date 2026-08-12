@@ -25,3 +25,57 @@ def windows_system_executable(name: str) -> str:
     ):
         raise OSError(f"untrusted Windows system executable: {candidate}")
     return str(candidate)
+
+
+def physical_filesystem_path(path: Path) -> str:
+    """Return the handle-resolved physical namespace path used for boundary comparison."""
+    resolved = path.resolve(strict=True)
+    if os.name != "nt":
+        return str(resolved)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.GetFinalPathNameByHandleW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    ]
+    kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    handle = kernel32.CreateFileW(
+        str(resolved),
+        0,
+        0x00000001 | 0x00000002 | 0x00000004,  # share read/write/delete
+        None,
+        3,  # OPEN_EXISTING
+        0x02000000,  # FILE_FLAG_BACKUP_SEMANTICS
+        None,
+    )
+    invalid = wintypes.HANDLE(-1).value
+    if handle in (None, invalid):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        size = kernel32.GetFinalPathNameByHandleW(
+            handle, None, 0, 0x00000001  # VOLUME_NAME_GUID | FILE_NAME_NORMALIZED
+        )
+        if size == 0:
+            raise ctypes.WinError(ctypes.get_last_error())
+        buffer = create_unicode_buffer(size + 1)
+        written = kernel32.GetFinalPathNameByHandleW(
+            handle, buffer, len(buffer), 0x00000001
+        )
+        if written == 0 or written >= len(buffer):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return buffer.value
+    finally:
+        kernel32.CloseHandle(handle)

@@ -16,7 +16,7 @@ from .approval import (
     verify_approval_bundle,
 )
 from .audit import AuditStore
-from .child_env import build_command_environment
+from .child_env import build_command_environment, sanitize_executable_search_path
 from .config import Settings
 from .control_plane import load_worker_context, verify_control_plane_generation
 from .control_plane_guard import (
@@ -54,6 +54,7 @@ from .sandbox_backend import (
     require_codex_sandbox_live_verification,
     verify_codex_sandbox_backend,
 )
+from .tool_safety import hold_executable_identity
 from .util import canonical_json, utc_now_iso
 from .workspace_history import (
     build_workspace_target_from_bytes,
@@ -332,18 +333,26 @@ def run_operation(operation_id: str, settings: Settings) -> int:
     failure_class: str | None = None
     network_policy_payload: dict[str, object] | None = None
     sandbox_backend_hold: Any | None = None
+    executable_hold: Any | None = None
 
     try:
         _verify_adb_target(normalized, settings)
         if approved_tier:
             refreshed = audit.get_operation(operation_id, include_events=False)
             _ensure_approval_execution_fresh(refreshed)
+        executable_identity = normalized.get("executable_identity")
+        if not isinstance(executable_identity, dict):
+            raise TypeError("execution has no immutable executable identity")
+        executable_hold = hold_executable_identity(executable_identity)
+        held_path = executable_hold.__enter__()
+        if held_path != Path(str(executable)).resolve(strict=True):
+            raise RuntimeError("held executable does not match the normalized command")
         if operation["tier"] == "codex_sandbox":
             if sandbox_backend is None:
                 raise ApprovedSandboxUnavailable("Approved Sandbox backend is unavailable")
             sandbox_backend_hold = hold_codex_sandbox_backend(sandbox_backend)
             sandbox_backend = sandbox_backend_hold.__enter__()
-            sandbox_backend_version = probe_codex_version(sandbox_backend)
+            sandbox_backend_version = probe_codex_version(sandbox_backend, settings)
         child_env = build_command_environment(
             os.environ,
             extra_names=settings.child_environment_allowlist,
@@ -351,12 +360,15 @@ def run_operation(operation_id: str, settings: Settings) -> int:
             git_command=normalized.get("program_key") == "git",
         )
         if operation["tier"] == "codex_sandbox" and sandbox_backend is not None:
-            helper_directory = str(Path(sandbox_backend.executable).parent)
-            existing_path = child_env.get("PATH", "")
-            child_env["PATH"] = (
-                helper_directory
-                if not existing_path
-                else helper_directory + os.pathsep + existing_path
+            assert settings.sandbox_scratch_dir is not None
+            sanitize_executable_search_path(
+                child_env,
+                forbidden_roots=(
+                    settings.workspace_root,
+                    settings.data_dir,
+                    settings.sandbox_scratch_dir,
+                ),
+                prepend=(Path(sandbox_backend.executable).parent,),
             )
         if operation["tier"] == "broker":
             network_policy = safe_network_policy(
@@ -433,7 +445,7 @@ def run_operation(operation_id: str, settings: Settings) -> int:
                 raise ApprovedSandboxUnavailable("Approved Sandbox backend is unavailable")
             child = subprocess.Popen(
                 build_codex_sandbox_argv(sandbox_backend, command=argv, cwd=cwd),
-                cwd=cwd,
+                cwd=Path(sandbox_backend.executable).parent,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -675,6 +687,13 @@ def run_operation(operation_id: str, settings: Settings) -> int:
         except Exception as cleanup_error:  # noqa: BLE001 - launcher lock is security state
             status = "failed"
             failure_class = "sandbox_cleanup_failure"
+            error = f"{type(cleanup_error).__name__}: {cleanup_error}"
+    if executable_hold is not None:
+        try:
+            executable_hold.__exit__(None, None, None)
+        except Exception as cleanup_error:  # noqa: BLE001 - executable lock is security state
+            status = "failed"
+            failure_class = "executable_identity_failure"
             error = f"{type(cleanup_error).__name__}: {cleanup_error}"
 
     postflight_error: str | None = None

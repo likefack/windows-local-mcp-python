@@ -1550,7 +1550,26 @@ def _parse_csv(data: bytes, kind: str, settings: Settings) -> CsvDocument:
 
 def _inspect_csv(data: bytes, kind: str, settings: Settings) -> dict[str, Any]:
     document = _parse_csv(data, kind, settings)
-    return {"format": kind, "encoding": document.encoding, "delimiter": document.dialect.delimiter, "quotechar": document.dialect.quotechar, "doublequote": document.dialect.doublequote, "escapechar": document.dialect.escapechar, "newline": document.newline, "final_newline": document.final_newline, "rows": len(document.rows), "columns": max((len(row) for row in document.rows), default=0), "preview": document.rows[:200], "truncated": len(document.rows) > 200}
+    return {
+        "format": kind,
+        "encoding": document.encoding,
+        "delimiter": document.dialect.delimiter,
+        "quotechar": document.dialect.quotechar,
+        "doublequote": document.dialect.doublequote,
+        "escapechar": document.dialect.escapechar,
+        "newline": document.newline,
+        "final_newline": document.final_newline,
+        "rows": len(document.rows),
+        "columns": max((len(row) for row in document.rows), default=0),
+        "preview": document.rows[:200],
+        "truncated": len(document.rows) > 200,
+        "preservation_capabilities": {
+            "semantic_cells": "preserved_except_declared_edits",
+            "encoding_bom_delimiter_newline": "preserved",
+            "lexical_quoting": "not_preserved_writer_rewrite",
+            "byte_identity": "not_preserved_after_edit",
+        },
+    }
 
 
 def _require_csv_bounds(document: CsvDocument, settings: Settings) -> None:
@@ -1964,7 +1983,15 @@ def inspect(data: bytes, path: str, settings: Settings, *, format: str | None = 
     return result
 
 
-def transform(data: bytes, path: str, operations: list[Any], settings: Settings, *, format: str | None = None) -> tuple[bytes, dict[str, Any]]:
+def transform(
+    data: bytes,
+    path: str,
+    operations: list[Any],
+    settings: Settings,
+    *,
+    format: str | None = None,
+    output_path: str | None = None,
+) -> tuple[bytes, dict[str, Any]]:
     if not isinstance(operations, list) or not operations:
         raise StructuredFileError("operations must be a non-empty array")
     if len(operations) > min(settings.max_structured_elements, 1000):
@@ -1973,7 +2000,15 @@ def transform(data: bytes, path: str, operations: list[Any], settings: Settings,
     kind = infer_format(path, format)
     if kind == "docx": output, extra = _transform_docx(data, operations, settings)
     elif kind == "xlsx": output, extra = _transform_xlsx(data, operations, settings)
-    elif kind in {"csv", "tsv"}: output, extra = _transform_csv(data, kind, operations, settings), {}
+    elif kind in {"csv", "tsv"}:
+        output, extra = _transform_csv(data, kind, operations, settings), {
+            "preservation_capabilities": {
+                "semantic_cells": "preserved_except_declared_edits",
+                "encoding_bom_delimiter_newline": "preserved",
+                "lexical_quoting": "not_preserved_writer_rewrite",
+                "byte_identity": "not_preserved_after_edit",
+            }
+        }
     elif kind == "zip": output, extra = _transform_zip(data, operations, settings), {}
     else:
         output, image_format = _transform_image(data, operations, settings)
@@ -1981,7 +2016,8 @@ def transform(data: bytes, path: str, operations: list[Any], settings: Settings,
             "PNG": {".png"}, "JPEG": {".jpg", ".jpeg"}, "WEBP": {".webp"},
             "GIF": {".gif"}, "BMP": {".bmp"}, "TIFF": {".tif", ".tiff"},
         }
-        if image_format is not None and PureWindowsPath(path).suffix.casefold() not in format_extensions[image_format]:
+        target_path = output_path or path
+        if image_format is not None and PureWindowsPath(target_path).suffix.casefold() not in format_extensions[image_format]:
             raise StructuredFileError(
                 "image conversion would not match the target extension; use a matching output path"
             )

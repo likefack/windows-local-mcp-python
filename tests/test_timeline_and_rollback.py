@@ -58,6 +58,38 @@ def test_workspace_checkpoint_restores_new_and_changed_files(tmp_path: Path) -> 
     assert "nested/b.txt" in restored["removed_files"]
 
 
+def test_scoped_checkpoint_restores_only_declared_path_and_preserves_other_changes(
+    tmp_path: Path,
+) -> None:
+    settings = settings_for(tmp_path)
+    target = settings.workspace_root / "target.txt"
+    unrelated = settings.workspace_root / "unrelated.txt"
+    target.write_text("before", encoding="utf-8")
+    unrelated.write_text("one", encoding="utf-8")
+    before = capture_workspace_state(
+        settings, "scoped-before", "before", paths={"target.txt"}
+    )
+    target.write_text("after", encoding="utf-8")
+    unrelated.write_text("two", encoding="utf-8")
+    after = capture_workspace_state(
+        settings, "scoped-after", "after", paths={"target.txt"}
+    )
+
+    result = restore_workspace_state(
+        settings,
+        after.manifest_path,
+        before.manifest_path,
+        operation_id="scoped-restore",
+    )
+
+    assert target.read_text(encoding="utf-8") == "before"
+    assert unrelated.read_text(encoding="utf-8") == "two"
+    assert result["rollback_scope"] == {
+        "kind": "paths",
+        "paths": ["target.txt"],
+    }
+
+
 def test_workspace_checkpoint_stops_on_external_change(tmp_path: Path) -> None:
     settings = settings_for(tmp_path)
     target = settings.workspace_root / "a.txt"

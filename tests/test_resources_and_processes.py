@@ -170,3 +170,35 @@ def test_target_write_lock_allows_different_targets_and_blocks_conflicts(tmp_pat
     # Once the target write finishes, a workspace-wide writer can acquire every slot.
     with WorkspaceExecutionLock(settings, timeout=0.5):
         pass
+
+
+def test_multi_target_lock_blocks_each_bound_path_without_becoming_workspace_wide(
+    tmp_path: Path,
+) -> None:
+    settings = make_settings(tmp_path)
+    target_a = settings.workspace_root / "source.bin"
+    target_b = settings.workspace_root / "result.bin"
+    unrelated = settings.workspace_root / "unrelated.bin"
+    while WorkspaceExecutionLock._target_slot(unrelated) in {
+        WorkspaceExecutionLock._target_slot(target_a),
+        WorkspaceExecutionLock._target_slot(target_b),
+    }:
+        unrelated = unrelated.with_name(f"x-{unrelated.name}")
+
+    result: list[str] = []
+
+    def attempt_source() -> None:
+        try:
+            with WorkspaceExecutionLock(settings, target=target_a, timeout=0.2):
+                result.append("acquired")
+        except TimeoutError:
+            result.append("timeout")
+
+    with WorkspaceExecutionLock(settings, targets=(target_b, target_a)):
+        with WorkspaceExecutionLock(settings, target=unrelated, timeout=0.5):
+            pass
+        thread = threading.Thread(target=attempt_source)
+        thread.start()
+        thread.join(timeout=2)
+
+    assert result == ["timeout"]

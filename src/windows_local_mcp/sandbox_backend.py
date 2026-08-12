@@ -6,6 +6,7 @@ import json
 import os
 import re
 import subprocess
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from ctypes import create_unicode_buffer, get_last_error, wintypes
@@ -13,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .child_env import build_command_environment, sanitize_executable_search_path
 from .config import Settings
 from .tool_safety import ensure_external_tool_executable
 from .util import canonical_json, sha256_text
@@ -22,6 +24,17 @@ _OPENAI_AUTHENTICODE_NAMES = ('O="OpenAI OpCo, LLC"', 'CN="OpenAI OpCo, LLC"')
 _SANDBOX_HELPERS = (
     "codex-command-runner.exe",
     "codex-windows-sandbox-setup.exe",
+)
+SANDBOX_SECURITY_PROPERTIES = (
+    "filesystem_read",
+    "filesystem_write",
+    "protected_information_read",
+    "internet",
+    "lan",
+    "loopback",
+    "descendant_containment",
+    "termination",
+    "resource_bound",
 )
 
 
@@ -160,6 +173,7 @@ def resolve_codex_sandbox_backend(settings: Settings) -> CodexSandboxBackend:
                     str(candidate),
                     workspace_root=settings.workspace_root,
                     data_dir=settings.data_dir,
+                    sandbox_scratch_dir=settings.sandbox_scratch_dir,
                 )
             ).resolve(strict=True)
             stat = executable.stat()
@@ -226,7 +240,9 @@ def require_codex_sandbox_live_verification(
 ) -> dict[str, Any]:
     """Bind execution to successful live checks of this exact installed backend."""
     if not settings.approved_sandbox_require_live_verification:
-        return {"required": False, "verified": False}
+        raise ApprovedSandboxUnavailable(
+            "Codex Sandbox live verification cannot be disabled by local configuration"
+        )
     marker = settings.data_dir / "control-plane" / "sandbox-live-verification.json"
     try:
         evidence = json.loads(marker.read_text(encoding="utf-8"))
@@ -234,25 +250,18 @@ def require_codex_sandbox_live_verification(
         raise ApprovedSandboxUnavailable(
             "Codex Sandbox has not completed Windows live verification for this profile"
         ) from error
-    required_checks = {
-        "simple_command",
-        "python_child",
-        "source_read",
-        "scratch_write",
-        "control_plane_denied",
-        "network_denied",
-        "grandchild_contained",
-        "timeout_terminated",
-        "filesystem_limit_enforced",
-    }
-    checks = evidence.get("checks")
+    properties = evidence.get("properties")
     if (
-        evidence.get("version") != 1
+        evidence.get("version") != 2
         or evidence.get("passed") is not True
         or evidence.get("backend_digest")
         != sha256_text(canonical_json(backend.as_dict()))
-        or not isinstance(checks, dict)
-        or any(checks.get(name) is not True for name in required_checks)
+        or not isinstance(properties, dict)
+        or any(
+            not isinstance(properties.get(name), dict)
+            or properties[name].get("status") != "verified"
+            for name in SANDBOX_SECURITY_PROPERTIES
+        )
     ):
         raise ApprovedSandboxUnavailable(
             "Codex Sandbox live verification is missing, failed, or stale for this backend"
@@ -317,7 +326,22 @@ def hold_codex_sandbox_backend(
             kernel32.CloseHandle(handle)
 
 
-def probe_codex_version(backend: CodexSandboxBackend) -> str:
+def probe_codex_version(backend: CodexSandboxBackend, settings: Settings) -> str:
+    environment = build_command_environment(
+        os.environ,
+        extra_names=settings.child_environment_allowlist,
+        nonce=uuid.uuid4().hex,
+    )
+    assert settings.sandbox_scratch_dir is not None
+    sanitize_executable_search_path(
+        environment,
+        forbidden_roots=(
+            settings.workspace_root,
+            settings.data_dir,
+            settings.sandbox_scratch_dir,
+        ),
+        prepend=(Path(backend.executable).parent,),
+    )
     try:
         result = subprocess.run(
             [backend.executable, "--version"],
@@ -329,6 +353,8 @@ def probe_codex_version(backend: CodexSandboxBackend) -> str:
             timeout=10,
             check=False,
             shell=False,
+            cwd=Path(backend.executable).parent,
+            env=environment,
         )
     except (OSError, subprocess.SubprocessError) as error:
         raise ApprovedSandboxUnavailable(
@@ -402,6 +428,7 @@ def _resolve_codex_helper(
             str(launcher.parent / name),
             workspace_root=settings.workspace_root,
             data_dir=settings.data_dir,
+            sandbox_scratch_dir=settings.sandbox_scratch_dir,
         )
     ).resolve(strict=True)
     if candidate.parent != launcher.parent:

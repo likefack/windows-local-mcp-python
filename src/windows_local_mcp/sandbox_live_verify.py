@@ -10,7 +10,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Any
 
-from .child_env import build_command_environment
+from .child_env import build_command_environment, sanitize_executable_search_path
 from .config import Settings
 from .process_utils import (
     capture_process_identity,
@@ -21,6 +21,7 @@ from .process_utils import (
 from .redaction import redact_text
 from .resources import NamedControlPlaneLock, scan_directory_bounded
 from .sandbox_backend import (
+    SANDBOX_SECURITY_PROPERTIES,
     CodexSandboxBackend,
     build_codex_sandbox_argv,
     hold_codex_sandbox_backend,
@@ -49,6 +50,40 @@ def _write_evidence(marker: Path, result: dict[str, Any]) -> None:
         temporary_marker.unlink(missing_ok=True)
 
 
+def _property_results(checks: dict[str, bool]) -> dict[str, dict[str, Any]]:
+    """Translate concrete probes into contract-level properties without overclaiming."""
+    requirements = {
+        "filesystem_read": ("source_read", "outside_user_read_denied"),
+        "filesystem_write": (
+            "scratch_write",
+            "source_workspace_write_denied",
+            "control_plane_write_denied",
+        ),
+        "protected_information_read": ("protected_information_denied",),
+        "internet": ("internet_denied",),
+        "lan": ("lan_denied",),
+        "loopback": ("loopback_denied",),
+        "descendant_containment": ("grandchild_boundary_inherited",),
+        "termination": ("timeout_terminated",),
+        "resource_bound": (
+            "filesystem_limit_enforced",
+            "filesystem_entry_limit_enforced",
+            "process_limit_enforced",
+            "memory_limit_enforced",
+        ),
+    }
+    result: dict[str, dict[str, Any]] = {}
+    for property_name in SANDBOX_SECURITY_PROPERTIES:
+        required = requirements[property_name]
+        missing = [name for name in required if checks.get(name) is not True]
+        result[property_name] = {
+            "status": "verified" if not missing else "unverified",
+            "checks": list(required),
+            "missing_or_failed": missing,
+        }
+    return result
+
+
 def _python_executable(settings: Settings) -> str:
     candidate = (Path(sys.base_prefix) / "python.exe").resolve(strict=True)
     for protected in (settings.workspace_root, settings.data_dir):
@@ -66,8 +101,16 @@ def _environment(settings: Settings, backend: CodexSandboxBackend, nonce: str) -
         extra_names=settings.child_environment_allowlist,
         nonce=nonce,
     )
-    helper = str(Path(backend.executable).parent)
-    environment["PATH"] = helper + os.pathsep + environment.get("PATH", "")
+    assert settings.sandbox_scratch_dir is not None
+    sanitize_executable_search_path(
+        environment,
+        forbidden_roots=(
+            settings.workspace_root,
+            settings.data_dir,
+            settings.sandbox_scratch_dir,
+        ),
+        prepend=(Path(backend.executable).parent,),
+    )
     return environment
 
 
@@ -80,17 +123,36 @@ def _run(
     timeout: float = 20,
 ) -> subprocess.CompletedProcess[bytes]:
     nonce = uuid.uuid4().hex
-    return subprocess.run(
-        build_codex_sandbox_argv(backend, command=command, cwd=str(cwd)),
-        cwd=cwd,
+    argv = build_codex_sandbox_argv(backend, command=command, cwd=str(cwd))
+    process = subprocess.Popen(
+        argv,
+        cwd=Path(backend.executable).parent,
         stdin=subprocess.DEVNULL,
-        capture_output=True,
-        timeout=timeout,
-        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         shell=False,
         creationflags=creation_flags(),
         env=_environment(settings, backend, nonce),
     )
+    identity = capture_process_identity(process.pid, nonce)
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        if not terminate_process_tree(identity):
+            process.kill()
+        try:
+            process.communicate(timeout=10)
+        except subprocess.TimeoutExpired as cleanup_error:
+            process.kill()
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
+            raise RuntimeError(
+                "timed-out sandbox verification process tree could not be drained"
+            ) from cleanup_error
+        raise subprocess.TimeoutExpired(argv, timeout) from error
+    return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
 
 
 @_sandbox_verification_serialized
@@ -107,7 +169,7 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
     marker = settings.data_dir / "control-plane" / "sandbox-live-verification.json"
     try:
         with hold_codex_sandbox_backend(backend):
-            version = probe_codex_version(backend)
+            version = probe_codex_version(backend, settings)
             simple = _run(
                 settings,
                 backend,
@@ -228,7 +290,7 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
             ]
             running = subprocess.Popen(
                 build_codex_sandbox_argv(backend, command=timeout_command, cwd=str(root)),
-                cwd=root,
+                cwd=Path(backend.executable).parent,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -262,7 +324,7 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
                     ],
                     cwd=str(root),
                 ),
-                cwd=root,
+                cwd=Path(backend.executable).parent,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -305,13 +367,17 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
             for name, passed in checks.items():
                 if not passed:
                     diagnostics.setdefault(name, "live check failed")
+            properties = _property_results(checks)
             result = {
-                "version": 1,
+                "version": 2,
                 "verified_at": utc_now_iso(),
                 "backend_digest": sha256_text(canonical_json(backend.as_dict())),
                 "backend_version": version,
                 "checks": checks,
-                "passed": bool(checks) and all(checks.values()),
+                "properties": properties,
+                "passed": all(
+                    item["status"] == "verified" for item in properties.values()
+                ),
                 "diagnostics": diagnostics,
             }
             _write_evidence(marker, result)
@@ -321,12 +387,14 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
         diagnostics["verification_error"] = redact_text(
             f"{type(error).__name__}: {error}"
         )[:2000]
+        properties = _property_results(checks)
         result = {
-            "version": 1,
+            "version": 2,
             "verified_at": utc_now_iso(),
             "backend_digest": sha256_text(canonical_json(backend.as_dict())),
             "backend_version": version,
             "checks": checks,
+            "properties": properties,
             "passed": False,
             "diagnostics": diagnostics,
         }

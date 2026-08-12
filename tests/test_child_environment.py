@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import pytest
@@ -6,6 +7,7 @@ from windows_local_mcp.child_env import (
     build_allowlisted_environment,
     build_command_environment,
     build_worker_environment,
+    sanitize_executable_search_path,
     sanitize_process_environment,
 )
 from windows_local_mcp.config import Settings
@@ -110,3 +112,31 @@ def test_process_environment_is_reduced_in_place() -> None:
     assert environment["LOCAL_MCP_TRANSPORT"] == "stdio"
     assert "PRIVATE_TOKEN" not in environment
     assert "GIT_DIR" not in environment
+
+
+def test_search_path_skips_inaccessible_ambient_entry_without_weakening_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    forbidden = tmp_path / "workspace"
+    prepend = tmp_path / "trusted-launcher"
+    allowed = tmp_path / "allowed-tools"
+    inaccessible = tmp_path / "inaccessible-alias"
+    for directory in (forbidden, prepend, allowed, inaccessible):
+        directory.mkdir()
+    original_resolve = Path.resolve
+
+    def resolve_with_inaccessible_alias(self: Path, strict: bool = False) -> Path:
+        if self == inaccessible:
+            raise PermissionError("simulated inaccessible App Execution Alias")
+        return original_resolve(self, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", resolve_with_inaccessible_alias)
+    environment = {"PATH": os.pathsep.join((str(inaccessible), str(allowed)))}
+
+    sanitize_executable_search_path(
+        environment,
+        forbidden_roots=(forbidden,),
+        prepend=(prepend,),
+    )
+
+    assert environment["PATH"].split(os.pathsep) == [str(prepend), str(allowed)]

@@ -8,6 +8,7 @@ import pytest
 from windows_local_mcp.config import Settings, load_settings
 from windows_local_mcp.git_env import sanitized_git_environment
 from windows_local_mcp.git_snapshot import capture_git_snapshot
+from windows_local_mcp.util import sha256_file
 
 
 @pytest.mark.parametrize(
@@ -102,6 +103,8 @@ def test_git_snapshot_ignores_hostile_repository_environment(
         data_dir=data,
         protect_data_dir_acl=False,
         git_enabled=True,
+        git_executable_path=Path(git),
+        git_executable_sha256=sha256_file(Path(git))[0],
     )
     settings.ensure_directories()
 
@@ -110,6 +113,17 @@ def test_git_snapshot_ignores_hostile_repository_environment(
     monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
     monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.bare")
     monkeypatch.setenv("GIT_CONFIG_VALUE_0", "true")
+    from windows_local_mcp import tool_safety
+
+    real_hash = tool_safety._sha256_file
+    helper_hash_count = 0
+
+    def counted_hash(path: Path) -> str:
+        nonlocal helper_hash_count
+        helper_hash_count += 1
+        return real_hash(path)
+
+    monkeypatch.setattr(tool_safety, "_sha256_file", counted_hash)
 
     snapshot = capture_git_snapshot(settings=settings, operation_id="git-env", stage="test")
 
@@ -117,6 +131,7 @@ def test_git_snapshot_ignores_hostile_repository_environment(
     content = Path(snapshot).read_text(encoding="utf-8")
     assert "===== status exit=0 =====" in content
     assert "===== branch exit=0 =====" in content
+    assert helper_hash_count == (2 if os.name == "nt" else 3)
 
 
 def test_git_snapshot_does_not_climb_to_parent_repository(tmp_path: Path) -> None:
@@ -140,6 +155,8 @@ def test_git_snapshot_does_not_climb_to_parent_repository(tmp_path: Path) -> Non
         data_dir=tmp_path / "data",
         protect_data_dir_acl=False,
         git_enabled=True,
+        git_executable_path=Path(git),
+        git_executable_sha256=sha256_file(Path(git))[0],
     )
     settings.ensure_directories()
 

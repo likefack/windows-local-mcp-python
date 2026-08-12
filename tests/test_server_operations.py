@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from windows_local_mcp.sandbox_backend import CodexSandboxBackend
 from windows_local_mcp.util import sha256_bytes
 
 
@@ -74,6 +75,31 @@ def test_crlf_read_identity_is_the_raw_commit_identity(
     assert target.read_bytes() == b"changed\r\n"
 
 
+def test_write_file_uses_a_target_scoped_execution_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, root = load_server(tmp_path, monkeypatch)
+    real_lock = server.WorkspaceExecutionLock
+    locked_targets: list[tuple[Path, ...] | None] = []
+
+    class RecordingLock:
+        def __init__(self, settings, timeout=30.0, *, target=None, targets=None):
+            selected = tuple(targets) if targets is not None else ((target,) if target else None)
+            locked_targets.append(selected)
+            self._lock = real_lock(settings, timeout, target=target, targets=targets)
+
+        def __enter__(self):
+            return self._lock.__enter__()
+
+        def __exit__(self, *args):
+            return self._lock.__exit__(*args)
+
+    monkeypatch.setattr(server, "WorkspaceExecutionLock", RecordingLock)
+    server.write_file("scoped.txt", "bounded mutation")
+
+    assert locked_targets == [((root / "scoped.txt").resolve(),)]
+
+
 def test_oversized_write_is_rejected_and_audited(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -105,8 +131,25 @@ def test_approved_sandbox_and_host_are_distinct_requests(
     codex = tmp_path / "trusted" / "codex.exe"
     codex.parent.mkdir()
     codex.write_bytes(b"fake installed codex")
-    server.runtime.settings.approved_sandbox_codex_path = codex
-    server.runtime.settings.approved_sandbox_require_live_verification = False
+    backend = CodexSandboxBackend(
+        executable=str(codex.resolve()),
+        executable_sha256="a" * 64,
+        executable_size=codex.stat().st_size,
+        executable_mtime_ns=codex.stat().st_mtime_ns,
+        windows_mode="elevated",
+        permission_profile=":workspace",
+        provenance="mock",
+        signature_status="Valid",
+        signer_subject="OpenAI",
+        signer_thumbprint="b" * 40,
+        helpers=(),
+    )
+    monkeypatch.setattr(server, "resolve_codex_sandbox_backend", lambda _settings: backend)
+    monkeypatch.setattr(
+        server,
+        "require_codex_sandbox_live_verification",
+        lambda _settings, _backend: {"version": 2, "passed": True},
+    )
 
     sandbox = server.request_sandbox_command(
         [sys.executable, "-c", "print('sandbox')"],
@@ -126,6 +169,44 @@ def test_approved_sandbox_and_host_are_distinct_requests(
     host_record = server.runtime.audit.get_operation(host["approval_id"])
     assert host_record["tier"] == "approved_host"
     assert host_record["request"]["sandbox_backend"] is None
+
+
+def test_sandbox_dependency_availability_is_separate_from_live_verified_route(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, _ = load_server(tmp_path, monkeypatch)
+    codex = tmp_path / "trusted" / "codex.exe"
+    codex.parent.mkdir()
+    codex.write_bytes(b"fake installed codex")
+    backend = CodexSandboxBackend(
+        executable=str(codex.resolve()),
+        executable_sha256="a" * 64,
+        executable_size=codex.stat().st_size,
+        executable_mtime_ns=codex.stat().st_mtime_ns,
+        windows_mode="elevated",
+        permission_profile=":workspace",
+        provenance="mock",
+        signature_status="Valid",
+        signer_subject="OpenAI",
+        signer_thumbprint="b" * 40,
+        helpers=(),
+    )
+    monkeypatch.setattr(server, "resolve_codex_sandbox_backend", lambda _settings: backend)
+    monkeypatch.setattr(
+        server,
+        "require_codex_sandbox_live_verification",
+        lambda _settings, _backend: (_ for _ in ()).throw(
+            RuntimeError("property evidence is incomplete")
+        ),
+    )
+
+    status = server._codex_sandbox_capability()
+
+    assert status["dependency_available"] is True
+    assert status["available"] is True
+    assert status["execution_route_available"] is False
+    assert status["windows_live_verified"] is False
+    assert "property evidence is incomplete" in status["execution_unavailable_reason"]
 
 
 def test_backup_and_diff_limits_fail_before_replacement(

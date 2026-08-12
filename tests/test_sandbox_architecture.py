@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -11,11 +13,16 @@ from windows_local_mcp.audit import AuditStore
 from windows_local_mcp.config import Settings
 from windows_local_mcp.policy import approved_request_hash
 from windows_local_mcp.sandbox_backend import (
+    SANDBOX_SECURITY_PROPERTIES,
     ApprovedSandboxUnavailable,
+    CodexSandboxBackend,
     build_codex_sandbox_argv,
     codex_sandbox_effective_policy,
+    require_codex_sandbox_live_verification,
     resolve_codex_sandbox_backend,
 )
+from windows_local_mcp.sandbox_live_verify import _run as run_live_probe
+from windows_local_mcp.util import canonical_json, sha256_text
 from windows_local_mcp.windows_system import windows_system_executable
 from windows_local_mcp.workspace_history import (
     capture_workspace_state,
@@ -103,6 +110,128 @@ def test_codex_policy_is_offline_and_does_not_trust_target_stderr() -> None:
     policy = codex_sandbox_effective_policy(workspace_write=True)
     assert policy["network_policy"]["internet"] == "deny"
     assert policy["filesystem_policy"]["outside_workspace_write"].startswith("denied")
+
+
+def test_sandbox_live_verification_is_property_scoped_and_fails_closed(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    backend = CodexSandboxBackend(
+        executable=str(tmp_path / "codex.exe"),
+        executable_sha256="a" * 64,
+        executable_size=1,
+        executable_mtime_ns=1,
+        windows_mode="elevated",
+        permission_profile=":workspace",
+        provenance="test",
+        signature_status="Valid",
+        signer_subject="OpenAI",
+        signer_thumbprint="b" * 40,
+        helpers=(),
+    )
+    marker = settings.data_dir / "control-plane" / "sandbox-live-verification.json"
+    backend_digest = sha256_text(canonical_json(backend.as_dict()))
+    marker.write_text(
+        canonical_json(
+            {
+                "version": 1,
+                "passed": True,
+                "backend_digest": backend_digest,
+                "checks": {"network_denied": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ApprovedSandboxUnavailable, match="missing, failed, or stale"):
+        require_codex_sandbox_live_verification(settings, backend)
+
+    properties = {
+        name: {"status": "verified"} for name in SANDBOX_SECURITY_PROPERTIES
+    }
+    properties["resource_bound"] = {"status": "unverified"}
+    marker.write_text(
+        canonical_json(
+            {
+                "version": 2,
+                "passed": True,
+                "backend_digest": backend_digest,
+                "properties": properties,
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ApprovedSandboxUnavailable, match="missing, failed, or stale"):
+        require_codex_sandbox_live_verification(settings, backend)
+
+    properties["resource_bound"] = {"status": "verified"}
+    marker.write_text(
+        canonical_json(
+            {
+                "version": 2,
+                "passed": True,
+                "backend_digest": backend_digest,
+                "properties": properties,
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert require_codex_sandbox_live_verification(settings, backend)["version"] == 2
+
+    settings.approved_sandbox_require_live_verification = False
+    with pytest.raises(ApprovedSandboxUnavailable, match="cannot be disabled"):
+        require_codex_sandbox_live_verification(settings, backend)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows process-tree live check")
+def test_live_probe_timeout_terminates_descendant_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    python = str((Path(sys.base_prefix) / "python.exe").resolve(strict=True))
+    backend = CodexSandboxBackend(
+        executable=python,
+        executable_sha256="a" * 64,
+        executable_size=Path(python).stat().st_size,
+        executable_mtime_ns=Path(python).stat().st_mtime_ns,
+        windows_mode="elevated",
+        permission_profile=":workspace",
+        provenance="test",
+        signature_status="Valid",
+        signer_subject="OpenAI",
+        signer_thumbprint="b" * 40,
+        helpers=(),
+    )
+    heartbeat = settings.sandbox_scratch_dir / "timeout-heartbeat.bin"
+    child_code = (
+        "from pathlib import Path\n"
+        "import time\n"
+        f"path=Path({str(heartbeat)!r})\n"
+        "while True:\n"
+        " with path.open('ab') as output: output.write(b'x')\n"
+        " time.sleep(.05)\n"
+    )
+    parent_code = (
+        "import subprocess,sys,time;"
+        f"subprocess.Popen([sys.executable,'-I','-c',{child_code!r}]);"
+        "time.sleep(60)"
+    )
+    monkeypatch.setattr(
+        "windows_local_mcp.sandbox_live_verify.build_codex_sandbox_argv",
+        lambda _backend, *, command, cwd: command,
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        run_live_probe(
+            settings,
+            backend,
+            settings.sandbox_scratch_dir,
+            [python, "-I", "-c", parent_code],
+            timeout=1,
+        )
+
+    size_after_stop = heartbeat.stat().st_size
+    time.sleep(0.3)
+    assert heartbeat.stat().st_size == size_after_stop
 
 
 def test_approved_request_hash_binds_capability_fields() -> None:

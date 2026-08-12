@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator,
 
 from .child_env import normalize_extra_environment_names, sanitize_process_environment
 from .git_env import strip_git_ambient_environment
-from .windows_system import windows_system_executable
+from .windows_system import physical_filesystem_path, windows_system_executable
 
 
 class Settings(BaseModel):
@@ -37,6 +37,13 @@ class Settings(BaseModel):
 
     adb_emulator_only: bool = True
     adb_allowed_serials: list[str] = Field(default_factory=list)
+    # Broker helpers are never selected from PATH. Enabling a capability and making it
+    # available are separate states; both an absolute path and an operator-pinned hash are
+    # required before automatic execution is possible.
+    git_executable_path: Path | None = None
+    git_executable_sha256: str | None = None
+    adb_executable_path: Path | None = None
+    adb_executable_sha256: str | None = None
 
     max_text_file_bytes: int = Field(default=2 * 1024 * 1024, ge=1024)
     max_write_bytes: int = Field(default=2 * 1024 * 1024, ge=1024)
@@ -164,12 +171,27 @@ class Settings(BaseModel):
             raise ValueError("path must not be empty")
         return Path(os.path.expandvars(os.path.expanduser(str(value)))).resolve()
 
-    @field_validator("approved_sandbox_codex_path", mode="before")
+    @field_validator(
+        "approved_sandbox_codex_path",
+        "git_executable_path",
+        "adb_executable_path",
+        mode="before",
+    )
     @classmethod
     def expand_optional_executable(cls, value: object) -> Path | None:
         if value is None or not str(value).strip():
             return None
         return Path(os.path.expandvars(os.path.expanduser(str(value)))).resolve(strict=True)
+
+    @field_validator("git_executable_sha256", "adb_executable_sha256", mode="before")
+    @classmethod
+    def normalize_executable_sha256(cls, value: object) -> str | None:
+        if value is None or not str(value).strip():
+            return None
+        digest = str(value).strip().casefold()
+        if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            raise ValueError("executable SHA-256 must contain exactly 64 hexadecimal characters")
+        return digest
 
     @field_validator("sandbox_scratch_dir", mode="before")
     @classmethod
@@ -234,6 +256,11 @@ class Settings(BaseModel):
             )
         if self.safe_powershell_scripts and not self.powershell_enabled:
             raise ValueError("safe_powershell_scripts requires powershell_enabled=true")
+        if self.approved_sandbox_enabled and not self.approved_sandbox_require_live_verification:
+            raise ValueError(
+                "approved_sandbox_require_live_verification cannot be disabled while "
+                "Approved Sandbox is enabled"
+            )
         for path in self.sandbox_dependency_readable_paths:
             if path == Path(path.anchor):
                 raise ValueError("sandbox_dependency_readable_paths cannot include a drive root")
@@ -256,6 +283,24 @@ class Settings(BaseModel):
                 raise ValueError(
                     "approved_sandbox_codex_path must be outside untrusted and control-plane roots"
                 )
+        for key in ("git", "adb"):
+            executable_path = getattr(self, f"{key}_executable_path")
+            executable_sha256 = getattr(self, f"{key}_executable_sha256")
+            if (executable_path is None) != (executable_sha256 is None):
+                raise ValueError(
+                    f"{key}_executable_path and {key}_executable_sha256 must be configured together"
+                )
+            if executable_path is None:
+                continue
+            if not executable_path.is_file() or _is_reparse(executable_path):
+                raise ValueError(f"{key}_executable_path must be a regular non-reparse file")
+            if any(
+                _is_relative_to(executable_path, protected)
+                for protected in (root, data, scratch)
+            ):
+                raise ValueError(
+                    f"{key}_executable_path must be outside workspace, data, and scratch roots"
+                )
         return self
 
     def ensure_directories(self) -> None:
@@ -272,13 +317,30 @@ class Settings(BaseModel):
             raise ValueError("sandbox_scratch_dir must not be a reparse point")
         workspace_identity = self.workspace_root.stat()
         data_identity = self.data_dir.stat()
-        if not workspace_identity.st_ino or not data_identity.st_ino:
-            raise RuntimeError("filesystem does not expose stable file identities")
-        if (workspace_identity.st_dev, workspace_identity.st_ino) == (
-            data_identity.st_dev,
-            data_identity.st_ino,
+        scratch_identity = self.sandbox_scratch_dir.stat()
+        if not all(
+            identity.st_ino
+            for identity in (workspace_identity, data_identity, scratch_identity)
         ):
-            raise ValueError("workspace_root and data_dir resolve to the same filesystem object")
+            raise RuntimeError("filesystem does not expose stable file identities")
+        identities = {
+            "workspace_root": (workspace_identity.st_dev, workspace_identity.st_ino),
+            "data_dir": (data_identity.st_dev, data_identity.st_ino),
+            "sandbox_scratch_dir": (scratch_identity.st_dev, scratch_identity.st_ino),
+        }
+        if len(set(identities.values())) != len(identities):
+            raise ValueError("workspace, data, and scratch must be distinct filesystem objects")
+        physical_paths = {
+            "workspace_root": physical_filesystem_path(self.workspace_root),
+            "data_dir": physical_filesystem_path(self.data_dir),
+            "sandbox_scratch_dir": physical_filesystem_path(self.sandbox_scratch_dir),
+        }
+        for left_index, (left_name, left_path) in enumerate(physical_paths.items()):
+            for right_name, right_path in list(physical_paths.items())[left_index + 1 :]:
+                if _physical_paths_overlap(left_path, right_path):
+                    raise ValueError(
+                        f"{left_name} and {right_name} physically overlap after alias resolution"
+                    )
         for name in (
             "logs",
             "outputs",
@@ -324,6 +386,16 @@ def _is_relative_to(candidate: Path, parent: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _physical_paths_overlap(left: str, right: str) -> bool:
+    normalized_left = os.path.normcase(left.rstrip("\\/"))
+    normalized_right = os.path.normcase(right.rstrip("\\/"))
+    try:
+        common = os.path.commonpath((normalized_left, normalized_right))
+    except ValueError:
+        return False
+    return common in {normalized_left, normalized_right}
 
 
 def _is_loopback_host(host: str) -> bool:
@@ -388,17 +460,22 @@ def _ensure_control_plane_namespace(settings: Settings) -> None:
     assert settings.sandbox_scratch_dir is not None
     scratch = settings.sandbox_scratch_dir.stat()
     expected = {
-        "version": 2,
+        "version": 3,
         "workspace_path": str(settings.workspace_root.resolve(strict=True)),
         "workspace_device": int(details.st_dev),
         "workspace_inode": int(details.st_ino),
+        "workspace_physical_path": physical_filesystem_path(settings.workspace_root),
         "data_dir_path": str(settings.data_dir.resolve(strict=True)),
         "data_dir_device": int(data.st_dev),
         "data_dir_inode": int(data.st_ino),
+        "data_dir_physical_path": physical_filesystem_path(settings.data_dir),
         "config_path": settings._config_path,
         "sandbox_scratch_path": str(settings.sandbox_scratch_dir.resolve(strict=True)),
         "sandbox_scratch_device": int(scratch.st_dev),
         "sandbox_scratch_inode": int(scratch.st_ino),
+        "sandbox_scratch_physical_path": physical_filesystem_path(
+            settings.sandbox_scratch_dir
+        ),
     }
     marker = settings.data_dir / "control-plane" / "namespace.json"
     payload = json.dumps(expected, sort_keys=True, separators=(",", ":"))
@@ -412,14 +489,23 @@ def _ensure_control_plane_namespace(settings: Settings) -> None:
             current = json.loads(marker.read_text(encoding="utf-8"))
         except (OSError, ValueError) as error:
             raise PermissionError("control-plane namespace marker is corrupt") from error
-        legacy = {
+        legacy_v2 = {
             key: value
             for key, value in expected.items()
+            if not key.endswith("_physical_path") and key != "version"
+        }
+        legacy_v2["version"] = 2
+        legacy_v1 = {
+            key: value
+            for key, value in legacy_v2.items()
             if key not in {"version", "data_dir_path", "data_dir_device", "data_dir_inode"}
         }
-        if current.get("version") == 1 and {
-            key: value for key, value in current.items() if key != "version"
-        } == legacy:
+        can_upgrade = current == legacy_v2 or (
+            current.get("version") == 1
+            and {key: value for key, value in current.items() if key != "version"}
+            == legacy_v1
+        )
+        if can_upgrade:
             temporary = marker.with_suffix(".upgrade.tmp")
             temporary.write_text(payload, encoding="utf-8")
             os.replace(temporary, marker)
