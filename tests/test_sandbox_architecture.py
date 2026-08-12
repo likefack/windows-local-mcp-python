@@ -21,6 +21,7 @@ from windows_local_mcp.sandbox_backend import (
     require_codex_sandbox_live_verification,
     resolve_codex_sandbox_backend,
 )
+from windows_local_mcp.sandbox_live_verify import _property_results
 from windows_local_mcp.sandbox_live_verify import _run as run_live_probe
 from windows_local_mcp.util import canonical_json, sha256_text
 from windows_local_mcp.windows_system import windows_system_executable
@@ -110,6 +111,27 @@ def test_codex_policy_is_offline_and_does_not_trust_target_stderr() -> None:
     policy = codex_sandbox_effective_policy(workspace_write=True)
     assert policy["network_policy"]["internet"] == "deny"
     assert policy["filesystem_policy"]["outside_workspace_write"].startswith("denied")
+
+
+def test_live_verification_properties_distinguish_failed_from_unverified() -> None:
+    properties = _property_results(
+        {
+            "source_read": True,
+            "outside_user_read_denied": False,
+            "control_plane_read_denied": True,
+            "scratch_write": True,
+            "source_workspace_write_denied": True,
+            "outside_user_write_denied": True,
+            "control_plane_write_denied": True,
+        }
+    )
+
+    assert properties["filesystem_read"]["status"] == "failed"
+    assert properties["filesystem_read"]["failed"] == ["outside_user_read_denied"]
+    assert properties["filesystem_write"]["status"] == "verified"
+    assert properties["resource_bound"]["status"] == "unverified"
+    assert properties["resource_bound"]["failed"] == []
+    assert "process_limit_enforced" in properties["resource_bound"]["unverified"]
 
 
 def test_sandbox_live_verification_is_property_scoped_and_fails_closed(
@@ -220,6 +242,7 @@ def test_live_probe_timeout_terminates_descendant_process(
         lambda _backend, *, command, cwd: command,
     )
 
+    probe_diagnostics: list[dict[str, object]] = []
     with pytest.raises(subprocess.TimeoutExpired):
         run_live_probe(
             settings,
@@ -227,11 +250,17 @@ def test_live_probe_timeout_terminates_descendant_process(
             settings.sandbox_scratch_dir,
             [python, "-I", "-c", parent_code],
             timeout=1,
+            probe_name="timeout-regression",
+            probe_diagnostics=probe_diagnostics,
         )
 
     size_after_stop = heartbeat.stat().st_size
     time.sleep(0.3)
     assert heartbeat.stat().st_size == size_after_stop
+    assert probe_diagnostics[0]["probe"] == "timeout-regression"
+    assert probe_diagnostics[0]["pid"]
+    assert probe_diagnostics[0]["timed_out"] is True
+    assert probe_diagnostics[0]["child_process_state"] == "terminated_and_drained"
 
 
 def test_approved_request_hash_binds_capability_fields() -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -53,17 +54,25 @@ def _write_evidence(marker: Path, result: dict[str, Any]) -> None:
 def _property_results(checks: dict[str, bool]) -> dict[str, dict[str, Any]]:
     """Translate concrete probes into contract-level properties without overclaiming."""
     requirements = {
-        "filesystem_read": ("source_read", "outside_user_read_denied"),
+        "filesystem_read": (
+            "source_read",
+            "outside_user_read_denied",
+            "control_plane_read_denied",
+        ),
         "filesystem_write": (
             "scratch_write",
             "source_workspace_write_denied",
+            "outside_user_write_denied",
             "control_plane_write_denied",
         ),
         "protected_information_read": ("protected_information_denied",),
         "internet": ("internet_denied",),
         "lan": ("lan_denied",),
         "loopback": ("loopback_denied",),
-        "descendant_containment": ("grandchild_boundary_inherited",),
+        "descendant_containment": (
+            "child_boundary_inherited",
+            "grandchild_boundary_inherited",
+        ),
         "termination": ("timeout_terminated",),
         "resource_bound": (
             "filesystem_limit_enforced",
@@ -75,11 +84,21 @@ def _property_results(checks: dict[str, bool]) -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
     for property_name in SANDBOX_SECURITY_PROPERTIES:
         required = requirements[property_name]
-        missing = [name for name in required if checks.get(name) is not True]
+        failed = [name for name in required if checks.get(name) is False]
+        unverified = [name for name in required if name not in checks]
+        incomplete = [name for name in required if checks.get(name) is not True]
         result[property_name] = {
-            "status": "verified" if not missing else "unverified",
+            "status": (
+                "verified"
+                if not incomplete
+                else "failed"
+                if failed
+                else "unverified"
+            ),
             "checks": list(required),
-            "missing_or_failed": missing,
+            "failed": failed,
+            "unverified": unverified,
+            "missing_or_failed": incomplete,
         }
     return result
 
@@ -121,9 +140,12 @@ def _run(
     command: list[str],
     *,
     timeout: float = 20,
+    probe_name: str | None = None,
+    probe_diagnostics: list[dict[str, Any]] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     nonce = uuid.uuid4().hex
     argv = build_codex_sandbox_argv(backend, command=command, cwd=str(cwd))
+    started = time.monotonic()
     process = subprocess.Popen(
         argv,
         cwd=Path(backend.executable).parent,
@@ -135,9 +157,21 @@ def _run(
         env=_environment(settings, backend, nonce),
     )
     identity = capture_process_identity(process.pid, nonce)
+    diagnostic = {
+        "probe": probe_name or "unnamed",
+        "argv": [redact_text(value)[:1000] for value in argv],
+        "pid": process.pid,
+    }
     try:
         stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as error:
+        diagnostic.update(
+            {
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+                "timed_out": True,
+                "child_process_state": "termination_requested",
+            }
+        )
         if not terminate_process_tree(identity):
             process.kill()
         try:
@@ -151,7 +185,27 @@ def _run(
             raise RuntimeError(
                 "timed-out sandbox verification process tree could not be drained"
             ) from cleanup_error
+        diagnostic.update(
+            {
+                "exit_code": process.returncode,
+                "child_process_state": "terminated_and_drained",
+            }
+        )
+        if probe_diagnostics is not None:
+            probe_diagnostics.append(diagnostic)
         raise subprocess.TimeoutExpired(argv, timeout) from error
+    diagnostic.update(
+        {
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+            "timed_out": False,
+            "exit_code": process.returncode,
+            "stdout": redact_text(stdout.decode("utf-8", errors="replace"))[:2000],
+            "stderr": redact_text(stderr.decode("utf-8", errors="replace"))[:2000],
+            "child_process_state": "exited_and_drained",
+        }
+    )
+    if probe_diagnostics is not None:
+        probe_diagnostics.append(diagnostic)
     return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
 
 
@@ -164,10 +218,24 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
     root.mkdir(parents=True, exist_ok=False)
     checks: dict[str, bool] = {}
     diagnostics: dict[str, str] = {}
+    probe_diagnostics: list[dict[str, Any]] = []
     version: str | None = None
     python = _python_executable(settings)
     marker = settings.data_dir / "control-plane" / "sandbox-live-verification.json"
+    source_canary = settings.workspace_root / f".wlmcp-live-source-{uuid.uuid4().hex}.txt"
+    source_write_target = settings.workspace_root / f".wlmcp-live-write-{uuid.uuid4().hex}.txt"
+    protected_canary = settings.workspace_root / f".wlmcp-live-secret-{uuid.uuid4().hex}.env"
+    outside_canary = Path.home() / f".wlmcp-live-outside-{uuid.uuid4().hex}.txt"
+    outside_write_target = Path.home() / f".wlmcp-live-write-{uuid.uuid4().hex}.txt"
+    control_write_target = settings.data_dir / "control-plane" / f"live-write-{uuid.uuid4().hex}.txt"
+    child_write_target = settings.workspace_root / f".wlmcp-live-child-{uuid.uuid4().hex}.txt"
+    grandchild_write_target = (
+        settings.workspace_root / f".wlmcp-live-grandchild-{uuid.uuid4().hex}.txt"
+    )
     try:
+        source_canary.write_text("source-readable-canary", encoding="utf-8")
+        protected_canary.write_text("WLMCP_LIVE_SECRET=canary-only", encoding="utf-8")
+        outside_canary.write_text("outside-readable-canary", encoding="utf-8")
         with hold_codex_sandbox_backend(backend):
             version = probe_codex_version(backend, settings)
             simple = _run(
@@ -175,35 +243,22 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
                 backend,
                 root,
                 [windows_system_executable("cmd.exe"), "/d", "/c", "exit", "0"],
+                probe_name="simple_command",
+                probe_diagnostics=probe_diagnostics,
             )
             checks["simple_command"] = simple.returncode == 0
 
-            child = _run(settings, backend, root, [python, "-I", "-c", "print('child-ok')"])
+            child = _run(
+                settings,
+                backend,
+                root,
+                [python, "-I", "-c", "print('child-ok')"],
+                probe_name="python_child",
+                probe_diagnostics=probe_diagnostics,
+            )
             checks["python_child"] = child.returncode == 0 and b"child-ok" in child.stdout
 
-            source = root / "source.txt"
-            source.write_text("bound-source", encoding="utf-8")
             source_result = _run(
-                settings,
-                backend,
-                root,
-                [python, "-I", "-c", "from pathlib import Path;print(Path('source.txt').read_text())"],
-            )
-            checks["source_read"] = source_result.returncode == 0 and b"bound-source" in source_result.stdout
-
-            write_result = _run(
-                settings,
-                backend,
-                root,
-                [python, "-I", "-c", "from pathlib import Path;Path('result.txt').write_text('result')"],
-            )
-            checks["scratch_write"] = (
-                write_result.returncode == 0
-                and (root / "result.txt").read_text(encoding="utf-8") == "result"
-            )
-
-            control_target = settings.data_dir / "control-plane" / "namespace.json"
-            control_result = _run(
                 settings,
                 backend,
                 root,
@@ -211,16 +266,76 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
                     python,
                     "-I",
                     "-c",
-                    (
-                        "import pathlib,sys;"
-                        f"p=pathlib.Path({str(control_target)!r});"
-                        "\ntry:p.read_bytes()"
-                        "\nexcept (OSError,PermissionError):sys.exit(0)"
-                        "\nelse:sys.exit(9)"
-                    ),
+                    f"from pathlib import Path;print(Path({str(source_canary)!r}).read_text())",
                 ],
+                probe_name="source_read",
+                probe_diagnostics=probe_diagnostics,
             )
-            checks["control_plane_denied"] = control_result.returncode == 0
+            checks["source_read"] = (
+                source_result.returncode == 0
+                and b"source-readable-canary" in source_result.stdout
+            )
+
+            write_result = _run(
+                settings,
+                backend,
+                root,
+                [python, "-I", "-c", "from pathlib import Path;Path('result.txt').write_text('result')"],
+                probe_name="scratch_write",
+                probe_diagnostics=probe_diagnostics,
+            )
+            checks["scratch_write"] = (
+                write_result.returncode == 0
+                and (root / "result.txt").read_text(encoding="utf-8") == "result"
+            )
+
+            def denied_access_probe(name: str, path: Path, operation: str) -> bool:
+                action = (
+                    "p.read_bytes()"
+                    if operation == "read"
+                    else "p.write_text('sandbox-write-probe')"
+                )
+                result = _run(
+                    settings,
+                    backend,
+                    root,
+                    [
+                        python,
+                        "-I",
+                        "-c",
+                        (
+                            "import pathlib,sys;"
+                            f"p=pathlib.Path({str(path)!r});"
+                            f"\ntry:{action}"
+                            "\nexcept (OSError,PermissionError):sys.exit(0)"
+                            "\nelse:sys.exit(9)"
+                        ),
+                    ],
+                    probe_name=name,
+                    probe_diagnostics=probe_diagnostics,
+                )
+                return result.returncode == 0
+
+            checks["source_workspace_write_denied"] = denied_access_probe(
+                "source_workspace_write_denied", source_write_target, "write"
+            )
+            checks["outside_user_read_denied"] = denied_access_probe(
+                "outside_user_read_denied", outside_canary, "read"
+            )
+            checks["outside_user_write_denied"] = denied_access_probe(
+                "outside_user_write_denied", outside_write_target, "write"
+            )
+            checks["protected_information_denied"] = denied_access_probe(
+                "protected_information_denied", protected_canary, "read"
+            )
+
+            control_target = settings.data_dir / "control-plane" / "namespace.json"
+            checks["control_plane_read_denied"] = denied_access_probe(
+                "control_plane_read_denied", control_target, "read"
+            )
+            checks["control_plane_write_denied"] = denied_access_probe(
+                "control_plane_write_denied", control_write_target, "write"
+            )
 
             network_result = _run(
                 settings,
@@ -237,20 +352,84 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
                         "\nelse:sys.exit(9)"
                     ),
                 ],
+                probe_name="internet_denied",
+                probe_diagnostics=probe_diagnostics,
             )
-            checks["network_denied"] = network_result.returncode == 0
+            checks["internet_denied"] = network_result.returncode == 0
 
-            grandchild_code = (
-                "from pathlib import Path;"
-                "Path('grandchild.txt').write_text('contained')"
+            def listener_probe(name: str, host: str) -> bool:
+                listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                try:
+                    listener.bind((host, 0))
+                    listener.listen(1)
+                    port = int(listener.getsockname()[1])
+                    result = _run(
+                        settings,
+                        backend,
+                        root,
+                        [
+                            python,
+                            "-I",
+                            "-c",
+                            (
+                                "import socket,sys;s=socket.socket();s.settimeout(2);"
+                                f"\ntry:s.connect(({host!r},{port}))"
+                                "\nexcept OSError:sys.exit(0)"
+                                "\nelse:sys.exit(9)"
+                            ),
+                        ],
+                        probe_name=name,
+                        probe_diagnostics=probe_diagnostics,
+                    )
+                    return result.returncode == 0
+                finally:
+                    listener.close()
+
+            checks["loopback_denied"] = listener_probe("loopback_denied", "127.0.0.1")
+            try:
+                route_probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                try:
+                    route_probe.connect(("1.1.1.1", 53))
+                    lan_address = str(route_probe.getsockname()[0])
+                finally:
+                    route_probe.close()
+                if lan_address.startswith("127.") or lan_address == "0.0.0.0":
+                    raise OSError("no non-loopback IPv4 address is available")
+                checks["lan_denied"] = listener_probe("lan_denied", lan_address)
+            except OSError as error:
+                checks["lan_denied"] = False
+                diagnostics["lan_denied"] = f"probe unavailable: {type(error).__name__}"
+
+            def descendant_boundary_code(write_target: Path) -> str:
+                return (
+                    "from pathlib import Path\n"
+                    "import sys\n"
+                    "ok=True\n"
+                    f"write_target=Path({str(write_target)!r})\n"
+                    f"secret=Path({str(protected_canary)!r})\n"
+                    "try: write_target.write_text('boundary-escape')\n"
+                    "except (OSError,PermissionError): pass\n"
+                    "else: ok=False\n"
+                    "try: secret.read_bytes()\n"
+                    "except (OSError,PermissionError): pass\n"
+                    "else: ok=False\n"
+                    "sys.exit(0 if ok else 9)\n"
+                )
+
+            child_direct = _run(
+                settings,
+                backend,
+                root,
+                [python, "-I", "-c", descendant_boundary_code(child_write_target)],
+                probe_name="child_boundary_inherited",
+                probe_diagnostics=probe_diagnostics,
             )
+            checks["child_boundary_inherited"] = child_direct.returncode == 0
+
+            grandchild_code = descendant_boundary_code(grandchild_write_target)
             child_code = (
                 "import subprocess,sys;"
                 f"subprocess.check_call([sys.executable,'-I','-c',{grandchild_code!r}])"
-            )
-            parent_code = (
-                "import subprocess,sys;"
-                f"subprocess.check_call([sys.executable,'-I','-c',{child_code!r}])"
             )
             descendant = _run(
                 settings,
@@ -260,12 +439,12 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
                     python,
                     "-I",
                     "-c",
-                    parent_code,
+                    child_code,
                 ],
+                probe_name="grandchild_boundary_inherited",
+                probe_diagnostics=probe_diagnostics,
             )
-            checks["grandchild_contained"] = (
-                descendant.returncode == 0 and (root / "grandchild.txt").is_file()
-            )
+            checks["grandchild_boundary_inherited"] = descendant.returncode == 0
 
             nonce = uuid.uuid4().hex
             heartbeat = root / "heartbeat.bin"
@@ -288,8 +467,12 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
                 "-c",
                 timeout_parent_code,
             ]
+            timeout_argv = build_codex_sandbox_argv(
+                backend, command=timeout_command, cwd=str(root)
+            )
+            timeout_started = time.monotonic()
             running = subprocess.Popen(
-                build_codex_sandbox_argv(backend, command=timeout_command, cwd=str(root)),
+                timeout_argv,
                 cwd=Path(backend.executable).parent,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
@@ -305,25 +488,42 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
             time.sleep(1)
             size_after = heartbeat.stat().st_size if heartbeat.exists() else 0
             checks["timeout_terminated"] = terminated and size_before == size_after
+            probe_diagnostics.append(
+                {
+                    "probe": "timeout_terminated",
+                    "argv": [redact_text(value)[:1000] for value in timeout_argv],
+                    "pid": running.pid,
+                    "elapsed_seconds": round(time.monotonic() - timeout_started, 3),
+                    "timed_out": True,
+                    "exit_code": running.poll(),
+                    "child_process_state": (
+                        "descendant_tree_terminated"
+                        if checks["timeout_terminated"]
+                        else "termination_not_proven"
+                    ),
+                }
+            )
 
             resource_root = root / "resource"
             resource_root.mkdir()
             nonce = uuid.uuid4().hex
+            writer_argv = build_codex_sandbox_argv(
+                backend,
+                command=[
+                    python,
+                    "-I",
+                    "-c",
+                    (
+                        "from pathlib import Path;import time;p=Path('resource/grow.bin');"
+                        "\nwith p.open('wb') as f:"
+                        "\n for _ in range(1000):f.write(b'x'*262144);f.flush();time.sleep(.05)"
+                    ),
+                ],
+                cwd=str(root),
+            )
+            writer_started = time.monotonic()
             writer = subprocess.Popen(
-                build_codex_sandbox_argv(
-                    backend,
-                    command=[
-                        python,
-                        "-I",
-                        "-c",
-                        (
-                            "from pathlib import Path;import time;p=Path('resource/grow.bin');"
-                            "\nwith p.open('wb') as f:"
-                            "\n for _ in range(1000):f.write(b'x'*262144);f.flush();time.sleep(.05)"
-                        ),
-                    ],
-                    cwd=str(root),
-                ),
+                writer_argv,
                 cwd=Path(backend.executable).parent,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
@@ -363,6 +563,93 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
                     f"detected={detected}; final_size={final_size}; "
                     f"launcher_returncode={writer.returncode}"
                 )
+            probe_diagnostics.append(
+                {
+                    "probe": "filesystem_limit_enforced",
+                    "argv": [redact_text(value)[:1000] for value in writer_argv],
+                    "pid": writer.pid,
+                    "elapsed_seconds": round(time.monotonic() - writer_started, 3),
+                    "exit_code": writer.returncode,
+                    "child_process_state": "terminated_at_bound" if detected else "exited",
+                    "final_size": final_size,
+                }
+            )
+
+            entry_root = root / "entries"
+            entry_root.mkdir()
+            nonce = uuid.uuid4().hex
+            entry_argv = build_codex_sandbox_argv(
+                backend,
+                command=[
+                    python,
+                    "-I",
+                    "-c",
+                    (
+                        "from pathlib import Path;import time;p=Path('entries');"
+                        "\nfor i in range(1000):"
+                        "\n (p/f'{i}.txt').write_text('x');time.sleep(.01)"
+                    ),
+                ],
+                cwd=str(root),
+            )
+            entry_started = time.monotonic()
+            entry_writer = subprocess.Popen(
+                entry_argv,
+                cwd=Path(backend.executable).parent,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                shell=False,
+                creationflags=creation_flags(),
+                env=_environment(settings, backend, nonce),
+            )
+            entry_identity = capture_process_identity(entry_writer.pid, nonce)
+            entry_detected = False
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and entry_writer.poll() is None:
+                usage = scan_directory_bounded(
+                    entry_root,
+                    stop_after_bytes=1024 * 1024,
+                    stop_after_entries=32,
+                )
+                if usage.entry_count > 32:
+                    entry_detected = terminate_process_tree(entry_identity)
+                    break
+                time.sleep(0.05)
+            entry_writer.wait(timeout=10)
+            final_entries = scan_directory_bounded(
+                entry_root,
+                stop_after_bytes=1024 * 1024,
+                stop_after_entries=10_000,
+            ).entry_count
+            checks["filesystem_entry_limit_enforced"] = (
+                entry_detected and final_entries < 128
+            )
+            if not checks["filesystem_entry_limit_enforced"]:
+                diagnostics["filesystem_entry_limit_enforced"] = (
+                    f"detected={entry_detected}; final_entries={final_entries}; "
+                    f"launcher_returncode={entry_writer.returncode}"
+                )
+            probe_diagnostics.append(
+                {
+                    "probe": "filesystem_entry_limit_enforced",
+                    "argv": [redact_text(value)[:1000] for value in entry_argv],
+                    "pid": entry_writer.pid,
+                    "elapsed_seconds": round(time.monotonic() - entry_started, 3),
+                    "exit_code": entry_writer.returncode,
+                    "child_process_state": (
+                        "terminated_at_bound" if entry_detected else "exited"
+                    ),
+                    "final_entries": final_entries,
+                }
+            )
+
+            diagnostics["process_limit_enforced"] = (
+                "no per-Sandbox descendant process-count runtime bound is implemented"
+            )
+            diagnostics["memory_limit_enforced"] = (
+                "no per-Sandbox process-tree memory runtime bound is implemented"
+            )
 
             for name, passed in checks.items():
                 if not passed:
@@ -379,6 +666,7 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
                     item["status"] == "verified" for item in properties.values()
                 ),
                 "diagnostics": diagnostics,
+                "probe_diagnostics": probe_diagnostics,
             }
             _write_evidence(marker, result)
             return result
@@ -397,8 +685,23 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
             "properties": properties,
             "passed": False,
             "diagnostics": diagnostics,
+            "probe_diagnostics": probe_diagnostics,
         }
         _write_evidence(marker, result)
         return result
     finally:
+        for path in (
+            source_canary,
+            source_write_target,
+            protected_canary,
+            outside_canary,
+            outside_write_target,
+            control_write_target,
+            child_write_target,
+            grandchild_write_target,
+        ):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
         shutil.rmtree(root, ignore_errors=True)
