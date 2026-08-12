@@ -1,5 +1,50 @@
 # 検証記録
 
+## 2026-08-13 Codex Sandbox実境界の修正
+
+### 対象と変更
+
+- 基準: 作業開始時の`main` / `d65f91f`。`SECURITY_CONTRACT.md`は変更していない。commit／pushも実施していない。
+- legacy `:workspace`指定を実行時の境界入力にせず、Codex CLIの`--sandbox-state-json`で限定read root、operation固有write root、protected-name deny、restricted networkを渡し、`--sandbox-state-disable-network`も併用した。
+- Codex launcherを`CREATE_SUSPENDED`で起動し、active process数、job全体commit memory、kill-on-closeを設定したWindows Job Objectへ割り当ててから初期threadを再開するようにした。launcher、command runner、child、grandchildを同じjobに収容する。
+- Verifierはchild／grandchildそれぞれについてsource write、outside-user read、protected read、control-plane read/write、Internet、LAN、loopbackを個別に検査する。独立した起動probeの例外は診断として残し、残りの安全なprobeを継続する。
+
+### installed Codex／Windows機構の調査
+
+- installed Codex CLI: `0.147.0-alpha.6.6`、`windows.sandbox="elevated"`。
+- CLIは限定filesystem entry、deny path/glob、restricted networkを含むsandbox-stateを受理し、Windows backendには専用local user、deny-read ACL helper、Firewall／WFP実装がある。
+- この環境のsetup markerはversion 5、offline userは`CodexSandboxOffline`、`proxy_ports=[]`、`allow_local_binding=false`だった。registryにはoffline user SIDを対象とするloopback TCP／UDPとnon-loopback outboundの3 block ruleが存在した。
+- それにもかかわらず実connectionはLAN／loopbackで成功した。設定またはruleの存在を境界成立の証拠にはしていない。
+- `deny_read_acl_state.json`は`{"principals": {}}`のままで、ログはread ACL処理成功を記録したがdeny ACEを1件も保持していなかった。限定policyを渡した実processはoutside-user canaryとworkspace内`.env`を読めたため、native Windows backendのdeny-readが実効化されていない。
+- WLMCP側で既存Codex sandbox userへuser-profile全域のdeny ACLを付ける案は、同じprincipalを使う別Codex実行へ影響し、必要toolchain rootを安全に再許可できず、異常終了時にuser file ACLを残す。WLMCP専用local user／restricted token／AppContainerとACL provisioning、または専用WFP policyを組み合わせる案は管理者セットアップとcredential／ACL／filter lifecycleを持つ別sandbox backendの新規開発になるため、この変更範囲では採用していない。
+
+### Windows実機結果
+
+同一Windows環境でhost listenerと実process treeを使って9 propertyを再測定した。
+
+| property | 結果 | 実測の要点 |
+| --- | --- | --- |
+| `filesystem_read` | failed | source read／control-plane read denialは成功、outside-user file read denialは失敗 |
+| `filesystem_write` | verified | scratch write、source／outside-user／control-plane write denialが成功 |
+| `protected_information_read` | failed | workspace内`.env`を親processが読めた |
+| `internet` | verified | host controlが到達可能な`1.1.1.1:443`をSandboxから拒否 |
+| `lan` | failed | host側LAN listenerへ接続できた |
+| `loopback` | failed | host側`127.0.0.1` listenerへ接続できた |
+| `descendant_containment` | failed | child／grandchildともoutside-user、protected、LAN、loopbackの拒否に失敗。source write、control-plane read/write、Internet拒否は成功 |
+| `termination` | verified | timeout後にjob全体を停止し、heartbeat停止とdescendant 0を確認 |
+| `resource_bound` | verified | process上限8で`process_count_limit`、memory上限192 MiBで`process_tree_memory_limit`を受信し、いずれもjob全停止、descendant 0、終了状態回収を確認。memory probeのpeak job memoryは226,209,792 bytes |
+
+集約結果は`passed=false`、`windows_live_verified=false`、`execution_route_available=false`である。AとBはinstalled backendの実効境界不足により修正不能、Cは修正済み。Sandbox失敗からApproved Hostへのautomatic fallbackはない。
+
+### 回帰確認
+
+- 関連pytest: 36 passed。
+- full pytestをACL汚染のない一時rootへ明示して実行: 221 passed、2 skipped。
+- 指定どおりの`pytest -q`も実行したが、既存`.pytest-tmp-default`をpytestが削除できない`WinError 5`により43 passed、180 setup errors。テスト本体の失敗ではなく、同じsuiteを別`--basetemp`で全通過した。既存directoryは削除・ACL変更していない。
+- `ruff check .`: pass。
+- `python -m compileall -q src tests`: pass。
+- `git diff --check`: pass（LF／CRLF変換warningのみ）。
+
 ## 2026-08-13 既知セキュリティ問題の再検証と修正
 
 ### 対象と基準

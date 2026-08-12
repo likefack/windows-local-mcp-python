@@ -7,7 +7,7 @@ import os
 import re
 import subprocess
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from ctypes import create_unicode_buffer, get_last_error, wintypes
 from dataclasses import dataclass
@@ -18,6 +18,7 @@ from .child_env import build_command_environment, sanitize_executable_search_pat
 from .config import Settings
 from .tool_safety import ensure_external_tool_executable
 from .util import canonical_json, sha256_text
+from .windows_job import WindowsJobLimits, WindowsSandboxJob
 
 _CODEX_VERSION = re.compile(r"^codex-cli\s+([^\s]+)")
 _OPENAI_AUTHENTICODE_NAMES = ('O="OpenAI OpCo, LLC"', 'CN="OpenAI OpCo, LLC"')
@@ -25,6 +26,7 @@ _SANDBOX_HELPERS = (
     "codex-command-runner.exe",
     "codex-windows-sandbox-setup.exe",
 )
+_WLMCP_ISOLATION_POLICY_VERSION = 1
 SANDBOX_SECURITY_PROPERTIES = (
     "filesystem_read",
     "filesystem_write",
@@ -79,6 +81,9 @@ class CodexSandboxBackend:
     signer_subject: str
     signer_thumbprint: str
     helpers: tuple[CodexSandboxHelper, ...]
+    isolation_policy_version: int = _WLMCP_ISOLATION_POLICY_VERSION
+    max_processes: int = 64
+    max_memory_bytes: int = 4 * 1024 * 1024 * 1024
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -96,6 +101,9 @@ class CodexSandboxBackend:
             "signer_subject": self.signer_subject,
             "signer_thumbprint": self.signer_thumbprint,
             "helper_dependencies": [helper.as_dict() for helper in self.helpers],
+            "wlmcp_isolation_policy_version": self.isolation_policy_version,
+            "max_processes": self.max_processes,
+            "max_memory_bytes": self.max_memory_bytes,
             "model_api_usage": "none; codex sandbox does not start an agent",
             "authentication_required": False,
             "distribution_mode": "installed_codex_dependency",
@@ -194,6 +202,8 @@ def resolve_codex_sandbox_backend(settings: Settings) -> CodexSandboxBackend:
                 signer_subject=str(authenticode["subject"]),
                 signer_thumbprint=str(authenticode["thumbprint"]),
                 helpers=helpers,
+                max_processes=settings.max_sandbox_processes,
+                max_memory_bytes=settings.max_sandbox_memory_bytes,
             )
         except (
             ApprovedSandboxUnavailable,
@@ -227,6 +237,9 @@ def verify_codex_sandbox_backend(
         "signer_subject",
         "signer_thumbprint",
         "helper_dependencies",
+        "wlmcp_isolation_policy_version",
+        "max_processes",
+        "max_memory_bytes",
     ):
         if actual.get(key) != expected.get(key):
             raise ApprovedSandboxUnavailable(
@@ -371,42 +384,181 @@ def probe_codex_version(backend: CodexSandboxBackend, settings: Settings) -> str
 def build_codex_sandbox_argv(
     backend: CodexSandboxBackend,
     *,
+    settings: Settings,
     command: list[str],
     cwd: str,
+    writable_roots: Sequence[Path] = (),
 ) -> list[str]:
     if not command:
         raise ValueError("Approved Sandbox command cannot be empty")
+    sandbox_state = codex_sandbox_state(
+        settings,
+        command=command,
+        cwd=Path(cwd),
+        writable_roots=writable_roots,
+    )
     return [
         backend.executable,
         "sandbox",
         "-c",
         f'windows.sandbox="{backend.windows_mode}"',
-        "-P",
-        backend.permission_profile,
-        "-C",
-        cwd,
+        "--sandbox-state-json",
+        canonical_json(sandbox_state),
+        "--sandbox-state-disable-network",
         "--",
         *command,
     ]
+
+
+def codex_sandbox_state(
+    settings: Settings,
+    *,
+    command: Sequence[str],
+    cwd: Path,
+    writable_roots: Sequence[Path] = (),
+) -> dict[str, Any]:
+    """Build the exact filesystem/network capability passed to the Codex backend."""
+    if not command:
+        raise ValueError("Approved Sandbox command cannot be empty")
+    cwd = cwd.resolve(strict=True)
+    workspace = settings.workspace_root.resolve(strict=True)
+    entries: list[dict[str, Any]] = [
+        _special_filesystem_entry("minimal", "read"),
+        _path_filesystem_entry(workspace, "read"),
+    ]
+    readable_roots = [
+        Path(command[0]).resolve(strict=True).parent,
+        *(path.resolve(strict=True) for path in settings.sandbox_dependency_readable_paths),
+    ]
+    seen: set[str] = set()
+    for path in [*readable_roots, *(root.resolve(strict=True) for root in writable_roots)]:
+        folded = os.path.normcase(str(path))
+        if folded in seen:
+            continue
+        seen.add(folded)
+        entries.append(
+            _path_filesystem_entry(
+                path,
+                "write"
+                if any(path == root.resolve(strict=True) for root in writable_roots)
+                else "read",
+            )
+        )
+    entries.extend(_protected_read_entries(settings, workspace))
+    return {
+        "permissionProfile": {
+            "type": "managed",
+            "file_system": {
+                "type": "restricted",
+                "entries": entries,
+                "glob_scan_max_depth": 64,
+            },
+            "network": "restricted",
+        },
+        "codexLinuxSandboxExe": None,
+        "sandboxCwd": cwd.as_uri(),
+        "useLegacyLandlock": False,
+    }
+
+
+def launch_codex_sandbox(
+    backend: CodexSandboxBackend,
+    *,
+    settings: Settings,
+    command: list[str],
+    cwd: Path,
+    writable_roots: Sequence[Path],
+    environment: dict[str, str],
+    stdin: Any,
+    stdout: Any,
+    stderr: Any,
+    limits: WindowsJobLimits | None = None,
+) -> tuple[subprocess.Popen[Any], WindowsSandboxJob, list[str]]:
+    """Launch suspended, attach the whole route to a bounded Job, then resume."""
+    argv = build_codex_sandbox_argv(
+        backend,
+        settings=settings,
+        command=command,
+        cwd=str(cwd),
+        writable_roots=writable_roots,
+    )
+    job = WindowsSandboxJob(
+        limits
+        or WindowsJobLimits(
+            max_processes=backend.max_processes,
+            max_memory_bytes=backend.max_memory_bytes,
+        )
+    )
+    try:
+        process = job.popen(
+            argv,
+            cwd=Path(backend.executable).parent,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+            shell=False,
+            creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            env=environment,
+        )
+    except Exception:
+        job.close()
+        raise
+    return process, job, argv
+
+
+def _path_filesystem_entry(path: Path, access: str) -> dict[str, Any]:
+    return {"path": {"type": "path", "path": str(path)}, "access": access}
+
+
+def _special_filesystem_entry(value: str, access: str) -> dict[str, Any]:
+    return {
+        "path": {"type": "special", "value": {"kind": value}},
+        "access": access,
+    }
+
+
+def _glob_filesystem_entry(pattern: str, access: str) -> dict[str, Any]:
+    return {
+        "path": {"type": "glob_pattern", "pattern": pattern},
+        "access": access,
+    }
+
+
+def _protected_read_entries(settings: Settings, workspace: Path) -> list[dict[str, Any]]:
+    prefix = workspace.as_posix().rstrip("/")
+    patterns: set[str] = set()
+    for name in settings.blocked_file_names:
+        patterns.add(f"{prefix}/{name}")
+        patterns.add(f"{prefix}/**/{name}")
+    patterns.add(f"{prefix}/.env.*")
+    patterns.add(f"{prefix}/**/.env.*")
+    for name in settings.read_denied_directories:
+        patterns.add(f"{prefix}/{name}")
+        patterns.add(f"{prefix}/**/{name}")
+        patterns.add(f"{prefix}/**/{name}/**")
+    return [_glob_filesystem_entry(pattern, "deny") for pattern in sorted(patterns)]
 
 
 def codex_sandbox_effective_policy(*, workspace_write: bool) -> dict[str, Any]:
     return {
         "sandbox_backend": "openai-codex-windows-sandbox",
         "filesystem_policy": {
-            "workspace": "read-write" if workspace_write else "backend profile may still allow write",
-            "outside_workspace_read": "broad Windows platform/user-readable scope",
-            "outside_workspace_write": "denied by Codex :workspace profile",
-            "protected_paths": "MCP validation and checkpoint scope remain narrower than backend read scope",
+            "source_workspace": "requested read-only with protected-path deny-read rules",
+            "execution_copy": "read-write" if workspace_write else "read-write disposable scratch",
+            "outside_workspace_read": "requested deny except minimal Windows/toolchain and explicit dependencies",
+            "outside_workspace_write": "denied except the per-operation scratch root",
+            "protected_paths": "requested Codex elevated deny-read policy; live evidence required",
         },
         "network_policy": {
             "internet": "deny",
             "lan": "deny",
-            "loopback": "backend-managed; not represented as a per-port guarantee",
-            "enforcement": "Codex elevated sandbox firewall/restricted-token policy",
+            "loopback": "deny",
+            "enforcement": "requested Codex per-sandbox-user firewall/WFP; live evidence required",
         },
-        "descendant_policy": "children remain under the Codex sandbox command runner/job",
-        "actual_execution_boundary": "dedicated lower-privilege Codex sandbox user plus restricted token",
+        "descendant_policy": "filesystem/network token plus outer Job Object inherited by descendants",
+        "resource_policy": "OS Job Object active-process and process-tree committed-memory limits",
+        "actual_execution_boundary": "live-verified Codex boundary plus WLMCP Job Object",
         "external_state_changes": "device, service, and IPC effects are command-dependent and may not be rollbackable",
         "rollback": "workspace checkpoints only; external effects are not undone",
     }

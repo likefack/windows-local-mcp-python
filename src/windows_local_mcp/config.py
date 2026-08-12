@@ -83,6 +83,12 @@ class Settings(BaseModel):
     max_pending_approvals: int = Field(default=100, ge=1, le=10000)
     max_open_transfers: int = Field(default=32, ge=1, le=1000)
     max_sandbox_scratch_bytes: int = Field(default=512 * 1024 * 1024, ge=1024 * 1024)
+    max_sandbox_processes: int = Field(default=64, ge=4, le=1024)
+    max_sandbox_memory_bytes: int = Field(
+        default=4 * 1024 * 1024 * 1024,
+        ge=128 * 1024 * 1024,
+        le=64 * 1024 * 1024 * 1024,
+    )
 
     # Parent environment is not inherited wholesale. Add only project-specific variables that a
     # child genuinely needs; known injection/redirection variables are rejected even if listed.

@@ -18,6 +18,7 @@ from windows_local_mcp.sandbox_backend import (
     CodexSandboxBackend,
     build_codex_sandbox_argv,
     codex_sandbox_effective_policy,
+    codex_sandbox_state,
     require_codex_sandbox_live_verification,
     resolve_codex_sandbox_backend,
 )
@@ -28,6 +29,7 @@ from windows_local_mcp.sandbox_live_verify import (
 )
 from windows_local_mcp.sandbox_live_verify import _run as run_live_probe
 from windows_local_mcp.util import canonical_json, sha256_text
+from windows_local_mcp.windows_job import WindowsJobLimits, WindowsSandboxJob
 from windows_local_mcp.windows_system import windows_system_executable
 from windows_local_mcp.workspace_history import (
     capture_workspace_state,
@@ -75,12 +77,17 @@ def test_codex_sandbox_adapter_binds_installed_launcher_without_agent(
     backend = resolve_codex_sandbox_backend(settings)
     argv = build_codex_sandbox_argv(
         backend,
+        settings=settings,
         command=[sys.executable, "-m", "pytest"],
         cwd=str(settings.workspace_root),
+        writable_roots=(settings.workspace_root,),
     )
     assert argv[0] == str(codex.resolve())
     assert argv[1] == "sandbox"
     assert "exec" not in argv[:8]
+    state = json.loads(argv[argv.index("--sandbox-state-json") + 1])
+    assert state["permissionProfile"]["network"] == "restricted"
+    assert "--sandbox-state-disable-network" in argv
     assert backend.as_dict()["model_api_usage"].startswith("none")
     assert backend.as_dict()["authentication_required"] is False
     assert backend.permission_profile == ":workspace"
@@ -115,6 +122,43 @@ def test_codex_policy_is_offline_and_does_not_trust_target_stderr() -> None:
     policy = codex_sandbox_effective_policy(workspace_write=True)
     assert policy["network_policy"]["internet"] == "deny"
     assert policy["filesystem_policy"]["outside_workspace_write"].startswith("denied")
+
+
+def test_codex_state_limits_reads_and_denies_protected_workspace_paths(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    executable = tmp_path / "tool" / "python.exe"
+    executable.parent.mkdir()
+    executable.write_bytes(b"tool")
+    runtime = settings.sandbox_scratch_dir / "runs" / "state-test"
+    runtime.mkdir(parents=True)
+
+    state = codex_sandbox_state(
+        settings,
+        command=[str(executable), "-c", "pass"],
+        cwd=runtime,
+        writable_roots=(runtime,),
+    )
+
+    profile = state["permissionProfile"]
+    assert profile["network"] == "restricted"
+    entries = profile["file_system"]["entries"]
+    assert {
+        "path": {"type": "path", "path": str(settings.workspace_root.resolve())},
+        "access": "read",
+    } in entries
+    assert {
+        "path": {"type": "path", "path": str(runtime.resolve())},
+        "access": "write",
+    } in entries
+    patterns = {
+        entry["path"]["pattern"] for entry in entries if entry["path"]["type"] == "glob_pattern"
+    }
+    workspace = settings.workspace_root.resolve().as_posix()
+    assert f"{workspace}/**/.env" in patterns
+    assert f"{workspace}/**/credentials.json" in patterns
+    assert all(str(Path.home()) not in str(entry) for entry in entries)
 
 
 def test_live_verification_properties_distinguish_failed_from_unverified() -> None:
@@ -286,9 +330,35 @@ def test_live_probe_timeout_terminates_descendant_process(
         f"subprocess.Popen([sys.executable,'-I','-c',{child_code!r}]);"
         "time.sleep(60)"
     )
+
+    def launch_direct(
+        _backend: CodexSandboxBackend,
+        *,
+        command: list[str],
+        cwd: Path,
+        environment: dict[str, str],
+        stdin: object,
+        stdout: object,
+        stderr: object,
+        **_kwargs: object,
+    ) -> tuple[subprocess.Popen[bytes], WindowsSandboxJob, list[str]]:
+        job = WindowsSandboxJob(
+            WindowsJobLimits(max_processes=8, max_memory_bytes=512 * 1024 * 1024)
+        )
+        process = job.popen(
+            command,
+            cwd=cwd,
+            env=environment,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+            shell=False,
+        )
+        return process, job, command
+
     monkeypatch.setattr(
-        "windows_local_mcp.sandbox_live_verify.build_codex_sandbox_argv",
-        lambda _backend, *, command, cwd: command,
+        "windows_local_mcp.sandbox_live_verify.launch_codex_sandbox",
+        launch_direct,
     )
 
     probe_diagnostics: list[dict[str, object]] = []
@@ -301,6 +371,7 @@ def test_live_probe_timeout_terminates_descendant_process(
             timeout=1,
             probe_name="timeout-regression",
             probe_diagnostics=probe_diagnostics,
+            raise_on_timeout=True,
         )
 
     size_after_stop = heartbeat.stat().st_size

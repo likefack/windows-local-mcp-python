@@ -47,9 +47,9 @@ from .safe_process import run_safe_process
 from .sandbox_backend import (
     ApprovedSandboxUnavailable,
     CodexSandboxBackend,
-    build_codex_sandbox_argv,
     codex_sandbox_effective_policy,
     hold_codex_sandbox_backend,
+    launch_codex_sandbox,
     probe_codex_version,
     require_codex_sandbox_live_verification,
     verify_codex_sandbox_backend,
@@ -333,6 +333,7 @@ def run_operation(operation_id: str, settings: Settings) -> int:
     failure_class: str | None = None
     network_policy_payload: dict[str, object] | None = None
     sandbox_backend_hold: Any | None = None
+    sandbox_job: Any | None = None
     executable_hold: Any | None = None
 
     try:
@@ -443,16 +444,16 @@ def run_operation(operation_id: str, settings: Settings) -> int:
         if operation["tier"] == "codex_sandbox":
             if sandbox_backend is None:
                 raise ApprovedSandboxUnavailable("Approved Sandbox backend is unavailable")
-            child = subprocess.Popen(
-                build_codex_sandbox_argv(sandbox_backend, command=argv, cwd=cwd),
-                cwd=Path(sandbox_backend.executable).parent,
+            child, sandbox_job, _sandbox_argv = launch_codex_sandbox(
+                sandbox_backend,
+                settings=settings,
+                command=argv,
+                cwd=Path(cwd),
+                writable_roots=(runtime_root,),
+                environment=child_env,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                shell=False,
-                creationflags=creation_flags(),
-                start_new_session=(os.name != "nt"),
-                env=child_env,
             )
         else:
             child = subprocess.Popen(
@@ -508,6 +509,14 @@ def run_operation(operation_id: str, settings: Settings) -> int:
         )
         runtime_entry_limit = max(128, settings.approval_manifest_max_files * 4)
         while True:
+            if sandbox_job is not None and sandbox_job.violation is not None:
+                sandbox_job.terminate()
+                child.wait(timeout=10)
+                exit_code = child.returncode
+                status = "failed"
+                error = f"sandbox OS resource limit exceeded: {sandbox_job.violation}"
+                failure_class = "sandbox_resource_policy"
+                break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _terminate_launched_child(child, child_identity)
@@ -518,9 +527,14 @@ def run_operation(operation_id: str, settings: Settings) -> int:
                 break
             try:
                 exit_code = child.wait(timeout=min(0.5, remaining))
-                status = "succeeded" if exit_code == 0 else "failed"
-                error = None if exit_code == 0 else f"command exited with code {exit_code}"
-                failure_class = None if exit_code == 0 else "command_failure"
+                if sandbox_job is not None and sandbox_job.violation is not None:
+                    status = "failed"
+                    error = f"sandbox OS resource limit exceeded: {sandbox_job.violation}"
+                    failure_class = "sandbox_resource_policy"
+                else:
+                    status = "succeeded" if exit_code == 0 else "failed"
+                    error = None if exit_code == 0 else f"command exited with code {exit_code}"
+                    failure_class = None if exit_code == 0 else "command_failure"
                 if operation["tier"] in {"broker", "codex_sandbox"}:
                     storage_error = _safe_runtime_storage_error(
                         runtime_root,
@@ -608,6 +622,16 @@ def run_operation(operation_id: str, settings: Settings) -> int:
         failure_class = "launcher_failure" if child is None else "execution_failure"
         error = f"{type(exc).__name__}: {exc}"
     finally:
+        if sandbox_job is not None:
+            try:
+                sandbox_job.terminate()
+                if not sandbox_job.wait_empty(timeout=10):
+                    raise RuntimeError("Sandbox Job Object descendants did not terminate")
+                sandbox_job.close()
+            except Exception as cleanup_error:  # noqa: BLE001 - containment must fail closed
+                status = "failed"
+                failure_class = "sandbox_cleanup_failure"
+                error = f"{type(cleanup_error).__name__}: {cleanup_error}"
         if stdout_capture is not None:
             stdout_capture.join()
         if stderr_capture is not None:

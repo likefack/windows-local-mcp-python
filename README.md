@@ -117,9 +117,13 @@ approved_sandbox_enabled = true
 approved_sandbox_codex_path = "C:\\path\\to\\codex.exe"
 approved_sandbox_require_live_verification = true
 sandbox_dependency_readable_paths = []
+max_sandbox_processes = 64
+max_sandbox_memory_bytes = 4294967296
 ```
 
 WLMCP は `codex sandbox` 専用 entrypoint を argv で起動し、agent／model API は使用しません。launcher と helper の path、署名、hash、file identity を承認と実行時に検証します。
+
+起動時には legacy profile 名だけに依存せず、source workspace の read、operation 固有 scratch の write、明示した依存 root の read、保護名の deny、network restricted を含む `sandbox-state` をCodex CLIへ渡します。さらにlauncherを一時停止状態で起動し、Windows Job Objectへ割り当ててから再開します。Job Objectはlauncherを含む子孫全体のprocess数、commit memory、終了時killをOSで強制します。上限違反はjob全体を停止し、WLMCPは子孫が0になったことと終了状態を回収できたことを確認します。
 
 Sandbox staging は `.env` 等の保護対象と、`.venv`、`node_modules`、`build`、`__pycache__` 等の生成・依存 tree を一律 copy しません。必要な外部依存は `sandbox_dependency_readable_paths` 等の明示的で検証可能な入力として扱い、暗黙に source workspace を参照させません。staging から除外しただけでは OS read denial の代替にならないため、保護情報の直接 read denial は上記の実機 property で別に検証します。
 
@@ -132,7 +136,7 @@ $env:LOCAL_MCP_CONFIG = 'C:\path\to\config.local.toml'
 
 検証結果は `filesystem_read`、`filesystem_write`、`protected_information_read`、`internet`、`lan`、`loopback`、`descendant_containment`、`termination`、`resource_bound` の property ごとに `verified`／`unverified` として保存します。旧形式の marker や一部だけ通過した marker は受理しません。`available` は依存関係と起動前提、`windows_live_verified` は OS 境界の実測、`execution_route_available` は必要な全 property を満たして実行可能かを別々に示します。`approved_sandbox_require_live_verification=false` で実行条件を回避することはできません。
 
-現在の検証器が process 数・memory を含む完全な `resource_bound` 等を証明できない場合、その property は `unverified` のままになり、Sandbox 経路は利用不可です。これは Approved Host への自動移行条件にはなりません。
+検証器は親・child・grandchildのfilesystem／network境界に加え、process数上限とprocess-tree memory上限の超過、違反時の全子孫停止、終了状態回収まで実測します。独立probeが例外になった場合、そのprobeを `unverified` として残し、安全に続行できる残りのprobeを継続します。1 propertyでも `failed`／`unverified` ならSandbox経路は利用不可であり、Approved Hostへ自動移行しません。
 
 ## ファイルと制御領域の保護
 

@@ -66,6 +66,10 @@ max_image_pixels = 40000000
 max_output_bytes_per_stream = 16777216
 max_data_dir_bytes = 536870912
 max_directory_entries = 3000
+# Per-Codex-Sandbox Windows Job Object limits. The process limit and committed-memory
+# limit apply to the launcher and the complete descendant tree.
+max_sandbox_processes = 64
+max_sandbox_memory_bytes = 4294967296
 output_preview_characters = 12000
 max_command_arguments = 64
 max_command_argument_characters = 1024
