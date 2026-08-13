@@ -19,6 +19,7 @@ from .config import Settings
 from .tool_safety import ensure_external_tool_executable
 from .util import canonical_json, sha256_text
 from .windows_job import WindowsJobLimits, WindowsSandboxJob
+from .windows_system import physical_filesystem_path
 
 _CODEX_VERSION = re.compile(r"^codex-cli\s+([^\s]+)")
 _OPENAI_AUTHENTICODE_NAMES = ('O="OpenAI OpCo, LLC"', 'CN="OpenAI OpCo, LLC"')
@@ -27,6 +28,8 @@ _SANDBOX_HELPERS = (
     "codex-windows-sandbox-setup.exe",
 )
 _WLMCP_ISOLATION_POLICY_VERSION = 1
+_SANDBOX_STATE_POLICY_VERSION = 1
+_SANDBOX_STATE_GLOB_SCAN_MAX_DEPTH = 64
 SANDBOX_SECURITY_PROPERTIES = (
     "filesystem_read",
     "filesystem_write",
@@ -248,6 +251,75 @@ def verify_codex_sandbox_backend(
     return backend
 
 
+def sandbox_isolation_context(
+    settings: Settings, backend: CodexSandboxBackend
+) -> dict[str, Any]:
+    """Return the stable security inputs that determine the effective Sandbox route."""
+
+    assert settings.sandbox_scratch_dir is not None
+
+    def root_identity(path: Path) -> dict[str, Any]:
+        resolved = path.resolve(strict=True)
+        details = resolved.stat()
+        return {
+            "device": int(details.st_dev),
+            "inode": int(details.st_ino),
+            "physical_path": physical_filesystem_path(resolved),
+        }
+
+    def stable_paths(paths: Sequence[Path]) -> list[str]:
+        return sorted(
+            {str(path.resolve()) for path in paths},
+            key=lambda value: (os.path.normcase(value), value),
+        )
+
+    def stable_names(values: Sequence[str]) -> list[str]:
+        return sorted(
+            {str(value) for value in values},
+            key=lambda value: (os.path.normcase(value), value),
+        )
+
+    return {
+        "version": 1,
+        "backend": backend.as_dict(),
+        "roots": {
+            "workspace_root": root_identity(settings.workspace_root),
+            "data_dir": root_identity(settings.data_dir),
+            "sandbox_scratch_dir": root_identity(settings.sandbox_scratch_dir),
+        },
+        "blocked_file_names": stable_names(settings.blocked_file_names),
+        "read_denied_directories": stable_names(settings.read_denied_directories),
+        "write_denied_directories": stable_names(settings.write_denied_directories),
+        "hidden_directories": stable_names(settings.hidden_directories),
+        "child_environment_allowlist": stable_names(settings.child_environment_allowlist),
+        "sandbox_dependency_readable_paths": stable_paths(
+            settings.sandbox_dependency_readable_paths
+        ),
+        "max_sandbox_scratch_bytes": settings.max_sandbox_scratch_bytes,
+        "wlmcp_isolation_policy_version": backend.isolation_policy_version,
+        "process_count_limit": backend.max_processes,
+        "process_tree_memory_limit_bytes": backend.max_memory_bytes,
+        "configured_process_count_limit": settings.max_sandbox_processes,
+        "configured_process_tree_memory_limit_bytes": settings.max_sandbox_memory_bytes,
+        "sandbox_state_policy": {
+            "version": _SANDBOX_STATE_POLICY_VERSION,
+            "filesystem_policy_generation": 1,
+            "network_policy_generation": 1,
+            "filesystem": "restricted",
+            "network": "restricted",
+            "direct_network_disabled": True,
+            "glob_scan_max_depth": _SANDBOX_STATE_GLOB_SCAN_MAX_DEPTH,
+            "use_legacy_landlock": False,
+        },
+    }
+
+
+def isolation_context_digest(settings: Settings, backend: CodexSandboxBackend) -> str:
+    """Hash the complete security-relevant configuration used by live verification."""
+
+    return sha256_text(canonical_json(sandbox_isolation_context(settings, backend)))
+
+
 def require_codex_sandbox_live_verification(
     settings: Settings, backend: CodexSandboxBackend
 ) -> dict[str, Any]:
@@ -264,11 +336,18 @@ def require_codex_sandbox_live_verification(
             "Codex Sandbox has not completed Windows live verification for this profile"
         ) from error
     properties = evidence.get("properties")
+    try:
+        expected_isolation_digest = isolation_context_digest(settings, backend)
+    except (OSError, PermissionError, RuntimeError, ValueError) as error:
+        raise ApprovedSandboxUnavailable(
+            "Codex Sandbox isolation context could not be resolved"
+        ) from error
     if (
-        evidence.get("version") != 2
+        evidence.get("version") != 3
         or evidence.get("passed") is not True
         or evidence.get("backend_digest")
         != sha256_text(canonical_json(backend.as_dict()))
+        or evidence.get("isolation_context_digest") != expected_isolation_digest
         or not isinstance(properties, dict)
         or any(
             not isinstance(properties.get(name), dict)
@@ -451,7 +530,7 @@ def codex_sandbox_state(
             "file_system": {
                 "type": "restricted",
                 "entries": entries,
-                "glob_scan_max_depth": 64,
+                "glob_scan_max_depth": _SANDBOX_STATE_GLOB_SCAN_MAX_DEPTH,
             },
             "network": "restricted",
         },

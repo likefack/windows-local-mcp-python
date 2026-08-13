@@ -42,6 +42,7 @@ from .risk import command_risk_facts
 from .sandbox_backend import (
     SANDBOX_SECURITY_PROPERTIES,
     codex_sandbox_effective_policy,
+    isolation_context_digest,
     require_codex_sandbox_live_verification,
     resolve_codex_sandbox_backend,
 )
@@ -252,8 +253,10 @@ def _codex_sandbox_capability() -> dict[str, Any]:
         if marker.is_file():
             evidence = json.loads(marker.read_text(encoding="utf-8"))
             if (
-                evidence.get("version") == 2
+                evidence.get("version") == 3
                 and evidence.get("backend_digest") == sha256_text(canonical_json(backend))
+                and evidence.get("isolation_context_digest")
+                == isolation_context_digest(runtime.settings, resolved)
                 and isinstance(evidence.get("properties"), dict)
             ):
                 status["properties"] = evidence["properties"]

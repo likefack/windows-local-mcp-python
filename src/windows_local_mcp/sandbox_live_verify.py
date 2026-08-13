@@ -24,13 +24,20 @@ from .sandbox_backend import (
     SANDBOX_SECURITY_PROPERTIES,
     CodexSandboxBackend,
     hold_codex_sandbox_backend,
+    isolation_context_digest,
     launch_codex_sandbox,
     probe_codex_version,
     resolve_codex_sandbox_backend,
 )
 from .util import canonical_json, sha256_text, utc_now_iso
-from .windows_job import WindowsJobLimits
+from .windows_job import WindowsJobLimits, WindowsSandboxJob
 from .windows_system import windows_system_executable
+
+_LAUNCH_FAILURE_RETURN_CODE = -255
+_TIMEOUT_RETURN_CODE = -254
+_PROBE_ERROR_RETURN_CODE = -253
+_BOUNDARY_ESCAPE_EXIT_CODE = 9
+ProbeCheck = bool | None
 
 
 def _sandbox_verification_serialized(function: Any) -> Any:
@@ -64,7 +71,9 @@ def _host_endpoint_reachable(host: str, port: int, *, timeout: float = 2) -> boo
     return True
 
 
-def _property_results(checks: dict[str, bool]) -> dict[str, dict[str, Any]]:
+def _property_results(
+    checks: dict[str, ProbeCheck], reasons: dict[str, str] | None = None
+) -> dict[str, dict[str, Any]]:
     """Translate concrete probes into contract-level properties without overclaiming."""
     requirements = {
         "filesystem_read": (
@@ -112,8 +121,15 @@ def _property_results(checks: dict[str, bool]) -> dict[str, dict[str, Any]]:
     for property_name in SANDBOX_SECURITY_PROPERTIES:
         required = requirements[property_name]
         failed = [name for name in required if checks.get(name) is False]
-        unverified = [name for name in required if name not in checks]
+        unverified = [
+            name for name in required if name not in checks or checks.get(name) is None
+        ]
         incomplete = [name for name in required if checks.get(name) is not True]
+        status_reasons = {
+            name: reasons[name]
+            for name in (*failed, *unverified)
+            if reasons is not None and name in reasons
+        }
         result[property_name] = {
             "status": (
                 "verified"
@@ -126,8 +142,89 @@ def _property_results(checks: dict[str, bool]) -> dict[str, dict[str, Any]]:
             "failed": failed,
             "unverified": unverified,
             "missing_or_failed": incomplete,
+            "reasons": status_reasons,
         }
     return result
+
+
+def _return_code_reason(returncode: int | None) -> str:
+    if returncode == _LAUNCH_FAILURE_RETURN_CODE:
+        return "unverified: Sandbox process launch failed"
+    if returncode == _TIMEOUT_RETURN_CODE:
+        return "unverified: probe timed out"
+    if returncode == _PROBE_ERROR_RETURN_CODE:
+        return "unverified: probe execution or cleanup failed"
+    if returncode is None:
+        return "unverified: probe did not produce an exit code"
+    return f"unverified: probe exited with diagnostic code {returncode}"
+
+
+def _classify_probe_result(
+    result: subprocess.CompletedProcess[bytes],
+    *,
+    success: bool,
+    boundary_escape_code: int | None = _BOUNDARY_ESCAPE_EXIT_CODE,
+) -> tuple[ProbeCheck, str]:
+    """Classify an executed probe without treating diagnostic failure as boundary escape."""
+
+    if result.returncode in {
+        _LAUNCH_FAILURE_RETURN_CODE,
+        _TIMEOUT_RETURN_CODE,
+        _PROBE_ERROR_RETURN_CODE,
+    }:
+        return None, _return_code_reason(result.returncode)
+    if boundary_escape_code is not None and result.returncode == boundary_escape_code:
+        return False, "failed: probe observed a boundary escape"
+    if result.returncode != 0:
+        return None, _return_code_reason(result.returncode)
+    if not success:
+        return None, "unverified: probe output or postcondition was not measurable"
+    return True, "verified: probe completed and the requested boundary held"
+
+
+def _record_probe_setup_failure(
+    probe_diagnostics: list[dict[str, Any]],
+    *,
+    probe: str,
+    started: float,
+    error: BaseException,
+    error_key: str = "probe_error",
+    argv: list[str] | None = None,
+    pid: int | None = None,
+    child_process_state: str = "probe_setup_failed",
+) -> None:
+    message = redact_text(f"{type(error).__name__}: {error}")[:1000]
+    timed_out = isinstance(error, subprocess.TimeoutExpired)
+    probe_diagnostics.append(
+        {
+            "probe": probe,
+            "pid": pid,
+            "argv": [redact_text(value)[:1000] for value in (argv or [])],
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+            "timeout_seconds": getattr(error, "timeout", None),
+            "timed_out": timed_out,
+            "exit_code": None,
+            error_key: message,
+            "probe_error": message,
+            "stdout": "",
+            "stderr": "",
+            "child_process_state": child_process_state,
+            "final_child_state": child_process_state,
+            "classification": "unverified",
+            "classification_reason": "unverified: probe setup failed",
+        }
+    )
+
+
+def _set_check(
+    checks: dict[str, ProbeCheck],
+    reasons: dict[str, str],
+    name: str,
+    value: ProbeCheck,
+    reason: str,
+) -> None:
+    checks[name] = value
+    reasons[name] = reason
 
 
 def _python_executable(settings: Settings) -> str:
@@ -186,74 +283,638 @@ def _run(
             stderr=subprocess.PIPE,
         )
     except Exception as error:  # noqa: BLE001 - one probe must not cancel independent probes
+        message = redact_text(f"{type(error).__name__}: {error}")[:1000]
         diagnostic = {
             "probe": probe_name or "unnamed",
             "argv": [redact_text(value)[:1000] for value in command],
+            "pid": None,
             "elapsed_seconds": round(time.monotonic() - started, 3),
+            "timeout_seconds": timeout,
             "timed_out": False,
             "exit_code": None,
-            "probe_error": redact_text(f"{type(error).__name__}: {error}")[:1000],
+            "launch_error": message,
+            "probe_error": message,
+            "stdout": "",
+            "stderr": "",
             "child_process_state": "launch_failed_before_process_creation",
+            "final_child_state": "launch_failed_before_process_creation",
+            "classification": "unverified",
+            "classification_reason": "unverified: Sandbox process launch failed",
         }
         if probe_diagnostics is not None:
             probe_diagnostics.append(diagnostic)
-        return subprocess.CompletedProcess(command, -255, b"", b"")
+        return subprocess.CompletedProcess(command, _LAUNCH_FAILURE_RETURN_CODE, b"", b"")
     diagnostic = {
         "probe": probe_name or "unnamed",
         "argv": [redact_text(value)[:1000] for value in argv],
         "pid": process.pid,
+        "timeout_seconds": timeout,
     }
+    timed_out = False
+    stdout = b""
+    stderr = b""
+    result_returncode = _PROBE_ERROR_RETURN_CODE
+    error_message: str | None = None
     try:
-        stdout, stderr = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired as error:
-        diagnostic.update(
-            {
-                "elapsed_seconds": round(time.monotonic() - started, 3),
-                "timed_out": True,
-                "child_process_state": "termination_requested",
-            }
-        )
-        job.terminate()
         try:
-            timeout_stdout, timeout_stderr = process.communicate(timeout=10)
-        except subprocess.TimeoutExpired as cleanup_error:
-            process.kill()
-            if process.stdout is not None:
-                process.stdout.close()
-            if process.stderr is not None:
-                process.stderr.close()
-            raise RuntimeError(
-                "timed-out sandbox verification process tree could not be drained"
-            ) from cleanup_error
-        diagnostic.update(
-            {
-                "exit_code": process.returncode,
-                "child_process_state": "terminated_and_drained",
-            }
-        )
-        if probe_diagnostics is not None:
-            probe_diagnostics.append(diagnostic)
-        if raise_on_timeout:
-            raise subprocess.TimeoutExpired(argv, timeout) from error
-        return subprocess.CompletedProcess(argv, -254, timeout_stdout, timeout_stderr)
+            stdout, stderr = process.communicate(timeout=timeout)
+            result_returncode = process.returncode
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            diagnostic.update(
+                {
+                    "elapsed_seconds": round(time.monotonic() - started, 3),
+                    "timed_out": True,
+                    "child_process_state": "termination_requested",
+                }
+            )
+            job.terminate()
+            try:
+                stdout, stderr = process.communicate(timeout=10)
+            except subprocess.TimeoutExpired as cleanup_error:
+                process.kill()
+                if process.stdout is not None:
+                    process.stdout.close()
+                if process.stderr is not None:
+                    process.stderr.close()
+                error_message = (
+                    "timed-out Sandbox verification process tree could not be drained: "
+                    f"{type(cleanup_error).__name__}"
+                )
+                result_returncode = _PROBE_ERROR_RETURN_CODE
+            result_returncode = _TIMEOUT_RETURN_CODE
+        except Exception as error:  # noqa: BLE001 - diagnostics must remain independent
+            error_message = redact_text(f"{type(error).__name__}: {error}")[:1000]
+            result_returncode = _PROBE_ERROR_RETURN_CODE
     finally:
         job.terminate()
         if not job.wait_empty(timeout=10):
             diagnostic["job_cleanup"] = "descendants_remained"
+            diagnostic["child_process_state"] = "descendants_remaining"
+            result_returncode = _PROBE_ERROR_RETURN_CODE
         job.close()
+    if error_message:
+        diagnostic["probe_error"] = error_message
+    if timed_out:
+        diagnostic["child_process_state"] = "terminated_and_drained"
     diagnostic.update(
         {
             "elapsed_seconds": round(time.monotonic() - started, 3),
-            "timed_out": False,
-            "exit_code": process.returncode,
+            "timed_out": timed_out,
+            "exit_code": result_returncode,
             "stdout": redact_text(stdout.decode("utf-8", errors="replace"))[:2000],
             "stderr": redact_text(stderr.decode("utf-8", errors="replace"))[:2000],
-            "child_process_state": "exited_and_drained",
+            "child_process_state": diagnostic.get(
+                "child_process_state", "exited_and_drained"
+            ),
+            "final_child_state": diagnostic.get(
+                "child_process_state", "exited_and_drained"
+            ),
+            "classification": (
+                "unverified"
+                if result_returncode in {
+                    _LAUNCH_FAILURE_RETURN_CODE,
+                    _TIMEOUT_RETURN_CODE,
+                    _PROBE_ERROR_RETURN_CODE,
+                }
+                else "executed"
+            ),
+            "classification_reason": _return_code_reason(result_returncode)
+            if result_returncode in {
+                _LAUNCH_FAILURE_RETURN_CODE,
+                _TIMEOUT_RETURN_CODE,
+                _PROBE_ERROR_RETURN_CODE,
+            }
+            else "probe executed; boundary result is classified by its caller",
         }
     )
     if probe_diagnostics is not None:
         probe_diagnostics.append(diagnostic)
-    return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+    if timed_out and raise_on_timeout:
+        raise subprocess.TimeoutExpired(argv, timeout)
+    return subprocess.CompletedProcess(argv, result_returncode, stdout, stderr)
+
+
+def _launch_resource_probe(
+    settings: Settings,
+    backend: CodexSandboxBackend,
+    *,
+    command: list[str],
+    cwd: Path,
+    environment: dict[str, str],
+    limits: WindowsJobLimits | None,
+    probe_name: str,
+    probe_diagnostics: list[dict[str, Any]],
+    started: float,
+) -> tuple[subprocess.Popen[Any], WindowsSandboxJob, list[str]] | None:
+    try:
+        return launch_codex_sandbox(
+            backend,
+            settings=settings,
+            command=command,
+            cwd=cwd,
+            writable_roots=(cwd,),
+            environment=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            limits=limits,
+        )
+    except Exception as error:  # noqa: BLE001 - one independent probe must not stop others
+        _record_probe_setup_failure(
+            probe_diagnostics,
+            probe=probe_name,
+            started=started,
+            error=error,
+            error_key="launch_error",
+            argv=command,
+        )
+        return None
+
+
+def _termination_probe(
+    settings: Settings,
+    backend: CodexSandboxBackend,
+    root: Path,
+    python: str,
+    probe_diagnostics: list[dict[str, Any]],
+) -> tuple[ProbeCheck, str]:
+    started = time.monotonic()
+    heartbeat = root / "heartbeat.bin"
+    heartbeat_code = (
+        "from pathlib import Path\n"
+        "import time\n"
+        "path=Path('heartbeat.bin')\n"
+        "while True:\n"
+        " with path.open('ab') as output: output.write(b'x')\n"
+        " time.sleep(.1)\n"
+    )
+    command = [
+        python,
+        "-I",
+        "-c",
+        (
+            "import subprocess,sys,time;"
+            f"subprocess.Popen([sys.executable,'-I','-c',{heartbeat_code!r}]);"
+            "time.sleep(60)"
+        ),
+    ]
+    nonce = uuid.uuid4().hex
+    launched = _launch_resource_probe(
+        settings,
+        backend,
+        command=command,
+        cwd=root,
+        environment=_environment(settings, backend, nonce),
+        limits=None,
+        probe_name="timeout_terminated",
+        probe_diagnostics=probe_diagnostics,
+        started=started,
+    )
+    if launched is None:
+        return None, "unverified: termination probe launch failed"
+    running, job, argv = launched
+    terminated = False
+    empty = False
+    size_before = 0
+    size_after = 0
+    try:
+        time.sleep(2)
+        terminated = job.terminate()
+        running.wait(timeout=10)
+        empty = job.wait_empty(timeout=10)
+        size_before = heartbeat.stat().st_size if heartbeat.exists() else 0
+        time.sleep(1)
+        size_after = heartbeat.stat().st_size if heartbeat.exists() else 0
+        value = terminated and empty and size_before > 0 and size_before == size_after
+        reason = (
+            "verified: Job Object termination stopped the process tree and heartbeat"
+            if value
+            else "unverified: termination or descendant quiescence was not measurable"
+        )
+        probe_diagnostics.append(
+            {
+                "probe": "timeout_terminated",
+                "argv": [redact_text(value)[:1000] for value in argv],
+                "pid": running.pid,
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+                "timed_out": True,
+                "exit_code": running.poll(),
+                "stdout": "",
+                "stderr": "",
+                "final_child_state": "descendant_tree_terminated" if value else "termination_not_proven",
+                "child_process_state": "descendant_tree_terminated" if value else "termination_not_proven",
+                "heartbeat_bytes_before": size_before,
+                "heartbeat_bytes_after": size_after,
+                "classification": "verified" if value else "unverified",
+                "classification_reason": reason,
+            }
+        )
+        return value if value else None, reason
+    except Exception as error:  # noqa: BLE001 - independent probe failure is unverified
+        _record_probe_setup_failure(
+            probe_diagnostics,
+            probe="timeout_terminated",
+            started=started,
+            error=error,
+            argv=argv,
+            pid=running.pid,
+            child_process_state="process_created_probe_failed",
+        )
+        return None, "unverified: termination probe failed after launch"
+    finally:
+        job.terminate()
+        job.close()
+
+
+def _filesystem_limit_probe(
+    settings: Settings,
+    backend: CodexSandboxBackend,
+    root: Path,
+    python: str,
+    probe_diagnostics: list[dict[str, Any]],
+) -> tuple[ProbeCheck, str]:
+    started = time.monotonic()
+    resource_root = root / "resource"
+    command = [
+        python,
+        "-I",
+        "-c",
+        (
+            "from pathlib import Path;import time;p=Path('resource/grow.bin');"
+            "\nwith p.open('wb') as f:"
+            "\n for _ in range(1000):f.write(b'x'*262144);f.flush();time.sleep(.05)"
+        ),
+    ]
+    try:
+        resource_root.mkdir()
+    except Exception as error:  # noqa: BLE001 - setup failure is unverified
+        _record_probe_setup_failure(
+            probe_diagnostics,
+            probe="filesystem_limit_enforced",
+            started=started,
+            error=error,
+            argv=command,
+        )
+        return None, "unverified: filesystem resource probe setup failed"
+    nonce = uuid.uuid4().hex
+    launched = _launch_resource_probe(
+        settings,
+        backend,
+        command=command,
+        cwd=root,
+        environment=_environment(settings, backend, nonce),
+        limits=None,
+        probe_name="filesystem_limit_enforced",
+        probe_diagnostics=probe_diagnostics,
+        started=started,
+    )
+    if launched is None:
+        return None, "unverified: filesystem resource probe launch failed"
+    writer, job, argv = launched
+    detected = False
+    writer_empty = False
+    final_size = 0
+    try:
+        identity = capture_process_identity(writer.pid, nonce)
+        baseline = process_tree_write_bytes(identity)
+        if baseline is None:
+            raise RuntimeError("sandbox filesystem write accounting is unavailable")
+        admitted_limit = 2 * 1024 * 1024
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and writer.poll() is None:
+            usage = scan_directory_bounded(
+                resource_root, stop_after_bytes=admitted_limit, stop_after_entries=32
+            )
+            written = process_tree_write_bytes(identity)
+            if written is None:
+                raise RuntimeError("sandbox filesystem write accounting became unavailable")
+            if usage.total_bytes > admitted_limit or written - baseline > admitted_limit:
+                detected = job.terminate()
+                break
+            time.sleep(0.1)
+        writer.wait(timeout=10)
+        writer_empty = job.wait_empty(timeout=10)
+        final_size = (resource_root / "grow.bin").stat().st_size
+        value = detected and writer_empty and final_size < 8 * 1024 * 1024
+        reason = (
+            "verified: filesystem write bound was detected and the job was drained"
+            if value
+            else "unverified: filesystem resource boundary was not directly measured"
+        )
+        probe_diagnostics.append(
+            {
+                "probe": "filesystem_limit_enforced",
+                "argv": [redact_text(value)[:1000] for value in argv],
+                "pid": writer.pid,
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+                "timed_out": False,
+                "exit_code": writer.returncode,
+                "stdout": "",
+                "stderr": "",
+                "final_child_state": "terminated_at_bound" if detected else "exited",
+                "child_process_state": "terminated_at_bound" if detected else "exited",
+                "final_size": final_size,
+                "classification": "verified" if value else "unverified",
+                "classification_reason": reason,
+            }
+        )
+        return value if value else None, reason
+    except Exception as error:  # noqa: BLE001 - independent probe failure is unverified
+        _record_probe_setup_failure(
+            probe_diagnostics,
+            probe="filesystem_limit_enforced",
+            started=started,
+            error=error,
+            argv=argv,
+            pid=writer.pid,
+            child_process_state="process_created_probe_failed",
+        )
+        return None, "unverified: filesystem resource probe failed after launch"
+    finally:
+        job.terminate()
+        job.close()
+
+
+def _filesystem_entry_limit_probe(
+    settings: Settings,
+    backend: CodexSandboxBackend,
+    root: Path,
+    python: str,
+    probe_diagnostics: list[dict[str, Any]],
+) -> tuple[ProbeCheck, str]:
+    started = time.monotonic()
+    entry_root = root / "entries"
+    command = [
+        python,
+        "-I",
+        "-c",
+        (
+            "from pathlib import Path;import time;p=Path('entries');"
+            "\nfor i in range(1000):"
+            "\n (p/f'{i}.txt').write_text('x');time.sleep(.01)"
+        ),
+    ]
+    try:
+        entry_root.mkdir()
+    except Exception as error:  # noqa: BLE001 - setup failure is unverified
+        _record_probe_setup_failure(
+            probe_diagnostics,
+            probe="filesystem_entry_limit_enforced",
+            started=started,
+            error=error,
+            argv=command,
+        )
+        return None, "unverified: filesystem entry probe setup failed"
+    nonce = uuid.uuid4().hex
+    launched = _launch_resource_probe(
+        settings,
+        backend,
+        command=command,
+        cwd=root,
+        environment=_environment(settings, backend, nonce),
+        limits=None,
+        probe_name="filesystem_entry_limit_enforced",
+        probe_diagnostics=probe_diagnostics,
+        started=started,
+    )
+    if launched is None:
+        return None, "unverified: filesystem entry probe launch failed"
+    writer, job, argv = launched
+    detected = False
+    entry_empty = False
+    final_entries = 0
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and writer.poll() is None:
+            usage = scan_directory_bounded(
+                entry_root, stop_after_bytes=1024 * 1024, stop_after_entries=32
+            )
+            if usage.entry_count > 32:
+                detected = job.terminate()
+                break
+            time.sleep(0.05)
+        writer.wait(timeout=10)
+        entry_empty = job.wait_empty(timeout=10)
+        final_entries = scan_directory_bounded(
+            entry_root, stop_after_bytes=1024 * 1024, stop_after_entries=10_000
+        ).entry_count
+        value = detected and entry_empty and final_entries < 128
+        reason = (
+            "verified: filesystem entry bound was detected and the job was drained"
+            if value
+            else "unverified: filesystem entry boundary was not directly measured"
+        )
+        probe_diagnostics.append(
+            {
+                "probe": "filesystem_entry_limit_enforced",
+                "argv": [redact_text(value)[:1000] for value in argv],
+                "pid": writer.pid,
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+                "timed_out": False,
+                "exit_code": writer.returncode,
+                "stdout": "",
+                "stderr": "",
+                "final_child_state": "terminated_at_bound" if detected else "exited",
+                "child_process_state": "terminated_at_bound" if detected else "exited",
+                "final_entries": final_entries,
+                "classification": "verified" if value else "unverified",
+                "classification_reason": reason,
+            }
+        )
+        return value if value else None, reason
+    except Exception as error:  # noqa: BLE001 - independent probe failure is unverified
+        _record_probe_setup_failure(
+            probe_diagnostics,
+            probe="filesystem_entry_limit_enforced",
+            started=started,
+            error=error,
+            argv=argv,
+            pid=writer.pid,
+            child_process_state="process_created_probe_failed",
+        )
+        return None, "unverified: filesystem entry probe failed after launch"
+    finally:
+        job.terminate()
+        job.close()
+
+
+def _process_limit_probe(
+    settings: Settings,
+    backend: CodexSandboxBackend,
+    root: Path,
+    python: str,
+    probe_diagnostics: list[dict[str, Any]],
+) -> tuple[ProbeCheck, str]:
+    started = time.monotonic()
+    command = [
+        python,
+        "-I",
+        "-c",
+        (
+            "import subprocess,sys,time\n"
+            'grandchild="import time; time.sleep(60)"\n'
+            'child=("import subprocess,sys,time;"'
+            "+f\"subprocess.Popen([sys.executable,'-I','-c',{grandchild!r}]);\""
+            '+"time.sleep(60)")\n'
+            "subprocess.Popen([sys.executable,'-I','-c',child])\n"
+            "for _ in range(32):\n"
+            " subprocess.Popen([sys.executable,'-I','-c','import time;time.sleep(60)'])\n"
+            "time.sleep(60)\n"
+        ),
+    ]
+    nonce = uuid.uuid4().hex
+    launched = _launch_resource_probe(
+        settings,
+        backend,
+        command=command,
+        cwd=root,
+        environment=_environment(settings, backend, nonce),
+        limits=WindowsJobLimits(max_processes=8, max_memory_bytes=512 * 1024 * 1024),
+        probe_name="process_limit_enforced",
+        probe_diagnostics=probe_diagnostics,
+        started=started,
+    )
+    if launched is None:
+        return None, "unverified: process-limit probe launch failed"
+    runner, job, argv = launched
+    violation: str | None = None
+    empty = False
+    try:
+        job.violation_event.wait(20)
+        violation = job.violation
+        job.terminate()
+        runner.wait(timeout=10)
+        empty = job.wait_empty(timeout=10)
+        value = violation == "process_count_limit" and empty and runner.poll() is not None
+        reason = (
+            "verified: Job Object active-process limit violation was collected"
+            if value
+            else "unverified: process-count boundary violation was not directly measured"
+        )
+        probe_diagnostics.append(
+            {
+                "probe": "process_limit_enforced",
+                "argv": [redact_text(value)[:1000] for value in argv],
+                "pid": runner.pid,
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+                "timed_out": False,
+                "exit_code": runner.returncode,
+                "stdout": "",
+                "stderr": "",
+                "final_child_state": "terminated_and_drained" if empty else "descendants_remaining",
+                "child_process_state": "terminated_and_drained" if empty else "descendants_remaining",
+                "violation": violation,
+                "descendants_remaining": not empty,
+                "probe_process_limit": 8,
+                "classification": "verified" if value else "unverified",
+                "classification_reason": reason,
+            }
+        )
+        return value if value else None, reason
+    except Exception as error:  # noqa: BLE001 - independent probe failure is unverified
+        _record_probe_setup_failure(
+            probe_diagnostics,
+            probe="process_limit_enforced",
+            started=started,
+            error=error,
+            argv=argv,
+            pid=runner.pid,
+            child_process_state="process_created_probe_failed",
+        )
+        return None, "unverified: process-limit probe failed after launch"
+    finally:
+        job.terminate()
+        job.close()
+
+
+def _memory_limit_probe(
+    settings: Settings,
+    backend: CodexSandboxBackend,
+    root: Path,
+    python: str,
+    probe_diagnostics: list[dict[str, Any]],
+) -> tuple[ProbeCheck, str]:
+    started = time.monotonic()
+    grandchild_code = "import time;x=bytearray(96*1024*1024);time.sleep(60)"
+    command = [
+        python,
+        "-I",
+        "-c",
+        (
+            "import subprocess,sys,time;"
+            "x=bytearray(96*1024*1024);"
+            f"subprocess.Popen([sys.executable,'-I','-c',{grandchild_code!r}]);"
+            "time.sleep(60)"
+        ),
+    ]
+    limit = 192 * 1024 * 1024
+    nonce = uuid.uuid4().hex
+    launched = _launch_resource_probe(
+        settings,
+        backend,
+        command=command,
+        cwd=root,
+        environment=_environment(settings, backend, nonce),
+        limits=WindowsJobLimits(max_processes=16, max_memory_bytes=limit),
+        probe_name="memory_limit_enforced",
+        probe_diagnostics=probe_diagnostics,
+        started=started,
+    )
+    if launched is None:
+        return None, "unverified: memory-limit probe launch failed"
+    runner, job, argv = launched
+    violation: str | None = None
+    empty = False
+    accounting: dict[str, int] = {}
+    try:
+        job.violation_event.wait(20)
+        violation = job.violation
+        job.terminate()
+        runner.wait(timeout=10)
+        empty = job.wait_empty(timeout=10)
+        accounting = job.accounting()
+        value = violation == "process_tree_memory_limit" and empty and runner.poll() is not None
+        reason = (
+            "verified: Job Object process-tree memory violation was collected"
+            if value
+            else "unverified: process-tree memory boundary violation was not directly measured"
+        )
+        probe_diagnostics.append(
+            {
+                "probe": "memory_limit_enforced",
+                "argv": [redact_text(value)[:1000] for value in argv],
+                "pid": runner.pid,
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+                "timed_out": False,
+                "exit_code": runner.returncode,
+                "stdout": "",
+                "stderr": "",
+                "final_child_state": "terminated_and_drained" if empty else "descendants_remaining",
+                "child_process_state": "terminated_and_drained" if empty else "descendants_remaining",
+                "violation": violation,
+                "descendants_remaining": not empty,
+                "probe_memory_limit_bytes": limit,
+                **accounting,
+                "classification": "verified" if value else "unverified",
+                "classification_reason": reason,
+            }
+        )
+        return value if value else None, reason
+    except Exception as error:  # noqa: BLE001 - independent probe failure is unverified
+        _record_probe_setup_failure(
+            probe_diagnostics,
+            probe="memory_limit_enforced",
+            started=started,
+            error=error,
+            argv=argv,
+            pid=runner.pid,
+            child_process_state="process_created_probe_failed",
+        )
+        return None, "unverified: memory-limit probe failed after launch"
+    finally:
+        job.terminate()
+        job.close()
 
 
 @_sandbox_verification_serialized
@@ -263,8 +924,9 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
     assert settings.sandbox_scratch_dir is not None
     root = settings.sandbox_scratch_dir / "live-verification" / uuid.uuid4().hex
     root.mkdir(parents=True, exist_ok=False)
-    checks: dict[str, bool] = {}
+    checks: dict[str, ProbeCheck] = {}
     diagnostics: dict[str, str] = {}
+    check_reasons: dict[str, str] = {}
     probe_diagnostics: list[dict[str, Any]] = []
     version: str | None = None
     python = _python_executable(settings)
@@ -274,16 +936,81 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
     protected_canary = _protected_information_canary_path(settings.workspace_root)
     outside_canary = Path.home() / f".wlmcp-live-outside-{uuid.uuid4().hex}.txt"
     outside_write_target = Path.home() / f".wlmcp-live-write-{uuid.uuid4().hex}.txt"
+    control_read_target = (
+        settings.data_dir / "control-plane" / f"live-read-{uuid.uuid4().hex}.json"
+    )
     control_write_target = settings.data_dir / "control-plane" / f"live-write-{uuid.uuid4().hex}.txt"
     child_write_target = settings.workspace_root / f".wlmcp-live-child-{uuid.uuid4().hex}.txt"
     grandchild_write_target = (
         settings.workspace_root / f".wlmcp-live-grandchild-{uuid.uuid4().hex}.txt"
     )
+    canary_ready: dict[str, bool] = {}
+
+    def prepare_canary(
+        name: str, path: Path, content: str, *, remove_after_setup: bool = False
+    ) -> None:
+        started = time.monotonic()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        except OSError as error:
+            canary_ready[name] = False
+            diagnostics[name] = redact_text(
+                f"probe setup failed: {type(error).__name__}"
+            )[:1000]
+            _record_probe_setup_failure(
+                probe_diagnostics,
+                probe=name,
+                started=started,
+                error=error,
+                argv=["host-canary-setup", str(path)],
+            )
+            return
+        canary_ready[name] = True
+        if not remove_after_setup:
+            return
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as error:
+            canary_ready[name] = False
+            diagnostics[name] = redact_text(
+                f"probe setup cleanup failed: {type(error).__name__}"
+            )[:1000]
+            _record_probe_setup_failure(
+                probe_diagnostics,
+                probe=name,
+                started=started,
+                error=error,
+                argv=["host-canary-cleanup", str(path)],
+            )
+
+    prepare_canary("source_read", source_canary, "source-readable-canary")
+    prepare_canary(
+        "protected_information_denied",
+        protected_canary,
+        "WLMCP_LIVE_SECRET=canary-only",
+    )
+    prepare_canary("outside_user_read_denied", outside_canary, "outside-readable-canary")
+    prepare_canary(
+        "source_workspace_write_denied",
+        source_write_target,
+        "host-write-canary",
+        remove_after_setup=True,
+    )
+    prepare_canary(
+        "outside_user_write_denied",
+        outside_write_target,
+        "host-write-canary",
+        remove_after_setup=True,
+    )
+    prepare_canary("control_plane_read_denied", control_read_target, "control-read-canary")
+    prepare_canary(
+        "control_plane_write_denied",
+        control_write_target,
+        "host-write-canary",
+        remove_after_setup=True,
+    )
     try:
-        source_canary.write_text("source-readable-canary", encoding="utf-8")
-        protected_canary.parent.mkdir()
-        protected_canary.write_text("WLMCP_LIVE_SECRET=canary-only", encoding="utf-8")
-        outside_canary.write_text("outside-readable-canary", encoding="utf-8")
         with hold_codex_sandbox_backend(backend):
             version = probe_codex_version(backend, settings)
             simple = _run(
@@ -294,7 +1021,10 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
                 probe_name="simple_command",
                 probe_diagnostics=probe_diagnostics,
             )
-            checks["simple_command"] = simple.returncode == 0
+            value, reason = _classify_probe_result(
+                simple, success=simple.returncode == 0, boundary_escape_code=None
+            )
+            _set_check(checks, check_reasons, "simple_command", value, reason)
 
             child = _run(
                 settings,
@@ -304,25 +1034,35 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
                 probe_name="python_child",
                 probe_diagnostics=probe_diagnostics,
             )
-            checks["python_child"] = child.returncode == 0 and b"child-ok" in child.stdout
+            value, reason = _classify_probe_result(
+                child,
+                success=child.returncode == 0 and b"child-ok" in child.stdout,
+                boundary_escape_code=None,
+            )
+            _set_check(checks, check_reasons, "python_child", value, reason)
 
-            source_result = _run(
-                settings,
-                backend,
-                root,
-                [
-                    python,
-                    "-I",
-                    "-c",
-                    f"from pathlib import Path;print(Path({str(source_canary)!r}).read_text())",
-                ],
-                probe_name="source_read",
-                probe_diagnostics=probe_diagnostics,
-            )
-            checks["source_read"] = (
-                source_result.returncode == 0
-                and b"source-readable-canary" in source_result.stdout
-            )
+            if canary_ready.get("source_read"):
+                source_result = _run(
+                    settings,
+                    backend,
+                    root,
+                    [
+                        python,
+                        "-I",
+                        "-c",
+                        f"from pathlib import Path;print(Path({str(source_canary)!r}).read_text())",
+                    ],
+                    probe_name="source_read",
+                    probe_diagnostics=probe_diagnostics,
+                )
+                value, reason = _classify_probe_result(
+                    source_result,
+                    success=b"source-readable-canary" in source_result.stdout,
+                    boundary_escape_code=None,
+                )
+            else:
+                value, reason = None, "unverified: source canary setup failed"
+            _set_check(checks, check_reasons, "source_read", value, reason)
 
             write_result = _run(
                 settings,
@@ -332,12 +1072,25 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
                 probe_name="scratch_write",
                 probe_diagnostics=probe_diagnostics,
             )
-            checks["scratch_write"] = (
-                write_result.returncode == 0
-                and (root / "result.txt").read_text(encoding="utf-8") == "result"
+            try:
+                scratch_written = (root / "result.txt").read_text(encoding="utf-8") == "result"
+            except OSError as error:
+                scratch_written = False
+                diagnostics["scratch_write"] = redact_text(
+                    f"postcondition read failed: {type(error).__name__}"
+                )[:1000]
+            value, reason = _classify_probe_result(
+                write_result,
+                success=scratch_written,
+                boundary_escape_code=None,
             )
+            _set_check(checks, check_reasons, "scratch_write", value, reason)
 
-            def denied_access_probe(name: str, path: Path, operation: str) -> bool:
+            def denied_access_probe(
+                name: str, path: Path, operation: str
+            ) -> tuple[ProbeCheck, str]:
+                if not canary_ready.get(name, True):
+                    return None, f"unverified: {name} canary setup failed"
                 action = (
                     "p.read_bytes()"
                     if operation == "read"
@@ -362,28 +1115,35 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
                     probe_name=name,
                     probe_diagnostics=probe_diagnostics,
                 )
-                return result.returncode == 0
+                return _classify_probe_result(
+                    result, success=result.returncode == 0
+                )
 
-            checks["source_workspace_write_denied"] = denied_access_probe(
+            value, reason = denied_access_probe(
                 "source_workspace_write_denied", source_write_target, "write"
             )
-            checks["outside_user_read_denied"] = denied_access_probe(
+            _set_check(checks, check_reasons, "source_workspace_write_denied", value, reason)
+            value, reason = denied_access_probe(
                 "outside_user_read_denied", outside_canary, "read"
             )
-            checks["outside_user_write_denied"] = denied_access_probe(
+            _set_check(checks, check_reasons, "outside_user_read_denied", value, reason)
+            value, reason = denied_access_probe(
                 "outside_user_write_denied", outside_write_target, "write"
             )
-            checks["protected_information_denied"] = denied_access_probe(
+            _set_check(checks, check_reasons, "outside_user_write_denied", value, reason)
+            value, reason = denied_access_probe(
                 "protected_information_denied", protected_canary, "read"
             )
+            _set_check(checks, check_reasons, "protected_information_denied", value, reason)
 
-            control_target = settings.data_dir / "control-plane" / "namespace.json"
-            checks["control_plane_read_denied"] = denied_access_probe(
-                "control_plane_read_denied", control_target, "read"
+            value, reason = denied_access_probe(
+                "control_plane_read_denied", control_read_target, "read"
             )
-            checks["control_plane_write_denied"] = denied_access_probe(
+            _set_check(checks, check_reasons, "control_plane_read_denied", value, reason)
+            value, reason = denied_access_probe(
                 "control_plane_write_denied", control_write_target, "write"
             )
+            _set_check(checks, check_reasons, "control_plane_write_denied", value, reason)
 
             internet_host = "1.1.1.1"
             internet_port = 443
@@ -395,9 +1155,23 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
             probe_diagnostics.append(
                 {
                     "probe": "internet_control_reachable",
+                    "pid": None,
+                    "argv": [],
                     "endpoint": f"{internet_host}:{internet_port}",
                     "elapsed_seconds": round(time.monotonic() - control_started, 3),
+                    "timed_out": False,
+                    "exit_code": None,
+                    "stdout": "",
+                    "stderr": "",
+                    "child_process_state": "host_control_completed",
+                    "final_child_state": "host_control_completed",
                     "reachable": internet_control_reachable,
+                    "classification": "executed" if internet_control_reachable else "unverified",
+                    "classification_reason": (
+                        "host control endpoint reachable"
+                        if internet_control_reachable
+                        else "unverified: host control endpoint unavailable"
+                    ),
                 }
             )
             if internet_control_reachable:
@@ -419,16 +1193,28 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
                     probe_name="internet_denied",
                     probe_diagnostics=probe_diagnostics,
                 )
-                checks["internet_denied"] = network_result.returncode == 0
+                value, reason = _classify_probe_result(
+                    network_result, success=network_result.returncode == 0
+                )
+                _set_check(checks, check_reasons, "internet_denied", value, reason)
             else:
                 diagnostics["internet_denied"] = (
                     "probe unavailable: host control could not connect to "
                     f"{internet_host}:{internet_port}"
                 )
+                _set_check(
+                    checks,
+                    check_reasons,
+                    "internet_denied",
+                    None,
+                    "unverified: host control could not establish the Internet listener",
+                )
 
-            def listener_probe(name: str, host: str) -> bool:
-                listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            def listener_probe(name: str, host: str) -> tuple[ProbeCheck, str]:
+                started = time.monotonic()
+                listener: socket.socket | None = None
                 try:
+                    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     listener.bind((host, 0))
                     listener.listen(1)
                     port = int(listener.getsockname()[1])
@@ -450,11 +1236,24 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
                         probe_name=name,
                         probe_diagnostics=probe_diagnostics,
                     )
-                    return result.returncode == 0
+                    return _classify_probe_result(
+                        result, success=result.returncode == 0
+                    )
+                except Exception as error:  # noqa: BLE001 - this probe is independent
+                    _record_probe_setup_failure(
+                        probe_diagnostics,
+                        probe=name,
+                        started=started,
+                        error=error,
+                        error_key="listener_error",
+                    )
+                    return None, "unverified: listener creation or probe setup failed"
                 finally:
-                    listener.close()
+                    if listener is not None:
+                        listener.close()
 
-            checks["loopback_denied"] = listener_probe("loopback_denied", "127.0.0.1")
+            value, reason = listener_probe("loopback_denied", "127.0.0.1")
+            _set_check(checks, check_reasons, "loopback_denied", value, reason)
             lan_address: str | None = None
             try:
                 route_probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -465,10 +1264,30 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
                     route_probe.close()
                 if lan_address.startswith("127.") or lan_address == "0.0.0.0":
                     raise OSError("no non-loopback IPv4 address is available")
-                checks["lan_denied"] = listener_probe("lan_denied", lan_address)
             except OSError as error:
-                diagnostics["lan_denied"] = f"probe unavailable: {type(error).__name__}"
+                message = f"probe unavailable: {type(error).__name__}"
+                diagnostics["lan_denied"] = message
+                _set_check(
+                    checks,
+                    check_reasons,
+                    "lan_denied",
+                    None,
+                    "unverified: no non-loopback listener could be prepared",
+                )
+            else:
+                value, reason = listener_probe("lan_denied", lan_address)
+                _set_check(checks, check_reasons, "lan_denied", value, reason)
 
+            descendant_check_names = (
+                "source_workspace_write_denied",
+                "outside_user_read_denied",
+                "protected_information_denied",
+                "control_plane_read_denied",
+                "control_plane_write_denied",
+                "internet_denied",
+                "lan_denied",
+                "loopback_denied",
+            )
             descendant_listeners: list[socket.socket] = []
             try:
                 loopback_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -495,15 +1314,15 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
                             "read",
                             str(protected_canary),
                         ),
-                        "control_plane_read_denied": ("read", str(control_target)),
+                        "control_plane_read_denied": ("read", str(control_read_target)),
                         "control_plane_write_denied": (
                             "write",
                             str(control_write_target),
                         ),
                     }
-                    endpoints: dict[str, tuple[str, int]] = {
-                        "loopback_denied": loopback_endpoint,
-                    }
+                    endpoints: dict[str, tuple[str, int]] = {}
+                    if loopback_endpoint is not None:
+                        endpoints["loopback_denied"] = loopback_endpoint
                     if internet_control_reachable:
                         endpoints["internet_denied"] = (internet_host, internet_port)
                     if lan_endpoint is not None:
@@ -537,9 +1356,58 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
                         diagnostics[f"{prefix}_boundary"] = (
                             f"invalid descendant probe output: {type(error).__name__}"
                         )
+                        reason = "unverified: descendant probe output was not measurable"
+                        if result.returncode in {
+                            _LAUNCH_FAILURE_RETURN_CODE,
+                            _TIMEOUT_RETURN_CODE,
+                            _PROBE_ERROR_RETURN_CODE,
+                        }:
+                            reason = _return_code_reason(result.returncode)
+                        for name in descendant_check_names:
+                            _set_check(checks, check_reasons, f"{prefix}_{name}", None, reason)
                         return
-                    for name, value in payload.items():
-                        checks[f"{prefix}_{name}"] = result.returncode == 0 and value is True
+                    for name in descendant_check_names:
+                        full_name = f"{prefix}_{name}"
+                        if not canary_ready.get(name, True):
+                            _set_check(
+                                checks,
+                                check_reasons,
+                                full_name,
+                                None,
+                                f"unverified: {name} canary setup failed",
+                            )
+                        elif result.returncode != 0:
+                            _set_check(
+                                checks,
+                                check_reasons,
+                                full_name,
+                                None,
+                                _return_code_reason(result.returncode),
+                            )
+                        elif name not in payload:
+                            _set_check(
+                                checks,
+                                check_reasons,
+                                full_name,
+                                None,
+                                "unverified: descendant probe endpoint was unavailable",
+                            )
+                        elif payload[name] is True:
+                            _set_check(
+                                checks,
+                                check_reasons,
+                                full_name,
+                                True,
+                                "verified: descendant inherited the requested denial",
+                            )
+                        else:
+                            _set_check(
+                                checks,
+                                check_reasons,
+                                full_name,
+                                False,
+                                "failed: descendant observed a boundary escape",
+                            )
 
                 try:
                     child_direct = _run(
@@ -555,6 +1423,14 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
                     diagnostics["child_boundary"] = redact_text(f"{type(error).__name__}: {error}")[
                         :1000
                     ]
+                    for name in descendant_check_names:
+                        _set_check(
+                            checks,
+                            check_reasons,
+                            f"child_{name}",
+                            None,
+                            "unverified: child descendant probe could not run",
+                        )
 
                 grandchild_code = descendant_boundary_code(grandchild_write_target)
                 child_code = (
@@ -577,314 +1453,78 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
                     diagnostics["grandchild_boundary"] = redact_text(
                         f"{type(error).__name__}: {error}"
                     )[:1000]
+                    for name in descendant_check_names:
+                        _set_check(
+                            checks,
+                            check_reasons,
+                            f"grandchild_{name}",
+                            None,
+                            "unverified: grandchild descendant probe could not run",
+                        )
+            except Exception as error:  # noqa: BLE001 - dependent setup must not stop later probes
+                diagnostics["descendant_boundary_setup"] = redact_text(
+                    f"{type(error).__name__}: {error}"
+                )[:1000]
+                _record_probe_setup_failure(
+                    probe_diagnostics,
+                    probe="descendant_boundary_setup",
+                    started=time.monotonic(),
+                    error=error,
+                )
+                for prefix in ("child", "grandchild"):
+                    for name in descendant_check_names:
+                        _set_check(
+                            checks,
+                            check_reasons,
+                            f"{prefix}_{name}",
+                            None,
+                            "unverified: descendant listener setup failed",
+                        )
             finally:
                 for listener in descendant_listeners:
                     listener.close()
 
-            nonce = uuid.uuid4().hex
-            heartbeat = root / "heartbeat.bin"
-            heartbeat_code = (
-                "from pathlib import Path\n"
-                "import time\n"
-                "path=Path('heartbeat.bin')\n"
-                "while True:\n"
-                " with path.open('ab') as output: output.write(b'x')\n"
-                " time.sleep(.1)\n"
+            value, reason = _termination_probe(
+                settings, backend, root, python, probe_diagnostics
             )
-            timeout_parent_code = (
-                "import subprocess,sys,time;"
-                f"subprocess.Popen([sys.executable,'-I','-c',{heartbeat_code!r}]);"
-                "time.sleep(60)"
+            _set_check(checks, check_reasons, "timeout_terminated", value, reason)
+
+            value, reason = _filesystem_limit_probe(
+                settings, backend, root, python, probe_diagnostics
             )
-            timeout_command = [
-                python,
-                "-I",
-                "-c",
-                timeout_parent_code,
-            ]
-            timeout_started = time.monotonic()
-            running, timeout_job, timeout_argv = launch_codex_sandbox(
-                backend,
-                settings=settings,
-                command=timeout_command,
-                cwd=root,
-                writable_roots=(root,),
-                environment=_environment(settings, backend, nonce),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            time.sleep(2)
-            terminated = timeout_job.terminate()
-            running.wait(timeout=10)
-            empty = timeout_job.wait_empty(timeout=10)
-            timeout_job.close()
-            size_before = heartbeat.stat().st_size if heartbeat.exists() else 0
-            time.sleep(1)
-            size_after = heartbeat.stat().st_size if heartbeat.exists() else 0
-            checks["timeout_terminated"] = terminated and empty and size_before == size_after
-            probe_diagnostics.append(
-                {
-                    "probe": "timeout_terminated",
-                    "argv": [redact_text(value)[:1000] for value in timeout_argv],
-                    "pid": running.pid,
-                    "elapsed_seconds": round(time.monotonic() - timeout_started, 3),
-                    "timed_out": True,
-                    "exit_code": running.poll(),
-                    "child_process_state": (
-                        "descendant_tree_terminated"
-                        if checks["timeout_terminated"]
-                        else "termination_not_proven"
-                    ),
-                }
+            _set_check(
+                checks, check_reasons, "filesystem_limit_enforced", value, reason
             )
 
-            resource_root = root / "resource"
-            resource_root.mkdir()
-            nonce = uuid.uuid4().hex
-            writer_command = [
-                python,
-                "-I",
-                "-c",
-                (
-                    "from pathlib import Path;import time;p=Path('resource/grow.bin');"
-                    "\nwith p.open('wb') as f:"
-                    "\n for _ in range(1000):f.write(b'x'*262144);f.flush();time.sleep(.05)"
-                ),
-            ]
-            writer_started = time.monotonic()
-            writer, writer_job, writer_argv = launch_codex_sandbox(
-                backend,
-                settings=settings,
-                command=writer_command,
-                cwd=root,
-                writable_roots=(root,),
-                environment=_environment(settings, backend, nonce),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+            value, reason = _filesystem_entry_limit_probe(
+                settings, backend, root, python, probe_diagnostics
             )
-            writer_identity = capture_process_identity(writer.pid, nonce)
-            write_baseline = process_tree_write_bytes(writer_identity)
-            if write_baseline is None:
-                raise RuntimeError("sandbox filesystem write accounting is unavailable")
-            admitted_limit = 2 * 1024 * 1024
-            detected = False
-            deadline = time.monotonic() + 10
-            while time.monotonic() < deadline and writer.poll() is None:
-                usage = scan_directory_bounded(
-                    resource_root,
-                    stop_after_bytes=admitted_limit,
-                    stop_after_entries=32,
-                )
-                written = process_tree_write_bytes(writer_identity)
-                if written is None:
-                    raise RuntimeError("sandbox filesystem write accounting became unavailable")
-                if usage.total_bytes > admitted_limit or written - write_baseline > admitted_limit:
-                    detected = writer_job.terminate()
-                    break
-                time.sleep(0.1)
-            writer.wait(timeout=10)
-            writer_empty = writer_job.wait_empty(timeout=10)
-            writer_job.close()
-            final_size = (resource_root / "grow.bin").stat().st_size
-            checks["filesystem_limit_enforced"] = (
-                detected and writer_empty and final_size < 8 * 1024 * 1024
-            )
-            if not checks["filesystem_limit_enforced"]:
-                diagnostics["filesystem_limit_enforced"] = (
-                    f"detected={detected}; final_size={final_size}; "
-                    f"launcher_returncode={writer.returncode}"
-                )
-            probe_diagnostics.append(
-                {
-                    "probe": "filesystem_limit_enforced",
-                    "argv": [redact_text(value)[:1000] for value in writer_argv],
-                    "pid": writer.pid,
-                    "elapsed_seconds": round(time.monotonic() - writer_started, 3),
-                    "exit_code": writer.returncode,
-                    "child_process_state": "terminated_at_bound" if detected else "exited",
-                    "final_size": final_size,
-                }
+            _set_check(
+                checks, check_reasons, "filesystem_entry_limit_enforced", value, reason
             )
 
-            entry_root = root / "entries"
-            entry_root.mkdir()
-            nonce = uuid.uuid4().hex
-            entry_command = [
-                python,
-                "-I",
-                "-c",
-                (
-                    "from pathlib import Path;import time;p=Path('entries');"
-                    "\nfor i in range(1000):"
-                    "\n (p/f'{i}.txt').write_text('x');time.sleep(.01)"
-                ),
-            ]
-            entry_started = time.monotonic()
-            entry_writer, entry_job, entry_argv = launch_codex_sandbox(
-                backend,
-                settings=settings,
-                command=entry_command,
-                cwd=root,
-                writable_roots=(root,),
-                environment=_environment(settings, backend, nonce),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+            value, reason = _process_limit_probe(
+                settings, backend, root, python, probe_diagnostics
             )
-            entry_detected = False
-            deadline = time.monotonic() + 10
-            while time.monotonic() < deadline and entry_writer.poll() is None:
-                usage = scan_directory_bounded(
-                    entry_root,
-                    stop_after_bytes=1024 * 1024,
-                    stop_after_entries=32,
-                )
-                if usage.entry_count > 32:
-                    entry_detected = entry_job.terminate()
-                    break
-                time.sleep(0.05)
-            entry_writer.wait(timeout=10)
-            entry_empty = entry_job.wait_empty(timeout=10)
-            entry_job.close()
-            final_entries = scan_directory_bounded(
-                entry_root,
-                stop_after_bytes=1024 * 1024,
-                stop_after_entries=10_000,
-            ).entry_count
-            checks["filesystem_entry_limit_enforced"] = (
-                entry_detected and entry_empty and final_entries < 128
-            )
-            if not checks["filesystem_entry_limit_enforced"]:
-                diagnostics["filesystem_entry_limit_enforced"] = (
-                    f"detected={entry_detected}; final_entries={final_entries}; "
-                    f"launcher_returncode={entry_writer.returncode}"
-                )
-            probe_diagnostics.append(
-                {
-                    "probe": "filesystem_entry_limit_enforced",
-                    "argv": [redact_text(value)[:1000] for value in entry_argv],
-                    "pid": entry_writer.pid,
-                    "elapsed_seconds": round(time.monotonic() - entry_started, 3),
-                    "exit_code": entry_writer.returncode,
-                    "child_process_state": (
-                        "terminated_at_bound" if entry_detected else "exited"
-                    ),
-                    "final_entries": final_entries,
-                }
-            )
+            _set_check(checks, check_reasons, "process_limit_enforced", value, reason)
 
-            process_probe_code = (
-                "import subprocess,sys,time\n"
-                'grandchild="import time; time.sleep(60)"\n'
-                'child=("import subprocess,sys,time;"'
-                "+f\"subprocess.Popen([sys.executable,'-I','-c',{grandchild!r}]);\""
-                '+"time.sleep(60)")\n'
-                "subprocess.Popen([sys.executable,'-I','-c',child])\n"
-                "for _ in range(32):\n"
-                " subprocess.Popen([sys.executable,'-I','-c','import time;time.sleep(60)'])\n"
-                "time.sleep(60)\n"
+            value, reason = _memory_limit_probe(
+                settings, backend, root, python, probe_diagnostics
             )
-            process_started = time.monotonic()
-            nonce = uuid.uuid4().hex
-            process_runner, process_job, process_argv = launch_codex_sandbox(
-                backend,
-                settings=settings,
-                command=[python, "-I", "-c", process_probe_code],
-                cwd=root,
-                writable_roots=(root,),
-                environment=_environment(settings, backend, nonce),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                limits=WindowsJobLimits(
-                    max_processes=8,
-                    max_memory_bytes=512 * 1024 * 1024,
-                ),
-            )
-            process_job.violation_event.wait(20)
-            process_violation = process_job.violation
-            process_job.terminate()
-            process_runner.wait(timeout=10)
-            process_empty = process_job.wait_empty(timeout=10)
-            process_job.close()
-            checks["process_limit_enforced"] = (
-                process_violation == "process_count_limit"
-                and process_empty
-                and process_runner.poll() is not None
-            )
-            probe_diagnostics.append(
-                {
-                    "probe": "process_limit_enforced",
-                    "argv": [redact_text(value)[:1000] for value in process_argv],
-                    "pid": process_runner.pid,
-                    "elapsed_seconds": round(time.monotonic() - process_started, 3),
-                    "exit_code": process_runner.returncode,
-                    "violation": process_violation,
-                    "descendants_remaining": not process_empty,
-                    "probe_process_limit": 8,
-                }
-            )
-
-            grandchild_memory_code = "import time;x=bytearray(96*1024*1024);time.sleep(60)"
-            child_memory_code = (
-                "import subprocess,sys,time;"
-                "x=bytearray(96*1024*1024);"
-                f"subprocess.Popen([sys.executable,'-I','-c',{grandchild_memory_code!r}]);"
-                "time.sleep(60)"
-            )
-            memory_started = time.monotonic()
-            nonce = uuid.uuid4().hex
-            memory_runner, memory_job, memory_argv = launch_codex_sandbox(
-                backend,
-                settings=settings,
-                command=[python, "-I", "-c", child_memory_code],
-                cwd=root,
-                writable_roots=(root,),
-                environment=_environment(settings, backend, nonce),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                limits=WindowsJobLimits(
-                    max_processes=16,
-                    max_memory_bytes=192 * 1024 * 1024,
-                ),
-            )
-            memory_job.violation_event.wait(20)
-            memory_violation = memory_job.violation
-            memory_job.terminate()
-            memory_runner.wait(timeout=10)
-            memory_empty = memory_job.wait_empty(timeout=10)
-            memory_accounting = memory_job.accounting()
-            memory_job.close()
-            checks["memory_limit_enforced"] = (
-                memory_violation == "process_tree_memory_limit"
-                and memory_empty
-                and memory_runner.poll() is not None
-            )
-            probe_diagnostics.append(
-                {
-                    "probe": "memory_limit_enforced",
-                    "argv": [redact_text(value)[:1000] for value in memory_argv],
-                    "pid": memory_runner.pid,
-                    "elapsed_seconds": round(time.monotonic() - memory_started, 3),
-                    "exit_code": memory_runner.returncode,
-                    "violation": memory_violation,
-                    "descendants_remaining": not memory_empty,
-                    "probe_memory_limit_bytes": 192 * 1024 * 1024,
-                    **memory_accounting,
-                }
-            )
+            _set_check(checks, check_reasons, "memory_limit_enforced", value, reason)
 
             for name, passed in checks.items():
-                if not passed:
-                    diagnostics.setdefault(name, "live check failed")
-            properties = _property_results(checks)
+                if passed is not True:
+                    diagnostics.setdefault(
+                        name,
+                        check_reasons.get(name, "unverified: probe did not verify the boundary"),
+                    )
+            properties = _property_results(checks, check_reasons)
             result = {
-                "version": 2,
+                "version": 3,
                 "verified_at": utc_now_iso(),
                 "backend_digest": sha256_text(canonical_json(backend.as_dict())),
+                "isolation_context_digest": isolation_context_digest(settings, backend),
                 "backend_version": version,
                 "checks": checks,
                 "properties": properties,
@@ -897,15 +1537,22 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
             _write_evidence(marker, result)
             return result
     except Exception as error:  # noqa: BLE001 - unavailable evidence must be durable and explicit
-        checks.setdefault("simple_command", False)
+        _set_check(
+            checks,
+            check_reasons,
+            "simple_command",
+            checks.get("simple_command"),
+            check_reasons.get("simple_command", "unverified: live verification aborted"),
+        )
         diagnostics["verification_error"] = redact_text(
             f"{type(error).__name__}: {error}"
         )[:2000]
-        properties = _property_results(checks)
+        properties = _property_results(checks, check_reasons)
         result = {
-            "version": 2,
+            "version": 3,
             "verified_at": utc_now_iso(),
             "backend_digest": sha256_text(canonical_json(backend.as_dict())),
+            "isolation_context_digest": isolation_context_digest(settings, backend),
             "backend_version": version,
             "checks": checks,
             "properties": properties,
@@ -922,6 +1569,7 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
             protected_canary,
             outside_canary,
             outside_write_target,
+            control_read_target,
             control_write_target,
             child_write_target,
             grandchild_write_target,

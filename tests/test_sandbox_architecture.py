@@ -19,10 +19,12 @@ from windows_local_mcp.sandbox_backend import (
     build_codex_sandbox_argv,
     codex_sandbox_effective_policy,
     codex_sandbox_state,
+    isolation_context_digest,
     require_codex_sandbox_live_verification,
     resolve_codex_sandbox_backend,
 )
 from windows_local_mcp.sandbox_live_verify import (
+    _classify_probe_result,
     _host_endpoint_reachable,
     _property_results,
     _protected_information_canary_path,
@@ -192,6 +194,21 @@ def test_live_verification_properties_distinguish_failed_from_unverified() -> No
     assert failed_network["lan"]["status"] == "failed"
 
 
+def test_live_probe_classification_does_not_overclaim_diagnostic_failures() -> None:
+    launch_failure = subprocess.CompletedProcess([], -255, b"", b"")
+    timeout = subprocess.CompletedProcess([], -254, b"", b"")
+    boundary_escape = subprocess.CompletedProcess([], 9, b"", b"")
+    denial = subprocess.CompletedProcess([], 0, b"denied", b"")
+
+    assert _classify_probe_result(launch_failure, success=False)[0] is None
+    assert _classify_probe_result(timeout, success=False)[0] is None
+    assert _classify_probe_result(boundary_escape, success=False)[0] is False
+    assert _classify_probe_result(denial, success=True)[0] is True
+    assert _classify_probe_result(
+        subprocess.CompletedProcess([], 1, b"probe setup error", b""), success=False
+    )[0] is None
+
+
 def test_protected_information_canary_uses_exact_blocked_filename(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     first = _protected_information_canary_path(workspace)
@@ -282,19 +299,231 @@ def test_sandbox_live_verification_is_property_scoped_and_fails_closed(
     marker.write_text(
         canonical_json(
             {
-                "version": 2,
+                "version": 3,
                 "passed": True,
                 "backend_digest": backend_digest,
+                "isolation_context_digest": isolation_context_digest(settings, backend),
                 "properties": properties,
             }
         ),
         encoding="utf-8",
     )
-    assert require_codex_sandbox_live_verification(settings, backend)["version"] == 2
+    assert require_codex_sandbox_live_verification(settings, backend)["version"] == 3
 
     settings.approved_sandbox_require_live_verification = False
     with pytest.raises(ApprovedSandboxUnavailable, match="cannot be disabled"):
         require_codex_sandbox_live_verification(settings, backend)
+
+
+def test_live_marker_is_stale_after_security_context_changes(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    backend = CodexSandboxBackend(
+        executable=str(tmp_path / "codex.exe"),
+        executable_sha256="a" * 64,
+        executable_size=1,
+        executable_mtime_ns=1,
+        windows_mode="elevated",
+        permission_profile=":workspace",
+        provenance="test",
+        signature_status="Valid",
+        signer_subject="OpenAI",
+        signer_thumbprint="b" * 40,
+        helpers=(),
+    )
+    marker = settings.data_dir / "control-plane" / "sandbox-live-verification.json"
+    original_digest = isolation_context_digest(settings, backend)
+    marker.write_text(
+        canonical_json(
+            {
+                "version": 3,
+                "passed": True,
+                "backend_digest": sha256_text(canonical_json(backend.as_dict())),
+                "isolation_context_digest": original_digest,
+                "properties": {
+                    name: {"status": "verified"}
+                    for name in SANDBOX_SECURITY_PROPERTIES
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert require_codex_sandbox_live_verification(settings, backend)["version"] == 3
+
+    original_blocked = list(settings.blocked_file_names)
+    original_dependencies = list(settings.sandbox_dependency_readable_paths)
+    original_processes = settings.max_sandbox_processes
+    original_memory = settings.max_sandbox_memory_bytes
+    changes = (
+        lambda: settings.blocked_file_names.append("changed-security-name"),
+        lambda: settings.sandbox_dependency_readable_paths.append(
+            tmp_path / "readable-dependency"
+        ),
+        lambda: setattr(settings, "max_sandbox_processes", original_processes + 1),
+        lambda: setattr(settings, "max_sandbox_memory_bytes", original_memory + 1),
+    )
+    for change in changes:
+        settings.blocked_file_names = list(original_blocked)
+        settings.sandbox_dependency_readable_paths = list(original_dependencies)
+        settings.max_sandbox_processes = original_processes
+        settings.max_sandbox_memory_bytes = original_memory
+        change()
+        with pytest.raises(ApprovedSandboxUnavailable, match="missing, failed, or stale"):
+            require_codex_sandbox_live_verification(settings, backend)
+
+    settings.blocked_file_names = list(reversed(original_blocked))
+    settings.sandbox_dependency_readable_paths = list(original_dependencies)
+    settings.max_sandbox_processes = original_processes
+    settings.max_sandbox_memory_bytes = original_memory
+    assert isolation_context_digest(settings, backend) == original_digest
+
+
+def test_live_probe_launch_failure_is_unverified_and_does_not_raise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    backend = CodexSandboxBackend(
+        executable=sys.executable,
+        executable_sha256="a" * 64,
+        executable_size=1,
+        executable_mtime_ns=1,
+        windows_mode="elevated",
+        permission_profile=":workspace",
+        provenance="test",
+        signature_status="Valid",
+        signer_subject="OpenAI",
+        signer_thumbprint="b" * 40,
+        helpers=(),
+    )
+
+    def unavailable(*_args: object, **_kwargs: object) -> object:
+        raise OSError("sandbox launcher unavailable")
+
+    monkeypatch.setattr(
+        "windows_local_mcp.sandbox_live_verify.launch_codex_sandbox", unavailable
+    )
+    probe_diagnostics: list[dict[str, object]] = []
+    result = run_live_probe(
+        settings,
+        backend,
+        settings.sandbox_scratch_dir,
+        [sys.executable, "-c", "pass"],
+        probe_name="launch-failure-regression",
+        probe_diagnostics=probe_diagnostics,
+    )
+
+    assert result.returncode == -255
+    value, reason = _classify_probe_result(result, success=False)
+    assert value is None
+    assert reason.startswith("unverified:")
+    assert probe_diagnostics[0]["pid"] is None
+    assert probe_diagnostics[0]["classification"] == "unverified"
+
+
+def test_independent_probe_launch_failure_does_not_stop_next_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    backend = CodexSandboxBackend(
+        executable=sys.executable,
+        executable_sha256="a" * 64,
+        executable_size=1,
+        executable_mtime_ns=1,
+        windows_mode="elevated",
+        permission_profile=":workspace",
+        provenance="test",
+        signature_status="Valid",
+        signer_subject="OpenAI",
+        signer_thumbprint="b" * 40,
+        helpers=(),
+    )
+    monkeypatch.setattr(
+        "windows_local_mcp.sandbox_live_verify.launch_codex_sandbox",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("launch failed")),
+    )
+    diagnostics: list[dict[str, object]] = []
+    results = [
+        run_live_probe(
+            settings,
+            backend,
+            settings.sandbox_scratch_dir,
+            [sys.executable, "-c", "pass"],
+            probe_name=name,
+            probe_diagnostics=diagnostics,
+        )
+        for name in ("first-independent-probe", "second-independent-probe")
+    ]
+
+    assert [result.returncode for result in results] == [-255, -255]
+    assert [item["probe"] for item in diagnostics] == [
+        "first-independent-probe",
+        "second-independent-probe",
+    ]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows Job Object resource check")
+def test_windows_job_object_process_limit_regression(tmp_path: Path) -> None:
+    python = str((Path(sys.base_prefix) / "python.exe").resolve(strict=True))
+    child_code = "import time;time.sleep(60)"
+    parent_code = (
+        "import subprocess,sys,time;"
+        f"[subprocess.Popen([sys.executable,'-I','-c',{child_code!r}]) for _ in range(16)];"
+        "time.sleep(60)"
+    )
+    job = WindowsSandboxJob(
+        WindowsJobLimits(max_processes=4, max_memory_bytes=512 * 1024 * 1024)
+    )
+    process = job.popen(
+        [python, "-I", "-c", parent_code],
+        cwd=tmp_path,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        shell=False,
+    )
+    try:
+        assert job.violation_event.wait(20)
+        assert job.violation == "process_count_limit"
+        job.terminate()
+        process.wait(timeout=10)
+        assert job.wait_empty(timeout=10)
+    finally:
+        job.close()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows Job Object resource check")
+def test_windows_job_object_memory_limit_regression(tmp_path: Path) -> None:
+    python = str((Path(sys.base_prefix) / "python.exe").resolve(strict=True))
+    allocation = 80 * 1024 * 1024
+    child_code = (
+        "import time;"
+        f"x=bytearray({allocation});x[::4096]=b'\\x01'*({allocation}//4096);"
+        "time.sleep(60)"
+    )
+    parent_code = (
+        "import subprocess,sys,time;"
+        f"x=bytearray({allocation});x[::4096]=b'\\x01'*({allocation}//4096);"
+        f"subprocess.Popen([sys.executable,'-I','-c',{child_code!r}]);"
+        "time.sleep(60)"
+    )
+    job = WindowsSandboxJob(
+        WindowsJobLimits(max_processes=8, max_memory_bytes=128 * 1024 * 1024)
+    )
+    process = job.popen(
+        [python, "-I", "-c", parent_code],
+        cwd=tmp_path,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        shell=False,
+    )
+    try:
+        assert job.violation_event.wait(20)
+        assert job.violation == "process_tree_memory_limit"
+        job.terminate()
+        process.wait(timeout=10)
+        assert job.wait_empty(timeout=10)
+    finally:
+        job.close()
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows process-tree live check")
