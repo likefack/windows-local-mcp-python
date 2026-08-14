@@ -100,16 +100,20 @@
 - Win32 file sharing を使い、保持中の helper file replacement と親 directory rename が拒否され、解放後だけ成功することを確認した。
 - subprocess timeout 時に identity-bound parent と descendant を終了し、grandchild heartbeat が停止することを Windows process-tree probe で確認した。これは Codex Sandbox 内の descendant containment の証拠ではない。
 - `SUBST W:` で workspace の別名を data path として構成し、physical overlap として設定拒否されることを確認した。割り当ては試験内で解除した。
-- installed Codex CLI `0.147.0-alpha.6.6` の backend identity／version 解決を確認した。最小 `codex sandbox` command は 20 秒で timeout したため、次の全 property は `unverified`、`passed=false`、実行経路 unavailable と記録した。
-  - `filesystem_read`
-  - `filesystem_write`
-  - `protected_information_read`
-  - `internet`
-  - `lan`
-  - `loopback`
-  - `descendant_containment`
-  - `termination`
-  - `resource_bound`
+- installed Codex CLI `0.147.0-alpha.6.6` の backend identity／version 解決を確認した。
+- 以前記録した「最小 `codex sandbox` command が 20 秒で timeout し、全 property が `unverified`」という結果は、Codex Desktop 自身の Sandbox 内から別の Codex Sandbox を起動した入れ子の検証だった。最上位 Sandbox process の PID は生成されたが、backend log に対象 `cmd.exe /d /c exit 0` の `START` はなく、対象 command の開始前で停止していた。通常ユーザー文脈では同じ backend と WLMCP の `WindowsSandboxJob` 経路が正常終了するため、この timeout を WLMCP の回帰または command 終了後の結果回収待ちとは判定しない。
+- 通常ユーザー文脈での最小実行は、WLMCP 経路 5 回が 0.279～0.339 秒、WLMCP を介さない直接 Codex CLI が 0.209 秒、live verifier 内の最小 command が 0.358 秒で、すべて exit code 0 かつ descendant drain 完了だった。
+- 同じ通常ユーザー文脈で live verifier 全体は 20.491 秒で完了した。最新 marker は `passed=false`、実行経路 unavailable で、property は次の結果だった。
+  - `filesystem_read`: `verified`。workspace 外のユーザーファイルは parent／child／grandchild のすべてで読み取りを拒否した。
+  - `filesystem_write`: `verified`。
+  - `internet`: `verified`。
+  - `protected_information_read`: `failed`。workspace 内の保護対象 `.env` を parent／child／grandchild のすべてで読み取れた。
+  - `lan`: `failed`。parent／child／grandchild のすべてで LAN 接続に成功した。
+  - `loopback`: `failed`。parent／child／grandchild のすべてで localhost 接続に成功した。
+  - `descendant_containment`: `failed`。
+  - `termination`: `verified`。
+  - `resource_bound`: `verified`。
+- Sandbox 実行ユーザー SID は firewall rule と一致し、setup marker も成功状態だったが、LAN／localhost の実接続は遮断されなかった。設定の存在だけでは Windows 内部での強制を証明できない。WFP の詳細確認や管理者権限での修復は実施していない。
 - Sandbox live verifier の初回実行で、アクセス不能な Windows App Execution Alias が host PATH sanitization を停止させる問題を再現した。信頼済み root の解決失敗は fail closed のまま、ambient PATH の利用不能 entry だけを除外する修正後に backend version 解決まで進むことを確認した。
 
 ### unit／mock／integration のみで確認した範囲
