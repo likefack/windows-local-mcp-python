@@ -261,10 +261,20 @@ if ($RunSandboxProbe) {
             useLegacyLandlock = $false
         } | ConvertTo-Json -Depth 10 -Compress
 
+        $sandboxConfig = 'windows.sandbox="elevated"'
+        $sandboxStateArgument = $sandboxState
+        $sandboxConfigArgument = $sandboxConfig
+        if ($PSVersionTable.PSVersion.Major -le 5) {
+            # Windows PowerShell 5.1はnative exeへ渡す際に埋め込みquoteを除去するため、
+            # codex.exe側へliteral quoteとして届くよう、この呼び出しに限ってescapeする。
+            $sandboxStateArgument = $sandboxStateArgument.Replace('"', '\"')
+            $sandboxConfigArgument = $sandboxConfigArgument.Replace('"', '\"')
+        }
+
         $arguments = @(
             "sandbox",
-            "-c", 'windows.sandbox="elevated"',
-            "--sandbox-state-json", $sandboxState,
+            "-c", $sandboxConfigArgument,
+            "--sandbox-state-json", $sandboxStateArgument,
             "--sandbox-state-disable-network",
             "--",
             $powerShell,
