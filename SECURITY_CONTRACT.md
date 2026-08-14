@@ -5,10 +5,16 @@
 食い違う場合、契約を弱めて実装へ合わせるのではなく、実装修正、安全な fail-closed、
 能力縮小、または表現の訂正によって解消します。
 
-この契約は 2026-08-13 時点の `broker-centered-sandboxed-processing-v1` を前提に固定します。
-今回のリリース候補レビュー中に許される変更は、曖昧さの除去、矛盾の解消、保証の強化です。
-保証を弱める変更が必要になった場合は、自動採用せず、現行契約、変更案、理由、保証への
-影響、既知問題の判定への影響を別途提示します。
+この契約は 2026-08-14 時点の `broker-centered-sandboxed-processing-v1` を前提に固定します。
+保証を弱める変更が必要な場合は自動採用せず、現行契約、変更案、理由、保証への影響、既知問題の
+判定への影響を提示し、trusted operator が明示的に受容した場合だけ契約へ反映します。
+
+2026-08-14 改訂では、通常 Windows user 文脈での実機検証により workspace 外 user file の
+read denial、workspace write 境界、Internet denial、termination、resource bound が成立する一方、
+workspace 内 protected information の read denial と LAN denial が現在の installed Codex Windows Sandbox
+では成立しないことを確認したため、この 2 点を個人利用 v1 の明示的な受容済み残存 risk へ変更します。
+未許可 loopback／localhost access は Sandbox 外の同一 host service を経由する権限迂回になり得るため、
+引き続き必須遮断境界とします。
 
 ## 1. 適用範囲と信頼モデル
 
@@ -57,9 +63,10 @@ DOCX、XLSX、CSV／TSV、ZIP、画像を bounded かつ宣言的に処理しま
 
 arbitrary code、project-controlled code、plugin／autoload、test／build、一般 command、
 Python、Node、PowerShell、Dart、Flutter など open-ended な処理を実行する経路です。
-ローカル承認と、実行に必要な security property が同一 backend に対する Windows live verification を
-通過していることを必要とします。Sandbox の失敗、timeout、未対応を理由に Approved Host へ
-自動 fallback しません。
+ローカル承認と、実行に必須と定めた security property が同一 backend に対する Windows live verification を
+通過していることを必要とします。受容済み残存 risk の property が `failed` でも、その事実を保持・表示した
+うえで、必須境界がすべて成立していれば route 利用を妨げません。Sandbox の失敗、timeout、未対応を理由に
+Approved Host へ自動 fallback しません。
 
 ### 2.4 Approved Host
 
@@ -106,23 +113,35 @@ OS 境界の安全性を証明した意味には使いません。`Windows live-
 `verified` と表示するには、同一の launcher、helper、version、署名、hash、policy generation に
 対して、その property を実機で確認します。
 
-確認対象は少なくとも次です。
+Sandbox route の必須境界は少なくとも次です。
 
+- workspace 外の不要な user file を読めない。workspace 外の `.env`、credential、secret もこの必須境界に含む
 - control-plane と `data_dir` を読み書きできない
 - write 可能範囲が、明示された scratch／実行 copy と Broker が検証して反映する出力範囲に限定される
 - source workspace を read-only と表示する場合、実効 OS capability でも write できない
-- policy で保護した `.env`、credential、secret を、staging から除外するだけでなく Sandbox 内の
-  process 自身も実効 OS capability で直接読めない
-- workspace 外の不要な user file を読めない。OS／toolchain の必要最小限の read scope は明示する
-- offline policy で Internet、LAN、未許可 loopback のそれぞれに接続できない
-- child／grandchild に同じ filesystem、network、control-plane、protected-information 境界が継承される
+- Internet へ接続できない
+- 未許可 loopback／localhost endpoint へ接続できない
+- child／grandchild に上記の必須 filesystem、network、control-plane 境界が継承される
 - timeout／cancel で descendant を含め停止できる
 - scratch、出力、時間、process、memory／filesystem consumption に現実的な上限がある
 
-staging からの除外、stdout／stderr の redaction、network deny は、Sandbox process が protected information を
-読めないことの代替にしません。一つでも実機で確認できない property は verified と表示しません。
-現在の installed Codex Sandbox で必要な境界を表現または検証できない場合、その property を必要とする
-execution route は unavailable として fail closed します。
+個人利用 v1 では、次の 2 点を明示的に受容する残存 risk とし、それ単独を理由に Sandbox route を
+unavailable にしません。
+
+- workspace 内に存在する `.env`、credential、secret 等の protected information を Sandbox process または
+  child／grandchild が直接読み取れる場合があること
+- Sandbox process または child／grandchild が LAN／private network 上の endpoint へ接続できる場合があること
+
+これらは安全、遮断済み、`verified` とは表示しません。実機で境界突破を確認した場合は property を
+`failed` のまま保存・表示し、受容済み残存 risk として route 判定から分離します。
+
+workspace 外 protected information の read、Internet access、未許可 loopback／localhost access はこの受容に
+含みません。これらの必須境界が `failed` または `unverified` の場合、Sandbox route は unavailable として
+fail closed します。
+
+staging からの除外、stdout／stderr の redaction、network deny は補助防御です。受容済み残存 risk の存在を
+隠したり `verified` に書き換えたりする根拠にはしません。現在の installed Codex Sandbox で必須境界を
+表現または検証できない場合、その execution route は unavailable として fail closed します。
 
 ### E. Approved Host boundary
 
@@ -196,11 +215,13 @@ execution route は unavailable として fail closed します。
 
 - policy で保護した `.env`、credential、secret を Broker read、automatic Git／diff／snapshot、audit／UI、
   Sandbox staging、artifact processing から意図せず model へ露出させません。
-- Codex Sandbox を含む open-ended execution では、protected information を staging へ含めないだけでなく、
-  Sandbox process とその descendant が source workspace 内外の protected path を実効 OS capability で直接
-  読めないことを必要とします。
+- workspace 外の protected path は、Codex Sandbox process とその descendant からも実効 OS capability で
+  直接読めないことを必要とします。
+- workspace 内 protected information は Sandbox staging へ自動追加しませんが、open-ended execution が
+  source workspace の実体を直接読める場合に `.env`、credential、secret の read denial が成立しないことを、
+  個人利用 v1 の受容済み残存 risk とします。この状態を「secret が Sandbox から読めない」と表示しません。
 - staging exclusion、argv／environment／stdout／stderr preview／error／audit field の redaction は防御を
-  多層化する補助策であり、Sandbox runtime の read denial の代替にしません。
+  多層化する補助策であり、workspace 外 protected-information read denial の代替にしません。
 - argv、environment、stdout／stderr preview、error、audit field は semantic redaction と容量制限を通します。
 - Approved Host で人間が明示的に secret access を承認した場合まで絶対に読めないことは保証しません。
 
@@ -214,12 +235,12 @@ admission／runtime bound を設けます。
 
 - `.venv`、`node_modules`、build tree、cache の存在だけで、不要な全量 copy／scan／hash を繰り返さない設計を
   優先します。
-- protected `.env` や secret が test／build に必要な場合、安全性を弱めて自動提供することはしません。
-  必要なら安全な代替入力を明示するか、その operation を fail closed します。
+- Broker／staging は protected `.env` や secret を test／build へ自動注入しません。Sandbox が workspace 内の
+  protected information を直接読み取れる受容済み残存 risk は、秘密情報を意図的に追加提供する根拠にはしません。
 - 既知 target の operation で全 workspace checkpoint が不要なら、対象限定を優先します。ただし manual／
   concurrent change detection を失う shortcut は使いません。
-- 性能改善のために protected-information boundary、rollback correctness、approval integrity、race detection を
-  弱めません。
+- 性能改善のために workspace 外 protected-information boundary、rollback correctness、approval integrity、
+  race detection を弱めません。
 
 ### M. Rollback truthfulness
 
@@ -250,8 +271,13 @@ admission／runtime bound を設けます。
 
 複数の security property を持つ capability は、少なくとも filesystem read、filesystem write、
 protected-information read、Internet、LAN、loopback、descendant containment、termination、resource bound を
-必要に応じて個別に `verified`／`unverified`／`not-applicable` と記録します。一部だけ通過した状態を、
-capability 全体の `Windows live-verified=true` へ丸めません。
+必要に応じて個別に `verified`／`failed`／`unverified`／`not-applicable` と記録します。
+
+property の実測結果と Sandbox route の利用可否は分離します。workspace 内 protected-information read と LAN が
+`failed` でも、受容済み残存 risk としてその事実を保持・表示し、その他の必須境界がすべて `verified` なら
+Sandbox route は利用可能として構いません。受容済み risk を `verified` に書き換えたり検証結果から削除したり
+しません。必須境界が `failed` または `unverified` の状態を capability 全体の
+`Windows live-verified=true` または execution-route-available へ丸めません。
 
 transport も capability truthfulness の対象です。stdio／HTTP 等の各 transport について、`configured`、
 `enabled`、`available` と実効 authentication／principal 前提を区別し、startup validation が拒否する状態を
@@ -267,12 +293,12 @@ MCP ADB E2E、Tunnel、deployment の代替にしません。
 - model の誤判断／過剰行動、悪意または予期しない workspace code
 - project-controlled config／plugin／hook／autoload、arbitrary child／grandchild process
 - malformed structured／binary input、secret leakage、workspace escape
-- unintended network／device／external-service access
+- unintended network／device／external-service access。ただし Section 5 で明示的に受容した LAN access を除く
 - workspace、`data_dir`、control-plane、scratch の境界違反
 - stale approval、replay、double execution、cancel race、ordinary TOCTOU
 - crash／timeout／cancellation、stale source／destination、path／filesystem race
 - Broker helper の PATH shadowing、差し替え、stale executable identity
-- Codex Sandbox の read／write／protected-information／network／descendant boundary 不足
+- Codex Sandbox の workspace 外 read／write／Internet／loopback／control-plane／必須 descendant boundary 不足
 - ordinary non-admin Windows user 権限で成立する現実的な攻撃
 - common project layout で起こる機能破綻、通常操作での重大 UX 破綻
 - 容易に trigger できる resource exhaustion、過剰 copy／scan／hash／lock／approval
@@ -280,9 +306,14 @@ MCP ADB E2E、Tunnel、deployment の代替にしません。
 
 ## 5. 対象外または受容する残存 risk
 
-次は v1 の Trusted Computing Base または明示的対象外です。ただし同じ技術分類でも、通常の project code
-や一般入力から現実的に到達できるものは対象内です。
+次は v1 の Trusted Computing Base、明示的対象外、または trusted operator が明示的に受容した残存 risk です。
+ただし同じ技術分類でも、ここで明示していないものや通常の project code／一般入力から別の必須境界を
+破るものは対象内です。
 
+- workspace 内に存在する `.env`、credential、secret 等を Codex Sandbox process またはその descendant が
+  直接読み取れること。workspace 外 protected information の read は含まない
+- Codex Sandbox process またはその descendant が LAN／private network endpoint へ接続できること。
+  Internet と未許可 loopback／localhost access は含まない
 - Windows kernel、hardware、firmware、Windows security model 自体の compromise
 - Administrator／trusted operator による意図的な security state 変更
 - provenance／live verification を通過した Sandbox 実装自体の未知の OS sandbox 0-day
@@ -303,14 +334,16 @@ MCP ADB E2E、Tunnel、deployment の代替にしません。
 | --- | --- |
 | Broker helper executable の provenance／path／hash／file identity と差し替え耐性 | A, B, O |
 | legacy `:workspace` と `workspace_write=false` の実効 filesystem boundary | C, D, O |
-| Sandbox runtime から `.env`／credential／secret を直接読める可能性 | D, K, O |
+| workspace 外 protected information の read denial | D, K, O |
+| workspace 内 `.env`／credential／secret の直接 read は受容済み残存 risk として正確に表示されるか | D, K, O |
 | `.env`／dependency tree を含む過剰 staging | K, L |
 | known-path operation の full workspace checkpoint | G, H, L |
 | artifact chunk ごとの全 file 再hash | I, L |
 | ChatGPT container source→result binding | G, I |
 | Sandbox launcher の host-side cwd／DLL／search-path | C, D, F |
-| Internet／LAN／loopback と child／grandchild の実効 containment | D, O |
-| Sandbox property ごとの live verification と aggregate 表示の整合 | D, O |
+| Internet／loopback と child／grandchild の必須 containment | D, O |
+| LAN access が受容済み残存 risk として正確に表示されるか | D, O |
+| Sandbox property ごとの live verification と route 判定の分離 | D, O |
 | DOCX／XLSX の過剰な file-wide rejection と保存能力表示 | J, L, O |
 | 画像 format conversion の実用性と capability 表示 | J, L, O |
 | CSV／TSV preservation 表示の正確性 | J, O |
@@ -328,11 +361,14 @@ MCP ADB E2E、Tunnel、deployment の代替にしません。
 release candidate と判断するには、少なくとも次を満たします。
 
 1. 対象内の既知または新規 Security Contract violation と release-blocking な実用性回帰が残っていない。
+   Section 5 で明示的に受容した workspace 内 protected-information read と LAN access は、それ自体では blocker
+   としないが、実測結果と残存 risk を隠してはならない。
 2. 修正後に security、practicality／performance、regression の独立 pass を繰り返し、2 回連続で新しい
    対象内 blocker を発見しない。
 3. full pytest、Ruff、compileall、`git diff --check` と、該当する security／structured-file／race／approval／
    recovery／transfer／resource／Activity／Undo の回帰を現在の commit に対して実行する。
 4. 実行可能な Windows live test、ADB emulator integration、Secure MCP Tunnel／ChatGPT E2E を実行し、
-   実行不能なものは未検証として理由を記録する。Sandbox は property ごとの検証結果を残す。
+   実行不能なものは未検証として理由を記録する。Sandbox は property ごとの実測結果と、それが必須境界か
+   受容済み残存 risk かを残す。
 5. README、`SPEC.md`、`VERIFICATION.md` と関連文書を現行実装へ合わせ、過去の architecture や過去の
    検証結果を現在の保証として再利用しない。
