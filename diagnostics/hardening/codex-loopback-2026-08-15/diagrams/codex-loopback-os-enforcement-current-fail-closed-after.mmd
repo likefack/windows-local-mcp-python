@@ -1,0 +1,6 @@
+flowchart LR
+    W["WLMCP"] --> V["localhost live verification"]
+    V -->|"failed / unverified"| X["Sandbox route unavailable"]
+    X --> N["自動 Host fallback なし"]
+    U["Codex upstream 修正"] --> R["同一 backend で再検証"]
+    R -->|"全必須境界 verified"| O["route を再開"]

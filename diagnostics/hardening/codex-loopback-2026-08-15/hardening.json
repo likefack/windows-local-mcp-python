@@ -1,0 +1,174 @@
+{
+  "documentType": "codex-security.hardening-analysis",
+  "schemaVersion": "1.0",
+  "analysisId": "hardening_20260815_codex_loopback",
+  "sourceEvidence": {
+    "kind": "mixed_source_collection",
+    "label": "WLMCP source, Windows live diagnostics, OpenAI Codex upstream, and Microsoft WFP documentation",
+    "collectionSha256": "5233a6ab221bdda9363f6238298c6c802c4d528f2d6c4738c103f7069edee706",
+    "artifactCount": 11,
+    "sourceDrift": "unknown",
+    "targetRevision": "e28bf9538ce0f350f01eb4f543e8480e36af0b7a"
+  },
+  "assessment": {
+    "outcome": "opportunities_identified",
+    "summary": "通常Firewall規則の追加では解決しない。独自高優先sublayerのuser-mode WFP hard blockは最小の有望案だが、対象PCでの動的filter対照実験が必要。"
+  },
+  "constraints": {
+    "profile": "security_first_small_change",
+    "changeHorizons": ["proof_of_concept", "incremental", "upstream"],
+    "nonNegotiables": [
+      "host全体のlocalhostを遮断しない",
+      "childとgrandchildもOSレベルで遮断する",
+      "Sandbox失敗からApproved Hostへ自動fallbackしない",
+      "独自AppContainerとkernel driverは最後の手段とする"
+    ],
+    "assumptions": [
+      "対象PCのApp Isolation sublayer weightとruntime action rightはまだ未取得",
+      "性能とmemoryの追加コストは未測定"
+    ]
+  },
+  "opportunities": [
+    {
+      "opportunityId": "codex-loopback-os-enforcement",
+      "title": "Codex offline principal の loopback を正しい WFP 裁定位置で遮断する",
+      "summary": "Windows Firewall policyでは選べないcustom sublayerとhard blockを直接WFPで検証する。",
+      "diagnosis": "App Isolationのloopback permitが、MPSSVC_WFへ変換された通常Firewall blockより実効的に優先されている。",
+      "evidence": [
+        {
+          "claimType": "observed",
+          "sourceKind": "experiment",
+          "evidenceId": "E011",
+          "path": "diagnostics/Invoke-CodexLoopbackProbe.ps1",
+          "claim": "parent、child、grandchildのTCP4、TCP6、UDP4、UDP6がhost listenerへ到達した。"
+        },
+        {
+          "claimType": "observed",
+          "sourceKind": "document",
+          "evidenceId": "E010",
+          "path": "diagnostics/Collect-CodexWfpState.Admin.ps1",
+          "claim": "Filter 70511はMPSSVC_APP_ISOLATIONのloopback permit、Filter 74502はMPSSVC_WFのCodex blockだった。"
+        },
+        {
+          "claimType": "inferred",
+          "sourceKind": "document",
+          "evidenceId": "E016",
+          "claim": "sublayer orderとaction rightが通常Firewall blockを実効的に無効化している可能性が最も高い。"
+        }
+      ],
+      "desiredInvariants": [
+        "CodexSandboxOffline processとdescendantは127/8と::1の未許可endpointへ接続できない。",
+        "通常host userとhost applicationのlocalhost接続は維持される。",
+        "filter topologyが変われば過去のlive evidenceを拒否する。"
+      ],
+      "proposalPath": "proposals/codex-loopback-os-enforcement.md",
+      "options": [
+        {
+          "optionId": "current-fail-closed",
+          "title": "現行 fail-closed と upstream 待ち",
+          "kind": "baseline",
+          "summary": "localhost境界がverifiedになるまでSandbox routeを利用しない。",
+          "diagramPaths": {
+            "before": "diagrams/codex-loopback-os-enforcement-before.mmd",
+            "after": "diagrams/codex-loopback-os-enforcement-current-fail-closed-after.mmd"
+          },
+          "evidenceCoverage": [
+            {
+              "evidenceId": "E011",
+              "effect": "addresses",
+              "tacticalFixRequired": false,
+              "rationale": "境界不成立のbackendを実行経路から外す。"
+            }
+          ],
+          "tradeoffs": [
+            {"dimension":"security","direction":"improves","confidence":"high","basis":"source-derived","assessment":"不成立の境界を安全と表示しない。","validationPlan":"route unavailableとHost自動fallbackなしを回帰確認する。"},
+            {"dimension":"performance","direction":"regresses","confidence":"high","basis":"source-derived","assessment":"open-ended executionが利用不能。","validationPlan":"対象workflowのblocked件数を測る。"},
+            {"dimension":"memory","direction":"neutral","confidence":"high","basis":"source-derived","assessment":"追加componentなし。","validationPlan":"不要。"},
+            {"dimension":"reliability","direction":"improves","confidence":"high","basis":"source-derived","assessment":"安全側に固定されるが可用性はない。","validationPlan":"marker失敗時のroute判定を確認する。"},
+            {"dimension":"operability","direction":"regresses","confidence":"medium","basis":"source-derived","assessment":"upstream追跡が必要。","validationPlan":"Codex更新ごとにlive verificationを実行する。"},
+            {"dimension":"migration","direction":"neutral","confidence":"high","basis":"source-derived","assessment":"現行設計を維持する。","validationPlan":"不要。"}
+          ],
+          "residualRisks": ["open-ended executionの長期利用不能"],
+          "implementationReadiness": {
+            "affectedComponents": [],
+            "workPackages": ["upstream修正の追跡", "Codex更新後のlive verification"],
+            "acceptanceCriteria": ["全必須propertyが同一backendでverifiedになるまでrouteが閉じる。"],
+            "migrationNotes": [],
+            "rollback": "変更なし。"
+          }
+        },
+        {
+          "optionId": "direct-wfp-dynamic",
+          "title": "独自 sublayer の直接 WFP hard block",
+          "kind": "isolation",
+          "summary": "user-mode dynamic WFP sessionでSID限定loopback hard blockを先行評価させる。",
+          "diagramPaths": {
+            "before": "diagrams/codex-loopback-os-enforcement-before.mmd",
+            "after": "diagrams/codex-loopback-os-enforcement-direct-wfp-after.mmd"
+          },
+          "evidenceCoverage": [
+            {"evidenceId":"E011","effect":"addresses","tacticalFixRequired":true,"rationale":"12経路のdrop event付きPoCが必要。"},
+            {"evidenceId":"E010","effect":"addresses","tacticalFixRequired":true,"rationale":"App Isolationより厳密に高いsublayerを作れることが条件。"}
+          ],
+          "tradeoffs": [
+            {"dimension":"security","direction":"improves","confidence":"medium","basis":"source-derived","assessment":"条件を満たせばOSレベルhard blockになる。未実測。","validationPlan":"12経路とfilter ID付きdrop eventを確認する。"},
+            {"dimension":"performance","direction":"unknown","confidence":"low","basis":"hypothetical","assessment":"ALE filter 2本の分類負荷が増える。","validationPlan":"1000接続のp50とp95 latency、CPUを比較する。"},
+            {"dimension":"memory","direction":"regresses","confidence":"low","basis":"hypothetical","assessment":"helper processと少数のBFE objectが増える。","validationPlan":"helper working setとBFE object数を測る。"},
+            {"dimension":"reliability","direction":"unknown","confidence":"medium","basis":"source-derived","assessment":"dynamic cleanupはOS所有だが、lease喪失時にSandbox Jobを終了するlifecycleが増える。","validationPlan":"正常終了、強制終了、Job終了、BFE restart、Windows restartを試す。"},
+            {"dimension":"operability","direction":"regresses","confidence":"medium","basis":"source-derived","assessment":"管理者setup、filter観測、upstream drift追跡が必要。","validationPlan":"install、診断、uninstall、stale SID recoveryを演習する。"},
+            {"dimension":"migration","direction":"regresses","confidence":"medium","basis":"source-derived","assessment":"PoC後にpolicy ownerを決める必要がある。","validationPlan":"upstream ownershipとWLMCP lifecycle ownerを比較する。"}
+          ],
+          "residualRisks": [
+            "同じCodexSandboxOffline SIDの他sessionもfilter lifetime中はloopbackを失う。",
+            "CodexのSIDまたはnetwork identity変更でconditionがstaleになる。"
+          ],
+          "implementationReadiness": {
+            "affectedComponents": ["diagnostics/Collect-CodexWfpState.Admin.ps1", "diagnostics/Invoke-CodexLoopbackProbe.ps1"],
+            "workPackages": ["read-only sublayer collector", "dynamic WFP PoC helper", "drop-event correlation", "crash cleanup validation"],
+            "acceptanceCriteria": ["12経路を対象filter IDで拒否する。", "host通常userの4経路は成功する。", "helper crash時にSandbox Jobが終了し、その後dynamic objectが消える。"],
+            "migrationNotes": ["PoC成功前にproduction codeへ統合しない。"],
+            "rollback": "dynamic engine sessionを閉じ、追加objectが消えたことを列挙確認する。"
+          }
+        },
+        {
+          "optionId": "accept-loopback-residual-risk",
+          "title": "localhost を明示的な残存 risk にする",
+          "kind": "incremental",
+          "summary": "契約を明示変更し、best-effort警告を補助防御として使う。",
+          "diagramPaths": {
+            "before": "diagrams/codex-loopback-os-enforcement-before.mmd",
+            "after": "diagrams/codex-loopback-os-enforcement-residual-risk-after.mmd"
+          },
+          "evidenceCoverage": [
+            {"evidenceId":"E011","effect":"unaffected","tacticalFixRequired":true,"rationale":"localhost到達自体は残る。"},
+            {"evidenceId":"E001","effect":"unaffected","tacticalFixRequired":true,"rationale":"trusted operatorによる明示的な契約変更が必要。"}
+          ],
+          "tradeoffs": [
+            {"dimension":"security","direction":"regresses","confidence":"high","basis":"source-derived","assessment":"host localhost service経由の権限迂回が残る。","validationPlan":"残存riskとして記録し、OS boundaryとは表示しない。"},
+            {"dimension":"performance","direction":"improves","confidence":"high","basis":"source-derived","assessment":"Sandbox routeを再利用できる。","validationPlan":"blocked workflowの回復を測る。"},
+            {"dimension":"memory","direction":"neutral","confidence":"high","basis":"source-derived","assessment":"小さな検査以外の追加なし。","validationPlan":"不要。"},
+            {"dimension":"reliability","direction":"regresses","confidence":"high","basis":"source-derived","assessment":"検査は任意socket codeに迂回される。","validationPlan":"直接socketの回避例を回帰資料に残す。"},
+            {"dimension":"operability","direction":"regresses","confidence":"medium","basis":"source-derived","assessment":"警告と承認、upstream復帰監視が必要。","validationPlan":"警告率と承認率を測る。"},
+            {"dimension":"migration","direction":"regresses","confidence":"high","basis":"source-derived","assessment":"Security Contract変更と将来の復帰が必要。","validationPlan":"契約差分と再検証手順をreviewする。"}
+          ],
+          "residualRisks": ["任意コードはbest-effort検査を迂回できる。"],
+          "implementationReadiness": {
+            "affectedComponents": ["SECURITY_CONTRACT.md", "src/windows_local_mcp/sandbox_backend.py"],
+            "workPackages": ["明示的risk acceptance", "補助警告", "upstream修正監視"],
+            "acceptanceCriteria": ["OS境界ではないことをUIと文書で明示する。"],
+            "migrationNotes": ["trusted operatorの明示承認なしに採用しない。"],
+            "rollback": "localhostを必須propertyへ戻し、live verification成功までrouteを閉じる。"
+          }
+        }
+      ],
+      "recommendedOptionId": "direct-wfp-dynamic",
+      "recommendation": "Option 2の動的filter対照実験だけを先に行い、成功するまではOption 1を維持する。"
+    }
+  ],
+  "openQuestions": [
+    "MPSSVC_APP_ISOLATION sublayer weightはUINT16_MAX未満か。",
+    "70511と70512のruntime action rightはhard permitか。",
+    "direct WFP hard blockは対象PCで12経路をdropできるか。",
+    "production lifecycleのownerをCodex upstream、管理service、BFE ACL委任のどれにするか。"
+  ]
+}
