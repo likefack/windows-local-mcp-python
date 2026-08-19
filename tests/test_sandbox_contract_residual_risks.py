@@ -6,9 +6,9 @@ import pytest
 
 from windows_local_mcp.config import Settings
 from windows_local_mcp.sandbox_backend import (
+    SANDBOX_SECURITY_PROPERTIES,
     ApprovedSandboxUnavailable,
     CodexSandboxBackend,
-    SANDBOX_SECURITY_PROPERTIES,
     isolation_context_digest,
     require_codex_sandbox_live_verification,
     sandbox_live_verification_route_eligible,
