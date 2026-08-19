@@ -20,3 +20,6 @@ windows-local-mcp-guide.xlsx
 # Local diagnostic output / fault-injection state must never be committed.
 diagnostics/WFP-*-Results/
 diagnostics/.c6-*
+
+# One-off hardening analysis artifacts are local/generated; durable conclusions belong in reviewed docs.
+diagnostics/hardening/
