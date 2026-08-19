@@ -23,3 +23,7 @@ diagnostics/.c6-*
 
 # One-off hardening analysis artifacts are local/generated; durable conclusions belong in reviewed docs.
 diagnostics/hardening/
+
+# One-off live-test payload staging. Durable outcomes belong in WFP_GUARD_VALIDATION.md.
+diagnostics/c45-smoke-probe/
+diagnostics/c5-concurrency-probe/
