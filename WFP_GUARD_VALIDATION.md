@@ -811,12 +811,19 @@ release gate では、最終 tree に対する full pytest / Ruff / compileall /
 | `3a592694abad53e9b80d703506b665845dc002b0` | stable worker identity への rebind、C5/C4.5 系 diagnostic hardening |
 | `efbc0c4ccfc4cc74be77507bec6f1419f0581f06` | C6.4 elevated helper crash fault-injection を追加 |
 | `6db48785d4825c1886e371d9f9a0a30e2dfd06a1` | C6.4 fault-injection hook を production tree から撤去 |
+| `1733701aea9ff8af0966a42a07605f646de62079` | C7 schema v4 identity binding、missing-only WFP reconstruction、TOCTOU hold を実装 |
+| `215d46b98515e487eb26d7500ed148f80e47f744` | IPv6 UDP loopback probe の DualMode 設定順を修正 |
 
 ---
 
 # 42. C7 — verified state と現在実体の identity binding
 
 C6 までで、WFP policy / UAC / IPC / read-back / fail-closed / launch ordering / concurrency / crash behavior を確認した。C7 では、過去に live verification した security boundary と、現在実際に使う binary / source / policy が同一であることを marker schema v4 へ結合した。
+
+C7 の本体実装 commit は次である。
+
+- `1733701aea9ff8af0966a42a07605f646de62079`
+- `feat(security): C7検証済み状態を実行時実体へ結合する`
 
 ## 42.1 schema v4 の identity
 
@@ -853,7 +860,7 @@ Sandbox child launch
 
 一方、既存 object の security-relevant field 不一致、unexpected conflicting object、または marker identity 不一致では silent repair しない。存在する object をすべて検証してから不足分を作るため、missing と mismatch が混在する場合も何も追加せず fail closed する。
 
-## 42.3 この変更で確認した範囲
+## 42.3 自動回帰で確認した範囲
 
 - schema v1～v3、必須 field 欠損、backend / Guard / policy / account / OS mismatch の拒否
 - stale marker が Guard 昇格経路、live probe、child launch、Approved Host fallback へ進まないこと
@@ -863,16 +870,124 @@ Sandbox child launch
 - complete read-back → `wfp_guard_verified` → child launch の順序
 - 実 import module の canonical path / SHA-256 / stable identity manifest と hold
 
-これらは unit / mock / Windows file-handle 回帰である。この変更後の通常 Windows user 文脈における UAC、live WFP object 再構築、実通信、production route E2E は別の実機 checkpoint であり、ここでは未実施である。
+C7 重点回帰は `92 passed`、通常 Windows user 文脈の full pytest は `304 passed, 2 skipped`。Ruff、compileall、`git diff --check` も pass した。
 
-C7 完了後は、WFP Guard だけを見て release せず、repository-wide Security Review / Scan、findings 修正、再 scan、最終 production-route E2E を通してから release gate を判断する。
+## 42.4 C7 live verification
+
+C7 実装後、通常 Windows user 文脈で `verify-codex-sandbox` を実行した。
+
+確認した事実:
+
+- marker schema = v4
+- route eligibility = true
+- 実際の installed Codex backend の version / Authenticode / stable file identity を取得
+- Guard implementation digest を取得
+- Windows build / UBR を identity へ含めた
+- local physical computer に完全修飾した Sandbox account identity を確認
+- WFP Guard binding digest を取得
+- `filesystem_read` / `filesystem_write` / `internet` / `loopback` / `termination` / `resource_bound` は route 判定上の必要条件を満たした
+- `protected_information_read` と descendant の protected-information denial は residual risk として失敗を保持し、aggregate `passed=false` を無理に success 表示へ変換していない
+
+この結果は「全 Sandbox property が完全 verified」という意味ではない。C7 の目的である identity binding と route eligibility の成立を確認した checkpoint である。
+
+## 42.5 exact missing WFP object の production-route reconstruction
+
+live marker を更新せず、maintenance cleanup で WLMCP の exact Guard sublayer と V4/V6 fixed filter だけを削除した。cleanup 前後で marker の SHA-256 が不変であることを確認した。
+
+その後、通常の `request_sandbox_command` production route を one-shot approval で実行した。
+
+実機 audit では次の順序を確認した。
+
+```text
+created
+↓
+approved_and_claimed
+↓
+worker_spawned
+↓
+approval_bundle_verified
+↓
+worker_started
+↓
+sandbox_policy_prepared
+↓
+wfp_guard_verified
+↓
+sandbox_policy_applied
+↓
+child_started
+↓
+worker_finished
+```
+
+operation は `codex_sandbox` tier、`status=succeeded`、`exit_code=0` で完了した。`wfp_guard_verified` と operation の final network policy に記録された V4/V6 filter は、cleanup 後に新しく割り当てられた runtime ID を持っており、削除前の object が残っていたのではなく fixed object が再作成されたことを確認した。
+
+重要な点は、再作成後も marker binding に含まれる V4/V6 `effective_weight` が削除前と一致し、完全 read-back の後にのみ `wfp_guard_verified` へ進み、その後に初めて `child_started` が記録されたことである。
+
+C7 実装時に懸念していた「`FWP_EMPTY` の再作成で `effective_weight` が変化し、valid marker + missing-only reconstruction が毎回 binding mismatch になる」問題は、この実機では再現しなかった。
+
+## 42.6 Host fallback の不在
+
+上記 production operation の全 event を確認し、`fallback` / `host` / `escalation` に該当する event は存在しなかった。
+
+したがって、missing-only reconstruction の正常系は Approved Host へ経路変更せず、そのまま `codex_sandbox` tier で完了した。
+
+これは C7 の設計原則である「Codex Sandbox failure / Guard failure から Approved Host へ自動 fallback しない」と整合する。
+
+## 42.7 再構築後の localhost 実通信
+
+fixed Guard 再構築後、maintained diagnostic `Invoke-CodexLoopbackProbe.ps1 -RunSandboxProbe` で parent / child / grandchild の実通信を再確認した。
+
+最初の再測定で host 側 IPv6 listener の `DualMode` 設定が bind 後に行われていたため、IPv6 UDP listener 作成時に Windows が `InvalidArgument` を返す diagnostic bug を発見した。
+
+次の commit で diagnostic を限定修正した。
+
+- `215d46b98515e487eb26d7500ed148f80e47f744`
+- `fix(diagnostics): IPv6 UDP listenerのDualMode設定順を修正`
+
+修正内容:
+
+- IPv6 UDP socket を `AddressFamily.InterNetworkV6` で未 bind の状態に生成
+- `DualMode = false` を設定してから `::1` へ bind
+- IPv6 TCP と UDP の listener 失敗処理を分離
+- listener 初期化失敗時に半端な socket / listener を残さない
+
+修正後の再実行では `listener_errors=[]` を確認した。
+
+実通信結果:
+
+- TCP IPv4: parent / child / grandchild のすべてで connection 成立せず、host 受信 token なし
+- TCP IPv6: parent / child / grandchild のすべてで connection 成立せず、host 受信 token なし
+- UDP IPv4: Sandbox 側 `Send()` は成功するが host 受信 token なし
+- UDP IPv6: Sandbox 側 `Send()` は成功するが host 受信 token なし
+- setup marker は probe 前後で不変
+
+UDP は connection-oriented ではなく `Send()` success だけで到達を証明できないため、diagnostic 自身も host token 受信を到達証拠としている。今回 host 受信は 0 であり遮断と整合するが、UDP のみをこの probe 単独で「WFP Guard が唯一の原因で drop した」とは表現しない。
+
+また、この direct Codex traffic probe では Codex 側 Firewall rule も有効であるため、実通信遮断の唯一の原因を WLMCP custom Guard へ帰属する証拠ではない。Phase B の Guard 有無対照試験と、今回の production-route reconstruction / complete read-back / launch ordering の証拠を組み合わせて評価する。
+
+## 42.8 C7 の結論
+
+C7 の実機 checkpoint は PASS とする。
+
+実証した性質は次である。
+
+1. schema v4 marker が現在の Guard implementation / Codex backend / account / OS / WFP stable binding に結合する。
+2. marker を変えず exact fixed WFP object だけが消失した場合、通常 production route から trusted Guard が missing object を再構築できる。
+3. 再構築後は complete read-back を通過しない限り `wfp_guard_verified` にならない。
+4. `wfp_guard_verified` より前に Sandbox child は起動しない。
+5. missing-only reconstruction 後も marker binding が成立し、operation は同じ `codex_sandbox` tier で成功する。
+6. Approved Host への自動 fallback / escalation は発生しない。
+7. 再構築後の localhost 実通信は IPv4 / IPv6、parent / child / grandchild で遮断結果と整合する。
+
+C7 完了後も、WFP Guard だけを見て release しない。repository-wide Security Review / Scan、findings 修正、再 scan、最終 production-route E2E を別 release gate として扱う。
 
 ---
 
 # 43. 現在地
 
-C7 実装の開始 baseline は main commit `b81ebe654bf99d0e64d9b4e1c7a7bc1bb04d9026` である。
+C7 実装の開始 baseline は main commit `b81ebe654bf99d0e64d9b4e1c7a7bc1bb04d9026`、本体実装 commit は `1733701aea9ff8af0966a42a07605f646de62079` である。
 
-localhost / WFP Guard 問題については「有効な block 方法を見つけた」という段階を越え、production launch path で fail closed を維持しながら異常終了へ耐えるところまで C6 で実機確認した。C7 では、その verified state を現在の Guard / backend / account / OS / policy identity へ結合する実装と自動回帰を追加した。
+localhost / WFP Guard 問題については「有効な block 方法を見つけた」という段階を越え、C6 で crash / fail-closed / lifecycle を実機確認し、C7 で verified state と現在実体を identity binding し、その missing-only reconstruction と production launch ordering を実機で完了まで確認した。
 
-以後は C7 後の通常 Windows user 文脈での live verification、missing object 再構築を含む production-route E2E、repository-wide security validation を進める。
+C7 は PASS。以後は repository-wide security validation、findings 修正・再 scan、最終 production-route E2E、packaging / install / upgrade / uninstall / release gate へ進む。
