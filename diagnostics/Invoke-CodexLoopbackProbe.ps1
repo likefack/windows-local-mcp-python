@@ -147,13 +147,32 @@ function New-ListenerSet {
             $set.tcp6 = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::IPv6Loopback, 0)
             $set.tcp6.Server.DualMode = $false
             $set.tcp6.Start(8)
-            $set.udp6 = [System.Net.Sockets.UdpClient]::new(
-                [System.Net.IPEndPoint]::new([System.Net.IPAddress]::IPv6Loopback, 0)
-            )
-            $set.udp6.Client.DualMode = $false
         }
         catch {
-            $set.errors += "IPv6 listener: $($_.Exception.Message)"
+            if ($null -ne $set.tcp6) {
+                $set.tcp6.Stop()
+                $set.tcp6 = $null
+            }
+            $set.errors += "IPv6 TCP listener: $($_.Exception.Message)"
+        }
+
+        try {
+            # UdpClient(IPEndPoint) binds immediately. Windows can reject changing
+            # IPV6_V6ONLY/DualMode after bind, so configure the socket first and bind last.
+            $set.udp6 = [System.Net.Sockets.UdpClient]::new(
+                [System.Net.Sockets.AddressFamily]::InterNetworkV6
+            )
+            $set.udp6.Client.DualMode = $false
+            $set.udp6.Client.Bind(
+                [System.Net.IPEndPoint]::new([System.Net.IPAddress]::IPv6Loopback, 0)
+            )
+        }
+        catch {
+            if ($null -ne $set.udp6) {
+                $set.udp6.Dispose()
+                $set.udp6 = $null
+            }
+            $set.errors += "IPv6 UDP listener: $($_.Exception.Message)"
         }
     }
     else {
