@@ -110,7 +110,7 @@ Approved Host は同一ユーザー権限で制御領域へ到達し得るため
 
 ## Codex Sandbox
 
-Live verificationは、各propertyを`verified`、`failed`、`unverified`の三値で保存します。`failed`は実際のprobeが境界脱出を観測した場合だけ、`unverified`は起動失敗、タイムアウト、listenerまたはprobe環境の準備失敗、出力を測定できない場合に使います。いずれか一つでも`failed`または`unverified`なら、Sandbox routeは利用不可のままで、Approved Hostへ自動移行しません。
+Live verificationは、各propertyを`verified`、`failed`、`unverified`の三値で保存します。`failed`は実際のprobeが境界脱出を観測した場合だけ、`unverified`は起動失敗、タイムアウト、listenerまたはprobe環境の準備失敗、出力を測定できない場合に使います。workspace内のprotected-information readとLAN accessは、個人利用v1の受容済み残存riskとして`failed`の事実を保持・表示しつつ、それ単独ではSandbox routeを利用不可にしません。その他の必須境界に`failed`または`unverified`があればrouteは利用不可のままであり、Approved Hostへ自動移行しません。
 
 live markerはlauncherとhelperのidentityだけでなく、`isolation_context_digest`によってworkspaceの実体、保護名・拒否directory、`sandbox_dependency_readable_paths`、Sandbox policy generation、process数・process-tree memory上限、scratch上限、許可環境変数などにも結合されます。これらを変更した場合、古いmarkerはstaleとして拒否され、再検証が必要です。
 
@@ -150,7 +150,7 @@ $env:LOCAL_MCP_CONFIG = 'C:\path\to\config.local.toml'
 
 検証結果は `filesystem_read`、`filesystem_write`、`protected_information_read`、`internet`、`lan`、`loopback`、`descendant_containment`、`termination`、`resource_bound` の property ごとに `verified`／`failed`／`unverified` として保存します。旧形式の marker、設定に結合しないmarker、一部だけ通過した marker は受理しません。`available` は依存関係と起動前提、`windows_live_verified` は OS 境界の実測、`execution_route_available` は必要な全 property を満たして実行可能かを別々に示します。`approved_sandbox_require_live_verification=false` で実行条件を回避することはできません。
 
-検証器は親・child・grandchildのfilesystem／network境界に加え、process数上限とprocess-tree memory上限の超過、違反時の全子孫停止、終了状態回収まで実測します。独立probeが例外になった場合、そのprobeを `unverified` として残し、安全に続行できる残りのprobeを継続します。1 propertyでも `failed`／`unverified` ならSandbox経路は利用不可であり、Approved Hostへ自動移行しません。
+検証器は親・child・grandchildのfilesystem／network境界に加え、process数上限とprocess-tree memory上限の超過、違反時の全子孫停止、終了状態回収まで実測します。独立probeが例外になった場合、そのprobeを `unverified` として残し、安全に続行できる残りのprobeを継続します。受容済み残存riskであるworkspace内のprotected-information readとLAN accessは、親・child・grandchildでの`failed`を保持・表示したままroute判定から分離します。それ以外の必須境界がすべて`verified`の場合に限りSandbox経路を利用でき、利用できない場合もApproved Hostへ自動移行しません。
 
 ## ファイルと制御領域の保護
 
