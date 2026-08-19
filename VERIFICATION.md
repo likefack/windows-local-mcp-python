@@ -27,10 +27,26 @@
 - compileall: `.venv\Scripts\python.exe -m compileall -q src tests` は通常 Windows user 文脈で pass。制限環境からは通常 user の full pytest が生成した `tests\__pycache__` への一時 `.pyc` 書込みが拒否されたため、同じ通常 user 文脈で再実行した。
 - `git diff --check`: pass。LF / CRLF の将来変換 warning のみ。
 
-### 検証境界
+### 実装時点の検証境界
 
-- 今回の通常 Windows user 回帰は unit / mock /既存 integration の検証であり、C7変更後の `verify-codex-sandbox`、UAC画面、live WFP objectの欠損再構築、実通信、production route E2E は実行していない。
+- C7 実装 commit 時点の通常 Windows user 回帰は unit / mock /既存 integration の検証であり、その時点では C7変更後の `verify-codex-sandbox`、UAC画面、live WFP objectの欠損再構築、実通信、production route E2E は未実施だった。
 - Codex Desktop自身の制限環境内からstdio MCP子プロセスを起動するfull pytestは、子プロセス作成前で停止した。この入れ子実行は製品回帰の証拠に使わず、通常 Windows user 文脈のfull pytest結果だけを採用した。
+
+### 後続の C7 実機 checkpoint — PASS
+
+C7 実装後、通常 Windows user / production route で未検証だった境界を追加確認した。
+
+- `verify-codex-sandbox` を実行し、marker schema v4、route eligibility、installed Codex backend identity / version / Authenticode、Guard implementation digest、Windows build / UBR、完全修飾した Sandbox account identity、WFP Guard binding digest を実機取得した。
+- live marker を変更せず、maintenance cleanup で WLMCP の exact Guard sublayer と V4/V6 fixed filter だけを削除した。cleanup 前後で marker SHA-256 が不変であることを確認した。
+- その状態から通常の `request_sandbox_command` production route を one-shot approval で実行し、missing fixed object が再構築されたことを audit と管理者 read-back で確認した。再構築後の runtime filter ID は削除前と異なり、同一 object が残っていたのではない。
+- 再構築後も V4/V6 `effective_weight` は削除前と一致し、C7 marker binding が成立した。`FWP_EMPTY` 再作成で effective weight が変わり、missing-only recovery が binding mismatch になる懸念はこの実機では再現しなかった。
+- audit event 順序は `sandbox_policy_prepared → wfp_guard_verified → sandbox_policy_applied → child_started → worker_finished`。Guard read-back verification 完了前に child は起動していない。
+- operation は `codex_sandbox` tier、`status=succeeded`、`exit_code=0`。該当 operation に fallback / host / escalation event はなく、Approved Host への自動 fallback は発生していない。
+- 再構築後に `Invoke-CodexLoopbackProbe.ps1 -RunSandboxProbe` を実行した。IPv6 UDP listener の diagnostic bug を発見し、`215d46b98515e487eb26d7500ed148f80e47f744` (`fix(diagnostics): IPv6 UDP listenerのDualMode設定順を修正`) で、未bind IPv6 socketへ `DualMode=false` を設定してから `::1` に bind するよう修正し、TCP/UDP の失敗処理も分離した。
+- diagnostic 修正後は `listener_errors=[]`。TCP IPv4 / IPv6 は parent / child / grandchild すべてで localhost connection が成立せず host token 受信なし。UDP IPv4 / IPv6 は Sandbox 側 `Send()` は成功したが host token 受信なし。setup marker は probe 前後で不変だった。
+- direct traffic probe では Codex 側 Firewall rule も有効なため、実通信 drop の唯一の原因を WLMCP custom Guard に帰属する証拠とはしない。Phase B の Guard 有無対照試験と、今回の production-route reconstruction / complete read-back / launch ordering を組み合わせて評価する。
+
+以上により、C7 の実機 checkpoint は PASS とする。詳細な localhost / WFP Guard 系列の証拠は `WFP_GUARD_VALIDATION.md` に記録する。
 
 ## 2026-08-19 Approved Host 子孫プロセスの事後改ざん防止
 
@@ -102,7 +118,7 @@
 
 ### 対象と基準
 
-- 最終確認対象: `main` / `30cd90f709793088621f5fbc2224077d5b0c374b`
+- 最終確認対象: `main` / `30cd90f709793088621f5bc2224077d5b0c374b`
 - 作業開始時は `81c8e86d39900d9ca0fcf4bb75ea1bc91b7dba31` だったが、作業中に別プロセスの `git pull origin main` が `0bcac0e` と `30cd90f` を fast-forward した。巻き戻さず、追加された Timeline 実装と回帰も含む現在の `main` で再検証した。
 - 基準: `SECURITY_CONTRACT.md`、SHA-256 `abc0c0bf47dd2952d97dbbc52b01f65e8b091fd8ce1f49cb98d955dc4e54c0e1`
 - `SECURITY_CONTRACT.md` 自体は変更していない。
