@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-import windows_local_mcp.worker as worker
+from windows_local_mcp import worker
 
 
 def test_runtime_storage_preflight_fails_closed(
