@@ -199,7 +199,7 @@ def _run_elevated_ensure(
         validated = _validated_report(report)
         if diagnostic_trace is not None:
             diagnostic_trace["elevated_exit_code"] = exit_code
-            diagnostic_trace["parent_readback_validation"] = True
+            diagnostic_trace["parent_report_validation"] = True
         return validated
     finally:
         listener.close()
@@ -496,7 +496,7 @@ def run_integration_diagnostic() -> dict[str, object]:
         )
         trace["wfp"] = {
             "ensure_called_by_elevated_guard": True,
-            "readback_validated_by_unelevated_parent": True,
+            "elevated_readback_report_validated_by_unelevated_parent": True,
             "verification": verification.as_dict(),
         }
         return {"success": True, "evidence": trace}
