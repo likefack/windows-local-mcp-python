@@ -5,6 +5,22 @@
 ACL、Sandbox userを修復、削除、再生成しません。後述の一気通貫Guard診断だけは、固定された
 WFP Guardが欠けている場合に、UACで昇格したGuardからそのexact objectをensureします。
 
+## 保守対象と歴史的実験の扱い
+
+`diagnostics/` で現在保守するのは、現行production実装の状態確認・実通信probe・Guard統合確認に
+直接使う次のscriptだけです。
+
+- `Invoke-CodexLoopbackProbe.ps1`
+- `CodexLoopbackProbe.Child.ps1`
+- `Collect-CodexWfpState.Admin.ps1`
+- `Invoke-WlmcpWfpGuardIntegration.ps1`
+
+Phase A / Phase B / C1で使ったWFP実験scriptは、設計判断と実機結果を
+`WFP_GUARD_VALIDATION.md`へ統合したためmainから削除しました。これらはproduction運用手順ではなく、
+途中段階のread-only collector、dynamic WFP mutation、static lifetime/crash実験でした。
+正確な過去scriptが必要な場合はGit履歴から取得し、現行diagnosticとして再利用しないでください。
+これにより、古いWFP実験scriptが現在のSecurity Contractやproduction Guard手順と誤認されることを避けます。
+
 ## 1. 通常Windows userでの状態収集
 
 通常のPowerShellで実行します。`-RunSandboxProbe`を付けない場合は、installed binary、
