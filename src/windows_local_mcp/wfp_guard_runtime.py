@@ -39,10 +39,6 @@ _PROCESS_QUERY_LIMITED_INFORMATION = 0x00001000
 _TH32CS_SNAPPROCESS = 0x00000002
 _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 _PIPE_PROCEED = b"wlmcp-wfp-guard-proceed-v1"
-_C6_4_CRASH_MARKER = (
-    Path(__file__).resolve().parents[2] / "diagnostics" / ".c6-4-wfp-helper-pause"
-)
-_C6_4_CRASH_PAUSE_SECONDS = 15.0
 
 
 class _ShellExecuteInfo(ctypes.Structure):
@@ -456,17 +452,6 @@ def _validated_report(value: dict[str, Any]) -> GuardVerification:
     return report
 
 
-def _wait_for_c6_4_crash_window() -> None:
-    """Pause only when the local C6.4 fault-injection marker is explicitly armed."""
-
-    try:
-        requested = _C6_4_CRASH_MARKER.is_file()
-    except OSError:
-        requested = False
-    if requested:
-        threading.Event().wait(_C6_4_CRASH_PAUSE_SECONDS)
-
-
 def _local_process_evidence(*, is_administrator: bool) -> dict[str, object]:
     try:
         executable = str(Path(sys.executable).resolve(strict=True))
@@ -539,7 +524,6 @@ def _elevated_main(pipe_name: str, *, include_integration_evidence: bool = False
                 )
                 if not is_administrator:
                     raise WfpGuardError("WFP Guard elevation was not established")
-                _wait_for_c6_4_crash_window()
                 verification = ensure_codex_loopback_block(new_windows_wfp_api())
                 payload = {"ok": True, "verification": verification.as_dict()}
                 if include_integration_evidence:
