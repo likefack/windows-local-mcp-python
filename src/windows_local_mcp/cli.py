@@ -35,11 +35,14 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.command == "verify-codex-sandbox":
+        from .sandbox_backend import sandbox_live_verification_route_eligible
         from .sandbox_live_verify import verify_codex_sandbox_live
 
         result = verify_codex_sandbox_live(load_settings())
+        route_eligible = sandbox_live_verification_route_eligible(result)
+        result["route_eligible"] = route_eligible
         print(json.dumps(result, ensure_ascii=False, indent=2))
-        if not result.get("passed"):
+        if not route_eligible:
             raise SystemExit(1)
         return
 

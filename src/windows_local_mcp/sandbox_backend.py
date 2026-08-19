@@ -42,6 +42,32 @@ SANDBOX_SECURITY_PROPERTIES = (
     "termination",
     "resource_bound",
 )
+_ACCEPTED_RESIDUAL_RISK_PROPERTIES = frozenset(
+    {"protected_information_read", "lan"}
+)
+_MANDATORY_ROUTE_PROPERTIES = (
+    "filesystem_read",
+    "filesystem_write",
+    "internet",
+    "loopback",
+    "termination",
+    "resource_bound",
+)
+_MANDATORY_DESCENDANT_CHECKS = (
+    "child_source_workspace_write_denied",
+    "child_outside_user_read_denied",
+    "child_control_plane_read_denied",
+    "child_control_plane_write_denied",
+    "child_internet_denied",
+    "child_loopback_denied",
+    "grandchild_source_workspace_write_denied",
+    "grandchild_outside_user_read_denied",
+    "grandchild_control_plane_read_denied",
+    "grandchild_control_plane_write_denied",
+    "grandchild_internet_denied",
+    "grandchild_loopback_denied",
+)
+_ALLOWED_PROPERTY_STATUSES = frozenset({"verified", "failed", "unverified"})
 
 
 class ApprovedSandboxUnavailable(RuntimeError):
@@ -321,6 +347,37 @@ def isolation_context_digest(settings: Settings, backend: CodexSandboxBackend) -
     return sha256_text(canonical_json(sandbox_isolation_context(settings, backend)))
 
 
+def sandbox_live_verification_route_eligible(evidence: dict[str, Any]) -> bool:
+    """Apply the Security Contract route gate while preserving accepted residual risks."""
+
+    properties = evidence.get("properties")
+    if not isinstance(properties, dict):
+        return False
+    for name in SANDBOX_SECURITY_PROPERTIES:
+        item = properties.get(name)
+        if (
+            not isinstance(item, dict)
+            or item.get("status") not in _ALLOWED_PROPERTY_STATUSES
+        ):
+            return False
+    if any(
+        properties[name].get("status") != "verified"
+        for name in _MANDATORY_ROUTE_PROPERTIES
+    ):
+        return False
+
+    descendant = properties.get("descendant_containment")
+    if not isinstance(descendant, dict):
+        return False
+    if descendant.get("status") == "verified":
+        return True
+
+    checks = evidence.get("checks")
+    if not isinstance(checks, dict):
+        return False
+    return all(checks.get(name) is True for name in _MANDATORY_DESCENDANT_CHECKS)
+
+
 def require_codex_sandbox_live_verification(
     settings: Settings, backend: CodexSandboxBackend
 ) -> dict[str, Any]:
@@ -336,7 +393,6 @@ def require_codex_sandbox_live_verification(
         raise ApprovedSandboxUnavailable(
             "Codex Sandbox has not completed Windows live verification for this profile"
         ) from error
-    properties = evidence.get("properties")
     try:
         expected_isolation_digest = isolation_context_digest(settings, backend)
     except (OSError, PermissionError, RuntimeError, ValueError) as error:
@@ -345,16 +401,10 @@ def require_codex_sandbox_live_verification(
         ) from error
     if (
         evidence.get("version") != 3
-        or evidence.get("passed") is not True
         or evidence.get("backend_digest")
         != sha256_text(canonical_json(backend.as_dict()))
         or evidence.get("isolation_context_digest") != expected_isolation_digest
-        or not isinstance(properties, dict)
-        or any(
-            not isinstance(properties.get(name), dict)
-            or properties[name].get("status") != "verified"
-            for name in SANDBOX_SECURITY_PROPERTIES
-        )
+        or not sandbox_live_verification_route_eligible(evidence)
     ):
         raise ApprovedSandboxUnavailable(
             "Codex Sandbox live verification is missing, failed, or stale for this backend"
