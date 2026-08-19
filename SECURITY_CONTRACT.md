@@ -150,6 +150,9 @@ staging からの除外、stdout／stderr の redaction、network deny は補助
   audit DB、approval state、CAS、journal、worker context、transfer state、runtime、policy generation の
   通常の改変は検出します。
 - 改変または検証不能を検出した場合は tamper／recovery marker を残し、後続処理を停止します。
+- Windows では親を一時停止して Job Object へ割り当ててから再開し、全子孫が終了したことを確認するまで
+  control-plane の事後検査へ進みません。実行期限を超えた子孫は Job 全体で終了し、終了確認不能時は
+  tamper 検査境界を検証不能として fail closed します。
 - Host の device、network、external service、process side effect を workspace rollback 可能とは表示しません。
 
 ### F. Approval integrity

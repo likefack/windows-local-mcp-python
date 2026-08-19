@@ -150,12 +150,12 @@ def _winerror(operation: str) -> WindowsJobUnavailable:
 
 
 class WindowsSandboxJob:
-    """Own an OS-enforced, kill-on-close resource boundary for one Sandbox tree."""
+    """Own an OS-enforced, kill-on-close boundary for one Windows process tree."""
 
-    def __init__(self, limits: WindowsJobLimits) -> None:
+    def __init__(self, limits: WindowsJobLimits | None = None) -> None:
         if os.name != "nt":
             raise WindowsJobUnavailable("Windows Job Objects require native Windows")
-        if limits.max_processes < 1 or limits.max_memory_bytes < 1:
+        if limits is not None and (limits.max_processes < 1 or limits.max_memory_bytes < 1):
             raise ValueError("Windows Job Object limits must be positive")
         self.limits = limits
         self._job = _kernel32.CreateJobObjectW(None, None)
@@ -184,13 +184,13 @@ class WindowsSandboxJob:
 
     def _configure_limits(self) -> None:
         info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-        info.BasicLimitInformation.LimitFlags = (
-            _JOB_OBJECT_LIMIT_ACTIVE_PROCESS
-            | _JOB_OBJECT_LIMIT_JOB_MEMORY
-            | _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        )
-        info.BasicLimitInformation.ActiveProcessLimit = self.limits.max_processes
-        info.JobMemoryLimit = self.limits.max_memory_bytes
+        info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if self.limits is not None:
+            info.BasicLimitInformation.LimitFlags |= (
+                _JOB_OBJECT_LIMIT_ACTIVE_PROCESS | _JOB_OBJECT_LIMIT_JOB_MEMORY
+            )
+            info.BasicLimitInformation.ActiveProcessLimit = self.limits.max_processes
+            info.JobMemoryLimit = self.limits.max_memory_bytes
         if not _kernel32.SetInformationJobObject(
             self._job,
             _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,

@@ -56,6 +56,7 @@ from .sandbox_backend import (
 )
 from .tool_safety import hold_executable_identity
 from .util import canonical_json, utc_now_iso
+from .windows_job import WindowsSandboxJob
 from .workspace_history import (
     build_workspace_target_from_bytes,
     capture_workspace_state,
@@ -335,6 +336,8 @@ def run_operation(operation_id: str, settings: Settings) -> int:
     wfp_guard_verification: dict[str, object] | None = None
     sandbox_backend_hold: Any | None = None
     sandbox_job: Any | None = None
+    host_job: WindowsSandboxJob | None = None
+    host_descendants_verified_empty = True
     executable_hold: Any | None = None
 
     try:
@@ -477,6 +480,22 @@ def run_operation(operation_id: str, settings: Settings) -> int:
                     {"diagnostic": str(guard_error)[:1000], "host_fallback": False},
                 )
                 raise
+        elif operation["tier"] == "approved_host" and os.name == "nt":
+            # Assign the suspended parent before it can create descendants. The Job has no
+            # Sandbox resource limits, but its kill-on-close and active-process accounting
+            # keep every Approved Host descendant inside the tamper-check interval.
+            host_job = WindowsSandboxJob()
+            child = host_job.popen(
+                argv,
+                cwd=cwd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                shell=False,
+                creationflags=creation_flags(),
+                env=child_env,
+            )
+            host_descendants_verified_empty = False
         else:
             child = subprocess.Popen(
                 argv,
@@ -555,6 +574,22 @@ def run_operation(operation_id: str, settings: Settings) -> int:
                 break
             try:
                 exit_code = child.wait(timeout=min(0.5, remaining))
+                if host_job is not None:
+                    if exit_code != 0:
+                        host_job.terminate()
+                        if not host_job.wait_empty(timeout=10):
+                            raise RuntimeError(
+                                "Approved Host Job Object descendants did not terminate"
+                            )
+                    else:
+                        descendants_deadline = max(0.0, deadline - time.monotonic())
+                        if not host_job.wait_empty(timeout=descendants_deadline):
+                            host_job.terminate()
+                            exit_code = None
+                            status = "timed_out"
+                            error = f"maximum runtime exceeded: {max_runtime} seconds"
+                            failure_class = "runtime_limit"
+                            break
                 if sandbox_job is not None and sandbox_job.violation is not None:
                     status = "failed"
                     error = f"sandbox OS resource limit exceeded: {sandbox_job.violation}"
@@ -650,6 +685,19 @@ def run_operation(operation_id: str, settings: Settings) -> int:
         failure_class = "launcher_failure" if child is None else "execution_failure"
         error = f"{type(exc).__name__}: {exc}"
     finally:
+        if host_job is not None:
+            try:
+                if not host_job.terminate():
+                    raise RuntimeError("Approved Host Job Object termination failed")
+                if not host_job.wait_empty(timeout=10):
+                    raise RuntimeError("Approved Host Job Object descendants did not terminate")
+                host_descendants_verified_empty = True
+            except Exception as cleanup_error:  # noqa: BLE001 - containment must fail closed
+                status = "failed"
+                failure_class = "approved_host_cleanup_failure"
+                error = f"{type(cleanup_error).__name__}: {cleanup_error}"
+            finally:
+                host_job.close()
         if sandbox_job is not None:
             try:
                 sandbox_job.terminate()
@@ -674,6 +722,8 @@ def run_operation(operation_id: str, settings: Settings) -> int:
 
     if operation["tier"] == "approved_host" and host_control_state is not None:
         try:
+            if not host_descendants_verified_empty:
+                raise RuntimeError("Approved Host descendant termination was not verified")
             fresh_operation = audit.get_operation(operation_id, include_events=False)
             fresh_binding = {
                 "id": fresh_operation["id"],

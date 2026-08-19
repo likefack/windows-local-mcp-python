@@ -1,7 +1,10 @@
 import os
 import sys
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+import pytest
 
 from windows_local_mcp.approval import prepare_approval_bundle
 from windows_local_mcp.audit import AuditStore
@@ -34,6 +37,7 @@ def _prepare_operation(
     data: Path,
     operation_id: str,
     script_text: str,
+    max_runtime_seconds: int = 30,
 ) -> tuple[Settings, AuditStore, Executor]:
     script = workspace / "main.py"
     script.write_text(script_text, encoding="utf-8")
@@ -70,7 +74,7 @@ def _prepare_operation(
         "approval_manifest_digest": digest,
         "approval_manifest_summary": {"mode": manifest["mode"]},
         "workspace_write": False,
-        "max_runtime_seconds": 30,
+        "max_runtime_seconds": max_runtime_seconds,
         "execution_tier": "approved_host",
     }
     store.create_operation(
@@ -218,3 +222,129 @@ def test_approved_host_control_plane_tamper_is_detected_and_blocks_future_work(
     assert operation["result"]["failure_class"] == "control_plane_tamper_unknown"
     assert "could not be verified" in str(operation["error"])
     assert (settings.data_dir / "control-plane" / "tamper-detected.json").is_file()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Approved Host descendant Job Object is Windows-only")
+def test_approved_host_waits_for_descendants_before_control_plane_postflight(
+    tmp_path: Path, monkeypatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    data = tmp_path / "data"
+    config = tmp_path / "config.toml"
+    _write_config(workspace, data, config)
+    monkeypatch.setenv("LOCAL_MCP_CONFIG", str(config))
+    monkeypatch.delenv("LOCAL_MCP_ROOT", raising=False)
+    operation_id = "approved-host-late-descendant-tamper"
+    late_write = data / "control-plane" / "late-write.txt"
+    descendant = (
+        "import time\n"
+        "from pathlib import Path\n"
+        "time.sleep(1.0)\n"
+        f"Path({str(late_write)!r}).write_text('late tamper', encoding='utf-8')\n"
+    )
+    script = (
+        "import subprocess, sys\n"
+        f"descendant={descendant!r}\n"
+        "subprocess.Popen([sys.executable, '-I', '-c', descendant], "
+        "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+        "stderr=subprocess.DEVNULL, close_fds=True)\n"
+        "print('parent exited')\n"
+    )
+
+    settings, store, executor = _prepare_operation(
+        workspace=workspace,
+        data=data,
+        operation_id=operation_id,
+        script_text=script,
+    )
+    store.approve_and_claim(operation_id, approver="integration-test")
+    result = executor.launch(operation_id, 30)
+    deadline = time.monotonic() + 3
+    while not late_write.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    operation = store.get_operation(operation_id)
+
+    assert late_write.read_text(encoding="utf-8") == "late tamper"
+    assert result["status"] == "failed"
+    assert operation["result"]["failure_class"] == "control_plane_tamper"
+    assert (settings.data_dir / "control-plane" / "tamper-detected.json").is_file()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Approved Host descendant Job Object is Windows-only")
+def test_approved_host_allows_legitimate_descendant_to_finish(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    data = tmp_path / "data"
+    config = tmp_path / "config.toml"
+    _write_config(workspace, data, config)
+    monkeypatch.setenv("LOCAL_MCP_CONFIG", str(config))
+    monkeypatch.delenv("LOCAL_MCP_ROOT", raising=False)
+    output = data / "outputs" / "descendant-result.txt"
+    descendant = (
+        "import time\n"
+        "from pathlib import Path\n"
+        "time.sleep(0.5)\n"
+        f"Path({str(output)!r}).write_text('finished', encoding='utf-8')\n"
+    )
+    script = (
+        "import subprocess, sys\n"
+        f"descendant={descendant!r}\n"
+        "subprocess.Popen([sys.executable, '-I', '-c', descendant], "
+        "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+        "stderr=subprocess.DEVNULL, close_fds=True)\n"
+    )
+
+    _, store, executor = _prepare_operation(
+        workspace=workspace,
+        data=data,
+        operation_id="approved-host-legitimate-descendant",
+        script_text=script,
+    )
+    store.approve_and_claim("approved-host-legitimate-descendant", approver="integration-test")
+    started = time.monotonic()
+    result = executor.launch("approved-host-legitimate-descendant", 30)
+
+    assert result["status"] == "succeeded"
+    assert time.monotonic() - started >= 0.4
+    assert output.read_text(encoding="utf-8") == "finished"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Approved Host descendant Job Object is Windows-only")
+def test_approved_host_terminates_descendants_at_runtime_limit(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    data = tmp_path / "data"
+    config = tmp_path / "config.toml"
+    _write_config(workspace, data, config)
+    monkeypatch.setenv("LOCAL_MCP_CONFIG", str(config))
+    monkeypatch.delenv("LOCAL_MCP_ROOT", raising=False)
+    late_write = data / "control-plane" / "after-timeout.txt"
+    descendant = (
+        "import time\n"
+        "from pathlib import Path\n"
+        "time.sleep(2.0)\n"
+        f"Path({str(late_write)!r}).write_text('escaped', encoding='utf-8')\n"
+    )
+    script = (
+        "import subprocess, sys\n"
+        f"descendant={descendant!r}\n"
+        "subprocess.Popen([sys.executable, '-I', '-c', descendant], "
+        "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+        "stderr=subprocess.DEVNULL, close_fds=True)\n"
+    )
+
+    _, store, executor = _prepare_operation(
+        workspace=workspace,
+        data=data,
+        operation_id="approved-host-descendant-timeout",
+        script_text=script,
+        max_runtime_seconds=1,
+    )
+    store.approve_and_claim("approved-host-descendant-timeout", approver="integration-test")
+    result = executor.launch("approved-host-descendant-timeout", 10)
+    time.sleep(1.5)
+
+    assert result["status"] == "timed_out"
+    assert result["failure_class"] == "runtime_limit"
+    assert not late_write.exists()

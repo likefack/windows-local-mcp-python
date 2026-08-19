@@ -1,5 +1,26 @@
 # 検証記録
 
+## 2026-08-19 Approved Host 子孫プロセスの事後改ざん防止
+
+### 再現と修正
+
+- 修正前は、Approved Host の親が子プロセスを残して終了すると operation が `succeeded` になり、その後に子が `data_dir/control-plane` へ書き込めることを実プロセスで再現した。
+- Windows の Approved Host 親を一時停止状態で起動し、kill-on-close を設定した operation 固有 Job Object へ割り当ててから再開するようにした。
+- 親の終了だけでは事後検査へ進まず、Job の active process が0になるまで待つ。実行期限を超えた子孫は Job 全体で終了し、子孫0を確認できない場合は改ざん検査境界を検証不能として fail closed にする。
+- Codex Sandbox は同じ Job Object 実装を従来どおり process 数・job memory 上限付きで使用し、Approved Host には Sandbox 用の resource 上限を流用しない。
+
+### Windows 回帰結果
+
+- 修正前の攻撃再現: 対象テストは `succeeded` と遅延書込みを観測して失敗した。
+- 修正後の攻撃回帰: 親の後に残った子の書込みを事後検査が検出し、operation は `control_plane_tamper` で失敗、tamper marker を作成した。
+- 正常系: 親の後に短時間だけ動く子は完了まで待機し、許可された出力を残して operation が成功した。
+- timeout 系: 実行期限を超える子を Job 全体で停止し、operation は `runtime_limit`、停止後の遅延書込みは発生しなかった。
+- Approved Host integration: 7 passed。
+- full pytest: 260 passed、2 skipped（固有の `--basetemp` を使用）。
+- `ruff check .`: pass。
+- `python -m compileall -q src tests`: pass。
+- `git diff --check`: pass（LF／CRLF の将来変換 warning のみ）。
+
 ## 2026-08-13 Codex Sandbox実境界の修正
 
 ### 対象と変更

@@ -106,7 +106,7 @@ Git／ADB helper は設定済み path、SHA-256、file identity を正規化時�
 
 承認後の実行ファイルも実行直前に path、SHA-256、device／inode、size、mtime を照合し、Windows では実行終了まで差し替えを拒否する handle を保持します。
 
-Approved Host は同一ユーザー権限で制御領域へ到達し得るため、実行中の audit、approval staging、CAS、journal、transfer、worker context を監視し、整合性を確認できない場合は fail closed marker を残して以後の処理を停止します。これは別 OS アカウントや service による完全な権限分離ではなく、改ざん検出境界です。
+Approved Host は同一ユーザー権限で制御領域へ到達し得るため、実行中の audit、approval staging、CAS、journal、transfer、worker context を監視し、整合性を確認できない場合は fail closed marker を残して以後の処理を停止します。Windows では親を一時停止して Job Object へ収容してから再開し、全子孫が終了したことを確認するまでこの事後検査へ進みません。実行期限を超えた子孫は Job 全体で終了します。これは別 OS アカウントや service による完全な権限分離ではなく、改ざん検出境界です。
 
 ## Codex Sandbox
 
