@@ -1,0 +1,12 @@
+﻿[
+    {
+        "file":  "C:\\dev\\windows-local-mcp-python\\diagnostics\\WFP-PhaseB-Step2-Results\\20260815-014336\\result.json",
+        "sha256":  "4F716C53DB034A729B6760C006A00257E7D74E9BD9A8407657A6185C3C3B8AE6",
+        "length":  6087
+    },
+    {
+        "file":  "C:\\dev\\windows-local-mcp-python\\diagnostics\\WFP-PhaseB-Step2-Results\\20260815-014336\\step2-log.txt",
+        "sha256":  "3E9946A9B3B48FDC6CA4E89DC2276FBC6E52A7C0F1998B6F737ECB21E325E478",
+        "length":  935
+    }
+]

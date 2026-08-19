@@ -1,0 +1,91 @@
+﻿{
+    "schema_version":  1,
+    "started_at":  "2026-08-15T01:43:36.9575246+09:00",
+    "host":  {
+                 "computer_name":  "LAPTOP-FTDLINQU",
+                 "user":  "LAPTOP-FTDLINQU\\22905",
+                 "process_id":  50300,
+                 "is_administrator":  true,
+                 "is_64_bit_process":  true,
+                 "codex_sandbox_offline":  {
+                                               "found":  true,
+                                               "name":  "CodexSandboxOffline",
+                                               "sid":  "S-1-5-21-1787218830-4025776409-3138769905-1004",
+                                               "enabled":  true
+                                           }
+             },
+    "step1_precheck":  {
+                           "passed":  true,
+                           "expected_app_isolation_weight":  7,
+                           "errors":  [
+
+                                      ],
+                           "filter_70511":  {
+                                                "requested_filter_id":  70511,
+                                                "found":  true,
+                                                "error_hex":  null,
+                                                "runtime_filter_id":  70511,
+                                                "filter_key":  "{fc335b0e-4112-40bd-8deb-6ad896364b9a}",
+                                                "name":  "AppContainerLoopback",
+                                                "description":  "This filter allows outbound AppContainer loopback traffic",
+                                                "layer_key":  "{c38d57d1-05a7-4c33-904f-7fbceee60e82}",
+                                                "sublayer_key":  "{ffe221c3-92a8-4564-a59f-dafb70756020}",
+                                                "flags":  4100,
+                                                "flags_hex":  "0x00001004",
+                                                "action_type":  4098,
+                                                "action_type_hex":  "0x00001002",
+                                                "action_name":  "FWP_ACTION_PERMIT",
+                                                "condition_count":  1,
+                                                "sublayer_found":  true,
+                                                "sublayer_error_hex":  null,
+                                                "sublayer_name":  "WFP 組み込み MPSSVC アプリ分離サブレイヤー",
+                                                "sublayer_weight":  7
+                                            },
+                           "filter_70512":  {
+                                                "requested_filter_id":  70512,
+                                                "found":  true,
+                                                "error_hex":  null,
+                                                "runtime_filter_id":  70512,
+                                                "filter_key":  "{774621d3-bdad-42c1-88d8-d1422918a3f1}",
+                                                "name":  "AppContainerLoopback",
+                                                "description":  "This filter allows outbound AppContainer loopback traffic",
+                                                "layer_key":  "{4a72393b-319f-44bc-84c3-ba54dcb3b6b4}",
+                                                "sublayer_key":  "{ffe221c3-92a8-4564-a59f-dafb70756020}",
+                                                "flags":  4100,
+                                                "flags_hex":  "0x00001004",
+                                                "action_type":  4098,
+                                                "action_type_hex":  "0x00001002",
+                                                "action_name":  "FWP_ACTION_PERMIT",
+                                                "condition_count":  1,
+                                                "sublayer_found":  true,
+                                                "sublayer_error_hex":  null,
+                                                "sublayer_name":  "WFP 組み込み MPSSVC アプリ分離サブレイヤー",
+                                                "sublayer_weight":  7
+                                            }
+                       },
+    "step2_dynamic_session":  {
+                                  "attempted":  true,
+                                  "opened":  true,
+                                  "session_key":  "{b37ea72d-fcee-4d71-b3b5-ac1d494a41ce}",
+                                  "flags":  1,
+                                  "flags_hex":  "0x00000001",
+                                  "held_until_operator_enter":  true,
+                                  "closed":  true,
+                                  "error":  null
+                              },
+    "policy_mutation":  {
+                            "wfp_sublayer_added":  false,
+                            "wfp_filter_added":  false,
+                            "windows_firewall_rule_changed":  false,
+                            "registry_changed":  false,
+                            "service_changed":  false,
+                            "expected_network_behavior_change":  false
+                        },
+    "output":  {
+                   "directory":  "C:\\dev\\windows-local-mcp-python\\diagnostics\\WFP-PhaseB-Step2-Results\\20260815-014336",
+                   "result_json":  "C:\\dev\\windows-local-mcp-python\\diagnostics\\WFP-PhaseB-Step2-Results\\20260815-014336\\result.json",
+                   "log":  "C:\\dev\\windows-local-mcp-python\\diagnostics\\WFP-PhaseB-Step2-Results\\20260815-014336\\step2-log.txt",
+                   "artifact_hashes":  "C:\\dev\\windows-local-mcp-python\\diagnostics\\WFP-PhaseB-Step2-Results\\20260815-014336\\artifact-sha256.json"
+               },
+    "finished_at":  "2026-08-15T01:43:55.3558044+09:00"
+}

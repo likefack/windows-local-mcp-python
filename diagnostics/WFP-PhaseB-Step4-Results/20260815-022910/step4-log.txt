@@ -1,0 +1,21 @@
+﻿[2026-08-15 02:29:10.410] Starting WLMCP Phase B Step 4.
+[2026-08-15 02:29:10.410] Output directory: C:\dev\windows-local-mcp-python\diagnostics\WFP-PhaseB-Step4-Results\20260815-022910
+[2026-08-15 02:29:10.410] Compiling the Step 4 helper.
+[2026-08-15 02:29:10.630] Interop layout check PASSED.
+[2026-08-15 02:29:10.630] Reading AppContainerLoopback filter 70511.
+[2026-08-15 02:29:10.645] Reading AppContainerLoopback filter 70512.
+[2026-08-15 02:29:10.665] PRECHECK PASSED.
+[2026-08-15 02:29:10.665] CodexSandboxOffline SID: S-1-5-21-1787218830-4025776409-3138769905-1004
+[2026-08-15 02:29:10.665] Operator SID: S-1-5-21-1787218830-4025776409-3138769905-1001
+[2026-08-15 02:29:10.665] App Isolation sublayer weight: 7
+[2026-08-15 02:29:10.665] Opening dynamic WFP session.
+[2026-08-15 02:29:10.665] Dynamic session opened: {cfca5a69-bfbe-4dde-a2e5-778b8718c560}
+[2026-08-15 02:29:10.665] Adding empty temporary sublayer, requested weight 10.
+[2026-08-15 02:29:10.683] Temporary sublayer observed weight: 10; App Isolation: 7.
+[2026-08-15 02:29:10.684] Adding V4 and V6 BLOCK filters atomically.
+[2026-08-15 02:29:10.699] V4 filter runtime ID: 75094
+[2026-08-15 02:29:10.700] V6 filter runtime ID: 75095
+[2026-08-15 02:29:10.741] STATIC READ-BACK VERIFICATION PASSED.
+[2026-08-15 02:40:03.557] Closing dynamic WFP session.
+[2026-08-15 02:40:03.557] Dynamic WFP session close PASSED.
+[2026-08-15 02:40:03.577] CLEANUP VERIFIED: V4/V6 filters and sublayer are absent.

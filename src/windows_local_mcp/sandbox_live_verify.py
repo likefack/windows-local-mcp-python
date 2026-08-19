@@ -23,9 +23,9 @@ from .resources import NamedControlPlaneLock, scan_directory_bounded
 from .sandbox_backend import (
     SANDBOX_SECURITY_PROPERTIES,
     CodexSandboxBackend,
+    guard_and_launch_codex_sandbox,
     hold_codex_sandbox_backend,
     isolation_context_digest,
-    launch_codex_sandbox,
     probe_codex_version,
     resolve_codex_sandbox_backend,
 )
@@ -271,7 +271,7 @@ def _run(
     nonce = uuid.uuid4().hex
     started = time.monotonic()
     try:
-        process, job, argv = launch_codex_sandbox(
+        process, job, argv, _guard = guard_and_launch_codex_sandbox(
             backend,
             settings=settings,
             command=command,
@@ -408,7 +408,7 @@ def _launch_resource_probe(
     started: float,
 ) -> tuple[subprocess.Popen[Any], WindowsSandboxJob, list[str]] | None:
     try:
-        return launch_codex_sandbox(
+        process, job, argv, _guard = guard_and_launch_codex_sandbox(
             backend,
             settings=settings,
             command=command,
@@ -420,6 +420,7 @@ def _launch_resource_probe(
             stderr=subprocess.DEVNULL,
             limits=limits,
         )
+        return process, job, argv
     except Exception as error:  # noqa: BLE001 - one independent probe must not stop others
         _record_probe_setup_failure(
             probe_diagnostics,

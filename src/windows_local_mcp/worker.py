@@ -48,8 +48,8 @@ from .sandbox_backend import (
     ApprovedSandboxUnavailable,
     CodexSandboxBackend,
     codex_sandbox_effective_policy,
+    guard_and_launch_codex_sandbox,
     hold_codex_sandbox_backend,
-    launch_codex_sandbox,
     probe_codex_version,
     require_codex_sandbox_live_verification,
     verify_codex_sandbox_backend,
@@ -332,6 +332,7 @@ def run_operation(operation_id: str, settings: Settings) -> int:
     error: str | None = None
     failure_class: str | None = None
     network_policy_payload: dict[str, object] | None = None
+    wfp_guard_verification: dict[str, object] | None = None
     sandbox_backend_hold: Any | None = None
     sandbox_job: Any | None = None
     executable_hold: Any | None = None
@@ -390,7 +391,8 @@ def run_operation(operation_id: str, settings: Settings) -> int:
             network_policy.update(
                 {
                     "backend_version": sandbox_backend_version,
-                    "isolation_setup_status": "verified_before_launch",
+                    "isolation_setup_status": "live_marker_verified",
+                    "wfp_guard_status": "pending",
                     "enforcement_status": "prepared",
                 }
             )
@@ -444,17 +446,37 @@ def run_operation(operation_id: str, settings: Settings) -> int:
         if operation["tier"] == "codex_sandbox":
             if sandbox_backend is None:
                 raise ApprovedSandboxUnavailable("Approved Sandbox backend is unavailable")
-            child, sandbox_job, _sandbox_argv = launch_codex_sandbox(
-                sandbox_backend,
-                settings=settings,
-                command=argv,
-                cwd=Path(cwd),
-                writable_roots=(runtime_root,),
-                environment=child_env,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
+
+            def record_guard_verified(payload: dict[str, object]) -> None:
+                nonlocal wfp_guard_verification, network_policy
+                wfp_guard_verification = dict(payload)
+                network_policy["wfp_guard_status"] = "verified_before_launch"
+                network_policy["wfp_guard"] = wfp_guard_verification
+                audit.update_operation(
+                    operation_id, network_policy_json=canonical_json(network_policy)
+                )
+                audit.add_event(operation_id, "wfp_guard_verified", wfp_guard_verification)
+
+            try:
+                child, sandbox_job, _sandbox_argv, _guard = guard_and_launch_codex_sandbox(
+                    sandbox_backend,
+                    settings=settings,
+                    command=argv,
+                    cwd=Path(cwd),
+                    writable_roots=(runtime_root,),
+                    environment=child_env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    on_guard_verified=record_guard_verified,
+                )
+            except ApprovedSandboxUnavailable as guard_error:
+                audit.add_event(
+                    operation_id,
+                    "wfp_guard_verification_failed",
+                    {"diagnostic": str(guard_error)[:1000], "host_fallback": False},
+                )
+                raise
         else:
             child = subprocess.Popen(
                 argv,
@@ -480,6 +502,12 @@ def run_operation(operation_id: str, settings: Settings) -> int:
                 operation_id, network_policy_json=canonical_json(network_policy_payload)
             )
             audit.add_event(operation_id, "network_policy_applied", network_policy_payload)
+        elif operation["tier"] == "codex_sandbox":
+            network_policy["enforcement_status"] = "active"
+            audit.update_operation(
+                operation_id, network_policy_json=canonical_json(network_policy)
+            )
+            audit.add_event(operation_id, "sandbox_policy_applied", network_policy)
         audit.update_operation(
             operation_id,
             child_pid=child_identity.pid,
@@ -847,6 +875,7 @@ def run_operation(operation_id: str, settings: Settings) -> int:
             request.get("sandbox_backend") if operation["tier"] == "codex_sandbox" else None
         ),
         "sandbox_backend_version": sandbox_backend_version,
+        "wfp_guard_verification": wfp_guard_verification,
         "failure_class": failure_class,
         "postflight_error": postflight_error,
         "host_fallback_performed": False,

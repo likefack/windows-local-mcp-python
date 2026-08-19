@@ -1,0 +1,17 @@
+﻿[2026-08-15 01:56:53.319] Starting WLMCP Phase B Step 3 verified v2.
+[2026-08-15 01:56:53.320] Output directory: C:\dev\windows-local-mcp-python\diagnostics\WFP-PhaseB-Step3-v2-Results\20260815-015653
+[2026-08-15 01:56:53.322] Compiling the WFP Step 3 v2 helper.
+[2026-08-15 01:56:53.508] Reading filter 70511.
+[2026-08-15 01:56:53.512] Reading filter 70512.
+[2026-08-15 01:56:53.532] PRECHECK PASSED.
+[2026-08-15 01:56:53.532] CodexSandboxOffline SID: S-1-5-21-1787218830-4025776409-3138769905-1004
+[2026-08-15 01:56:53.532] App Isolation sublayer weight: 7
+[2026-08-15 01:56:53.532] Temporary sublayer weight to test: 8
+[2026-08-15 01:56:53.532] Opening dynamic WFP session.
+[2026-08-15 01:56:53.542] Dynamic session opened: {1797582c-65d5-45fe-8577-fba85f551980}
+[2026-08-15 01:56:53.543] Adding ONE EMPTY temporary sublayer: key={72f68031-1eae-4656-bde5-4e25b316d131}, weight=8
+[2026-08-15 01:56:53.550] FwpmSubLayerAdd0 returned success.
+[2026-08-15 01:56:53.555] STEP 3 ERROR: Temporary sublayer read-back verification failed.
+[2026-08-15 01:56:53.559] Closing dynamic WFP session.
+[2026-08-15 01:56:53.562] Dynamic WFP session close PASSED.
+[2026-08-15 01:56:53.567] CLEANUP VERIFIED: temporary sublayer is absent.

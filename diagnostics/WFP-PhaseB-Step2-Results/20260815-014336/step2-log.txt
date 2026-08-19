@@ -1,0 +1,13 @@
+﻿[2026-08-15 01:43:36.750] Starting WLMCP Phase B Step 1/2.
+[2026-08-15 01:43:36.750] Output directory: C:\dev\windows-local-mcp-python\diagnostics\WFP-PhaseB-Step2-Results\20260815-014336
+[2026-08-15 01:43:36.754] Compiling the WFP Step 1/2 helper.
+[2026-08-15 01:43:36.940] Reading filter 70511.
+[2026-08-15 01:43:36.944] Reading filter 70512.
+[2026-08-15 01:43:36.964] STEP 1 PASSED.
+[2026-08-15 01:43:36.967] CodexSandboxOffline SID: S-1-5-21-1787218830-4025776409-3138769905-1004
+[2026-08-15 01:43:36.967] App Isolation sublayer weight: 7
+[2026-08-15 01:43:36.974] Opening dynamic WFP session.
+[2026-08-15 01:43:36.979] STEP 2 OPENED. Session key: {b37ea72d-fcee-4d71-b3b5-ac1d494a41ce}
+[2026-08-15 01:43:36.979] Session flags: 0x00000001 (FWPM_SESSION_FLAG_DYNAMIC)
+[2026-08-15 01:43:55.352] Closing dynamic WFP session.
+[2026-08-15 01:43:55.355] STEP 2 PASSED. Dynamic WFP session opened and closed successfully.

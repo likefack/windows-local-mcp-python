@@ -19,6 +19,7 @@ from windows_local_mcp.sandbox_backend import (
     build_codex_sandbox_argv,
     codex_sandbox_effective_policy,
     codex_sandbox_state,
+    guard_and_launch_codex_sandbox,
     isolation_context_digest,
     require_codex_sandbox_live_verification,
     resolve_codex_sandbox_backend,
@@ -31,6 +32,7 @@ from windows_local_mcp.sandbox_live_verify import (
 )
 from windows_local_mcp.sandbox_live_verify import _run as run_live_probe
 from windows_local_mcp.util import canonical_json, sha256_text
+from windows_local_mcp.wfp_guard import GuardVerification, WfpGuardError
 from windows_local_mcp.windows_job import WindowsJobLimits, WindowsSandboxJob
 from windows_local_mcp.windows_system import windows_system_executable
 from windows_local_mcp.workspace_history import (
@@ -53,6 +55,126 @@ def _settings(tmp_path: Path) -> Settings:
     )
     settings.ensure_directories()
     return settings
+
+
+def _guard_verification() -> GuardVerification:
+    return GuardVerification(
+        guard_version="wlmcp-wfp-loopback-guard-v1",
+        policy_generation=1,
+        target_account="CodexSandboxOffline",
+        target_sid="S-1-5-21-100-200-300-1004",
+        app_isolation_sublayer_key="ffe221c3-92a8-4564-a59f-dafb70756020",
+        app_isolation_weight=7,
+        guard_sublayer_key="7019c9c2-acc9-5a02-97cb-d9ccdca1b9ab",
+        guard_sublayer_weight=10,
+        v4_filter_key="0acea791-e272-5a9c-ae2f-5bf41970dd41",
+        v4_filter_id=501,
+        v4_effective_weight=100,
+        v6_filter_key="cb98391f-1773-5060-bfb6-3de2306f8baa",
+        v6_filter_id=502,
+        v6_effective_weight=100,
+    )
+
+
+def _test_backend() -> CodexSandboxBackend:
+    return CodexSandboxBackend(
+        executable=sys.executable,
+        executable_sha256="a" * 64,
+        executable_size=1,
+        executable_mtime_ns=1,
+        windows_mode="elevated",
+        permission_profile=":workspace",
+        provenance="test",
+        signature_status="Valid",
+        signer_subject="OpenAI",
+        signer_thumbprint="b" * 40,
+        helpers=(),
+    )
+
+
+def test_guard_preflight_succeeds_before_codex_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    calls: list[str] = []
+    expected = (object(), object(), ["codex", "sandbox"])
+
+    def verify_guard() -> GuardVerification:
+        calls.append("guard")
+        return _guard_verification()
+
+    def launch(*_args: object, **_kwargs: object) -> tuple[object, object, list[str]]:
+        calls.append("launch")
+        return expected
+
+    monkeypatch.setattr(
+        "windows_local_mcp.wfp_guard_runtime.ensure_runtime_codex_loopback_guard",
+        verify_guard,
+    )
+    monkeypatch.setattr("windows_local_mcp.sandbox_backend.launch_codex_sandbox", launch)
+    process, job, argv, guard = guard_and_launch_codex_sandbox(
+        _test_backend(),
+        settings=settings,
+        command=[sys.executable, "-c", "pass"],
+        cwd=settings.workspace_root,
+        writable_roots=(),
+        environment={},
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert (process, job, argv) == expected
+    assert calls == ["guard", "launch"]
+    assert guard["target_sid"] == "S-1-5-21-100-200-300-1004"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        WfpGuardError("required object is absent"),
+        WfpGuardError("read-back verification failed"),
+        WfpGuardError("SID/filter/sublayer mismatch"),
+        OSError("Guard IPC failed"),
+    ],
+)
+def test_guard_preflight_failure_never_starts_codex_or_subprocess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    settings = _settings(tmp_path)
+    launch_calls: list[str] = []
+
+    def fail_guard() -> GuardVerification:
+        raise error
+
+    def forbidden_launch(*_args: object, **_kwargs: object) -> object:
+        launch_calls.append("launch")
+        raise AssertionError("Codex launch must not be reached")
+
+    def forbidden_popen(*_args: object, **_kwargs: object) -> object:
+        launch_calls.append("popen")
+        raise AssertionError("subprocess must not be reached")
+
+    monkeypatch.setattr(
+        "windows_local_mcp.wfp_guard_runtime.ensure_runtime_codex_loopback_guard",
+        fail_guard,
+    )
+    monkeypatch.setattr(
+        "windows_local_mcp.sandbox_backend.launch_codex_sandbox", forbidden_launch
+    )
+    monkeypatch.setattr(subprocess, "Popen", forbidden_popen)
+    with pytest.raises(ApprovedSandboxUnavailable, match="WFP Guard verification failed"):
+        guard_and_launch_codex_sandbox(
+            _test_backend(),
+            settings=settings,
+            command=[sys.executable, "-c", "pass"],
+            cwd=settings.workspace_root,
+            writable_roots=(),
+            environment={},
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    assert launch_calls == []
 
 
 def test_codex_sandbox_adapter_binds_installed_launcher_without_agent(
@@ -399,7 +521,8 @@ def test_live_probe_launch_failure_is_unverified_and_does_not_raise(
         raise OSError("sandbox launcher unavailable")
 
     monkeypatch.setattr(
-        "windows_local_mcp.sandbox_live_verify.launch_codex_sandbox", unavailable
+        "windows_local_mcp.sandbox_live_verify.guard_and_launch_codex_sandbox",
+        unavailable,
     )
     probe_diagnostics: list[dict[str, object]] = []
     result = run_live_probe(
@@ -437,7 +560,7 @@ def test_independent_probe_launch_failure_does_not_stop_next_probe(
         helpers=(),
     )
     monkeypatch.setattr(
-        "windows_local_mcp.sandbox_live_verify.launch_codex_sandbox",
+        "windows_local_mcp.sandbox_live_verify.guard_and_launch_codex_sandbox",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("launch failed")),
     )
     diagnostics: list[dict[str, object]] = []
@@ -570,7 +693,7 @@ def test_live_probe_timeout_terminates_descendant_process(
         stdout: object,
         stderr: object,
         **_kwargs: object,
-    ) -> tuple[subprocess.Popen[bytes], WindowsSandboxJob, list[str]]:
+    ) -> tuple[subprocess.Popen[bytes], WindowsSandboxJob, list[str], dict[str, object]]:
         job = WindowsSandboxJob(
             WindowsJobLimits(max_processes=8, max_memory_bytes=512 * 1024 * 1024)
         )
@@ -583,10 +706,10 @@ def test_live_probe_timeout_terminates_descendant_process(
             stderr=stderr,
             shell=False,
         )
-        return process, job, command
+        return process, job, command, _guard_verification().as_dict()
 
     monkeypatch.setattr(
-        "windows_local_mcp.sandbox_live_verify.launch_codex_sandbox",
+        "windows_local_mcp.sandbox_live_verify.guard_and_launch_codex_sandbox",
         launch_direct,
     )
 

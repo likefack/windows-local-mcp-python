@@ -127,6 +127,16 @@ max_sandbox_memory_bytes = 4294967296
 
 WLMCP は `codex sandbox` 専用 entrypoint を argv で起動し、agent／model API は使用しません。launcher と helper の path、署名、hash、file identity を承認と実行時に検証します。
 
+Sandbox 起動直前には、`CodexSandboxOffline` の SID を Windows から解決し、ALE_AUTH_CONNECT_V4／V6 の loopback BLOCK を direct WFP で ensure して全項目を read-back します。Guard の sublayer は現在の App Isolation sublayer より高い weight を必要とし、object は static、non-dynamic、non-persistent です。正しい既存 object は再利用し、不一致や検証不能時は Sandbox を起動せず、Approved Host へ移行しません。BLOCK は各 Sandbox の終了、timeout、launcher failure、Job Object 違反では削除せず、Windows 再起動または BFE 停止後の次回起動前に再作成します。WFP 変更だけを固定操作の昇格 Guard に隔離し、WLMCP server／worker 自体は通常権限のままです。
+
+明示的な管理者メンテナンスだけは次の固定コマンドを使用できます。通常の worker 経路から cleanup は呼び出されません。
+
+```powershell
+.\.venv\Scripts\python.exe -m windows_local_mcp.wfp_guard_runtime --maintenance-verify
+.\.venv\Scripts\python.exe -m windows_local_mcp.wfp_guard_runtime --maintenance-ensure
+.\.venv\Scripts\python.exe -m windows_local_mcp.wfp_guard_runtime --maintenance-cleanup
+```
+
 起動時には legacy profile 名だけに依存せず、source workspace の read、operation 固有 scratch の write、明示した依存 root の read、保護名の deny、network restricted を含む `sandbox-state` をCodex CLIへ渡します。さらにlauncherを一時停止状態で起動し、Windows Job Objectへ割り当ててから再開します。Job Objectはlauncherを含む子孫全体のprocess数、commit memory、終了時killをOSで強制します。上限違反はjob全体を停止し、WLMCPは子孫が0になったことと終了状態を回収できたことを確認します。
 
 Sandbox staging は `.env` 等の保護対象と、`.venv`、`node_modules`、`build`、`__pycache__` 等の生成・依存 tree を一律 copy しません。必要な外部依存は `sandbox_dependency_readable_paths` 等の明示的で検証可能な入力として扱い、暗黙に source workspace を参照させません。staging から除外しただけでは OS read denial の代替にならないため、保護情報の直接 read denial は上記の実機 property で別に検証します。

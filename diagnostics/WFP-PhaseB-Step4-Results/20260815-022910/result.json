@@ -1,0 +1,340 @@
+﻿{
+    "schema_version":  1,
+    "started_at":  "2026-08-15T02:29:10.6638845+09:00",
+    "host":  {
+                 "computer_name":  "LAPTOP-FTDLINQU",
+                 "operator":  "LAPTOP-FTDLINQU\\22905",
+                 "operator_sid":  "S-1-5-21-1787218830-4025776409-3138769905-1001",
+                 "process_id":  50300,
+                 "is_administrator":  true,
+                 "is_64_bit_process":  true,
+                 "codex_sandbox_offline":  {
+                                               "found":  true,
+                                               "name":  "CodexSandboxOffline",
+                                               "sid":  "S-1-5-21-1787218830-4025776409-3138769905-1004",
+                                               "enabled":  true
+                                           }
+             },
+    "interop_layout":  {
+                           "passed":  true,
+                           "observed":  {
+                                            "display_data_size":  16,
+                                            "byte_blob_size":  16,
+                                            "sublayer_size":  72,
+                                            "value_size":  16,
+                                            "condition_value_size":  16,
+                                            "filter_condition_size":  40,
+                                            "action_size":  20,
+                                            "filter_size":  200,
+                                            "sublayer_weight_offset":  64,
+                                            "condition_field_key_offset":  0,
+                                            "condition_match_type_offset":  16,
+                                            "condition_value_offset":  24,
+                                            "filter_flags_offset":  32,
+                                            "filter_layer_offset":  64,
+                                            "filter_sublayer_offset":  80,
+                                            "filter_weight_offset":  96,
+                                            "filter_condition_count_offset":  112,
+                                            "filter_condition_ptr_offset":  120,
+                                            "filter_action_offset":  128
+                                        },
+                           "expected":  {
+                                            "display_data_size":  16,
+                                            "byte_blob_size":  16,
+                                            "sublayer_size":  72,
+                                            "value_size":  16,
+                                            "condition_value_size":  16,
+                                            "filter_condition_size":  40,
+                                            "action_size":  20,
+                                            "filter_size":  200,
+                                            "sublayer_weight_offset":  64,
+                                            "condition_field_key_offset":  0,
+                                            "condition_match_type_offset":  16,
+                                            "condition_value_offset":  24,
+                                            "filter_flags_offset":  32,
+                                            "filter_layer_offset":  64,
+                                            "filter_sublayer_offset":  80,
+                                            "filter_weight_offset":  96,
+                                            "filter_condition_count_offset":  112,
+                                            "filter_condition_ptr_offset":  120,
+                                            "filter_action_offset":  128
+                                        },
+                           "errors":  [
+
+                                      ]
+                       },
+    "precheck":  {
+                     "passed":  true,
+                     "errors":  [
+
+                                ],
+                     "expected_app_isolation_sublayer_key":  "{ffe221c3-92a8-4564-a59f-dafb70756020}",
+                     "expected_flags_condition_key":  "{632ce23b-5167-435c-86d7-e903684aa80c}",
+                     "app_isolation_sublayer_key":  "{ffe221c3-92a8-4564-a59f-dafb70756020}",
+                     "app_isolation_weight":  7,
+                     "reference_filter_v4":  {
+                                                 "requested_filter_id":  70511,
+                                                 "found":  true,
+                                                 "error_hex":  null,
+                                                 "runtime_filter_id":  70511,
+                                                 "filter_key":  "{fc335b0e-4112-40bd-8deb-6ad896364b9a}",
+                                                 "name":  "AppContainerLoopback",
+                                                 "description":  "This filter allows outbound AppContainer loopback traffic",
+                                                 "flags":  4100,
+                                                 "flags_hex":  "0x00001004",
+                                                 "layer_key":  "{c38d57d1-05a7-4c33-904f-7fbceee60e82}",
+                                                 "sublayer_key":  "{ffe221c3-92a8-4564-a59f-dafb70756020}",
+                                                 "sublayer_found":  true,
+                                                 "sublayer_error_hex":  null,
+                                                 "sublayer_name":  "WFP 組み込み MPSSVC アプリ分離サブレイヤー",
+                                                 "sublayer_weight":  7,
+                                                 "action_type":  4098,
+                                                 "action_type_hex":  "0x00001002",
+                                                 "action_name":  "FWP_ACTION_PERMIT",
+                                                 "condition_count":  1,
+                                                 "conditions":  [
+                                                                    {
+                                                                        "field_key":  "{632ce23b-5167-435c-86d7-e903684aa80c}",
+                                                                        "field_name":  "FWPM_CONDITION_FLAGS",
+                                                                        "match_type":  6,
+                                                                        "value_type":  3,
+                                                                        "uint32_value":  1,
+                                                                        "normalized_dacl_sddl":  null
+                                                                    }
+                                                                ]
+                                             },
+                     "reference_filter_v6":  {
+                                                 "requested_filter_id":  70512,
+                                                 "found":  true,
+                                                 "error_hex":  null,
+                                                 "runtime_filter_id":  70512,
+                                                 "filter_key":  "{774621d3-bdad-42c1-88d8-d1422918a3f1}",
+                                                 "name":  "AppContainerLoopback",
+                                                 "description":  "This filter allows outbound AppContainer loopback traffic",
+                                                 "flags":  4100,
+                                                 "flags_hex":  "0x00001004",
+                                                 "layer_key":  "{4a72393b-319f-44bc-84c3-ba54dcb3b6b4}",
+                                                 "sublayer_key":  "{ffe221c3-92a8-4564-a59f-dafb70756020}",
+                                                 "sublayer_found":  true,
+                                                 "sublayer_error_hex":  null,
+                                                 "sublayer_name":  "WFP 組み込み MPSSVC アプリ分離サブレイヤー",
+                                                 "sublayer_weight":  7,
+                                                 "action_type":  4098,
+                                                 "action_type_hex":  "0x00001002",
+                                                 "action_name":  "FWP_ACTION_PERMIT",
+                                                 "condition_count":  1,
+                                                 "conditions":  [
+                                                                    {
+                                                                        "field_key":  "{632ce23b-5167-435c-86d7-e903684aa80c}",
+                                                                        "field_name":  "FWPM_CONDITION_FLAGS",
+                                                                        "match_type":  6,
+                                                                        "value_type":  3,
+                                                                        "uint32_value":  1,
+                                                                        "normalized_dacl_sddl":  null
+                                                                    }
+                                                                ]
+                                             }
+                 },
+    "temporary_sublayer":  {
+                               "key":  "{2cb3904a-47d3-421c-ae63-bce6adce7f8b}",
+                               "requested_weight":  10,
+                               "add_succeeded":  true,
+                               "observed":  {
+                                                "found":  true,
+                                                "error_hex":  null,
+                                                "key":  "{2cb3904a-47d3-421c-ae63-bce6adce7f8b}",
+                                                "name":  "WLMCP_PhaseB_Temporary_Codex_Loopback_Block_Sublayer",
+                                                "description":  "Temporary Step 4 sublayer for CodexSandboxOffline loopback block.",
+                                                "flags":  0,
+                                                "weight":  10
+                                            },
+                               "verified_higher_than_app_isolation":  true
+                           },
+    "temporary_filters":  {
+                              "transaction_committed":  true,
+                              "expected_target_sid":  "S-1-5-21-1787218830-4025776409-3138769905-1004",
+                              "expected_loopback_flag":  1,
+                              "expected_user_match_type":  0,
+                              "expected_flags_match_type":  6,
+                              "expected_user_value_type":  14,
+                              "expected_flags_value_type":  3,
+                              "expected_normalized_dacl_sddl":  "D:(A;;CC;;;S-1-5-21-1787218830-4025776409-3138769905-1004)",
+                              "v4_filter_key":  "{e14e058c-8e0e-4ddc-9e5c-3b57b9835047}",
+                              "v6_filter_key":  "{f6a040a3-8c02-4c96-a85e-7f68d5a43220}",
+                              "v4_filter_id":  75094,
+                              "v6_filter_id":  75095,
+                              "v4_readback":  {
+                                                  "requested_filter_id":  75094,
+                                                  "found":  true,
+                                                  "error_hex":  null,
+                                                  "runtime_filter_id":  75094,
+                                                  "filter_key":  "{e14e058c-8e0e-4ddc-9e5c-3b57b9835047}",
+                                                  "name":  "WLMCP_PhaseB_Temporary_Codex_Loopback_Block_V4",
+                                                  "description":  "Temporary Step 4 block: CodexSandboxOffline loopback V4.",
+                                                  "flags":  0,
+                                                  "flags_hex":  "0x00000000",
+                                                  "layer_key":  "{c38d57d1-05a7-4c33-904f-7fbceee60e82}",
+                                                  "sublayer_key":  "{2cb3904a-47d3-421c-ae63-bce6adce7f8b}",
+                                                  "sublayer_found":  true,
+                                                  "sublayer_error_hex":  null,
+                                                  "sublayer_name":  "WLMCP_PhaseB_Temporary_Codex_Loopback_Block_Sublayer",
+                                                  "sublayer_weight":  10,
+                                                  "action_type":  4097,
+                                                  "action_type_hex":  "0x00001001",
+                                                  "action_name":  "FWP_ACTION_BLOCK",
+                                                  "condition_count":  2,
+                                                  "conditions":  [
+                                                                     {
+                                                                         "field_key":  "{af043a0a-b34d-4f86-979c-c90371af6e66}",
+                                                                         "field_name":  "FWPM_CONDITION_ALE_USER_ID",
+                                                                         "match_type":  0,
+                                                                         "value_type":  14,
+                                                                         "uint32_value":  3533192384,
+                                                                         "normalized_dacl_sddl":  "D:(A;;CC;;;S-1-5-21-1787218830-4025776409-3138769905-1004)"
+                                                                     },
+                                                                     {
+                                                                         "field_key":  "{632ce23b-5167-435c-86d7-e903684aa80c}",
+                                                                         "field_name":  "FWPM_CONDITION_FLAGS",
+                                                                         "match_type":  6,
+                                                                         "value_type":  3,
+                                                                         "uint32_value":  1,
+                                                                         "normalized_dacl_sddl":  null
+                                                                     }
+                                                                 ]
+                                              },
+                              "v6_readback":  {
+                                                  "requested_filter_id":  75095,
+                                                  "found":  true,
+                                                  "error_hex":  null,
+                                                  "runtime_filter_id":  75095,
+                                                  "filter_key":  "{f6a040a3-8c02-4c96-a85e-7f68d5a43220}",
+                                                  "name":  "WLMCP_PhaseB_Temporary_Codex_Loopback_Block_V6",
+                                                  "description":  "Temporary Step 4 block: CodexSandboxOffline loopback V6.",
+                                                  "flags":  0,
+                                                  "flags_hex":  "0x00000000",
+                                                  "layer_key":  "{4a72393b-319f-44bc-84c3-ba54dcb3b6b4}",
+                                                  "sublayer_key":  "{2cb3904a-47d3-421c-ae63-bce6adce7f8b}",
+                                                  "sublayer_found":  true,
+                                                  "sublayer_error_hex":  null,
+                                                  "sublayer_name":  "WLMCP_PhaseB_Temporary_Codex_Loopback_Block_Sublayer",
+                                                  "sublayer_weight":  10,
+                                                  "action_type":  4097,
+                                                  "action_type_hex":  "0x00001001",
+                                                  "action_name":  "FWP_ACTION_BLOCK",
+                                                  "condition_count":  2,
+                                                  "conditions":  [
+                                                                     {
+                                                                         "field_key":  "{af043a0a-b34d-4f86-979c-c90371af6e66}",
+                                                                         "field_name":  "FWPM_CONDITION_ALE_USER_ID",
+                                                                         "match_type":  0,
+                                                                         "value_type":  14,
+                                                                         "uint32_value":  3533192384,
+                                                                         "normalized_dacl_sddl":  "D:(A;;CC;;;S-1-5-21-1787218830-4025776409-3138769905-1004)"
+                                                                     },
+                                                                     {
+                                                                         "field_key":  "{632ce23b-5167-435c-86d7-e903684aa80c}",
+                                                                         "field_name":  "FWPM_CONDITION_FLAGS",
+                                                                         "match_type":  6,
+                                                                         "value_type":  3,
+                                                                         "uint32_value":  1,
+                                                                         "normalized_dacl_sddl":  null
+                                                                     }
+                                                                 ]
+                                              },
+                              "v4_verified":  true,
+                              "v6_verified":  true
+                          },
+    "active":  {
+                   "ready_for_step5":  false,
+                   "filters_active":  false,
+                   "waiting_for_operator_enter":  false
+               },
+    "cleanup":  {
+                    "close_attempted":  true,
+                    "close_rc_hex":  "0x00000000",
+                    "close_succeeded":  true,
+                    "emergency_delete_attempted":  false,
+                    "emergency_delete_results":  [
+
+                                                 ],
+                    "v4_filter_absent":  true,
+                    "v6_filter_absent":  true,
+                    "sublayer_absent":  true,
+                    "v4_post_close":  {
+                                          "requested_filter_id":  75094,
+                                          "found":  false,
+                                          "error_hex":  "0x80320003",
+                                          "runtime_filter_id":  0,
+                                          "filter_key":  null,
+                                          "name":  null,
+                                          "description":  null,
+                                          "flags":  0,
+                                          "flags_hex":  null,
+                                          "layer_key":  null,
+                                          "sublayer_key":  null,
+                                          "sublayer_found":  false,
+                                          "sublayer_error_hex":  null,
+                                          "sublayer_name":  null,
+                                          "sublayer_weight":  0,
+                                          "action_type":  0,
+                                          "action_type_hex":  null,
+                                          "action_name":  null,
+                                          "condition_count":  0,
+                                          "conditions":  [
+
+                                                         ]
+                                      },
+                    "v6_post_close":  {
+                                          "requested_filter_id":  75095,
+                                          "found":  false,
+                                          "error_hex":  "0x80320003",
+                                          "runtime_filter_id":  0,
+                                          "filter_key":  null,
+                                          "name":  null,
+                                          "description":  null,
+                                          "flags":  0,
+                                          "flags_hex":  null,
+                                          "layer_key":  null,
+                                          "sublayer_key":  null,
+                                          "sublayer_found":  false,
+                                          "sublayer_error_hex":  null,
+                                          "sublayer_name":  null,
+                                          "sublayer_weight":  0,
+                                          "action_type":  0,
+                                          "action_type_hex":  null,
+                                          "action_name":  null,
+                                          "condition_count":  0,
+                                          "conditions":  [
+
+                                                         ]
+                                      },
+                    "sublayer_post_close":  {
+                                                "found":  false,
+                                                "error_hex":  "0x80320007",
+                                                "key":  "{2cb3904a-47d3-421c-ae63-bce6adce7f8b}",
+                                                "name":  null,
+                                                "description":  null,
+                                                "flags":  0,
+                                                "weight":  0
+                                            }
+                },
+    "policy_mutation":  {
+                            "temporary_wfp_sublayer_added":  true,
+                            "temporary_wfp_filters_added":  true,
+                            "windows_firewall_rule_changed":  false,
+                            "registry_changed":  false,
+                            "service_changed":  false,
+                            "provider_added":  false,
+                            "driver_added":  false,
+                            "persistent_wfp_object_created":  false,
+                            "expected_network_behavior_change_while_active":  "Block CodexSandboxOffline loopback outbound connect/first datagram at ALE_AUTH_CONNECT V4/V6."
+                        },
+    "error":  null,
+    "output":  {
+                   "directory":  "C:\\dev\\windows-local-mcp-python\\diagnostics\\WFP-PhaseB-Step4-Results\\20260815-022910",
+                   "result_json":  "C:\\dev\\windows-local-mcp-python\\diagnostics\\WFP-PhaseB-Step4-Results\\20260815-022910\\result.json",
+                   "log":  "C:\\dev\\windows-local-mcp-python\\diagnostics\\WFP-PhaseB-Step4-Results\\20260815-022910\\step4-log.txt",
+                   "artifact_hashes":  "C:\\dev\\windows-local-mcp-python\\diagnostics\\WFP-PhaseB-Step4-Results\\20260815-022910\\artifact-sha256.json"
+               },
+    "finished_at":  "2026-08-15T02:40:03.5792336+09:00"
+}

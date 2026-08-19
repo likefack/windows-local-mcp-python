@@ -7,7 +7,7 @@ import os
 import re
 import subprocess
 import uuid
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from ctypes import create_unicode_buffer, get_last_error, wintypes
 from dataclasses import dataclass
@@ -18,6 +18,7 @@ from .child_env import build_command_environment, sanitize_executable_search_pat
 from .config import Settings
 from .tool_safety import ensure_external_tool_executable
 from .util import canonical_json, sha256_text
+from .wfp_guard import GUARD_POLICY_GENERATION, GUARD_VERSION
 from .windows_job import WindowsJobLimits, WindowsSandboxJob
 from .windows_system import physical_filesystem_path
 
@@ -586,6 +587,51 @@ def launch_codex_sandbox(
     return process, job, argv
 
 
+def guard_and_launch_codex_sandbox(
+    backend: CodexSandboxBackend,
+    *,
+    settings: Settings,
+    command: list[str],
+    cwd: Path,
+    writable_roots: Sequence[Path],
+    environment: dict[str, str],
+    stdin: Any,
+    stdout: Any,
+    stderr: Any,
+    limits: WindowsJobLimits | None = None,
+    on_guard_verified: Callable[[dict[str, object]], None] | None = None,
+) -> tuple[
+    subprocess.Popen[Any], WindowsSandboxJob, list[str], dict[str, object]
+]:
+    """Verify the fixed WFP Guard immediately before starting the Sandbox route."""
+
+    from .wfp_guard import WfpGuardError
+    from .wfp_guard_runtime import ensure_runtime_codex_loopback_guard
+
+    try:
+        verification = ensure_runtime_codex_loopback_guard()
+    except (OSError, RuntimeError, WfpGuardError) as error:
+        raise ApprovedSandboxUnavailable(
+            f"Codex Sandbox WFP Guard verification failed: {error}"
+        ) from error
+    guard_payload = verification.as_dict()
+    if on_guard_verified is not None:
+        on_guard_verified(guard_payload)
+    process, job, argv = launch_codex_sandbox(
+        backend,
+        settings=settings,
+        command=command,
+        cwd=cwd,
+        writable_roots=writable_roots,
+        environment=environment,
+        stdin=stdin,
+        stdout=stdout,
+        stderr=stderr,
+        limits=limits,
+    )
+    return process, job, argv, guard_payload
+
+
 def _path_filesystem_entry(path: Path, access: str) -> dict[str, Any]:
     return {"path": {"type": "path", "path": str(path)}, "access": access}
 
@@ -633,7 +679,12 @@ def codex_sandbox_effective_policy(*, workspace_write: bool) -> dict[str, Any]:
             "internet": "deny",
             "lan": "deny",
             "loopback": "deny",
-            "enforcement": "requested Codex per-sandbox-user firewall/WFP; live evidence required",
+            "enforcement": (
+                "Codex network restriction plus read-back-verified static non-persistent "
+                "direct WFP loopback block"
+            ),
+            "loopback_guard": GUARD_VERSION,
+            "loopback_guard_policy_generation": GUARD_POLICY_GENERATION,
         },
         "descendant_policy": "filesystem/network token plus outer Job Object inherited by descendants",
         "resource_policy": "OS Job Object active-process and process-tree committed-memory limits",
