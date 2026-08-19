@@ -1,6 +1,0 @@
-﻿[2026-08-15 01:11:10.188] Starting WFP Phase A Lite v2.
-[2026-08-15 01:11:10.193] Output directory: C:\dev\windows-local-mcp-python\diagnostics\WFP-PhaseA-Results\20260815-011110
-[2026-08-15 01:11:10.193] Compiling the in-process WFP reader.
-[2026-08-15 01:11:10.478] Reading only runtime filter IDs: 70511, 70512, 74502, 75081
-[2026-08-15 01:11:10.923] Read-only WFP collection completed.
-[2026-08-15 01:11:10.923] No WFP/Firewall/registry/service mutation API was called.
