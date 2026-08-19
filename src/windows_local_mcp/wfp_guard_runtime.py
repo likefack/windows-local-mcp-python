@@ -76,29 +76,66 @@ class _ProcessEntry32W(ctypes.Structure):
     ]
 
 
-def ensure_runtime_codex_loopback_guard() -> GuardVerification:
-    """Ensure/read back the fixed WFP boundary, elevating only the Guard if needed."""
+def ensure_runtime_codex_loopback_guard(
+    *,
+    force_elevated: bool = False,
+    diagnostic_trace: dict[str, object] | None = None,
+) -> GuardVerification:
+    """Ensure/read back the fixed WFP boundary, elevating only the Guard if needed.
+
+    ``force_elevated`` exists for the real-machine integration diagnostic. It makes
+    that diagnostic exercise the production UAC/IPC path even when the fixed WFP
+    objects already exist and can be read without elevation.
+    """
 
     if os.name != "nt":
         raise WfpGuardError("The WFP Guard requires native Windows")
+    if force_elevated:
+        if _is_administrator():
+            raise WfpGuardError(
+                "The end-to-end WFP Guard diagnostic requires an unelevated caller"
+            )
+        return _run_elevated_ensure(diagnostic_trace=diagnostic_trace)
     try:
         # Correct static objects are normally readable and need no elevation or mutation.
         return verify_codex_loopback_block(new_windows_wfp_api())
     except Exception:  # noqa: BLE001 - elevated ensure re-checks all fields and still fails closed
         if _is_administrator():
             return ensure_codex_loopback_block(new_windows_wfp_api())
-    return _run_elevated_ensure()
+    return _run_elevated_ensure(diagnostic_trace=diagnostic_trace)
 
 
-def _run_elevated_ensure() -> GuardVerification:
+def _run_elevated_ensure(
+    *, diagnostic_trace: dict[str, object] | None = None
+) -> GuardVerification:
     pipe_name = rf"\\.\pipe\wlmcp-wfp-guard-{uuid.uuid4().hex}"
     listener = Listener(pipe_name, family="AF_PIPE")
     messages: queue.Queue[bytes | BaseException] = queue.Queue(maxsize=1)
     process_handle: wintypes.HANDLE | None = None
+    if diagnostic_trace is not None:
+        diagnostic_trace.update(
+            {
+                "transport": "Windows named pipe (multiprocessing.connection.AF_PIPE)",
+                "pipe_server_pid": os.getpid(),
+                "shell_execute": {"api": "ShellExecuteExW", "verb": "runas"},
+                "pipe_proceed_token_sent": False,
+                "pipe_peer_identity_verified": False,
+            }
+        )
     try:
         try:
-            process_handle = _shell_execute_elevated(pipe_name)
+            if diagnostic_trace is None:
+                process_handle = _shell_execute_elevated(pipe_name)
+            else:
+                process_handle = _shell_execute_elevated(
+                    pipe_name, include_integration_evidence=True
+                )
             elevated_pid = _process_id_from_handle(process_handle)
+            if diagnostic_trace is not None:
+                diagnostic_trace["runas_process_pid"] = elevated_pid
+                diagnostic_trace["runas_process_executable"] = _process_executable_path(
+                    elevated_pid
+                )
         except Exception:
             listener.close()
             raise
@@ -111,13 +148,25 @@ def _run_elevated_ensure() -> GuardVerification:
                     # bootstrap pipe to the process returned by runas or the Python process
                     # directly launched by the Windows venv launcher represented by that handle.
                     client_pid = _named_pipe_client_process_id(connection.fileno())
-                    if not _is_expected_pipe_client(client_pid, elevated_pid):
+                    peer_verified = _is_expected_pipe_client(client_pid, elevated_pid)
+                    if diagnostic_trace is not None:
+                        diagnostic_trace["pipe_client_pid"] = client_pid
+                        diagnostic_trace["pipe_client_executable"] = _process_executable_path(
+                            client_pid
+                        )
+                        diagnostic_trace["pipe_client_parent_pid"] = _process_parent_id(
+                            client_pid
+                        )
+                        diagnostic_trace["pipe_peer_identity_verified"] = peer_verified
+                    if not peer_verified:
                         raise WfpGuardError(
                             "Elevated WFP Guard IPC connected from an unexpected process"
                         )
                     # Keep the verified peer alive until its ancestry is checked, then release
                     # that same connection to perform the fixed privileged operation.
                     connection.send_bytes(_PIPE_PROCEED)
+                    if diagnostic_trace is not None:
+                        diagnostic_trace["pipe_proceed_token_sent"] = True
                     messages.put(connection.recv_bytes(), block=False)
                 finally:
                     connection.close()
@@ -140,25 +189,41 @@ def _run_elevated_ensure() -> GuardVerification:
         if not isinstance(payload, dict) or payload.get("ok") is not True:
             diagnostic = payload.get("error") if isinstance(payload, dict) else "invalid response"
             raise WfpGuardError(f"Elevated WFP Guard failed: {diagnostic}")
+        if diagnostic_trace is not None:
+            diagnostic_trace["elevated_guard_evidence"] = payload.get("elevated_process")
+            diagnostic_trace["elevated_ensure_called"] = True
         report = payload.get("verification")
         if not isinstance(report, dict):
             raise WfpGuardError("Elevated WFP Guard returned no verification evidence")
-        _wait_for_elevated_exit(process_handle)
-        return _validated_report(report)
+        exit_code = _wait_for_elevated_exit(process_handle)
+        validated = _validated_report(report)
+        if diagnostic_trace is not None:
+            diagnostic_trace["elevated_exit_code"] = exit_code
+            diagnostic_trace["parent_readback_validation"] = True
+        return validated
     finally:
         listener.close()
         if process_handle:
             _close_process_handle(process_handle)
 
 
-def _shell_execute_elevated(pipe_name: str) -> wintypes.HANDLE:
+def _shell_execute_elevated(
+    pipe_name: str, *, include_integration_evidence: bool = False
+) -> wintypes.HANDLE:
     shell32 = ctypes.WinDLL("shell32", use_last_error=True)
     shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(_ShellExecuteInfo)]
     shell32.ShellExecuteExW.restype = wintypes.BOOL
     launcher_path = Path(_expected_venv_launcher_path())
-    parameters = subprocess.list2cmdline(
-        ["-I", "-m", "windows_local_mcp.wfp_guard_runtime", "--elevated-ensure", pipe_name]
-    )
+    arguments = [
+        "-I",
+        "-m",
+        "windows_local_mcp.wfp_guard_runtime",
+        "--elevated-ensure",
+        pipe_name,
+    ]
+    if include_integration_evidence:
+        arguments.append("--integration-evidence")
+    parameters = subprocess.list2cmdline(arguments)
     info = _ShellExecuteInfo()
     info.cbSize = ctypes.sizeof(info)
     info.fMask = _SEE_MASK_NOCLOSEPROCESS
@@ -174,7 +239,7 @@ def _shell_execute_elevated(pipe_name: str) -> wintypes.HANDLE:
     return info.hProcess
 
 
-def _wait_for_elevated_exit(process_handle: wintypes.HANDLE) -> None:
+def _wait_for_elevated_exit(process_handle: wintypes.HANDLE) -> int:
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
     kernel32.WaitForSingleObject.restype = wintypes.DWORD
@@ -190,6 +255,7 @@ def _wait_for_elevated_exit(process_handle: wintypes.HANDLE) -> None:
         )
     if exit_code.value != 0:
         raise WfpGuardError(f"Elevated WFP Guard exited with code {exit_code.value}")
+    return int(exit_code.value)
 
 
 def _process_id_from_handle(process_handle: wintypes.HANDLE) -> int:
@@ -386,11 +452,64 @@ def _validated_report(value: dict[str, Any]) -> GuardVerification:
     return report
 
 
+def _local_process_evidence(*, is_administrator: bool) -> dict[str, object]:
+    try:
+        executable = str(Path(sys.executable).resolve(strict=True))
+    except (OSError, RuntimeError, ValueError):
+        executable = sys.executable
+    return {
+        "pid": os.getpid(),
+        "parent_pid": os.getppid(),
+        "python_executable": executable,
+        "is_administrator": is_administrator,
+    }
+
+
+def run_integration_diagnostic() -> dict[str, object]:
+    """Exercise the real unelevated-to-elevated Guard route and return JSON evidence."""
+
+    trace: dict[str, object] = {
+        "diagnostic": "wlmcp-wfp-guard-integration-v1",
+        "production_entrypoint": "ensure_runtime_codex_loopback_guard(force_elevated=True)",
+        "required_route": [
+            "unelevated WLMCP process",
+            "ShellExecuteExW(runAs/UAC)",
+            "elevated Guard",
+            "named pipe IPC",
+            "real WFP ensure/read-back",
+        ],
+    }
+    try:
+        if os.name != "nt":
+            raise WfpGuardError("The integration diagnostic requires native Windows")
+        normal_is_administrator = _is_administrator()
+        trace["normal_process"] = _local_process_evidence(
+            is_administrator=normal_is_administrator
+        )
+        if normal_is_administrator:
+            raise WfpGuardError(
+                "The integration diagnostic must be started by an unelevated Windows process"
+            )
+        verification = ensure_runtime_codex_loopback_guard(
+            force_elevated=True,
+            diagnostic_trace=trace,
+        )
+        trace["wfp"] = {
+            "ensure_called_by_elevated_guard": True,
+            "readback_validated_by_unelevated_parent": True,
+            "verification": verification.as_dict(),
+        }
+        return {"success": True, "evidence": trace}
+    except Exception as error:  # noqa: BLE001 - diagnostic must preserve failure evidence
+        trace["failure"] = f"{type(error).__name__}: {error}"
+        return {"success": False, "evidence": trace}
+
+
 def _is_administrator() -> bool:
     return bool(ctypes.WinDLL("shell32", use_last_error=True).IsUserAnAdmin())
 
 
-def _elevated_main(pipe_name: str) -> int:
+def _elevated_main(pipe_name: str, *, include_integration_evidence: bool = False) -> int:
     try:
         connection = Client(pipe_name, family="AF_PIPE")
         try:
@@ -399,12 +518,20 @@ def _elevated_main(pipe_name: str) -> int:
             payload: dict[str, object]
             exit_code = 0
             try:
-                if not _is_administrator():
+                is_administrator = _is_administrator()
+                elevated_process = _local_process_evidence(
+                    is_administrator=is_administrator
+                )
+                if not is_administrator:
                     raise WfpGuardError("WFP Guard elevation was not established")
                 verification = ensure_codex_loopback_block(new_windows_wfp_api())
                 payload = {"ok": True, "verification": verification.as_dict()}
+                if include_integration_evidence:
+                    payload["elevated_process"] = elevated_process
             except Exception as error:  # noqa: BLE001 - exact failure returns to fail-closed caller
                 payload = {"ok": False, "error": f"{type(error).__name__}: {error}"[:1000]}
+                if include_integration_evidence:
+                    payload["elevated_process"] = locals().get("elevated_process")
                 exit_code = 2
             connection.send_bytes(canonical_json(payload).encode("utf-8"))
         finally:
@@ -416,8 +543,16 @@ def _elevated_main(pipe_name: str) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
-    if len(arguments) == 2 and arguments[0] == "--elevated-ensure":
-        return _elevated_main(arguments[1])
+    if arguments == ["--integration-diagnostic"]:
+        result = run_integration_diagnostic()
+        print(canonical_json(result))
+        return 0 if result.get("success") is True else 1
+    if arguments[0:1] == ["--elevated-ensure"] and len(arguments) in {2, 3}:
+        if len(arguments) == 3 and arguments[2] != "--integration-evidence":
+            raise SystemExit("Invalid elevated Guard diagnostic argument")
+        return _elevated_main(
+            arguments[1], include_integration_evidence=len(arguments) == 3
+        )
     if arguments == ["--maintenance-verify"]:
         print(canonical_json(verify_codex_loopback_block(new_windows_wfp_api()).as_dict()))
         return 0

@@ -1,8 +1,9 @@
 # Codex Windows Sandbox loopback診断
 
 このdirectoryのscriptは、Codex Windows Sandboxのloopback遮断不全を、設定変更と
-診断を分離して調べるためのものです。Firewall規則、WFP filter、ACL、Sandbox userを
-修復、削除、再生成しません。
+診断を分離して調べるためのものです。既存のprobe／collectorはFirewall規則、WFP filter、
+ACL、Sandbox userを修復、削除、再生成しません。後述の一気通貫Guard診断だけは、固定された
+WFP Guardが欠けている場合に、UACで昇格したGuardからそのexact objectをensureします。
 
 ## 1. 通常Windows userでの状態収集
 
@@ -54,3 +55,27 @@ TCP／UDPごとのWFP XMLへ保存されます。
 block filterが生成されていなければ、Firewall ruleからWFPへの変換・適用区間が直接原因です。
 block filterが存在しても上位のloopback allowが勝つ場合は、CodexのFirewall rule設計が
 Windowsのloopback分類・優先順位を拘束できていないことが直接原因です。
+
+## 3. 通常権限WLMCPからのGuard一気通貫診断
+
+この診断は、通常権限のPythonプロセスから本番の
+`ensure_runtime_codex_loopback_guard` を強制的にUAC経路へ通し、
+`ShellExecuteExW` の `runas`、昇格Guard、named pipeの接続元PID検証、
+実WFPのensure/read-backを1回で記録します。固定Guardが既に存在する場合は削除せず再利用し、
+存在しない場合だけ昇格Guardが固定のstatic／non-persistent objectを追加します。
+
+Codex Desktopの入れ子Sandboxや管理者PowerShellではなく、通常のWindowsユーザーが開いた
+PowerShellで実行してください。UACの承認または管理者資格情報の入力が必要です。
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
+  C:\dev\windows-local-mcp-python\diagnostics\Invoke-WlmcpWfpGuardIntegration.ps1
+```
+
+成功の最低条件は、結果JSONの `success=true`、通常側の `is_administrator=false`、
+`shell_execute.api=ShellExecuteExW` と `verb=runas`、
+`pipe_peer_identity_verified=true`、昇格側の `is_administrator=true`、
+`elevated_ensure_called=true`、`parent_readback_validation=true`、および
+`wfp.verification` の固定v4／v6 filter・static／non-persistent証跡です。
+この診断はWFP裁定が実通信をdropしたことや12経路のloopback遮断までは証明しないため、
+それらは別の実通信診断として扱います。

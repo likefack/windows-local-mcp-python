@@ -207,6 +207,25 @@ def test_elevated_parent_rejects_unexpected_runas_executable(
     assert connection.sent == []
 
 
+def test_force_elevated_route_uses_production_guard_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trace: dict[str, object] = {}
+    calls: list[dict[str, object] | None] = []
+
+    def fake_run(*, diagnostic_trace: dict[str, object] | None = None) -> GuardVerification:
+        calls.append(diagnostic_trace)
+        return _verification()
+
+    monkeypatch.setattr(runtime, "_is_administrator", lambda: False)
+    monkeypatch.setattr(runtime, "_run_elevated_ensure", fake_run)
+
+    assert runtime.ensure_runtime_codex_loopback_guard(
+        force_elevated=True, diagnostic_trace=trace
+    ) == _verification()
+    assert calls == [trace]
+
+
 @pytest.mark.parametrize("inherited_auth", [None, "not-inherited-or-used"])
 def test_elevated_main_does_not_require_inherited_environment(
     monkeypatch: pytest.MonkeyPatch, inherited_auth: str | None
