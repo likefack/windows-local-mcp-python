@@ -1,6 +1,0 @@
-flowchart LR
-    W["WLMCP"] --> P["文字列・環境・既知 endpoint の警告"]
-    P --> C["Codex Sandbox"]
-    C --> S["任意 project code"]
-    S -->|"直接 socket で迂回可能"| H["Host localhost service"]
-    H --> R["明示的 accepted residual risk"]
