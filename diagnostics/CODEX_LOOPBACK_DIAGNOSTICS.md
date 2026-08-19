@@ -75,7 +75,11 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File `
 成功の最低条件は、結果JSONの `success=true`、通常側の `is_administrator=false`、
 `shell_execute.api=ShellExecuteExW` と `verb=runas`、
 `pipe_peer_identity_verified=true`、昇格側の `is_administrator=true`、
-`elevated_ensure_called=true`、`parent_readback_validation=true`、および
+`elevated_ensure_called=true`、`parent_report_validation=true`、および
+`wfp.elevated_readback_report_validated_by_unelevated_parent=true`、
 `wfp.verification` の固定v4／v6 filter・static／non-persistent証跡です。
+`parent_report_validation` は通常権限parentがWFP objectを直接read-backしたことを意味しません。
+昇格Guardが実WFPをensure/read-backし、そのreportを通常権限parentが固定schema／policyに照らして
+検証できたことを示します。
 この診断はWFP裁定が実通信をdropしたことや12経路のloopback遮断までは証明しないため、
 それらは別の実通信診断として扱います。
