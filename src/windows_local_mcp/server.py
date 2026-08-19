@@ -40,6 +40,7 @@ from .redaction import redact_command_args, redact_text
 from .resources import NamedControlPlaneLock, WorkspaceExecutionLock, enforce_data_quota
 from .risk import command_risk_facts
 from .sandbox_backend import (
+    SANDBOX_LIVE_MARKER_VERSION,
     SANDBOX_SECURITY_PROPERTIES,
     codex_sandbox_effective_policy,
     isolation_context_digest,
@@ -253,10 +254,15 @@ def _codex_sandbox_capability() -> dict[str, Any]:
         if marker.is_file():
             evidence = json.loads(marker.read_text(encoding="utf-8"))
             if (
-                evidence.get("version") == 3
+                evidence.get("version") == SANDBOX_LIVE_MARKER_VERSION
                 and evidence.get("backend_digest") == sha256_text(canonical_json(backend))
                 and evidence.get("isolation_context_digest")
                 == isolation_context_digest(runtime.settings, resolved)
+                and evidence.get("backend_version") == resolved.version
+                and isinstance(evidence.get("guard_implementation"), dict)
+                and isinstance(evidence.get("sandbox_account_identity"), dict)
+                and isinstance(evidence.get("wfp_guard_binding"), dict)
+                and isinstance(evidence.get("windows_os_identity"), dict)
                 and isinstance(evidence.get("properties"), dict)
             ):
                 status["properties"] = evidence["properties"]

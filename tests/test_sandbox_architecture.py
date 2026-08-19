@@ -23,6 +23,7 @@ from windows_local_mcp.sandbox_backend import (
     isolation_context_digest,
     require_codex_sandbox_live_verification,
     resolve_codex_sandbox_backend,
+    sandbox_isolation_context,
 )
 from windows_local_mcp.sandbox_live_verify import (
     _classify_probe_result,
@@ -32,7 +33,13 @@ from windows_local_mcp.sandbox_live_verify import (
 )
 from windows_local_mcp.sandbox_live_verify import _run as run_live_probe
 from windows_local_mcp.util import canonical_json, sha256_text
-from windows_local_mcp.wfp_guard import GuardVerification, WfpGuardError
+from windows_local_mcp.wfp_guard import (
+    GuardVerification,
+    SandboxAccountIdentity,
+    WfpGuardError,
+    guard_verification_binding,
+    guard_verification_binding_digest,
+)
 from windows_local_mcp.windows_job import WindowsJobLimits, WindowsSandboxJob
 from windows_local_mcp.windows_system import windows_system_executable
 from windows_local_mcp.workspace_history import (
@@ -62,6 +69,9 @@ def _guard_verification() -> GuardVerification:
         guard_version="wlmcp-wfp-loopback-guard-v1",
         policy_generation=1,
         target_account="CodexSandboxOffline",
+        target_computer_name="TESTPC",
+        target_qualified_account=r"TESTPC\CodexSandboxOffline",
+        target_sid_name_use=1,
         target_sid="S-1-5-21-100-200-300-1004",
         app_isolation_sublayer_key="ffe221c3-92a8-4564-a59f-dafb70756020",
         app_isolation_weight=7,
@@ -73,6 +83,17 @@ def _guard_verification() -> GuardVerification:
         v6_filter_key="cb98391f-1773-5060-bfb6-3de2306f8baa",
         v6_filter_id=502,
         v6_effective_weight=100,
+    )
+
+
+def _account_identity() -> SandboxAccountIdentity:
+    verification = _guard_verification()
+    return SandboxAccountIdentity(
+        account_name=verification.target_account,
+        computer_name=verification.target_computer_name,
+        qualified_account_name=verification.target_qualified_account,
+        sid=verification.target_sid,
+        sid_name_use=verification.target_sid_name_use,
     )
 
 
@@ -89,7 +110,34 @@ def _test_backend() -> CodexSandboxBackend:
         signer_subject="OpenAI",
         signer_thumbprint="b" * 40,
         helpers=(),
+        version="test-version",
     )
+
+
+def _valid_live_marker(
+    settings: Settings, backend: CodexSandboxBackend
+) -> dict[str, object]:
+    context = sandbox_isolation_context(settings, backend)
+    guard_implementation = context["wfp_guard_implementation"]
+    os_identity = context["windows_os_identity"]
+    verification = _guard_verification()
+    return {
+        "version": 4,
+        "passed": True,
+        "backend_digest": sha256_text(canonical_json(backend.as_dict())),
+        "backend_version": backend.version,
+        "isolation_context_digest": sha256_text(canonical_json(context)),
+        "guard_implementation": guard_implementation,
+        "guard_implementation_digest": guard_implementation["digest"],
+        "windows_os_identity": os_identity,
+        "windows_os_identity_digest": sha256_text(canonical_json(os_identity)),
+        "sandbox_account_identity": _account_identity().as_dict(),
+        "wfp_guard_binding": guard_verification_binding(verification),
+        "wfp_guard_binding_digest": guard_verification_binding_digest(verification),
+        "properties": {
+            name: {"status": "verified"} for name in SANDBOX_SECURITY_PROPERTIES
+        },
+    }
 
 
 def test_guard_preflight_succeeds_before_codex_launch(
@@ -126,6 +174,57 @@ def test_guard_preflight_succeeds_before_codex_launch(
     assert (process, job, argv) == expected
     assert calls == ["guard", "launch"]
     assert guard["target_sid"] == "S-1-5-21-100-200-300-1004"
+
+
+def test_valid_marker_allows_missing_exact_guard_reconstruction_before_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    backend = _test_backend()
+    evidence = _valid_live_marker(settings, backend)
+    marker = settings.data_dir / "control-plane" / "sandbox-live-verification.json"
+    marker.write_text(canonical_json(evidence), encoding="utf-8")
+    calls: list[str] = []
+    expected = (object(), object(), ["codex", "sandbox"])
+
+    monkeypatch.setattr(
+        "windows_local_mcp.sandbox_backend.resolve_sandbox_account_identity",
+        _account_identity,
+    )
+
+    def reconstruct_and_read_back() -> GuardVerification:
+        calls.append("ensure-and-read-back")
+        return _guard_verification()
+
+    def record_verified(_payload: dict[str, object]) -> None:
+        calls.append("wfp_guard_verified")
+
+    def launch(*_args: object, **_kwargs: object) -> tuple[object, object, list[str]]:
+        calls.append("launch")
+        return expected
+
+    monkeypatch.setattr(
+        "windows_local_mcp.wfp_guard_runtime.ensure_runtime_codex_loopback_guard",
+        reconstruct_and_read_back,
+    )
+    monkeypatch.setattr("windows_local_mcp.sandbox_backend.launch_codex_sandbox", launch)
+
+    process, job, argv, _guard = guard_and_launch_codex_sandbox(
+        backend,
+        settings=settings,
+        command=[sys.executable, "-c", "pass"],
+        cwd=settings.workspace_root,
+        writable_roots=(),
+        environment={},
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        on_guard_verified=record_verified,
+        expected_live_evidence=evidence,
+    )
+
+    assert (process, job, argv) == expected
+    assert calls == ["ensure-and-read-back", "wfp_guard_verified", "launch"]
 
 
 @pytest.mark.parametrize(
@@ -197,6 +296,10 @@ def test_codex_sandbox_adapter_binds_installed_launcher_without_agent(
             "thumbprint": "A" * 40,
         },
     )
+    monkeypatch.setattr(
+        "windows_local_mcp.sandbox_backend.probe_codex_version",
+        lambda *_: "test-version",
+    )
 
     backend = resolve_codex_sandbox_backend(settings)
     argv = build_codex_sandbox_argv(
@@ -217,6 +320,11 @@ def test_codex_sandbox_adapter_binds_installed_launcher_without_agent(
     assert backend.permission_profile == ":workspace"
     assert backend.provenance == "explicit-trusted-local-config"
     assert backend.signature_status == "Valid"
+    assert backend.signer_subject == 'CN="OpenAI OpCo, LLC"'
+    assert backend.signer_thumbprint == "A" * 40
+    assert backend.executable_sha256 == sha256_text("test codex launcher")
+    assert backend.stable_file_identity["platform"] in {"windows", "posix"}
+    assert backend.version == "test-version"
     assert [helper.name for helper in backend.helpers] == [
         "codex-command-runner.exe",
         "codex-windows-sandbox-setup.exe",
@@ -367,9 +475,13 @@ def test_host_endpoint_control_distinguishes_reachable_from_unavailable(
 
 
 def test_sandbox_live_verification_is_property_scoped_and_fails_closed(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = _settings(tmp_path)
+    monkeypatch.setattr(
+        "windows_local_mcp.sandbox_backend.resolve_sandbox_account_identity",
+        _account_identity,
+    )
     backend = CodexSandboxBackend(
         executable=str(tmp_path / "codex.exe"),
         executable_sha256="a" * 64,
@@ -399,6 +511,13 @@ def test_sandbox_live_verification_is_property_scoped_and_fails_closed(
     with pytest.raises(ApprovedSandboxUnavailable, match="missing, failed, or stale"):
         require_codex_sandbox_live_verification(settings, backend)
 
+    marker.write_text(
+        canonical_json({**_valid_live_marker(settings, backend), "version": 3}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ApprovedSandboxUnavailable, match="missing, failed, or stale"):
+        require_codex_sandbox_live_verification(settings, backend)
+
     properties = {
         name: {"status": "verified"} for name in SANDBOX_SECURITY_PROPERTIES
     }
@@ -418,27 +537,22 @@ def test_sandbox_live_verification_is_property_scoped_and_fails_closed(
         require_codex_sandbox_live_verification(settings, backend)
 
     properties["resource_bound"] = {"status": "verified"}
-    marker.write_text(
-        canonical_json(
-            {
-                "version": 3,
-                "passed": True,
-                "backend_digest": backend_digest,
-                "isolation_context_digest": isolation_context_digest(settings, backend),
-                "properties": properties,
-            }
-        ),
-        encoding="utf-8",
-    )
-    assert require_codex_sandbox_live_verification(settings, backend)["version"] == 3
+    marker.write_text(canonical_json(_valid_live_marker(settings, backend)), encoding="utf-8")
+    assert require_codex_sandbox_live_verification(settings, backend)["version"] == 4
 
     settings.approved_sandbox_require_live_verification = False
     with pytest.raises(ApprovedSandboxUnavailable, match="cannot be disabled"):
         require_codex_sandbox_live_verification(settings, backend)
 
 
-def test_live_marker_is_stale_after_security_context_changes(tmp_path: Path) -> None:
+def test_live_marker_is_stale_after_security_context_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     settings = _settings(tmp_path)
+    monkeypatch.setattr(
+        "windows_local_mcp.sandbox_backend.resolve_sandbox_account_identity",
+        _account_identity,
+    )
     backend = CodexSandboxBackend(
         executable=str(tmp_path / "codex.exe"),
         executable_sha256="a" * 64,
@@ -454,22 +568,8 @@ def test_live_marker_is_stale_after_security_context_changes(tmp_path: Path) -> 
     )
     marker = settings.data_dir / "control-plane" / "sandbox-live-verification.json"
     original_digest = isolation_context_digest(settings, backend)
-    marker.write_text(
-        canonical_json(
-            {
-                "version": 3,
-                "passed": True,
-                "backend_digest": sha256_text(canonical_json(backend.as_dict())),
-                "isolation_context_digest": original_digest,
-                "properties": {
-                    name: {"status": "verified"}
-                    for name in SANDBOX_SECURITY_PROPERTIES
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    assert require_codex_sandbox_live_verification(settings, backend)["version"] == 3
+    marker.write_text(canonical_json(_valid_live_marker(settings, backend)), encoding="utf-8")
+    assert require_codex_sandbox_live_verification(settings, backend)["version"] == 4
 
     original_blocked = list(settings.blocked_file_names)
     original_dependencies = list(settings.sandbox_dependency_readable_paths)
@@ -497,6 +597,109 @@ def test_live_marker_is_stale_after_security_context_changes(tmp_path: Path) -> 
     settings.max_sandbox_processes = original_processes
     settings.max_sandbox_memory_bytes = original_memory
     assert isolation_context_digest(settings, backend) == original_digest
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        "backend_digest",
+        "backend_version",
+        "guard_implementation",
+        "policy_generation",
+        "account_identity",
+        "os_identity",
+        "required_field",
+    ],
+)
+def test_c7_marker_identity_mismatch_is_stale_without_live_reverification(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mismatch: str
+) -> None:
+    settings = _settings(tmp_path)
+    backend = _test_backend()
+    evidence = _valid_live_marker(settings, backend)
+    marker = settings.data_dir / "control-plane" / "sandbox-live-verification.json"
+
+    monkeypatch.setattr(
+        "windows_local_mcp.sandbox_backend.resolve_sandbox_account_identity",
+        _account_identity,
+    )
+    if mismatch == "backend_digest":
+        evidence["backend_digest"] = "0" * 64
+    elif mismatch == "backend_version":
+        evidence["backend_version"] = "different-version"
+    elif mismatch == "guard_implementation":
+        implementation = json.loads(canonical_json(evidence["guard_implementation"]))
+        implementation["modules"][0]["sha256"] = "0" * 64
+        implementation["digest"] = sha256_text(canonical_json(implementation))
+        evidence["guard_implementation"] = implementation
+        evidence["guard_implementation_digest"] = implementation["digest"]
+    elif mismatch == "policy_generation":
+        binding = json.loads(canonical_json(evidence["wfp_guard_binding"]))
+        binding["policy_generation"] = 2
+        evidence["wfp_guard_binding"] = binding
+        evidence["wfp_guard_binding_digest"] = sha256_text(canonical_json(binding))
+    elif mismatch == "account_identity":
+        account = _account_identity().as_dict()
+        account["sid"] = "S-1-5-21-100-200-300-9999"
+        binding = json.loads(canonical_json(evidence["wfp_guard_binding"]))
+        binding["sandbox_account_identity"] = account
+        evidence["sandbox_account_identity"] = account
+        evidence["wfp_guard_binding"] = binding
+        evidence["wfp_guard_binding_digest"] = sha256_text(canonical_json(binding))
+    elif mismatch == "os_identity":
+        os_identity = dict(evidence["windows_os_identity"])
+        os_identity["build"] = int(os_identity.get("build", 0)) + 1
+        evidence["windows_os_identity"] = os_identity
+        evidence["windows_os_identity_digest"] = sha256_text(
+            canonical_json(os_identity)
+        )
+    else:
+        evidence.pop("wfp_guard_binding_digest")
+    marker.write_text(canonical_json(evidence), encoding="utf-8")
+
+    with pytest.raises(ApprovedSandboxUnavailable, match="missing, failed, or stale"):
+        require_codex_sandbox_live_verification(settings, backend)
+
+
+def test_stale_c7_marker_never_starts_guard_uac_probe_or_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    backend = _test_backend()
+    evidence = _valid_live_marker(settings, backend)
+    evidence["backend_version"] = "stale-version"
+    marker = settings.data_dir / "control-plane" / "sandbox-live-verification.json"
+    marker.write_text(canonical_json(evidence), encoding="utf-8")
+    calls: list[str] = []
+
+    def forbidden(*_args: object, **_kwargs: object) -> object:
+        calls.append("forbidden")
+        raise AssertionError("stale marker must stop before Guard or child launch")
+
+    monkeypatch.setattr(
+        "windows_local_mcp.sandbox_backend.resolve_sandbox_account_identity",
+        _account_identity,
+    )
+    monkeypatch.setattr(
+        "windows_local_mcp.wfp_guard_runtime.ensure_runtime_codex_loopback_guard",
+        forbidden,
+    )
+    monkeypatch.setattr("windows_local_mcp.sandbox_backend.launch_codex_sandbox", forbidden)
+
+    with pytest.raises(ApprovedSandboxUnavailable, match="missing, failed, or stale"):
+        guard_and_launch_codex_sandbox(
+            backend,
+            settings=settings,
+            command=[sys.executable, "-c", "pass"],
+            cwd=settings.workspace_root,
+            writable_roots=(),
+            environment={},
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            expected_live_evidence=evidence,
+        )
+    assert calls == []
 
 
 def test_live_probe_launch_failure_is_unverified_and_does_not_raise(

@@ -58,6 +58,7 @@ from .sandbox_backend import (
 )
 from .tool_safety import hold_executable_identity
 from .util import canonical_json, utc_now_iso
+from .wfp_guard_identity import hold_wfp_guard_implementation
 from .windows_job import WindowsSandboxJob
 from .workspace_history import (
     build_workspace_target_from_bytes,
@@ -97,6 +98,7 @@ def run_operation(operation_id: str, settings: Settings) -> int:
     approved_tier = operation["tier"] in {"codex_sandbox", "approved_host"}
     sandbox_backend: CodexSandboxBackend | None = None
     sandbox_backend_version: str | None = None
+    sandbox_live_evidence: dict[str, Any] | None = None
     workspace_lock: WorkspaceExecutionLock | None = None
     tracks_workspace = _requires_workspace_execution_lock(operation, request, normalized)
     if tracks_workspace:
@@ -153,7 +155,9 @@ def run_operation(operation_id: str, settings: Settings) -> int:
                         "Approved Sandbox request has no immutable backend binding"
                     )
                 sandbox_backend = verify_codex_sandbox_backend(settings, expected_backend)
-                require_codex_sandbox_live_verification(settings, sandbox_backend)
+                sandbox_live_evidence = require_codex_sandbox_live_verification(
+                    settings, sandbox_backend
+                )
             audit.add_event(operation_id, "approval_bundle_verified", {})
         elif operation["tier"] == "broker":
             safe_request = request.get("safe_request")
@@ -377,6 +381,7 @@ def run_operation(operation_id: str, settings: Settings) -> int:
     network_policy_payload: dict[str, object] | None = None
     wfp_guard_verification: dict[str, object] | None = None
     sandbox_backend_hold: Any | None = None
+    guard_implementation_hold: Any | None = None
     sandbox_job: Any | None = None
     host_job: WindowsSandboxJob | None = None
     host_descendants_verified_empty = True
@@ -399,7 +404,16 @@ def run_operation(operation_id: str, settings: Settings) -> int:
                 raise ApprovedSandboxUnavailable("Approved Sandbox backend is unavailable")
             sandbox_backend_hold = hold_codex_sandbox_backend(sandbox_backend)
             sandbox_backend = sandbox_backend_hold.__enter__()
+            guard_implementation_hold = hold_wfp_guard_implementation()
+            guard_implementation_hold.__enter__()
             sandbox_backend_version = probe_codex_version(sandbox_backend, settings)
+            if sandbox_backend_version != sandbox_backend.version:
+                raise ApprovedSandboxUnavailable(
+                    "Approved Sandbox backend version changed before execution"
+                )
+            sandbox_live_evidence = require_codex_sandbox_live_verification(
+                settings, sandbox_backend
+            )
         child_env = build_command_environment(
             os.environ,
             extra_names=settings.child_environment_allowlist,
@@ -502,6 +516,10 @@ def run_operation(operation_id: str, settings: Settings) -> int:
         if operation["tier"] == "codex_sandbox":
             if sandbox_backend is None:
                 raise ApprovedSandboxUnavailable("Approved Sandbox backend is unavailable")
+            if sandbox_live_evidence is None:
+                raise ApprovedSandboxUnavailable(
+                    "Approved Sandbox has no immutable C7 live marker evidence"
+                )
 
             def record_guard_verified(payload: dict[str, object]) -> None:
                 nonlocal wfp_guard_verification, network_policy
@@ -525,6 +543,7 @@ def run_operation(operation_id: str, settings: Settings) -> int:
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     on_guard_verified=record_guard_verified,
+                    expected_live_evidence=sandbox_live_evidence,
                 )
             except ApprovedSandboxUnavailable as guard_error:
                 network_policy["wfp_guard_status"] = "verification_failed"
@@ -866,6 +885,13 @@ def run_operation(operation_id: str, settings: Settings) -> int:
         if host_control_locks is not None:
             host_control_locks.close()
             host_control_locks = None
+    if guard_implementation_hold is not None:
+        try:
+            guard_implementation_hold.__exit__(None, None, None)
+        except Exception as cleanup_error:  # noqa: BLE001 - Guard hold is security state
+            status = "failed"
+            failure_class = "sandbox_cleanup_failure"
+            error = f"{type(cleanup_error).__name__}: {cleanup_error}"
     if sandbox_backend_hold is not None:
         try:
             sandbox_backend_hold.__exit__(None, None, None)

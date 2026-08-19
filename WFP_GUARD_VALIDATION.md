@@ -1,8 +1,8 @@
-# WFP Guard セキュリティ検証記録 — Phase A から C6.4
+# WFP Guard セキュリティ検証記録 — Phase A から C7
 
 更新日: 2026-08-20
 
-この文書は、Codex Windows Sandbox から Windows ホストの localhost へ到達できていた問題について、調査開始から WLMCP の production WFP Guard へ統合し、異常終了試験 C6.4 まで完了した経緯を、後から再検証できる形で残すための記録である。
+この文書は、Codex Windows Sandbox から Windows ホストの localhost へ到達できていた問題について、調査開始から WLMCP の production WFP Guard へ統合し、異常終了試験 C6.4 と identity binding C7 までの経緯を、後から再検証できる形で残すための記録である。
 
 `VERIFICATION.md` がリポジトリ全体の検証履歴を扱うのに対し、この文書は localhost / WFP Guard 系列だけを詳細に追う。
 
@@ -814,20 +814,56 @@ release gate では、最終 tree に対する full pytest / Ruff / compileall /
 
 ---
 
-# 42. 次の段階: C7
+# 42. C7 — verified state と現在実体の identity binding
 
-C6 までで、WFP policy / UAC / IPC / read-back / fail-closed / launch ordering / concurrency / crash behavior を確認した。
+C6 までで、WFP policy / UAC / IPC / read-back / fail-closed / launch ordering / concurrency / crash behavior を確認した。C7 では、過去に live verification した security boundary と、現在実際に使う binary / source / policy が同一であることを marker schema v4 へ結合した。
 
-次の C7 は、過去に live verification した security boundary と、現在実際に使う binary / source / policy が同じであることを完全に bind する段階である。
+## 42.1 schema v4 の identity
 
-少なくとも次の変更で古い verified state を再利用しないようにする必要がある。
+v4 marker は次を必須とする。
 
-- Codex executable / helper の変更
-- Guard source / package identity の変更
-- Guard policy generation の変更
-- WFP object identity / configuration の変更
-- Sandbox backend / policy digest の変更
-- security-relevant Windows environment の変更
+- 実際に import された Guard module 群の canonical path、content SHA-256、Windows handle 由来の volume serial number / file index、size
+- Guard version と policy generation
+- Codex launcher / helper の canonical path、content SHA-256、Windows stable file identity、size、実際の version
+- Authenticode `Valid`、leaf signer subject、leaf certificate thumbprint
+- Windows product、build、UBR、native architecture
+- この PC へ完全修飾した Sandbox account、SID、`SidTypeUser`
+- live verification で complete read-back した WFP fixed object の stable identity
+- 従来の `isolation_context_digest` が含む roots、policy、resource limit 等
+
+mtime は補助的な drift signal として marker に含めるが、単独では security identity の根拠にしない。Guard module と Codex executable closure は verification から child 起動まで handle で保持し、置換・書込みを拒否する。
+
+v1～v3 または必須 field 欠損から v4 field を推測・移行しない。identity mismatch は marker stale として扱い、通常 operation は live verification を自動実行せず、route unavailable / fail closed とする。再検証には `verify-codex-sandbox` の明示実行が必要である。
+
+## 42.2 missing と mismatch の分離
+
+static non-persistent WFP object は reboot や BFE restart で消失し得る。marker v4 の Guard implementation、policy generation、Codex backend、Sandbox account、OS identity、schema がすべて現在値と一致する場合、exact fixed object が単に missing であれば trusted Guard による ensure / recreate を許可する。
+
+順序は C2～C6 と同じく次を必須とする。
+
+```text
+ensure exact missing object
+↓
+complete read-back verification
+↓
+wfp_guard_verified
+↓
+Sandbox child launch
+```
+
+一方、既存 object の security-relevant field 不一致、unexpected conflicting object、または marker identity 不一致では silent repair しない。存在する object をすべて検証してから不足分を作るため、missing と mismatch が混在する場合も何も追加せず fail closed する。
+
+## 42.3 この変更で確認した範囲
+
+- schema v1～v3、必須 field 欠損、backend / Guard / policy / account / OS mismatch の拒否
+- stale marker が Guard 昇格経路、live probe、child launch、Approved Host fallback へ進まないこと
+- exact missing object だけが trusted ensure 経路へ進むこと
+- existing mismatch が silent repair へ進まないこと
+- missing sibling と conflicting object が混在しても object を追加しないこと
+- complete read-back → `wfp_guard_verified` → child launch の順序
+- 実 import module の canonical path / SHA-256 / stable identity manifest と hold
+
+これらは unit / mock / Windows file-handle 回帰である。この変更後の通常 Windows user 文脈における UAC、live WFP object 再構築、実通信、production route E2E は別の実機 checkpoint であり、ここでは未実施である。
 
 C7 完了後は、WFP Guard だけを見て release せず、repository-wide Security Review / Scan、findings 修正、再 scan、最終 production-route E2E を通してから release gate を判断する。
 
@@ -835,8 +871,8 @@ C7 完了後は、WFP Guard だけを見て release せず、repository-wide Sec
 
 # 43. 現在地
 
-C6.4 の cleanup 後 baseline は commit `6db48785d4825c1886e371d9f9a0a30e2dfd06a1` である。
+C7 実装の開始 baseline は main commit `b81ebe654bf99d0e64d9b4e1c7a7bc1bb04d9026` である。
 
-この baseline までで、localhost / WFP Guard 問題については「有効な block 方法を見つけた」という段階を越え、production launch path で fail closed を維持しながら異常終了へ耐えるところまで実機確認した。
+localhost / WFP Guard 問題については「有効な block 方法を見つけた」という段階を越え、production launch path で fail closed を維持しながら異常終了へ耐えるところまで C6 で実機確認した。C7 では、その verified state を現在の Guard / backend / account / OS / policy identity へ結合する実装と自動回帰を追加した。
 
-以後は C7 の identity binding と release-quality security validation を進める。
+以後は C7 後の通常 Windows user 文脈での live verification、missing object 再構築を含む production-route E2E、repository-wide security validation を進める。

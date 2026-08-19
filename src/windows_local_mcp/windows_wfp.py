@@ -16,8 +16,10 @@ from .wfp_guard import (
     GUARD_V6_FILTER_KEY,
     FilterConditionSnapshot,
     FilterSnapshot,
+    SandboxAccountIdentity,
     SubLayerSnapshot,
     WfpGuardError,
+    WfpGuardStateMismatchError,
 )
 
 _ERROR_SUCCESS = 0
@@ -156,7 +158,7 @@ class WindowsWfpApi:
         self._kernel32 = ctypes.WinDLL("kernel32.dll", use_last_error=True)
         self._configure_functions()
 
-    def resolve_account_sid(self, account_name: str) -> str:
+    def resolve_account_identity(self, account_name: str) -> SandboxAccountIdentity:
         if not account_name or "\\" in account_name:
             raise WfpGuardError("The WFP Guard target must be an unqualified local account name")
         local_computer_name = self._local_computer_name()
@@ -198,8 +200,16 @@ class WindowsWfpApi:
         )
         resolved = self._sid_to_string(ctypes.cast(sid, ctypes.c_void_p))
         if resolved == self._current_process_sid():
-            raise WfpGuardError("CodexSandboxOffline SID equals the Guard operator SID")
-        return resolved
+            raise WfpGuardStateMismatchError(
+                "CodexSandboxOffline SID equals the Guard operator SID"
+            )
+        return SandboxAccountIdentity(
+            account_name=account_name,
+            computer_name=local_computer_name,
+            qualified_account_name=qualified_account_name,
+            sid=resolved,
+            sid_name_use=int(use.value),
+        )
 
     def read_sublayer(self, key: uuid.UUID) -> SubLayerSnapshot:
         with self._engine() as engine:
@@ -525,9 +535,11 @@ class WindowsWfpApi:
             or not local_computer_name
             or resolved_domain.casefold() != local_computer_name.casefold()
         ):
-            raise WfpGuardError(f"LookupAccountNameW resolved {account_name} outside this computer")
+            raise WfpGuardStateMismatchError(
+                f"LookupAccountNameW resolved {account_name} outside this computer"
+            )
         if sid_name_use != _SID_TYPE_USER:
-            raise WfpGuardError(
+            raise WfpGuardStateMismatchError(
                 f"LookupAccountNameW resolved {account_name} as SID_NAME_USE={sid_name_use}, "
                 "not SidTypeUser"
             )

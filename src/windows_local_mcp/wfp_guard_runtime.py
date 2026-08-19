@@ -25,11 +25,14 @@ from .wfp_guard import (
     TARGET_ACCOUNT,
     GuardVerification,
     WfpGuardError,
+    WfpGuardMissingError,
+    WfpGuardStateMismatchError,
     ensure_codex_loopback_block,
     maintenance_remove_codex_loopback_block,
     new_windows_wfp_api,
     verify_codex_loopback_block,
 )
+from .wfp_guard_identity import capture_wfp_guard_implementation_identity
 
 _ELEVATED_WAIT_SECONDS = 60
 _SEE_MASK_NOCLOSEPROCESS = 0x00000040
@@ -99,6 +102,12 @@ def ensure_runtime_codex_loopback_guard(
     try:
         # Correct static objects are normally readable and need no elevation or mutation.
         return verify_codex_loopback_block(new_windows_wfp_api())
+    except WfpGuardStateMismatchError:
+        # Existing conflicting state must not be sent to an elevated silent-repair path.
+        raise
+    except WfpGuardMissingError:
+        if _is_administrator():
+            return ensure_codex_loopback_block(new_windows_wfp_api())
     except Exception:  # noqa: BLE001 - elevated ensure re-checks all fields and still fails closed
         if _is_administrator():
             return ensure_codex_loopback_block(new_windows_wfp_api())
@@ -188,6 +197,10 @@ def _run_elevated_ensure(
         payload = json.loads(received.decode("utf-8"))
         if not isinstance(payload, dict) or payload.get("ok") is not True:
             diagnostic = payload.get("error") if isinstance(payload, dict) else "invalid response"
+            if isinstance(payload, dict) and payload.get("error_kind") == "state_mismatch":
+                raise WfpGuardStateMismatchError(
+                    f"Elevated WFP Guard found conflicting state: {diagnostic}"
+                )
             raise WfpGuardError(f"Elevated WFP Guard failed: {diagnostic}")
         if diagnostic_trace is not None:
             diagnostic_trace["elevated_guard_evidence"] = payload.get("elevated_process")
@@ -195,6 +208,12 @@ def _run_elevated_ensure(
         report = payload.get("verification")
         if not isinstance(report, dict):
             raise WfpGuardError("Elevated WFP Guard returned no verification evidence")
+        implementation_digest = payload.get("guard_implementation_digest")
+        current_implementation = capture_wfp_guard_implementation_identity()
+        if implementation_digest != current_implementation.get("digest"):
+            raise WfpGuardError(
+                "Elevated WFP Guard implementation identity differs from its caller"
+            )
         exit_code = _wait_for_elevated_exit(process_handle)
         validated = _validated_report(report)
         if diagnostic_trace is not None:
@@ -434,6 +453,11 @@ def _validated_report(value: dict[str, Any]) -> GuardVerification:
         report.guard_version != GUARD_VERSION
         or report.policy_generation != GUARD_POLICY_GENERATION
         or report.target_account != TARGET_ACCOUNT
+        or not report.target_computer_name
+        or report.target_qualified_account
+        != f"{report.target_computer_name}\\{TARGET_ACCOUNT}"
+        or report.target_sid_name_use != 1
+        or not report.target_sid.startswith("S-1-")
         or report.app_isolation_sublayer_key != str(APP_ISOLATION_SUBLAYER_KEY)
         or report.guard_sublayer_key != str(GUARD_SUBLAYER_KEY)
         or report.guard_sublayer_weight != GUARD_SUBLAYER_WEIGHT
@@ -525,11 +549,24 @@ def _elevated_main(pipe_name: str, *, include_integration_evidence: bool = False
                 if not is_administrator:
                     raise WfpGuardError("WFP Guard elevation was not established")
                 verification = ensure_codex_loopback_block(new_windows_wfp_api())
-                payload = {"ok": True, "verification": verification.as_dict()}
+                implementation = capture_wfp_guard_implementation_identity()
+                payload = {
+                    "ok": True,
+                    "verification": verification.as_dict(),
+                    "guard_implementation_digest": implementation["digest"],
+                }
                 if include_integration_evidence:
                     payload["elevated_process"] = elevated_process
             except Exception as error:  # noqa: BLE001 - exact failure returns to fail-closed caller
-                payload = {"ok": False, "error": f"{type(error).__name__}: {error}"[:1000]}
+                payload = {
+                    "ok": False,
+                    "error": f"{type(error).__name__}: {error}"[:1000],
+                    "error_kind": (
+                        "state_mismatch"
+                        if isinstance(error, WfpGuardStateMismatchError)
+                        else "guard_failure"
+                    ),
+                }
                 if include_integration_evidence:
                     payload["elevated_process"] = locals().get("elevated_process")
                 exit_code = 2

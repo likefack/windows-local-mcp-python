@@ -8,6 +8,7 @@ import subprocess
 import sys
 import time
 import uuid
+from contextlib import ExitStack
 from functools import wraps
 from pathlib import Path
 from typing import Any
@@ -21,15 +22,19 @@ from .process_utils import (
 from .redaction import redact_text
 from .resources import NamedControlPlaneLock, scan_directory_bounded
 from .sandbox_backend import (
+    SANDBOX_LIVE_MARKER_VERSION,
     SANDBOX_SECURITY_PROPERTIES,
     CodexSandboxBackend,
     guard_and_launch_codex_sandbox,
     hold_codex_sandbox_backend,
-    isolation_context_digest,
     probe_codex_version,
     resolve_codex_sandbox_backend,
+    sandbox_isolation_context,
 )
 from .util import canonical_json, sha256_text, utc_now_iso
+from .wfp_guard import GuardVerification, guard_verification_binding
+from .wfp_guard_identity import hold_wfp_guard_implementation
+from .wfp_guard_runtime import ensure_runtime_codex_loopback_guard
 from .windows_job import WindowsJobLimits, WindowsSandboxJob
 from .windows_system import windows_system_executable
 
@@ -56,6 +61,48 @@ def _write_evidence(marker: Path, result: dict[str, Any]) -> None:
         os.replace(temporary_marker, marker)
     finally:
         temporary_marker.unlink(missing_ok=True)
+
+
+def _c7_marker_identity(
+    settings: Settings,
+    backend: CodexSandboxBackend,
+    *,
+    backend_version: str | None,
+    guard_implementation: dict[str, Any] | None,
+    guard_verification: GuardVerification | None,
+) -> dict[str, Any]:
+    """Build the mandatory v4 identity fields without inventing failed evidence."""
+
+    context = sandbox_isolation_context(settings, backend)
+    os_identity = context["windows_os_identity"]
+    binding = (
+        guard_verification_binding(guard_verification)
+        if guard_verification is not None
+        else None
+    )
+    return {
+        "version": SANDBOX_LIVE_MARKER_VERSION,
+        "backend_digest": sha256_text(canonical_json(backend.as_dict())),
+        "backend_version": backend_version,
+        "isolation_context_digest": sha256_text(canonical_json(context)),
+        "guard_implementation": guard_implementation,
+        "guard_implementation_digest": (
+            guard_implementation.get("digest")
+            if isinstance(guard_implementation, dict)
+            else None
+        ),
+        "windows_os_identity": os_identity,
+        "windows_os_identity_digest": sha256_text(canonical_json(os_identity)),
+        "sandbox_account_identity": (
+            binding.get("sandbox_account_identity")
+            if isinstance(binding, dict)
+            else None
+        ),
+        "wfp_guard_binding": binding,
+        "wfp_guard_binding_digest": (
+            sha256_text(canonical_json(binding)) if isinstance(binding, dict) else None
+        ),
+    }
 
 
 def _protected_information_canary_path(workspace_root: Path) -> Path:
@@ -930,6 +977,8 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
     check_reasons: dict[str, str] = {}
     probe_diagnostics: list[dict[str, Any]] = []
     version: str | None = None
+    guard_implementation: dict[str, Any] | None = None
+    guard_verification: GuardVerification | None = None
     python = _python_executable(settings)
     marker = settings.data_dir / "control-plane" / "sandbox-live-verification.json"
     source_canary = settings.workspace_root / f".wlmcp-live-source-{uuid.uuid4().hex}.txt"
@@ -1012,8 +1061,19 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
         remove_after_setup=True,
     )
     try:
-        with hold_codex_sandbox_backend(backend):
+        with ExitStack() as identity_holds:
+            identity_holds.enter_context(hold_codex_sandbox_backend(backend))
+            guard_implementation = identity_holds.enter_context(
+                hold_wfp_guard_implementation()
+            )
             version = probe_codex_version(backend, settings)
+            if version != backend.version:
+                raise RuntimeError(
+                    "Codex backend version changed before live verification"
+                )
+            # Live verification may recreate exact missing static non-persistent objects.
+            # Existing conflicting state still fails closed in the fixed Guard.
+            guard_verification = ensure_runtime_codex_loopback_guard()
             simple = _run(
                 settings,
                 backend,
@@ -1522,11 +1582,14 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
                     )
             properties = _property_results(checks, check_reasons)
             result = {
-                "version": 3,
+                **_c7_marker_identity(
+                    settings,
+                    backend,
+                    backend_version=version,
+                    guard_implementation=guard_implementation,
+                    guard_verification=guard_verification,
+                ),
                 "verified_at": utc_now_iso(),
-                "backend_digest": sha256_text(canonical_json(backend.as_dict())),
-                "isolation_context_digest": isolation_context_digest(settings, backend),
-                "backend_version": version,
                 "checks": checks,
                 "properties": properties,
                 "passed": all(
@@ -1550,11 +1613,14 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
         )[:2000]
         properties = _property_results(checks, check_reasons)
         result = {
-            "version": 3,
+            **_c7_marker_identity(
+                settings,
+                backend,
+                backend_version=version,
+                guard_implementation=guard_implementation,
+                guard_verification=guard_verification,
+            ),
             "verified_at": utc_now_iso(),
-            "backend_digest": sha256_text(canonical_json(backend.as_dict())),
-            "isolation_context_digest": isolation_context_digest(settings, backend),
-            "backend_version": version,
             "checks": checks,
             "properties": properties,
             "passed": False,

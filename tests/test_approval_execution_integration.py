@@ -97,7 +97,10 @@ def _wmi_late_process_script(path: Path) -> str:
         "import time; from pathlib import Path; time.sleep(1.0); "
         f"Path({path.as_posix()!r}).write_text('wmi late tamper', encoding='utf-8')"
     )
-    command_line = subprocess.list2cmdline([sys.executable, "-c", late_code])
+    # WMI must create the stable base interpreter directly. A venv launcher can exit before
+    # its redirected child starts, which makes this outside-Job regression nondeterministic.
+    base_python = Path(sys.base_prefix) / "python.exe"
+    command_line = subprocess.list2cmdline([str(base_python), "-I", "-c", late_code])
     powershell_command = (
         "$ErrorActionPreference='Stop'; "
         "$process = [wmiclass]'Win32_Process'; "

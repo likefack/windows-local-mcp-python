@@ -19,6 +19,7 @@ from windows_local_mcp.wfp_guard import (
     GUARD_V6_FILTER_KEY,
     FilterConditionSnapshot,
     FilterSnapshot,
+    SandboxAccountIdentity,
     SubLayerSnapshot,
     WfpGuardError,
     ensure_codex_loopback_block,
@@ -48,9 +49,15 @@ class FakeWfpApi:
         self.fail_add_filters = False
         self.fail_readback = False
 
-    def resolve_account_sid(self, account_name: str) -> str:
+    def resolve_account_identity(self, account_name: str) -> SandboxAccountIdentity:
         assert account_name == "CodexSandboxOffline"
-        return self.sid
+        return SandboxAccountIdentity(
+            account_name=account_name,
+            computer_name="TESTPC",
+            qualified_account_name=f"TESTPC\\{account_name}",
+            sid=self.sid,
+            sid_name_use=1,
+        )
 
     def read_sublayer(self, key: uuid.UUID) -> SubLayerSnapshot:
         if key == APP_ISOLATION_SUBLAYER_KEY:
@@ -158,6 +165,22 @@ def test_missing_sublayer_with_existing_filter_is_not_guessed_or_overwritten() -
     with pytest.raises(WfpGuardError, match="without the required Guard sublayer"):
         ensure_codex_loopback_block(api)
     assert api.add_sublayer_calls == 0
+
+
+def test_missing_filter_is_not_recreated_when_sibling_state_conflicts() -> None:
+    api = FakeWfpApi()
+    api.filters[GUARD_V4_FILTER_KEY] = replace(
+        api.filters[GUARD_V4_FILTER_KEY], found=False
+    )
+    api.filters[GUARD_V6_FILTER_KEY] = replace(
+        api.filters[GUARD_V6_FILTER_KEY], action="permit"
+    )
+
+    with pytest.raises(WfpGuardError, match="unexpected content"):
+        ensure_codex_loopback_block(api)
+
+    assert api.add_sublayer_calls == 0
+    assert api.add_filter_calls == []
 
 
 @pytest.mark.parametrize(

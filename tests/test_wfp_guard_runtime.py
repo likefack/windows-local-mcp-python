@@ -22,7 +22,11 @@ from windows_local_mcp.wfp_guard import (
     TARGET_ACCOUNT,
     GuardVerification,
     WfpGuardError,
+    WfpGuardMissingError,
+    WfpGuardStateMismatchError,
 )
+
+_GUARD_IMPLEMENTATION_DIGEST = "a" * 64
 
 
 def _verification() -> GuardVerification:
@@ -30,6 +34,9 @@ def _verification() -> GuardVerification:
         guard_version=GUARD_VERSION,
         policy_generation=GUARD_POLICY_GENERATION,
         target_account=TARGET_ACCOUNT,
+        target_computer_name="TESTPC",
+        target_qualified_account=rf"TESTPC\{TARGET_ACCOUNT}",
+        target_sid_name_use=1,
         target_sid="S-1-5-21-100-200-300-1004",
         app_isolation_sublayer_key=str(APP_ISOLATION_SUBLAYER_KEY),
         app_isolation_weight=7,
@@ -117,13 +124,24 @@ def _install_elevated_parent_fakes(
     )
     monkeypatch.setattr(runtime, "_wait_for_elevated_exit", lambda _handle: None)
     monkeypatch.setattr(runtime, "_close_process_handle", closed_handles.append)
+    monkeypatch.setattr(
+        runtime,
+        "capture_wfp_guard_implementation_identity",
+        lambda: {"digest": _GUARD_IMPLEMENTATION_DIGEST},
+    )
     return listener, closed_handles
 
 
 def test_elevated_parent_accepts_readback_from_exact_runas_process(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    payload = canonical_json({"ok": True, "verification": _verification().as_dict()}).encode()
+    payload = canonical_json(
+        {
+            "ok": True,
+            "verification": _verification().as_dict(),
+            "guard_implementation_digest": _GUARD_IMPLEMENTATION_DIGEST,
+        }
+    ).encode()
     connection = _FakeConnection(payload)
     listener, closed_handles = _install_elevated_parent_fakes(
         monkeypatch, connection=connection, client_pid=4242
@@ -158,7 +176,13 @@ def test_elevated_parent_rejects_readback_from_different_process(
 def test_elevated_parent_accepts_direct_child_of_venv_launcher(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    payload = canonical_json({"ok": True, "verification": _verification().as_dict()}).encode()
+    payload = canonical_json(
+        {
+            "ok": True,
+            "verification": _verification().as_dict(),
+            "guard_implementation_digest": _GUARD_IMPLEMENTATION_DIGEST,
+        }
+    ).encode()
     connection = _FakeConnection(payload)
     _install_elevated_parent_fakes(monkeypatch, connection=connection, client_pid=5151)
     monkeypatch.setattr(runtime, "_process_parent_id", lambda process_id: 4242)
@@ -226,6 +250,53 @@ def test_force_elevated_route_uses_production_guard_path(
     assert calls == [trace]
 
 
+def test_missing_exact_guard_object_uses_trusted_ensure_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def missing(_api: object) -> GuardVerification:
+        calls.append("verify-missing")
+        raise WfpGuardMissingError("fixed filter is missing")
+
+    def elevated(*, diagnostic_trace: dict[str, object] | None = None) -> GuardVerification:
+        assert diagnostic_trace is None
+        calls.append("trusted-elevated-ensure")
+        return _verification()
+
+    monkeypatch.setattr(runtime, "verify_codex_loopback_block", missing)
+    monkeypatch.setattr(runtime, "new_windows_wfp_api", lambda: object())
+    monkeypatch.setattr(runtime, "_is_administrator", lambda: False)
+    monkeypatch.setattr(runtime, "_run_elevated_ensure", elevated)
+
+    assert runtime.ensure_runtime_codex_loopback_guard() == _verification()
+    assert calls == ["verify-missing", "trusted-elevated-ensure"]
+
+
+def test_existing_guard_state_mismatch_never_uses_silent_repair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def mismatch(_api: object) -> GuardVerification:
+        calls.append("verify-mismatch")
+        raise WfpGuardStateMismatchError("fixed filter conflicts")
+
+    def forbidden(*_args: object, **_kwargs: object) -> GuardVerification:
+        calls.append("forbidden-repair")
+        raise AssertionError("conflicting state must not be repaired")
+
+    monkeypatch.setattr(runtime, "verify_codex_loopback_block", mismatch)
+    monkeypatch.setattr(runtime, "new_windows_wfp_api", lambda: object())
+    monkeypatch.setattr(runtime, "_is_administrator", lambda: False)
+    monkeypatch.setattr(runtime, "_run_elevated_ensure", forbidden)
+    monkeypatch.setattr(runtime, "ensure_codex_loopback_block", forbidden)
+
+    with pytest.raises(WfpGuardStateMismatchError, match="conflicts"):
+        runtime.ensure_runtime_codex_loopback_guard()
+    assert calls == ["verify-mismatch"]
+
+
 @pytest.mark.parametrize("inherited_auth", [None, "not-inherited-or-used"])
 def test_elevated_main_does_not_require_inherited_environment(
     monkeypatch: pytest.MonkeyPatch, inherited_auth: str | None
@@ -250,6 +321,11 @@ def test_elevated_main_does_not_require_inherited_environment(
     monkeypatch.setattr(runtime, "_is_administrator", lambda: True)
     monkeypatch.setattr(runtime, "new_windows_wfp_api", lambda: object())
     monkeypatch.setattr(runtime, "ensure_codex_loopback_block", lambda _api: _verification())
+    monkeypatch.setattr(
+        runtime,
+        "capture_wfp_guard_implementation_identity",
+        lambda: {"digest": _GUARD_IMPLEMENTATION_DIGEST},
+    )
     monkeypatch.setattr(runtime, "Client", fake_client)
     if inherited_auth is None:
         monkeypatch.delenv("WLMCP_WFP_GUARD_AUTH", raising=False)
@@ -257,7 +333,11 @@ def test_elevated_main_does_not_require_inherited_environment(
         monkeypatch.setenv("WLMCP_WFP_GUARD_AUTH", inherited_auth)
 
     assert runtime._elevated_main(r"\\.\pipe\test-wfp-guard") == 0
-    assert json.loads(sent[0]) == {"ok": True, "verification": _verification().as_dict()}
+    assert json.loads(sent[0]) == {
+        "ok": True,
+        "verification": _verification().as_dict(),
+        "guard_implementation_digest": _GUARD_IMPLEMENTATION_DIGEST,
+    }
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows named-pipe peer identity")

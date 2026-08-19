@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ctypes
-import hashlib
 import json
 import os
 import re
@@ -10,15 +9,24 @@ import uuid
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from ctypes import create_unicode_buffer, get_last_error, wintypes
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 from .child_env import build_command_environment, sanitize_executable_search_path
 from .config import Settings
-from .tool_safety import ensure_external_tool_executable
+from .tool_safety import capture_executable_identity, ensure_external_tool_executable
 from .util import canonical_json, sha256_text
-from .wfp_guard import GUARD_POLICY_GENERATION, GUARD_VERSION
+from .wfp_guard import (
+    GUARD_POLICY_GENERATION,
+    GUARD_VERSION,
+    WfpGuardError,
+    WfpGuardStateMismatchError,
+    guard_verification_binding,
+    guard_verification_binding_digest,
+    resolve_sandbox_account_identity,
+)
+from .wfp_guard_identity import capture_wfp_guard_implementation_identity
 from .windows_job import WindowsJobLimits, WindowsSandboxJob
 from .windows_system import physical_filesystem_path
 
@@ -31,6 +39,7 @@ _SANDBOX_HELPERS = (
 _WLMCP_ISOLATION_POLICY_VERSION = 1
 _SANDBOX_STATE_POLICY_VERSION = 1
 _SANDBOX_STATE_GLOB_SCAN_MAX_DEPTH = 64
+SANDBOX_LIVE_MARKER_VERSION = 4
 SANDBOX_SECURITY_PROPERTIES = (
     "filesystem_read",
     "filesystem_write",
@@ -84,6 +93,7 @@ class CodexSandboxHelper:
     signature_status: str
     signer_subject: str
     signer_thumbprint: str
+    stable_file_identity: dict[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -95,6 +105,7 @@ class CodexSandboxHelper:
             "signature_status": self.signature_status,
             "signer_subject": self.signer_subject,
             "signer_thumbprint": self.signer_thumbprint,
+            "stable_file_identity": self.stable_file_identity,
         }
 
 
@@ -111,6 +122,8 @@ class CodexSandboxBackend:
     signer_subject: str
     signer_thumbprint: str
     helpers: tuple[CodexSandboxHelper, ...]
+    version: str = "unresolved"
+    stable_file_identity: dict[str, Any] = field(default_factory=dict)
     isolation_policy_version: int = _WLMCP_ISOLATION_POLICY_VERSION
     max_processes: int = 64
     max_memory_bytes: int = 4 * 1024 * 1024 * 1024
@@ -123,13 +136,14 @@ class CodexSandboxBackend:
             "executable_sha256": self.executable_sha256,
             "executable_size": self.executable_size,
             "executable_mtime_ns": self.executable_mtime_ns,
-            "version": "resolved_after_approval",
+            "version": self.version,
             "windows_mode": self.windows_mode,
             "permission_profile": self.permission_profile,
             "provenance": self.provenance,
             "signature_status": self.signature_status,
             "signer_subject": self.signer_subject,
             "signer_thumbprint": self.signer_thumbprint,
+            "stable_file_identity": self.stable_file_identity,
             "helper_dependencies": [helper.as_dict() for helper in self.helpers],
             "wlmcp_isolation_policy_version": self.isolation_policy_version,
             "max_processes": self.max_processes,
@@ -214,17 +228,20 @@ def resolve_codex_sandbox_backend(settings: Settings) -> CodexSandboxBackend:
                     sandbox_scratch_dir=settings.sandbox_scratch_dir,
                 )
             ).resolve(strict=True)
-            stat = executable.stat()
             authenticode = _openai_authenticode_identity(executable)
+            executable_identity = capture_executable_identity(
+                executable,
+                provenance=provenance,
+            )
             helpers = tuple(
                 _resolve_codex_helper(settings, executable, name)
                 for name in _SANDBOX_HELPERS
             )
-            return CodexSandboxBackend(
+            backend = CodexSandboxBackend(
                 executable=str(executable),
-                executable_sha256=_sha256_file(executable),
-                executable_size=stat.st_size,
-                executable_mtime_ns=stat.st_mtime_ns,
+                executable_sha256=str(executable_identity["sha256"]),
+                executable_size=int(executable_identity["size"]),
+                executable_mtime_ns=int(executable_identity["mtime_ns"]),
                 windows_mode=settings.approved_sandbox_windows_mode,
                 permission_profile=settings.approved_sandbox_permission_profile,
                 provenance=provenance,
@@ -232,9 +249,15 @@ def resolve_codex_sandbox_backend(settings: Settings) -> CodexSandboxBackend:
                 signer_subject=str(authenticode["subject"]),
                 signer_thumbprint=str(authenticode["thumbprint"]),
                 helpers=helpers,
+                stable_file_identity=dict(executable_identity["stable_file_identity"]),
                 max_processes=settings.max_sandbox_processes,
                 max_memory_bytes=settings.max_sandbox_memory_bytes,
             )
+            # Version output is part of the backend identity, and the complete executable
+            # closure remains held while the version command runs.
+            with hold_codex_sandbox_backend(backend):
+                version = probe_codex_version(backend, settings)
+            return replace(backend, version=version)
         except (
             ApprovedSandboxUnavailable,
             FileNotFoundError,
@@ -266,7 +289,9 @@ def verify_codex_sandbox_backend(
         "signature_status",
         "signer_subject",
         "signer_thumbprint",
+        "stable_file_identity",
         "helper_dependencies",
+        "version",
         "wlmcp_isolation_policy_version",
         "max_processes",
         "max_memory_bytes",
@@ -307,8 +332,10 @@ def sandbox_isolation_context(
         )
 
     return {
-        "version": 1,
+        "version": 2,
         "backend": backend.as_dict(),
+        "wfp_guard_implementation": capture_wfp_guard_implementation_identity(),
+        "windows_os_identity": windows_os_identity(),
         "roots": {
             "workspace_root": root_identity(settings.workspace_root),
             "data_dir": root_identity(settings.data_dir),
@@ -345,6 +372,64 @@ def isolation_context_digest(settings: Settings, backend: CodexSandboxBackend) -
     """Hash the complete security-relevant configuration used by live verification."""
 
     return sha256_text(canonical_json(sandbox_isolation_context(settings, backend)))
+
+
+def windows_os_identity() -> dict[str, Any]:
+    """Return the Windows product/build/UBR/architecture identity bound to live evidence."""
+
+    if os.name != "nt":
+        return {"platform": os.name, "supported_security_boundary": False}
+
+    import winreg
+
+    key_path = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as key:
+            values = {
+                name: winreg.QueryValueEx(key, name)[0]
+                for name in (
+                    "ProductName",
+                    "EditionID",
+                    "DisplayVersion",
+                    "CurrentMajorVersionNumber",
+                    "CurrentMinorVersionNumber",
+                    "CurrentBuildNumber",
+                    "UBR",
+                )
+            }
+    except OSError as error:
+        raise ApprovedSandboxUnavailable(
+            "Windows product/build identity could not be read"
+        ) from error
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetNativeSystemInfo.argtypes = [wintypes.LPVOID]
+    kernel32.GetNativeSystemInfo.restype = None
+    system_info = (ctypes.c_byte * 64)()
+    kernel32.GetNativeSystemInfo(ctypes.byref(system_info))
+    architecture_code = ctypes.cast(
+        ctypes.byref(system_info), ctypes.POINTER(ctypes.c_ushort)
+    ).contents.value
+    architecture = {
+        0: "x86",
+        5: "arm",
+        6: "ia64",
+        9: "amd64",
+        12: "arm64",
+    }.get(int(architecture_code), f"unknown-{architecture_code}")
+    if architecture.startswith("unknown-"):
+        raise ApprovedSandboxUnavailable("Windows native architecture is unrecognized")
+    return {
+        "platform": "windows",
+        "product_name": str(values["ProductName"]),
+        "edition_id": str(values["EditionID"]),
+        "display_version": str(values["DisplayVersion"]),
+        "major_version": int(values["CurrentMajorVersionNumber"]),
+        "minor_version": int(values["CurrentMinorVersionNumber"]),
+        "build": int(values["CurrentBuildNumber"]),
+        "ubr": int(values["UBR"]),
+        "native_architecture": architecture,
+    }
 
 
 def sandbox_live_verification_route_eligible(evidence: dict[str, Any]) -> bool:
@@ -394,16 +479,44 @@ def require_codex_sandbox_live_verification(
             "Codex Sandbox has not completed Windows live verification for this profile"
         ) from error
     try:
-        expected_isolation_digest = isolation_context_digest(settings, backend)
+        context = sandbox_isolation_context(settings, backend)
+        expected_isolation_digest = sha256_text(canonical_json(context))
     except (OSError, PermissionError, RuntimeError, ValueError) as error:
         raise ApprovedSandboxUnavailable(
             "Codex Sandbox isolation context could not be resolved"
         ) from error
+    guard_implementation = context.get("wfp_guard_implementation")
+    os_identity = context.get("windows_os_identity")
+    if not isinstance(guard_implementation, dict) or not isinstance(os_identity, dict):
+        raise ApprovedSandboxUnavailable(
+            "Codex Sandbox isolation context is missing C7 identity fields"
+        )
+    try:
+        account_identity = resolve_sandbox_account_identity().as_dict()
+    except WfpGuardError as error:
+        raise ApprovedSandboxUnavailable(
+            "Codex Sandbox account identity could not be resolved"
+        ) from error
+    wfp_binding = evidence.get("wfp_guard_binding")
     if (
-        evidence.get("version") != 3
+        evidence.get("version") != SANDBOX_LIVE_MARKER_VERSION
         or evidence.get("backend_digest")
         != sha256_text(canonical_json(backend.as_dict()))
+        or evidence.get("backend_version") != backend.version
         or evidence.get("isolation_context_digest") != expected_isolation_digest
+        or evidence.get("guard_implementation_digest")
+        != guard_implementation.get("digest")
+        or evidence.get("guard_implementation") != guard_implementation
+        or evidence.get("windows_os_identity_digest")
+        != sha256_text(canonical_json(os_identity))
+        or evidence.get("windows_os_identity") != os_identity
+        or evidence.get("sandbox_account_identity") != account_identity
+        or not isinstance(wfp_binding, dict)
+        or wfp_binding.get("guard_version") != GUARD_VERSION
+        or wfp_binding.get("policy_generation") != GUARD_POLICY_GENERATION
+        or wfp_binding.get("sandbox_account_identity") != account_identity
+        or evidence.get("wfp_guard_binding_digest")
+        != sha256_text(canonical_json(wfp_binding))
         or not sandbox_live_verification_route_eligible(evidence)
     ):
         raise ApprovedSandboxUnavailable(
@@ -650,21 +763,56 @@ def guard_and_launch_codex_sandbox(
     stderr: Any,
     limits: WindowsJobLimits | None = None,
     on_guard_verified: Callable[[dict[str, object]], None] | None = None,
+    expected_live_evidence: dict[str, Any] | None = None,
 ) -> tuple[
     subprocess.Popen[Any], WindowsSandboxJob, list[str], dict[str, object]
 ]:
     """Verify the fixed WFP Guard immediately before starting the Sandbox route."""
 
-    from .wfp_guard import WfpGuardError
     from .wfp_guard_runtime import ensure_runtime_codex_loopback_guard
 
+    if expected_live_evidence is not None:
+        current_evidence = require_codex_sandbox_live_verification(settings, backend)
+        if current_evidence != expected_live_evidence:
+            raise ApprovedSandboxUnavailable(
+                "Codex Sandbox live marker changed before WFP verification; "
+                "run verify-codex-sandbox explicitly"
+            )
+        try:
+            account_identity = resolve_sandbox_account_identity().as_dict()
+        except WfpGuardError as error:
+            raise ApprovedSandboxUnavailable(
+                "Codex Sandbox account identity could not be revalidated; "
+                "run verify-codex-sandbox explicitly"
+            ) from error
+        if account_identity != current_evidence.get("sandbox_account_identity"):
+            raise ApprovedSandboxUnavailable(
+                "Codex Sandbox account identity changed after live verification; "
+                "run verify-codex-sandbox explicitly"
+            )
     try:
         verification = ensure_runtime_codex_loopback_guard()
+    except WfpGuardStateMismatchError as error:
+        raise ApprovedSandboxUnavailable(
+            "Codex Sandbox WFP state conflicts with the verified marker; "
+            "run verify-codex-sandbox explicitly"
+        ) from error
     except (OSError, RuntimeError, WfpGuardError) as error:
         raise ApprovedSandboxUnavailable(
             f"Codex Sandbox WFP Guard verification failed: {error}"
         ) from error
     guard_payload = verification.as_dict()
+    if expected_live_evidence is not None:
+        binding = guard_verification_binding(verification)
+        if (
+            binding != expected_live_evidence.get("wfp_guard_binding")
+            or guard_verification_binding_digest(verification)
+            != expected_live_evidence.get("wfp_guard_binding_digest")
+        ):
+            raise ApprovedSandboxUnavailable(
+                "Codex Sandbox WFP read-back differs from the live marker; "
+                "run verify-codex-sandbox explicitly"
+            )
     if on_guard_verified is not None:
         on_guard_verified(guard_payload)
     process, job, argv = launch_codex_sandbox(
@@ -744,14 +892,6 @@ def codex_sandbox_effective_policy(*, workspace_write: bool) -> dict[str, Any]:
     }
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _resolve_codex_helper(
     settings: Settings, launcher: Path, name: str
 ) -> CodexSandboxHelper:
@@ -772,16 +912,20 @@ def _resolve_codex_helper(
 
 
 def _binary_identity(path: Path) -> dict[str, Any]:
-    stat = path.stat()
     authenticode = _openai_authenticode_identity(path)
+    captured = capture_executable_identity(
+        path,
+        provenance="openai-authenticode-signed-codex-dependency",
+    )
     return {
         "executable": str(path),
-        "executable_sha256": _sha256_file(path),
-        "executable_size": stat.st_size,
-        "executable_mtime_ns": stat.st_mtime_ns,
+        "executable_sha256": captured["sha256"],
+        "executable_size": captured["size"],
+        "executable_mtime_ns": captured["mtime_ns"],
         "signature_status": str(authenticode["status"]),
         "signer_subject": str(authenticode["subject"]),
         "signer_thumbprint": str(authenticode["thumbprint"]),
+        "stable_file_identity": captured["stable_file_identity"],
     }
 
 

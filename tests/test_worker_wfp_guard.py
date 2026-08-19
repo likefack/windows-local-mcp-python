@@ -47,6 +47,7 @@ def _backend() -> CodexSandboxBackend:
         signer_subject="OpenAI",
         signer_thumbprint="b" * 40,
         helpers=(),
+        version="test",
     )
 
 
@@ -55,6 +56,9 @@ def _guard_payload() -> dict[str, object]:
         "guard_version": "wlmcp-wfp-loopback-guard-v1",
         "policy_generation": 1,
         "target_account": "CodexSandboxOffline",
+        "target_computer_name": "TESTPC",
+        "target_qualified_account": r"TESTPC\CodexSandboxOffline",
+        "target_sid_name_use": 1,
         "target_sid": "S-1-5-21-100-200-300-1004",
         "app_isolation_sublayer_key": "ffe221c3-92a8-4564-a59f-dafb70756020",
         "app_isolation_weight": 7,
@@ -162,7 +166,8 @@ def _prepare_operation(
     )
     monkeypatch.setattr("windows_local_mcp.worker.verify_codex_sandbox_backend", lambda *_: backend)
     monkeypatch.setattr(
-        "windows_local_mcp.worker.require_codex_sandbox_live_verification", lambda *_: {}
+        "windows_local_mcp.worker.require_codex_sandbox_live_verification",
+        lambda *_: {"version": 4},
     )
     monkeypatch.setattr(
         "windows_local_mcp.worker._ensure_approval_execution_fresh", lambda *_: None
@@ -173,6 +178,10 @@ def _prepare_operation(
     )
     monkeypatch.setattr(
         "windows_local_mcp.worker.hold_codex_sandbox_backend", lambda value: nullcontext(value)
+    )
+    monkeypatch.setattr(
+        "windows_local_mcp.worker.hold_wfp_guard_implementation",
+        lambda: nullcontext({"digest": "c" * 64}),
     )
     monkeypatch.setattr("windows_local_mcp.worker.probe_codex_version", lambda *_: "test")
     monkeypatch.setattr(
@@ -386,3 +395,42 @@ def test_worker_guard_failure_prevents_launch_and_has_no_host_fallback(
     assert "wfp_guard_verification_failed" in event_types
     assert "child_started" not in event_types
     assert launches == []
+
+
+def test_worker_stale_marker_stops_before_guard_and_never_falls_back_to_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    operation_id, _backend_value = _prepare_operation(settings, monkeypatch)
+    calls: list[str] = []
+
+    def stale_marker(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise ApprovedSandboxUnavailable(
+            "Codex Sandbox live verification is missing, failed, or stale"
+        )
+
+    def forbidden_guard(*_args: object, **_kwargs: object) -> object:
+        calls.append("guard-or-child")
+        raise AssertionError("stale marker must stop before WFP Guard and child launch")
+
+    monkeypatch.setattr(
+        "windows_local_mcp.worker.require_codex_sandbox_live_verification",
+        stale_marker,
+    )
+    monkeypatch.setattr(
+        "windows_local_mcp.worker.guard_and_launch_codex_sandbox",
+        forbidden_guard,
+    )
+    monkeypatch.setattr(subprocess, "Popen", forbidden_guard)
+
+    assert run_operation(operation_id, settings) == 1
+    record = AuditStore(settings).get_operation(operation_id, include_events=True)
+    assert record["status"] == "failed"
+    assert "missing, failed, or stale" in record["error"]
+    assert "child_started" not in {
+        event["event_type"] for event in record["events"]
+    }
+    assert "pre_execution_verification_failed" in {
+        event["event_type"] for event in record["events"]
+    }
+    assert calls == []

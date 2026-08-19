@@ -1,5 +1,37 @@
 # 検証記録
 
+## 2026-08-20 C7 verified state identity binding
+
+### baseline と実装前 checkpoint
+
+- `git pull --ff-only origin main` を通常 Windows user 文脈で実行し、`HEAD=b81ebe654bf99d0e64d9b4e1c7a7bc1bb04d9026`、同期済み、作業開始時 clean を確認した。
+- 既知の一時 failure 対象 `test_approved_host_control_plane_tamper_is_detected_and_blocks_future_work` は 5 回連続で通過した。
+- 実装前 full pytest 中に `test_approved_host_detects_wmi_process_outside_job_before_postflight` の遅延 canary が一度だけ欠落した。operation 自体は成功しており、WMI が venv launcher を起動した後に launcher が先に終了できる test fixture の不安定性だった。WMI が `sys.base_prefix\python.exe` を直接作成するよう fixture を限定修正し、対象 5 回連続と実装前 full pytest `288 passed, 2 skipped` を確認した。
+- 実装前 Ruff、compileall、`git diff --check` は通過した。
+
+### C7 identity と fail-closed behavior
+
+- live marker を schema v4 へ切り替え、v1～v3または必須 field 欠損から C7 evidence を推測・移行しない。
+- 実際に import された Guard module closure を canonical path、content SHA-256、Windows handle 由来の volume serial number / file index、size、Guard version、policy generation へ結合する。mtime は補助 drift signal であり、単独では trust anchor にしない。
+- Codex launcher / helper を content SHA-256、Windows stable file identity、size、実際の version、Authenticode `Valid`、leaf signer subject、leaf certificate thumbprintへ結合する。
+- Windows product / build / UBR / native architecture、local physical computer へ完全修飾した Sandbox account identity、stable WFP read-back binding を marker へ結合する。
+- marker identity mismatch は通常 operation を live verification、Guard UAC probe、child launch、Approved Host fallback へ進めず、`verify-codex-sandbox` の明示実行を要求する。
+- marker identity がすべて現在値と一致し、static non-persistent WFP fixed object が単に missing の場合だけ trusted Guard の ensure / recreate を許可する。existing mismatch / conflict は silent repair せず、missing と mismatch が混在する場合も object を追加しない。
+- launch ordering は `ensure → complete read-back → wfp_guard_verified → child launch` を維持する。Guard module と Codex executable closure は security check から child lifetime まで置換・書込みを拒否する handle を保持する。
+
+### 自動回帰と静的検査
+
+- C7重点回帰: `92 passed`。schema v1～v3、backend / Guard / policy / account / OS /必須 field mismatch、stale marker、missing exact object、existing conflict、mixed missing / conflict、read-back / launch ordering、actual imported module identity / hold を含む。
+- 通常 Windows user 文脈の full pytest: `304 passed, 2 skipped in 81.75s`。
+- Ruff: `.venv\Scripts\python.exe -m ruff check --no-cache src tests` は pass。
+- compileall: `.venv\Scripts\python.exe -m compileall -q src tests` は通常 Windows user 文脈で pass。制限環境からは通常 user の full pytest が生成した `tests\__pycache__` への一時 `.pyc` 書込みが拒否されたため、同じ通常 user 文脈で再実行した。
+- `git diff --check`: pass。LF / CRLF の将来変換 warning のみ。
+
+### 検証境界
+
+- 今回の通常 Windows user 回帰は unit / mock /既存 integration の検証であり、C7変更後の `verify-codex-sandbox`、UAC画面、live WFP objectの欠損再構築、実通信、production route E2E は実行していない。
+- Codex Desktop自身の制限環境内からstdio MCP子プロセスを起動するfull pytestは、子プロセス作成前で停止した。この入れ子実行は製品回帰の証拠に使わず、通常 Windows user 文脈のfull pytest結果だけを採用した。
+
 ## 2026-08-19 Approved Host 子孫プロセスの事後改ざん防止
 
 ### 再現と修正

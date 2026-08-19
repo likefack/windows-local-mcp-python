@@ -38,6 +38,11 @@ def test_broker_helper_requires_matching_explicit_hash(tmp_path: Path) -> None:
     assert identity["path"] == str(executable.resolve())
     assert identity["sha256"] == digest
     assert identity["provenance"] == "explicit-local-config"
+    stable_identity = identity["stable_file_identity"]
+    assert stable_identity["platform"] == ("windows" if os.name == "nt" else "posix")
+    if os.name == "nt":
+        assert stable_identity["volume_serial_number"] >= 0
+        assert stable_identity["file_index"] > 0
 
     settings.git_executable_sha256 = "0" * 64
     with pytest.raises(PermissionError, match="SHA-256"):

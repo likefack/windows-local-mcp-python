@@ -113,6 +113,24 @@ OS 境界の安全性を証明した意味には使いません。`Windows live-
 `verified` と表示するには、同一の launcher、helper、version、署名、hash、policy generation に
 対して、その property を実機で確認します。
 
+Live verification marker は schema v4 のみを受理します。v1～v3 または必須 field が欠けた marker から
+C7 identity を推測・移行しません。v4 は、実際に import された WFP Guard module の canonical path、
+content SHA-256、Windows handle から取得した volume serial number と file index、size、Guard version、
+policy generation に結合します。mtime は補助的な drift signal であり、単独では trust anchor にしません。
+Guard module は verification から child 起動まで置換・書込みを拒否する handle を保持します。
+
+Codex launcher と adjacent helper は canonical path、content SHA-256、Windows stable file identity、size、
+実際の version、Authenticode の `Valid` status、leaf signer subject、leaf certificate thumbprint に結合します。
+さらに Windows product、build、UBR、native architecture、Sandbox account identity、WFP read-back identity を
+marker に結合し、現在値と異なれば marker を stale として通常 operation を停止します。通常 operation は
+stale marker を理由に live verification を自動実行せず、`verify-codex-sandbox` の明示実行を必要とします。
+
+WFP の static non-persistent fixed object は reboot や BFE restart で消失し得るため、marker v4 の Guard、
+policy、backend、account、OS identity がすべて現在値と一致し、object が単に missing の場合だけ、trusted
+Guard が exact object を再構築できます。その場合も `ensure → complete read-back → wfp_guard_verified →
+child launch` の順序を崩しません。既存 object の security-relevant field 不一致、conflicting object、または
+marker identity 不一致は無変更で fail closed とし、silent repair しません。
+
 Sandbox route の必須境界は少なくとも次です。
 
 - workspace 外の不要な user file を読めない。workspace 外の `.env`、credential、secret もこの必須境界に含む

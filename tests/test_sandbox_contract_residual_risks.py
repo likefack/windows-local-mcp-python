@@ -9,11 +9,16 @@ from windows_local_mcp.sandbox_backend import (
     SANDBOX_SECURITY_PROPERTIES,
     ApprovedSandboxUnavailable,
     CodexSandboxBackend,
-    isolation_context_digest,
     require_codex_sandbox_live_verification,
+    sandbox_isolation_context,
     sandbox_live_verification_route_eligible,
 )
 from windows_local_mcp.util import canonical_json, sha256_text
+from windows_local_mcp.wfp_guard import (
+    GUARD_POLICY_GENERATION,
+    GUARD_VERSION,
+    SandboxAccountIdentity,
+)
 
 MANDATORY_DESCENDANT_CHECKS = (
     "child_source_workspace_write_denied",
@@ -29,6 +34,16 @@ MANDATORY_DESCENDANT_CHECKS = (
     "grandchild_internet_denied",
     "grandchild_loopback_denied",
 )
+
+
+def _account_identity() -> SandboxAccountIdentity:
+    return SandboxAccountIdentity(
+        account_name="CodexSandboxOffline",
+        computer_name="TESTPC",
+        qualified_account_name=r"TESTPC\CodexSandboxOffline",
+        sid="S-1-5-21-100-200-300-1004",
+        sid_name_use=1,
+    )
 
 
 def _settings(tmp_path: Path) -> Settings:
@@ -56,6 +71,7 @@ def _backend(tmp_path: Path) -> CodexSandboxBackend:
         signer_subject="OpenAI",
         signer_thumbprint="b" * 40,
         helpers=(),
+        version="test-version",
     )
 
 
@@ -77,20 +93,42 @@ def _accepted_residual_risk_evidence(
             "grandchild_lan_denied": False,
         }
     )
+    context = sandbox_isolation_context(settings, backend)
+    guard_implementation = context["wfp_guard_implementation"]
+    os_identity = context["windows_os_identity"]
+    account_identity = _account_identity().as_dict()
+    wfp_binding = {
+        "guard_version": GUARD_VERSION,
+        "policy_generation": GUARD_POLICY_GENERATION,
+        "sandbox_account_identity": account_identity,
+        "test_binding": True,
+    }
     return {
-        "version": 3,
+        "version": 4,
         "passed": False,
         "backend_digest": sha256_text(canonical_json(backend.as_dict())),
-        "isolation_context_digest": isolation_context_digest(settings, backend),
+        "backend_version": backend.version,
+        "isolation_context_digest": sha256_text(canonical_json(context)),
+        "guard_implementation": guard_implementation,
+        "guard_implementation_digest": guard_implementation["digest"],
+        "windows_os_identity": os_identity,
+        "windows_os_identity_digest": sha256_text(canonical_json(os_identity)),
+        "sandbox_account_identity": account_identity,
+        "wfp_guard_binding": wfp_binding,
+        "wfp_guard_binding_digest": sha256_text(canonical_json(wfp_binding)),
         "properties": properties,
         "checks": checks,
     }
 
 
 def test_accepted_workspace_secret_and_lan_failures_do_not_block_route(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = _settings(tmp_path)
+    monkeypatch.setattr(
+        "windows_local_mcp.sandbox_backend.resolve_sandbox_account_identity",
+        _account_identity,
+    )
     backend = _backend(tmp_path)
     evidence = _accepted_residual_risk_evidence(settings, backend)
 
@@ -104,8 +142,14 @@ def test_accepted_workspace_secret_and_lan_failures_do_not_block_route(
     assert accepted["properties"]["lan"]["status"] == "failed"
 
 
-def test_mandatory_descendant_failure_still_fails_closed(tmp_path: Path) -> None:
+def test_mandatory_descendant_failure_still_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     settings = _settings(tmp_path)
+    monkeypatch.setattr(
+        "windows_local_mcp.sandbox_backend.resolve_sandbox_account_identity",
+        _account_identity,
+    )
     backend = _backend(tmp_path)
     evidence = _accepted_residual_risk_evidence(settings, backend)
     checks = evidence["checks"]
