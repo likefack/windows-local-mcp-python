@@ -14,4 +14,12 @@ windows-local-mcp-guide.docx
 windows-local-mcp-guide.xlsx
 ~$windows-local-mcp-guide.xlsx
 
+# Generated security-scan output. Keep durable findings in reviewed docs/issues instead.
+/scan/
+
+# Local diagnostic output / fault-injection state must never be committed.
 diagnostics/WFP-*-Results/
+diagnostics/.c6-*
+
+# One-off hardening analysis artifacts are local/generated; durable conclusions belong in reviewed docs.
+diagnostics/hardening/

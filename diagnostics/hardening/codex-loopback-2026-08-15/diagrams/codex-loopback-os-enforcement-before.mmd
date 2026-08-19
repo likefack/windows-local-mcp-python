@@ -1,7 +1,0 @@
-flowchart LR
-    W["WLMCP: restricted network 要求"] --> C["Codex elevated Sandbox"]
-    C --> S["CodexSandboxOffline\nparent / child / grandchild"]
-    S --> F["MPSSVC_WF\nCodex BLOCK"]
-    S --> A["MPSSVC_APP_ISOLATION\nAppContainerLoopback PERMIT 70511/70512"]
-    A --> H["Host localhost listener"]
-    F -. "実測では最終拒否にならない" .-> H
