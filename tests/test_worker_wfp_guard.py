@@ -295,6 +295,9 @@ def test_worker_guard_failure_prevents_launch_and_has_no_host_fallback(
     record = AuditStore(settings).get_operation(operation_id, include_events=True)
     assert record["result"]["failure_class"] == "sandbox_backend_failure"
     assert record["result"]["host_fallback_performed"] is False
+    assert record["network_policy"]["wfp_guard_status"] == "verification_failed"
+    assert record["network_policy"]["enforcement_status"] == "prepared"
+    assert "wfp_guard" not in record["network_policy"]
     event_types = [event["event_type"] for event in record["events"]]
     assert "wfp_guard_verification_failed" in event_types
     assert "child_started" not in event_types
