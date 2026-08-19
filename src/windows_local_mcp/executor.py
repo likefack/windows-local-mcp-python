@@ -53,8 +53,10 @@ class Executor:
             env=child_env,
         )
         identity = capture_process_identity(process.pid, nonce)
-        self.audit.update_operation(
+        bootstrap_identity_recorded = self.audit.transition_operation(
             operation_id,
+            from_statuses={"queued"},
+            status="queued",
             worker_pid=identity.pid,
             worker_create_time=identity.create_time,
             worker_executable=identity.executable,
@@ -65,7 +67,12 @@ class Executor:
             "worker_spawned",
             {
                 "worker_pid": process.pid,
+                "launcher_pid": identity.pid,
+                "launcher_create_time": identity.create_time,
+                "launcher_executable": identity.executable,
+                "identity_role": "bootstrap_launcher",
                 "identity_verified": True,
+                "operation_identity_updated": bootstrap_identity_recorded,
                 "immutable_context_sha256": context_sha256,
                 "isolated_import_mode": True,
             },
@@ -92,30 +99,38 @@ class Executor:
         return self._public_result(self.audit.get_operation(operation_id, include_events=False))
 
     def stop(self, operation_id: str) -> dict[str, Any]:
-        operation = self.audit.get_operation(operation_id, include_events=False)
-        if operation["status"] in TERMINAL_STATUSES:
-            return self._public_result(operation)
+        while True:
+            operation = self.audit.get_operation(operation_id, include_events=False)
+            if operation["status"] in TERMINAL_STATUSES:
+                return self._public_result(operation)
 
-        identities = self._identities(operation)
-        if not identities:
-            raise RuntimeError("job has no verifiable live process identity; refusing PID-only stop")
-        matched = False
-        for identity in identities:
-            if terminate_process_tree(identity):
-                matched = True
-        if not matched:
+            identities = self._identities(operation)
+            if not identities:
+                raise RuntimeError("job has no verifiable live process identity; refusing PID-only stop")
+            matched = False
+            for identity in identities:
+                if terminate_process_tree(identity):
+                    matched = True
+            if matched:
+                break
+
+            current_status = str(operation["status"])
+            if current_status not in {"queued", "running"}:
+                return self._public_result(operation)
+            # If worker self-binding raced this stale bootstrap read, the status comparison
+            # fails and the loop retries with the newly committed stable identity.
             transitioned = self.audit.transition_operation(
                 operation_id,
-                from_statuses={"queued", "running"},
+                from_statuses={current_status},
                 status="interrupted",
                 finished_at=utc_now_iso(),
                 error="stale process identity; no process was terminated",
             )
             if transitioned:
                 self.audit.add_event(operation_id, "stale_identity", {})
-            return self._public_result(
-                self.audit.get_operation(operation_id, include_events=False)
-            )
+                return self._public_result(
+                    self.audit.get_operation(operation_id, include_events=False)
+                )
 
         transitioned = self.audit.transition_operation(
             operation_id,
@@ -130,19 +145,26 @@ class Executor:
 
     def _reconcile_stale_jobs(self) -> None:
         for operation in self.audit.list_active_operations():
-            identities = self._identities(operation)
-            if identities and any(process_identity_matches(identity) for identity in identities):
-                continue
-            now = utc_now_iso()
-            transitioned = self.audit.transition_operation(
-                operation["id"],
-                from_statuses={"queued", "running"},
-                status="interrupted",
-                finished_at=now,
-                error="stale job reconciled at server startup; no PID-only termination attempted",
-            )
-            if transitioned:
-                self.audit.add_event(operation["id"], "stale_job_reconciled", {})
+            while True:
+                current = self.audit.get_operation(operation["id"], include_events=False)
+                current_status = str(current["status"])
+                if current_status not in {"queued", "running"}:
+                    break
+                identities = self._identities(current)
+                if identities and any(
+                    process_identity_matches(identity) for identity in identities
+                ):
+                    break
+                transitioned = self.audit.transition_operation(
+                    operation["id"],
+                    from_statuses={current_status},
+                    status="interrupted",
+                    finished_at=utc_now_iso(),
+                    error="stale job reconciled at server startup; no PID-only termination attempted",
+                )
+                if transitioned:
+                    self.audit.add_event(operation["id"], "stale_job_reconciled", {})
+                    break
 
     @staticmethod
     def _identities(operation: dict[str, Any]) -> list[ProcessIdentity]:

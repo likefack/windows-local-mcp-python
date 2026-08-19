@@ -208,6 +208,27 @@ def run_operation(operation_id: str, settings: Settings) -> int:
     if not nonce:
         raise RuntimeError("worker process nonce is missing")
 
+    try:
+        # Windows venv launchers may hand execution to the base interpreter while retaining
+        # the PID. Bind the durable audit identity only after this worker is fully running.
+        worker_identity = capture_process_identity(os.getpid(), nonce)
+    except Exception as error:  # noqa: BLE001 - uncertain worker identity must fail closed
+        if workspace_lock is not None:
+            workspace_lock.__exit__(None, None, None)
+        audit.transition_operation(
+            operation_id,
+            from_statuses={"queued", "running"},
+            status="failed",
+            finished_at=utc_now_iso(),
+            error=f"worker identity verification failed: {type(error).__name__}: {error}",
+        )
+        audit.add_event(
+            operation_id,
+            "worker_identity_verification_failed",
+            {"error": f"{type(error).__name__}: {error}"[:1000]},
+        )
+        return 1
+
     stdout_path = settings.data_dir / "outputs" / f"{operation_id}.stdout.log"
     stderr_path = settings.data_dir / "outputs" / f"{operation_id}.stderr.log"
     enforce_data_quota(settings, incoming_bytes=2 * settings.max_output_bytes_per_stream)
@@ -217,7 +238,10 @@ def run_operation(operation_id: str, settings: Settings) -> int:
         from_statuses={"queued"},
         status="running",
         started_at=utc_now_iso(),
-        worker_pid=os.getpid(),
+        worker_pid=worker_identity.pid,
+        worker_create_time=worker_identity.create_time,
+        worker_executable=worker_identity.executable,
+        process_nonce=nonce,
         stdout_path=str(stdout_path),
         stderr_path=str(stderr_path),
     ):
@@ -225,7 +249,17 @@ def run_operation(operation_id: str, settings: Settings) -> int:
         if workspace_lock is not None:
             workspace_lock.__exit__(None, None, None)
         return 1
-    audit.add_event(operation_id, "worker_started", {"worker_pid": os.getpid()})
+    audit.add_event(
+        operation_id,
+        "worker_started",
+        {
+            "worker_pid": worker_identity.pid,
+            "worker_create_time": worker_identity.create_time,
+            "worker_executable": worker_identity.executable,
+            "identity_role": "stable_worker",
+            "identity_verified": True,
+        },
+    )
 
     staged_sandbox_commit = bool(
         operation["tier"] == "codex_sandbox"

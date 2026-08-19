@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 import subprocess
 import sys
 import time
@@ -13,6 +14,7 @@ import pytest
 
 from windows_local_mcp.audit import AuditStore
 from windows_local_mcp.config import Settings
+from windows_local_mcp.executor import Executor
 from windows_local_mcp.policy import NormalizedCommand
 from windows_local_mcp.process_utils import ProcessIdentity
 from windows_local_mcp.sandbox_backend import ApprovedSandboxUnavailable, CodexSandboxBackend
@@ -145,6 +147,12 @@ def _prepare_operation(
         approval_status="claimed",
     )
     audit.update_operation(operation_id, process_nonce="nonce")
+    audit.update_operation(
+        operation_id,
+        worker_pid=1234,
+        worker_create_time=10.0,
+        worker_executable=r"C:\runtime\Scripts\python.exe",
+    )
 
     monkeypatch.setattr("windows_local_mcp.worker.verify_control_plane_generation", lambda *_: None)
     monkeypatch.setattr("windows_local_mcp.worker.approved_request_hash", lambda _: "approved-hash")
@@ -172,12 +180,88 @@ def _prepare_operation(
         lambda pid, nonce: ProcessIdentity(
             pid=pid,
             create_time=1.0,
-            executable=str(Path(sys.executable).resolve(strict=True)),
+            executable=r"C:\Python314\python.exe",
             nonce=nonce,
         ),
     )
     monkeypatch.setattr("windows_local_mcp.worker.process_tree_write_bytes", lambda *_: 0)
     return operation_id, backend
+
+
+def test_worker_rebinds_redirector_identity_before_approved_payload_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    operation_id, _backend_value = _prepare_operation(settings, monkeypatch)
+    stable_executable = r"C:\Python314\python.exe"
+    child = FakeChild()
+    job = FakeJob()
+
+    def guarded_launch(
+        *_args: object, **kwargs: object
+    ) -> tuple[object, object, list[str], dict[str, object]]:
+        operation = AuditStore(settings).get_operation(operation_id, include_events=False)
+        assert operation["status"] == "running"
+        assert operation["worker_pid"] == os.getpid()
+        assert operation["worker_create_time"] == 1.0
+        assert operation["worker_executable"] == stable_executable
+        kwargs["on_guard_verified"](_guard_payload())
+        return child, job, ["codex", "sandbox"], _guard_payload()
+
+    monkeypatch.setattr("windows_local_mcp.worker.guard_and_launch_codex_sandbox", guarded_launch)
+    monkeypatch.setattr(
+        "windows_local_mcp.worker._terminate_launched_child",
+        lambda launched, _identity: launched.terminate(),
+    )
+
+    assert run_operation(operation_id, settings) == 0
+    record = AuditStore(settings).get_operation(operation_id, include_events=True)
+    assert record["worker_pid"] == os.getpid()
+    assert record["worker_create_time"] == 1.0
+    assert record["worker_executable"] == stable_executable
+    started = next(event for event in record["events"] if event["event_type"] == "worker_started")
+    assert started["payload"] == {
+        "identity_role": "stable_worker",
+        "identity_verified": True,
+        "worker_create_time": 1.0,
+        "worker_executable": stable_executable,
+        "worker_pid": os.getpid(),
+    }
+
+
+def test_bootstrap_stop_prevents_worker_from_launching_payload_after_self_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    operation_id, _backend_value = _prepare_operation(settings, monkeypatch)
+    initial_identities: list[ProcessIdentity] = []
+
+    monkeypatch.setattr("windows_local_mcp.executor.process_identity_matches", lambda _identity: True)
+
+    def stale_launcher(identity: ProcessIdentity) -> bool:
+        initial_identities.append(identity)
+        return False
+
+    monkeypatch.setattr("windows_local_mcp.executor.terminate_process_tree", stale_launcher)
+    executor = Executor(settings, AuditStore(settings))
+    assert executor.stop(operation_id)["status"] == "interrupted"
+    assert initial_identities == [
+        ProcessIdentity(
+            pid=1234,
+            create_time=10.0,
+            executable=r"C:\runtime\Scripts\python.exe",
+            nonce="nonce",
+        )
+    ]
+
+    def forbidden_launch(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("a stopped bootstrap worker must not launch an approved payload")
+
+    monkeypatch.setattr("windows_local_mcp.worker.guard_and_launch_codex_sandbox", forbidden_launch)
+    assert run_operation(operation_id, settings) == 1
+    record = AuditStore(settings).get_operation(operation_id, include_events=True)
+    assert record["status"] == "interrupted"
+    assert any(event["event_type"] == "worker_start_suppressed" for event in record["events"])
 
 
 @pytest.mark.parametrize(

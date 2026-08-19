@@ -12,6 +12,7 @@ from windows_local_mcp.config import Settings
 from windows_local_mcp.executor import Executor
 from windows_local_mcp.process_utils import (
     ProcessIdentity,
+    process_identity_matches,
     terminate_process_tree,
     wait_for_untracked_current_user_processes,
 )
@@ -62,6 +63,30 @@ def test_pid_reuse_identity_mismatch_never_terminates_current_process() -> None:
         nonce="wrong",
     )
     assert terminate_process_tree(fake) is False
+
+
+def test_process_identity_matches_stable_worker_not_redirector_bootstrap(
+    monkeypatch,
+) -> None:
+    stable_executable = os.path.normcase(str(Path(sys.executable).resolve()))
+
+    class FakeProcess:
+        def create_time(self) -> float:
+            return 20.0
+
+        def exe(self) -> str:
+            return sys.executable
+
+        def environ(self) -> dict[str, str]:
+            return {"WINDOWS_LOCAL_MCP_JOB_NONCE": "nonce"}
+
+    monkeypatch.setattr("windows_local_mcp.process_utils.psutil.Process", lambda _pid: FakeProcess())
+    stable = ProcessIdentity(4321, 20.0, stable_executable, "nonce")
+    redirector = ProcessIdentity(4321, 10.0, r"C:\runtime\Scripts\python.exe", "nonce")
+
+    assert process_identity_matches(stable)
+    assert not process_identity_matches(redirector)
+    assert not process_identity_matches(ProcessIdentity(4321, 20.0, stable_executable, "wrong"))
 
 
 def test_wait_for_untracked_current_user_processes_waits_for_new_process_to_exit(
@@ -120,6 +145,200 @@ def test_stale_job_is_reconciled_without_pid_only_termination(tmp_path: Path) ->
     operation = store.get_operation(operation_id)
     assert operation["status"] == "interrupted"
     assert operation["events"][-1]["event_type"] == "stale_job_reconciled"
+
+
+def test_stable_worker_identity_drives_reconciliation_and_stop_after_redirector_handoff(
+    tmp_path: Path, monkeypatch
+) -> None:
+    settings = make_settings(tmp_path)
+    store = AuditStore(settings)
+    operation_id = store.create_operation(
+        tool_name="execute",
+        tier="safe_command",
+        status="running",
+        cwd=str(settings.workspace_root),
+        request={},
+    )
+    stable_identity = ProcessIdentity(
+        pid=4321,
+        create_time=20.0,
+        executable=r"C:\Python314\python.exe",
+        nonce="nonce",
+    )
+    store.update_operation(
+        operation_id,
+        worker_pid=stable_identity.pid,
+        worker_create_time=stable_identity.create_time,
+        worker_executable=stable_identity.executable,
+        process_nonce=stable_identity.nonce,
+    )
+    matched: list[ProcessIdentity] = []
+    terminated: list[ProcessIdentity] = []
+
+    def identity_matches(identity: ProcessIdentity) -> bool:
+        matched.append(identity)
+        return identity == stable_identity
+
+    def terminate(identity: ProcessIdentity) -> bool:
+        terminated.append(identity)
+        return identity == stable_identity
+
+    monkeypatch.setattr("windows_local_mcp.executor.process_identity_matches", identity_matches)
+    monkeypatch.setattr("windows_local_mcp.executor.terminate_process_tree", terminate)
+
+    executor = Executor(settings, store)
+    assert store.get_operation(operation_id, include_events=False)["status"] == "running"
+    assert matched == [stable_identity]
+    assert executor.stop(operation_id)["status"] == "cancelled"
+    assert terminated == [stable_identity]
+
+
+def test_late_bootstrap_capture_cannot_overwrite_worker_self_binding(
+    tmp_path: Path, monkeypatch
+) -> None:
+    settings = make_settings(tmp_path)
+    store = AuditStore(settings)
+    executor = Executor(settings, store)
+    operation_id = store.create_operation(
+        tool_name="execute",
+        tier="safe_command",
+        status="queued",
+        cwd=str(settings.workspace_root),
+        request={},
+    )
+    stable_executable = r"C:\Python314\python.exe"
+    redirector_executable = r"C:\runtime\Scripts\python.exe"
+
+    class FakeLauncher:
+        pid = 4321
+
+    def fake_popen(*_args, **kwargs) -> FakeLauncher:
+        nonce = kwargs["env"]["WINDOWS_LOCAL_MCP_JOB_NONCE"]
+        assert store.transition_operation(
+            operation_id,
+            from_statuses={"queued"},
+            status="running",
+            worker_pid=4321,
+            worker_create_time=20.0,
+            worker_executable=stable_executable,
+            process_nonce=nonce,
+        )
+        return FakeLauncher()
+
+    monkeypatch.setattr("windows_local_mcp.executor.subprocess.Popen", fake_popen)
+    monkeypatch.setattr(
+        "windows_local_mcp.executor.create_worker_context",
+        lambda *_args, **_kwargs: (tmp_path / "context.json", "a" * 64),
+    )
+    monkeypatch.setattr(
+        "windows_local_mcp.executor.isolated_worker_argv",
+        lambda *_args, **_kwargs: ["python"],
+    )
+    monkeypatch.setattr(
+        "windows_local_mcp.executor.capture_process_identity",
+        lambda pid, nonce: ProcessIdentity(pid, 10.0, redirector_executable, nonce),
+    )
+
+    assert executor.launch(operation_id, 0)["status"] == "running"
+    operation = store.get_operation(operation_id, include_events=True)
+    assert operation["worker_pid"] == 4321
+    assert operation["worker_create_time"] == 20.0
+    assert operation["worker_executable"] == stable_executable
+    spawned = next(event for event in operation["events"] if event["event_type"] == "worker_spawned")
+    assert spawned["payload"]["identity_role"] == "bootstrap_launcher"
+    assert spawned["payload"]["launcher_create_time"] == 10.0
+    assert spawned["payload"]["launcher_executable"] == redirector_executable
+    assert spawned["payload"]["operation_identity_updated"] is False
+
+
+def test_stop_retries_stable_identity_when_worker_self_binding_wins_race(
+    tmp_path: Path, monkeypatch
+) -> None:
+    settings = make_settings(tmp_path)
+    store = AuditStore(settings)
+    executor = Executor(settings, store)
+    operation_id = store.create_operation(
+        tool_name="execute",
+        tier="safe_command",
+        status="queued",
+        cwd=str(settings.workspace_root),
+        request={},
+    )
+    bootstrap = ProcessIdentity(4321, 10.0, r"C:\runtime\Scripts\python.exe", "nonce")
+    stable = ProcessIdentity(4321, 20.0, r"C:\Python314\python.exe", "nonce")
+    store.update_operation(
+        operation_id,
+        worker_pid=bootstrap.pid,
+        worker_create_time=bootstrap.create_time,
+        worker_executable=bootstrap.executable,
+        process_nonce=bootstrap.nonce,
+    )
+    attempts: list[ProcessIdentity] = []
+
+    def terminate(identity: ProcessIdentity) -> bool:
+        attempts.append(identity)
+        if identity == bootstrap:
+            assert store.transition_operation(
+                operation_id,
+                from_statuses={"queued"},
+                status="running",
+                worker_pid=stable.pid,
+                worker_create_time=stable.create_time,
+                worker_executable=stable.executable,
+                process_nonce=stable.nonce,
+            )
+            return False
+        return identity == stable
+
+    monkeypatch.setattr("windows_local_mcp.executor.terminate_process_tree", terminate)
+
+    assert executor.stop(operation_id)["status"] == "cancelled"
+    assert attempts == [bootstrap, stable]
+
+
+def test_reconciliation_retries_when_worker_self_binding_wins_race(
+    tmp_path: Path, monkeypatch
+) -> None:
+    settings = make_settings(tmp_path)
+    store = AuditStore(settings)
+    operation_id = store.create_operation(
+        tool_name="execute",
+        tier="safe_command",
+        status="queued",
+        cwd=str(settings.workspace_root),
+        request={},
+    )
+    bootstrap = ProcessIdentity(4321, 10.0, r"C:\runtime\Scripts\python.exe", "nonce")
+    stable = ProcessIdentity(4321, 20.0, r"C:\Python314\python.exe", "nonce")
+    store.update_operation(
+        operation_id,
+        worker_pid=bootstrap.pid,
+        worker_create_time=bootstrap.create_time,
+        worker_executable=bootstrap.executable,
+        process_nonce=bootstrap.nonce,
+    )
+    attempts: list[ProcessIdentity] = []
+
+    def identity_matches(identity: ProcessIdentity) -> bool:
+        attempts.append(identity)
+        if identity == bootstrap:
+            assert store.transition_operation(
+                operation_id,
+                from_statuses={"queued"},
+                status="running",
+                worker_pid=stable.pid,
+                worker_create_time=stable.create_time,
+                worker_executable=stable.executable,
+                process_nonce=stable.nonce,
+            )
+            return False
+        return identity == stable
+
+    monkeypatch.setattr("windows_local_mcp.executor.process_identity_matches", identity_matches)
+
+    Executor(settings, store)
+    assert store.get_operation(operation_id, include_events=False)["status"] == "running"
+    assert attempts == [bootstrap, stable]
 
 
 def test_data_dir_quota_rejects_additional_artifacts(tmp_path: Path) -> None:
