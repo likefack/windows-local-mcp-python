@@ -77,6 +77,10 @@ class OperationDeadlineExceeded(RuntimeError):
     pass
 
 
+class RuntimeStoragePolicyError(RuntimeError):
+    pass
+
+
 def run_operation(operation_id: str, settings: Settings) -> int:
     operation_started = time.monotonic()
     audit = AuditStore(settings)
@@ -446,6 +450,17 @@ def run_operation(operation_id: str, settings: Settings) -> int:
             pass
         if operation["tier"] == "broker" and normalized.get("program_key") == "adb":
             cwd = str(runtime_root)
+        runtime_limit = min(
+            settings.approval_manifest_max_bytes + settings.max_write_bytes,
+            settings.max_data_dir_bytes // 2,
+        )
+        runtime_entry_limit = max(128, settings.approval_manifest_max_files * 4)
+        if operation["tier"] in {"broker", "codex_sandbox"}:
+            _enforce_runtime_storage_preflight(
+                runtime_root,
+                byte_limit=runtime_limit,
+                entry_limit=runtime_entry_limit,
+            )
         if time.monotonic() >= deadline:
             raise OperationDeadlineExceeded(
                 f"operation deadline exceeded before child start: {max_runtime} seconds"
@@ -560,11 +575,6 @@ def run_operation(operation_id: str, settings: Settings) -> int:
         )
         stdout_capture.start()
         stderr_capture.start()
-        runtime_limit = min(
-            settings.approval_manifest_max_bytes + settings.max_write_bytes,
-            settings.max_data_dir_bytes // 2,
-        )
-        runtime_entry_limit = max(128, settings.approval_manifest_max_files * 4)
         while True:
             if sandbox_job is not None and sandbox_job.violation is not None:
                 sandbox_job.terminate()
@@ -652,6 +662,16 @@ def run_operation(operation_id: str, settings: Settings) -> int:
                         error = storage_error
                         failure_class = "sandbox_resource_policy"
                         break
+    except RuntimeStoragePolicyError as exc:
+        exit_code = None
+        status = "failed"
+        failure_class = "sandbox_resource_policy"
+        error = str(exc)
+        audit.add_event(
+            operation_id,
+            "runtime_storage_preflight_failed",
+            {"error": error[:1000]},
+        )
     except ApprovalExecutionExpired as exc:
         if child_identity is not None:
             _terminate_launched_child(child, child_identity)
@@ -1022,6 +1042,18 @@ def _requires_workspace_execution_lock(
 def _terminate_launched_child(child: Any, identity: ProcessIdentity) -> None:
     del child
     terminate_process_tree(identity)
+
+
+def _enforce_runtime_storage_preflight(
+    runtime_root: Path, *, byte_limit: int, entry_limit: int
+) -> None:
+    storage_error = _safe_runtime_storage_error(
+        runtime_root,
+        byte_limit=byte_limit,
+        entry_limit=entry_limit,
+    )
+    if storage_error is not None:
+        raise RuntimeStoragePolicyError(storage_error)
 
 
 def _safe_runtime_storage_error(
