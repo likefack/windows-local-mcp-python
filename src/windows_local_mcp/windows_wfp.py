@@ -21,6 +21,8 @@ from .wfp_guard import (
 )
 
 _ERROR_SUCCESS = 0
+_ERROR_INSUFFICIENT_BUFFER = 122
+_ERROR_MORE_DATA = 234
 _RPC_C_AUTHN_WINNT = 10
 _FWP_E_FILTER_NOT_FOUND = 0x80320003
 _FWP_E_SUBLAYER_NOT_FOUND = 0x80320007
@@ -36,6 +38,8 @@ _SDDL_REVISION_1 = 1
 _DACL_SECURITY_INFORMATION = 0x00000004
 _TOKEN_QUERY = 0x0008
 _TOKEN_USER = 1
+_SID_TYPE_USER = 1
+_COMPUTER_NAME_PHYSICAL_NETBIOS = 4
 
 _CONDITION_FLAGS = uuid.UUID("632ce23b-5167-435c-86d7-e903684aa80c")
 _CONDITION_ALE_USER_ID = uuid.UUID("af043a0a-b34d-4f86-979c-c90371af6e66")
@@ -153,25 +157,32 @@ class WindowsWfpApi:
         self._configure_functions()
 
     def resolve_account_sid(self, account_name: str) -> str:
+        if not account_name or "\\" in account_name:
+            raise WfpGuardError("The WFP Guard target must be an unqualified local account name")
+        local_computer_name = self._local_computer_name()
+        # 単純名の解決は信頼ドメインへ広がり得るため、このPCの名前で対象を限定する。
+        qualified_account_name = f"{local_computer_name}\\{account_name}"
         sid_size = wintypes.DWORD(0)
         domain_size = wintypes.DWORD(0)
         use = wintypes.DWORD(0)
         self._advapi32.LookupAccountNameW(
             None,
-            account_name,
+            qualified_account_name,
             None,
             ctypes.byref(sid_size),
             None,
             ctypes.byref(domain_size),
             ctypes.byref(use),
         )
-        if ctypes.get_last_error() != 122 or sid_size.value == 0:  # ERROR_INSUFFICIENT_BUFFER
+        if (
+            ctypes.get_last_error() != _ERROR_INSUFFICIENT_BUFFER or sid_size.value == 0
+        ):  # ERROR_INSUFFICIENT_BUFFER
             self._raise_last_error("LookupAccountNameW(size)")
         sid = ctypes.create_string_buffer(sid_size.value)
         domain = ctypes.create_unicode_buffer(domain_size.value)
         if not self._advapi32.LookupAccountNameW(
             None,
-            account_name,
+            qualified_account_name,
             sid,
             ctypes.byref(sid_size),
             domain,
@@ -179,6 +190,12 @@ class WindowsWfpApi:
             ctypes.byref(use),
         ):
             self._raise_last_error("LookupAccountNameW")
+        self._verify_local_user_resolution(
+            account_name=account_name,
+            resolved_domain=domain.value,
+            local_computer_name=local_computer_name,
+            sid_name_use=use.value,
+        )
         resolved = self._sid_to_string(ctypes.cast(sid, ctypes.c_void_p))
         if resolved == self._current_process_sid():
             raise WfpGuardError("CodexSandboxOffline SID equals the Guard operator SID")
@@ -471,6 +488,50 @@ class WindowsWfpApi:
             return value.value & 0xFFFFFFFF
         return None
 
+    def _local_computer_name(self) -> str:
+        size = wintypes.DWORD(0)
+        if self._kernel32.GetComputerNameExW(
+            _COMPUTER_NAME_PHYSICAL_NETBIOS,
+            None,
+            ctypes.byref(size),
+        ):
+            raise WfpGuardError("GetComputerNameExW returned an unexpected success")
+        if (
+            ctypes.get_last_error() not in (_ERROR_MORE_DATA, _ERROR_INSUFFICIENT_BUFFER)
+            or not size.value
+        ):
+            self._raise_last_error("GetComputerNameExW(size)")
+        buffer = ctypes.create_unicode_buffer(size.value)
+        if not self._kernel32.GetComputerNameExW(
+            _COMPUTER_NAME_PHYSICAL_NETBIOS,
+            buffer,
+            ctypes.byref(size),
+        ):
+            self._raise_last_error("GetComputerNameExW")
+        if not buffer.value:
+            raise WfpGuardError("GetComputerNameExW returned an empty computer name")
+        return buffer.value
+
+    @staticmethod
+    def _verify_local_user_resolution(
+        *,
+        account_name: str,
+        resolved_domain: str,
+        local_computer_name: str,
+        sid_name_use: int,
+    ) -> None:
+        if (
+            not resolved_domain
+            or not local_computer_name
+            or resolved_domain.casefold() != local_computer_name.casefold()
+        ):
+            raise WfpGuardError(f"LookupAccountNameW resolved {account_name} outside this computer")
+        if sid_name_use != _SID_TYPE_USER:
+            raise WfpGuardError(
+                f"LookupAccountNameW resolved {account_name} as SID_NAME_USE={sid_name_use}, "
+                "not SidTypeUser"
+            )
+
     def _current_process_sid(self) -> str:
         token = wintypes.HANDLE()
         if not self._advapi32.OpenProcessToken(
@@ -624,6 +685,12 @@ class WindowsWfpApi:
         a.GetTokenInformation.restype = wintypes.BOOL
 
         k = self._kernel32
+        k.GetComputerNameExW.argtypes = [
+            wintypes.DWORD,
+            wintypes.LPWSTR,
+            ctypes.POINTER(wintypes.DWORD),
+        ]
+        k.GetComputerNameExW.restype = wintypes.BOOL
         k.GetCurrentProcess.argtypes = []
         k.GetCurrentProcess.restype = wintypes.HANDLE
         k.CloseHandle.argtypes = [wintypes.HANDLE]

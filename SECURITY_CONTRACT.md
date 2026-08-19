@@ -121,6 +121,7 @@ Sandbox route の必須境界は少なくとも次です。
 - source workspace を read-only と表示する場合、実効 OS capability でも write できない
 - Internet へ接続できない
 - 未許可 loopback／localhost endpoint へ接続できない
+- loopback Guard の対象 SID は、この PC のコンピューター名で完全修飾して解決し、返された参照ドメインがこの PC 自身であり、`SID_NAME_USE == SidTypeUser (1)` であることを確認できない場合は Sandbox route を利用しない
 - child／grandchild に上記の必須 filesystem、network、control-plane 境界が継承される
 - timeout／cancel で descendant を含め停止できる
 - scratch、出力、時間、process、memory／filesystem consumption に現実的な上限がある

@@ -4,7 +4,6 @@ import ctypes
 import json
 import os
 import queue
-import secrets
 import subprocess
 import sys
 import threading
@@ -32,11 +31,13 @@ from .wfp_guard import (
     verify_codex_loopback_block,
 )
 
-_AUTH_ENV = "WLMCP_WFP_GUARD_AUTH"
 _ELEVATED_WAIT_SECONDS = 60
 _SEE_MASK_NOCLOSEPROCESS = 0x00000040
 _SW_HIDE = 0
 _WAIT_OBJECT_0 = 0
+_TH32CS_SNAPPROCESS = 0x00000002
+_INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+_PIPE_PROCEED = b"wlmcp-wfp-guard-proceed-v1"
 
 
 class _ShellExecuteInfo(ctypes.Structure):
@@ -59,6 +60,21 @@ class _ShellExecuteInfo(ctypes.Structure):
     ]
 
 
+class _ProcessEntry32W(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", wintypes.DWORD),
+        ("cntUsage", wintypes.DWORD),
+        ("th32ProcessID", wintypes.DWORD),
+        ("th32DefaultHeapID", ctypes.c_size_t),
+        ("th32ModuleID", wintypes.DWORD),
+        ("cntThreads", wintypes.DWORD),
+        ("th32ParentProcessID", wintypes.DWORD),
+        ("pcPriClassBase", wintypes.LONG),
+        ("dwFlags", wintypes.DWORD),
+        ("szExeFile", wintypes.WCHAR * 260),
+    ]
+
+
 def ensure_runtime_codex_loopback_guard() -> GuardVerification:
     """Ensure/read back the fixed WFP boundary, elevating only the Guard if needed."""
 
@@ -75,41 +91,44 @@ def ensure_runtime_codex_loopback_guard() -> GuardVerification:
 
 def _run_elevated_ensure() -> GuardVerification:
     pipe_name = rf"\\.\pipe\wlmcp-wfp-guard-{uuid.uuid4().hex}"
-    authkey = secrets.token_bytes(32)
-    listener = Listener(pipe_name, family="AF_PIPE", authkey=authkey)
+    listener = Listener(pipe_name, family="AF_PIPE")
     messages: queue.Queue[bytes | BaseException] = queue.Queue(maxsize=1)
-
-    def receive() -> None:
-        try:
-            connection = listener.accept()
-            try:
-                messages.put(connection.recv_bytes(), block=False)
-            finally:
-                connection.close()
-        except BaseException as error:  # noqa: BLE001 - forwarded to the waiting preflight
-            try:
-                messages.put(error, block=False)
-            except queue.Full:
-                pass
-
-    receiver = threading.Thread(target=receive, name="wlmcp-wfp-guard-ipc", daemon=True)
-    receiver.start()
-    previous_auth = os.environ.get(_AUTH_ENV)
-    os.environ[_AUTH_ENV] = authkey.hex()
     process_handle: wintypes.HANDLE | None = None
     try:
         try:
             process_handle = _shell_execute_elevated(pipe_name)
+            elevated_pid = _process_id_from_handle(process_handle)
         except Exception:
             listener.close()
             raise
-    finally:
-        if previous_auth is None:
-            os.environ.pop(_AUTH_ENV, None)
-        else:
-            os.environ[_AUTH_ENV] = previous_auth
 
-    try:
+        def receive() -> None:
+            try:
+                connection = listener.accept()
+                try:
+                    # UAC intentionally does not inherit the caller's environment. Bind the
+                    # bootstrap pipe to the process returned by runas or the Python process
+                    # directly launched by the Windows venv launcher represented by that handle.
+                    client_pid = _named_pipe_client_process_id(connection.fileno())
+                    if not _is_expected_pipe_client(client_pid, elevated_pid):
+                        raise WfpGuardError(
+                            "Elevated WFP Guard IPC connected from an unexpected process"
+                        )
+                    # Keep the verified peer alive until its ancestry is checked, then release
+                    # that same connection to perform the fixed privileged operation.
+                    connection.send_bytes(_PIPE_PROCEED)
+                    messages.put(connection.recv_bytes(), block=False)
+                finally:
+                    connection.close()
+            except BaseException as error:  # noqa: BLE001 - forwarded to the waiting preflight
+                try:
+                    messages.put(error, block=False)
+                except queue.Full:
+                    pass
+
+        receiver = threading.Thread(target=receive, name="wlmcp-wfp-guard-ipc", daemon=True)
+        receiver.start()
+
         try:
             received = messages.get(timeout=_ELEVATED_WAIT_SECONDS)
         except queue.Empty as error:
@@ -128,7 +147,7 @@ def _run_elevated_ensure() -> GuardVerification:
     finally:
         listener.close()
         if process_handle:
-            ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(process_handle)
+            _close_process_handle(process_handle)
 
 
 def _shell_execute_elevated(pipe_name: str) -> wintypes.HANDLE:
@@ -171,6 +190,80 @@ def _wait_for_elevated_exit(process_handle: wintypes.HANDLE) -> None:
         raise WfpGuardError(f"Elevated WFP Guard exited with code {exit_code.value}")
 
 
+def _process_id_from_handle(process_handle: wintypes.HANDLE) -> int:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetProcessId.argtypes = [wintypes.HANDLE]
+    kernel32.GetProcessId.restype = wintypes.DWORD
+    process_id = int(kernel32.GetProcessId(process_handle))
+    if process_id <= 0:
+        raise WfpGuardError(
+            f"Elevated WFP Guard process identity is unavailable: WinError {ctypes.get_last_error()}"
+        )
+    return process_id
+
+
+def _named_pipe_client_process_id(pipe_handle: int) -> int:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetNamedPipeClientProcessId.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.ULONG),
+    ]
+    kernel32.GetNamedPipeClientProcessId.restype = wintypes.BOOL
+    process_id = wintypes.ULONG()
+    if not kernel32.GetNamedPipeClientProcessId(
+        wintypes.HANDLE(pipe_handle), ctypes.byref(process_id)
+    ):
+        raise WfpGuardError(
+            "Elevated WFP Guard IPC peer identity is unavailable: "
+            f"WinError {ctypes.get_last_error()}"
+        )
+    return int(process_id.value)
+
+
+def _is_expected_pipe_client(client_pid: int, elevated_pid: int) -> bool:
+    if client_pid == elevated_pid:
+        return True
+    # Python 3.14 venv executables are launchers: ShellExecuteEx returns the launcher's
+    # handle while its direct base-Python child imports this module and opens the pipe.
+    return _process_parent_id(client_pid) == elevated_pid
+
+
+def _process_parent_id(process_id: int) -> int:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ProcessEntry32W)]
+    kernel32.Process32FirstW.restype = wintypes.BOOL
+    kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ProcessEntry32W)]
+    kernel32.Process32NextW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    snapshot = kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
+    if snapshot == _INVALID_HANDLE_VALUE:
+        raise WfpGuardError(
+            "Elevated WFP Guard process tree is unavailable: "
+            f"WinError {ctypes.get_last_error()}"
+        )
+    try:
+        entry = _ProcessEntry32W()
+        entry.dwSize = ctypes.sizeof(entry)
+        has_entry = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        while has_entry:
+            if int(entry.th32ProcessID) == process_id:
+                return int(entry.th32ParentProcessID)
+            has_entry = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    raise WfpGuardError("Elevated WFP Guard IPC peer process is unavailable")
+
+
+def _close_process_handle(process_handle: wintypes.HANDLE) -> None:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle(process_handle)
+
+
 def _validated_report(value: dict[str, Any]) -> GuardVerification:
     try:
         report = GuardVerification(**value)
@@ -203,26 +296,21 @@ def _is_administrator() -> bool:
 
 
 def _elevated_main(pipe_name: str) -> int:
-    auth = os.environ.get(_AUTH_ENV, "")
     try:
-        authkey = bytes.fromhex(auth)
-        if len(authkey) != 32:
-            raise ValueError("invalid authentication key")
-    except ValueError:
-        return 2
-    payload: dict[str, object]
-    exit_code = 0
-    try:
-        if not _is_administrator():
-            raise WfpGuardError("WFP Guard elevation was not established")
-        verification = ensure_codex_loopback_block(new_windows_wfp_api())
-        payload = {"ok": True, "verification": verification.as_dict()}
-    except Exception as error:  # noqa: BLE001 - exact failure is returned to fail-closed caller
-        payload = {"ok": False, "error": f"{type(error).__name__}: {error}"[:1000]}
-        exit_code = 2
-    try:
-        connection = Client(pipe_name, family="AF_PIPE", authkey=authkey)
+        connection = Client(pipe_name, family="AF_PIPE")
         try:
+            if connection.recv_bytes() != _PIPE_PROCEED:
+                return 3
+            payload: dict[str, object]
+            exit_code = 0
+            try:
+                if not _is_administrator():
+                    raise WfpGuardError("WFP Guard elevation was not established")
+                verification = ensure_codex_loopback_block(new_windows_wfp_api())
+                payload = {"ok": True, "verification": verification.as_dict()}
+            except Exception as error:  # noqa: BLE001 - exact failure returns to fail-closed caller
+                payload = {"ok": False, "error": f"{type(error).__name__}: {error}"[:1000]}
+                exit_code = 2
             connection.send_bytes(canonical_json(payload).encode("utf-8"))
         finally:
             connection.close()
