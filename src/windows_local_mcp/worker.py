@@ -478,6 +478,10 @@ def run_operation(operation_id: str, settings: Settings) -> int:
                     on_guard_verified=record_guard_verified,
                 )
             except ApprovedSandboxUnavailable as guard_error:
+                network_policy["wfp_guard_status"] = "verification_failed"
+                audit.update_operation(
+                    operation_id, network_policy_json=canonical_json(network_policy)
+                )
                 audit.add_event(
                     operation_id,
                     "wfp_guard_verification_failed",
