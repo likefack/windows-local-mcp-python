@@ -15,7 +15,6 @@ from windows_local_mcp.sandbox_backend import (
 )
 from windows_local_mcp.util import canonical_json, sha256_text
 
-
 MANDATORY_DESCENDANT_CHECKS = (
     "child_source_workspace_write_denied",
     "child_outside_user_read_denied",
