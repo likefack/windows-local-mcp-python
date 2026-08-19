@@ -30,10 +30,12 @@ from .policy import CommandPolicy, NormalizedCommand, approved_request_hash
 from .process_utils import (
     ProcessIdentity,
     build_process_argv,
+    capture_current_user_processes,
     capture_process_identity,
     creation_flags,
     process_tree_write_bytes,
     terminate_process_tree,
+    wait_for_untracked_current_user_processes,
 )
 from .redaction import redact_text, redact_value
 from .resources import (
@@ -259,6 +261,8 @@ def run_operation(operation_id: str, settings: Settings) -> int:
 
     host_control_state: dict[str, Any] | None = None
     host_operation_binding: dict[str, Any] | None = None
+    host_user_process_baseline: set[tuple[int, float]] | None = None
+    host_process_census_required = False
     host_control_locks: ExitStack | None = None
     if operation["tier"] == "approved_host":
         try:
@@ -481,9 +485,11 @@ def run_operation(operation_id: str, settings: Settings) -> int:
                 )
                 raise
         elif operation["tier"] == "approved_host" and os.name == "nt":
-            # Assign the suspended parent before it can create descendants. The Job has no
-            # Sandbox resource limits, but its kill-on-close and active-process accounting
-            # keep every Approved Host descendant inside the tamper-check interval.
+            # Capture the baseline immediately before launch. Job Objects do not account for
+            # Win32_Process.Create processes, so postflight also waits for new same-user
+            # processes observed after this point.
+            host_process_census_required = True
+            host_user_process_baseline = capture_current_user_processes()
             host_job = WindowsSandboxJob()
             child = host_job.popen(
                 argv,
@@ -724,6 +730,25 @@ def run_operation(operation_id: str, settings: Settings) -> int:
         try:
             if not host_descendants_verified_empty:
                 raise RuntimeError("Approved Host descendant termination was not verified")
+            if os.name == "nt" and host_process_census_required:
+                if host_user_process_baseline is None:
+                    raise RuntimeError("Approved Host same-user process baseline is missing")
+                untracked_processes = wait_for_untracked_current_user_processes(
+                    host_user_process_baseline,
+                    deadline=deadline,
+                    excluded_pids={os.getpid()},
+                )
+                if untracked_processes:
+                    pids = sorted(pid for pid, _ in untracked_processes)
+                    audit.add_event(
+                        operation_id,
+                        "approved_host_untracked_process_detected",
+                        {"pids": pids},
+                    )
+                    raise RuntimeError(
+                        "Approved Host observed same-user process(es) outside its Job Object "
+                        f"that did not exit before the operation deadline: {', '.join(map(str, pids))}"
+                    )
             fresh_operation = audit.get_operation(operation_id, include_events=False)
             fresh_binding = {
                 "id": fresh_operation["id"],

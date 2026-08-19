@@ -35,6 +35,7 @@ _ELEVATED_WAIT_SECONDS = 60
 _SEE_MASK_NOCLOSEPROCESS = 0x00000040
 _SW_HIDE = 0
 _WAIT_OBJECT_0 = 0
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x00001000
 _TH32CS_SNAPPROCESS = 0x00000002
 _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
 _PIPE_PROCEED = b"wlmcp-wfp-guard-proceed-v1"
@@ -154,6 +155,7 @@ def _shell_execute_elevated(pipe_name: str) -> wintypes.HANDLE:
     shell32 = ctypes.WinDLL("shell32", use_last_error=True)
     shell32.ShellExecuteExW.argtypes = [ctypes.POINTER(_ShellExecuteInfo)]
     shell32.ShellExecuteExW.restype = wintypes.BOOL
+    launcher_path = Path(_expected_venv_launcher_path())
     parameters = subprocess.list2cmdline(
         ["-I", "-m", "windows_local_mcp.wfp_guard_runtime", "--elevated-ensure", pipe_name]
     )
@@ -161,9 +163,9 @@ def _shell_execute_elevated(pipe_name: str) -> wintypes.HANDLE:
     info.cbSize = ctypes.sizeof(info)
     info.fMask = _SEE_MASK_NOCLOSEPROCESS
     info.lpVerb = "runas"
-    info.lpFile = sys.executable
+    info.lpFile = str(launcher_path)
     info.lpParameters = parameters
-    info.lpDirectory = str(Path(sys.executable).resolve(strict=True).parent)
+    info.lpDirectory = str(launcher_path.parent)
     info.nShow = _SW_HIDE
     if not shell32.ShellExecuteExW(ctypes.byref(info)) or not info.hProcess:
         raise WfpGuardError(
@@ -220,12 +222,106 @@ def _named_pipe_client_process_id(pipe_handle: int) -> int:
     return int(process_id.value)
 
 
+def _same_executable_path(actual: str, expected: str) -> bool:
+    try:
+        actual_path = Path(actual).resolve(strict=True)
+        expected_path = Path(expected).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return os.path.normcase(str(actual_path)) == os.path.normcase(str(expected_path))
+
+
+def _expected_venv_launcher_path() -> str:
+    try:
+        prefix = Path(sys.prefix).resolve(strict=True)
+        base_prefix = Path(sys.base_prefix).resolve(strict=True)
+        executable = Path(sys.executable).resolve(strict=True)
+        expected = (prefix / "Scripts" / "python.exe").resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise WfpGuardError(
+            "The elevated WFP Guard requires a valid Python venv launcher"
+        ) from error
+    if prefix == base_prefix or not _same_executable_path(str(executable), str(expected)):
+        raise WfpGuardError(
+            "The elevated WFP Guard requires the repository .venv\\Scripts\\python.exe launcher"
+        )
+    return str(executable)
+
+
+def _expected_base_python_path() -> str:
+    _expected_venv_launcher_path()
+    try:
+        base_prefix = Path(sys.base_prefix).resolve(strict=True)
+        configured_base = getattr(sys, "_base_executable", "") or str(base_prefix / "python.exe")
+        base_executable = Path(configured_base).resolve(strict=True)
+        expected = (base_prefix / "python.exe").resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise WfpGuardError(
+            "The elevated WFP Guard requires a valid base Python executable"
+        ) from error
+    if not _same_executable_path(str(base_executable), str(expected)):
+        raise WfpGuardError("The elevated WFP Guard requires the venv's base Python executable")
+    return str(base_executable)
+
+
+def _process_executable_path(process_id: int) -> str:
+    if process_id <= 0:
+        raise WfpGuardError("Elevated WFP Guard process identity is invalid")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    process_handle = kernel32.OpenProcess(
+        _PROCESS_QUERY_LIMITED_INFORMATION,
+        False,
+        process_id,
+    )
+    if not process_handle:
+        raise WfpGuardError(
+            "Elevated WFP Guard process executable is unavailable: "
+            f"WinError {ctypes.get_last_error()}"
+        )
+    try:
+        buffer_length = wintypes.DWORD(32768)
+        buffer = ctypes.create_unicode_buffer(buffer_length.value)
+        if (
+            not kernel32.QueryFullProcessImageNameW(
+                process_handle,
+                0,
+                buffer,
+                ctypes.byref(buffer_length),
+            )
+            or buffer_length.value <= 0
+        ):
+            raise WfpGuardError(
+                "Elevated WFP Guard process executable is unavailable: "
+                f"WinError {ctypes.get_last_error()}"
+            )
+        try:
+            return str(Path(buffer.value[: buffer_length.value]).resolve(strict=True))
+        except (OSError, RuntimeError, ValueError) as error:
+            raise WfpGuardError("Elevated WFP Guard process executable path is invalid") from error
+    finally:
+        _close_process_handle(process_handle)
+
+
 def _is_expected_pipe_client(client_pid: int, elevated_pid: int) -> bool:
+    expected_launcher = _expected_venv_launcher_path()
+    if not _same_executable_path(_process_executable_path(elevated_pid), expected_launcher):
+        return False
     if client_pid == elevated_pid:
         return True
-    # Python 3.14 venv executables are launchers: ShellExecuteEx returns the launcher's
-    # handle while its direct base-Python child imports this module and opens the pipe.
-    return _process_parent_id(client_pid) == elevated_pid
+    # Python 3.14 venv executables are launchers: only their direct base-Python child
+    # may import this module and open the pipe. A parent PID match alone is insufficient.
+    if _process_parent_id(client_pid) != elevated_pid:
+        return False
+    return _same_executable_path(_process_executable_path(client_pid), _expected_base_python_path())
 
 
 def _process_parent_id(process_id: int) -> int:
@@ -241,8 +337,7 @@ def _process_parent_id(process_id: int) -> int:
     snapshot = kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
     if snapshot == _INVALID_HANDLE_VALUE:
         raise WfpGuardError(
-            "Elevated WFP Guard process tree is unavailable: "
-            f"WinError {ctypes.get_last_error()}"
+            f"Elevated WFP Guard process tree is unavailable: WinError {ctypes.get_last_error()}"
         )
     try:
         entry = _ProcessEntry32W()

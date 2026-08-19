@@ -106,7 +106,7 @@ Git／ADB helper は設定済み path、SHA-256、file identity を正規化時�
 
 承認後の実行ファイルも実行直前に path、SHA-256、device／inode、size、mtime を照合し、Windows では実行終了まで差し替えを拒否する handle を保持します。
 
-Approved Host は同一ユーザー権限で制御領域へ到達し得るため、実行中の audit、approval staging、CAS、journal、transfer、worker context を監視し、整合性を確認できない場合は fail closed marker を残して以後の処理を停止します。Windows では親を一時停止して Job Object へ収容してから再開し、全子孫が終了したことを確認するまでこの事後検査へ進みません。実行期限を超えた子孫は Job 全体で終了します。これは別 OS アカウントや service による完全な権限分離ではなく、改ざん検出境界です。
+Approved Host は同一ユーザー権限で制御領域へ到達し得るため、実行中の audit、approval staging、CAS、journal、transfer、worker context を監視し、整合性を確認できない場合は fail closed marker を残して以後の処理を停止します。Windows では親を一時停止して Job Object へ収容してから再開し、Job の全 descendant が終了したことを確認します。通常の `CreateProcess` の子は Job に入りますが、`Win32_Process.Create` のように Job 外で作られる同一ユーザー process もあるため、起動前の同一ユーザー process 基準と終了待ちを追加し、新規 process が残る間はこの事後検査へ進みません。実行期限を超えた子孫や同一ユーザー process、または同一ユーザー process の基準・現在値を取得できない場合は fail closed します。これは別 OS アカウントや service による完全な権限分離ではなく、guarded interval 中の改ざん検出境界です。
 
 ## Codex Sandbox
 
@@ -127,7 +127,7 @@ max_sandbox_memory_bytes = 4294967296
 
 WLMCP は `codex sandbox` 専用 entrypoint を argv で起動し、agent／model API は使用しません。launcher と helper の path、署名、hash、file identity を承認と実行時に検証します。
 
-Sandbox 起動直前には、この PC のコンピューター名で完全修飾した `CodexSandboxOffline` の SID を Windows から解決し、返された参照ドメインがこの PC の物理 NetBIOS 名と一致すること、`SID_NAME_USE` が `SidTypeUser`（1）であることを確認します。単純名から信頼ドメインへ広がる解決や、ユーザー以外の SID は受け入れません。そのうえで ALE_AUTH_CONNECT_V4／V6 の loopback BLOCK を direct WFP で ensure して全項目を read-back します。Guard の sublayer は現在の App Isolation sublayer より高い weight を必要とし、object は static、non-dynamic、non-persistent です。正しい既存 object は再利用し、不一致や検証不能時は Sandbox を起動せず、Approved Host へ移行しません。通常権限側は `runas` が返した process handle の PID と named pipe が報告する接続元 PID を照合し、Python の venv launcher を経由する場合はその直接の子 process までに限定します。UAC で継承されない環境変数へ依存せず、起動した管理者 Guard 本人からの read-back 証拠だけを受理します。BLOCK は各 Sandbox の終了、timeout、launcher failure、Job Object 違反では削除せず、Windows 再起動または BFE 停止後の次回起動前に再作成します。WFP 変更だけを固定操作の昇格 Guard に隔離し、WLMCP server／worker 自体は通常権限のままです。
+Sandbox 起動直前には、この PC のコンピューター名で完全修飾した `CodexSandboxOffline` の SID を Windows から解決し、返された参照ドメインがこの PC の物理 NetBIOS 名と一致すること、`SID_NAME_USE` が `SidTypeUser`（1）であることを確認します。単純名から信頼ドメインへ広がる解決や、ユーザー以外の SID は受け入れません。そのうえで ALE_AUTH_CONNECT_V4／V6 の loopback BLOCK を direct WFP で ensure して全項目を read-back します。Guard の sublayer は現在の App Isolation sublayer より高い weight を必要とし、object は static、non-dynamic、non-persistent です。正しい既存 object は再利用し、不一致や検証不能時は Sandbox を起動せず、Approved Host へ移行しません。通常権限側は、`runas` が返した process handle の PID の実体が固定の `.venv\Scripts\python.exe` であることを確認します。named pipe が報告する接続元 PID はその同一 launcher、またはその直接の子 process に限り、直接の子 process を受け入れる場合も実体が `sys.base_prefix\python.exe` の base Python executable と一致することを確認します。UAC で継承されない環境変数へ依存せず、起動した管理者 Guard 本人からの read-back 証拠だけを受理します。BLOCK は各 Sandbox の終了、timeout、launcher failure、Job Object 違反では削除せず、Windows 再起動または BFE 停止後の次回起動前に再作成します。WFP 変更だけを固定操作の昇格 Guard に隔離し、WLMCP server／worker 自体は通常権限のままです。
 
 明示的な管理者メンテナンスだけは次の固定コマンドを使用できます。通常の worker 経路から cleanup は呼び出されません。
 

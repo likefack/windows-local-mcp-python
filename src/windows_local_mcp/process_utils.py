@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -18,6 +19,9 @@ class ProcessIdentity:
     create_time: float
     executable: str
     nonce: str
+
+
+ProcessKey = tuple[int, float]
 
 
 def _quote_cmd_arg(value: str) -> str:
@@ -56,6 +60,60 @@ def capture_process_identity(pid: int, nonce: str) -> ProcessIdentity:
     if not _process_has_nonce(process, nonce):
         raise RuntimeError("process nonce could not be verified")
     return identity
+
+
+def capture_current_user_processes() -> set[ProcessKey]:
+    """Return PID/creation-time keys for processes running as this process's user."""
+    try:
+        username = psutil.Process(os.getpid()).username()
+    except (psutil.AccessDenied, psutil.NoSuchProcess, OSError) as error:
+        raise RuntimeError("current Windows user identity could not be read") from error
+    if not username:
+        raise RuntimeError("current Windows user identity is empty")
+
+    snapshot: set[ProcessKey] = set()
+    for process in psutil.process_iter(["pid", "create_time", "username"]):
+        try:
+            info = process.info
+            if info.get("username") != username:
+                continue
+            create_time = info.get("create_time")
+            if create_time is None:
+                raise RuntimeError(
+                    f"process creation time could not be read for same-user PID {info.get('pid')}"
+                )
+            snapshot.add((int(info["pid"]), float(create_time)))
+        except (psutil.NoSuchProcess, psutil.ZombieProcess):
+            continue
+        except psutil.AccessDenied as error:
+            raise RuntimeError("same-user process identity enumeration was denied") from error
+    return snapshot
+
+
+def wait_for_untracked_current_user_processes(
+    baseline: set[ProcessKey],
+    *,
+    deadline: float,
+    excluded_pids: set[int] | frozenset[int] = frozenset(),
+) -> set[ProcessKey]:
+    """Wait until same-user processes created after baseline have exited.
+
+    This supplements, but does not replace, the Windows Job Object. It closes the
+    WMI/provider process-creation path that is not represented in the Job's
+    active-process count. An untracked process still alive at the deadline is
+    returned so the caller can fail closed.
+    """
+    while True:
+        current = capture_current_user_processes()
+        untracked = {
+            key for key in current - baseline if key[0] not in excluded_pids
+        }
+        if not untracked:
+            return set()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return untracked
+        time.sleep(min(0.05, remaining))
 
 
 def process_identity_matches(identity: ProcessIdentity) -> bool:

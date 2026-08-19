@@ -82,6 +82,10 @@ def _install_elevated_parent_fakes(
     *,
     connection: _FakeConnection,
     client_pid: int,
+    client_executable: str = r"C:\Python314\python.exe",
+    elevated_executable: str = r"C:\repo\.venv\Scripts\python.exe",
+    expected_launcher: str = r"C:\repo\.venv\Scripts\python.exe",
+    expected_base: str = r"C:\Python314\python.exe",
 ) -> tuple[_FakeListener, list[object]]:
     listener = _FakeListener(connection)
     closed_handles: list[object] = []
@@ -96,6 +100,21 @@ def _install_elevated_parent_fakes(
     monkeypatch.setattr(runtime, "_process_id_from_handle", lambda _handle: 4242)
     monkeypatch.setattr(runtime, "_named_pipe_client_process_id", lambda _handle: client_pid)
     monkeypatch.setattr(runtime, "_process_parent_id", lambda _pid: 9999)
+    monkeypatch.setattr(runtime, "_expected_venv_launcher_path", lambda: expected_launcher)
+    monkeypatch.setattr(runtime, "_expected_base_python_path", lambda: expected_base)
+    monkeypatch.setattr(
+        runtime,
+        "_same_executable_path",
+        lambda actual, expected: (
+            os.path.normcase(os.path.normpath(actual))
+            == os.path.normcase(os.path.normpath(expected))
+        ),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_process_executable_path",
+        lambda process_id: elevated_executable if process_id == 4242 else client_executable,
+    )
     monkeypatch.setattr(runtime, "_wait_for_elevated_exit", lambda _handle: None)
     monkeypatch.setattr(runtime, "_close_process_handle", closed_handles.append)
     return listener, closed_handles
@@ -147,6 +166,45 @@ def test_elevated_parent_accepts_direct_child_of_venv_launcher(
     assert runtime._run_elevated_ensure() == _verification()
     assert connection.recv_called is True
     assert connection.sent == [runtime._PIPE_PROCEED]
+
+
+def test_elevated_parent_rejects_unexpected_executable_with_matching_parent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _FakeConnection(b"untrusted")
+    _install_elevated_parent_fakes(
+        monkeypatch,
+        connection=connection,
+        client_pid=5151,
+        client_executable=r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+    )
+    monkeypatch.setattr(runtime, "_process_parent_id", lambda _pid: 4242)
+
+    with pytest.raises(WfpGuardError, match="unexpected process"):
+        runtime._run_elevated_ensure()
+
+    assert connection.recv_called is False
+    assert connection.sent == []
+
+
+def test_elevated_parent_rejects_unexpected_runas_executable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = _FakeConnection(b"untrusted")
+    _install_elevated_parent_fakes(
+        monkeypatch,
+        connection=connection,
+        client_pid=5151,
+        elevated_executable=r"C:\Python314\python.exe",
+        expected_launcher=r"C:\repo\.venv\Scripts\python.exe",
+    )
+    monkeypatch.setattr(runtime, "_process_parent_id", lambda _pid: 4242)
+
+    with pytest.raises(WfpGuardError, match="unexpected process"):
+        runtime._run_elevated_ensure()
+
+    assert connection.recv_called is False
+    assert connection.sent == []
 
 
 @pytest.mark.parametrize("inherited_auth", [None, "not-inherited-or-used"])

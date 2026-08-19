@@ -1,4 +1,5 @@
 import os
+import subprocess
 import sys
 import time
 from datetime import UTC, datetime, timedelta
@@ -89,6 +90,55 @@ def _prepare_operation(
         request_expires_at=expires,
     )
     return settings, store, executor
+
+
+def _wmi_late_process_script(path: Path) -> str:
+    late_code = (
+        "import time; from pathlib import Path; time.sleep(1.0); "
+        f"Path({path.as_posix()!r}).write_text('wmi late tamper', encoding='utf-8')"
+    )
+    command_line = subprocess.list2cmdline([sys.executable, "-c", late_code])
+    powershell_command = (
+        "$ErrorActionPreference='Stop'; "
+        "$process = [wmiclass]'Win32_Process'; "
+        "$inParams = $process.GetMethodParameters('Create'); "
+        f"$inParams.CommandLine = '{command_line.replace(chr(39), chr(39) * 2)}'; "
+        "$outParams = $process.InvokeMethod('Create', $inParams, $null); "
+        "if ([int]$outParams.ReturnValue -ne 0) { exit [int]$outParams.ReturnValue }"
+    )
+    return (
+        "import subprocess\n"
+        f"powershell_command={powershell_command!r}\n"
+        "completed=subprocess.run([\n"
+        "    'powershell.exe', '-NoProfile', '-NonInteractive', '-Command', powershell_command\n"
+        "], capture_output=True, text=True)\n"
+        "if completed.returncode != 0:\n"
+        "    raise SystemExit(completed.returncode)\n"
+    )
+
+
+def _require_local_wmi() -> None:
+    completed = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            (
+                "$ErrorActionPreference='Stop'; "
+                "$process = [wmiclass]'Win32_Process'; "
+                "$process.GetMethodParameters('Create') | Out-Null"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        pytest.skip(
+            "local Win32_Process WMI provider is unavailable: "
+            f"{completed.stderr.strip()[:300]}"
+        )
 
 
 def test_local_approval_launches_immutable_snapshot_once(
@@ -266,6 +316,41 @@ def test_approved_host_waits_for_descendants_before_control_plane_postflight(
     operation = store.get_operation(operation_id)
 
     assert late_write.read_text(encoding="utf-8") == "late tamper"
+    assert result["status"] == "failed"
+    assert operation["result"]["failure_class"] == "control_plane_tamper"
+    assert (settings.data_dir / "control-plane" / "tamper-detected.json").is_file()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Approved Host WMI process boundary is Windows-only")
+def test_approved_host_detects_wmi_process_outside_job_before_postflight(
+    tmp_path: Path, monkeypatch
+) -> None:
+    _require_local_wmi()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    data = tmp_path / "data"
+    config = tmp_path / "config.toml"
+    _write_config(workspace, data, config)
+    monkeypatch.setenv("LOCAL_MCP_CONFIG", str(config))
+    monkeypatch.delenv("LOCAL_MCP_ROOT", raising=False)
+    operation_id = "approved-host-wmi-late-tamper"
+    late_write = data / "control-plane" / "wmi-late-write.txt"
+    script = _wmi_late_process_script(late_write)
+
+    settings, store, executor = _prepare_operation(
+        workspace=workspace,
+        data=data,
+        operation_id=operation_id,
+        script_text=script,
+    )
+    store.approve_and_claim(operation_id, approver="integration-test")
+    result = executor.launch(operation_id, 30)
+    deadline = time.monotonic() + 3
+    while not late_write.exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    operation = store.get_operation(operation_id)
+
+    assert late_write.read_text(encoding="utf-8") == "wmi late tamper"
     assert result["status"] == "failed"
     assert operation["result"]["failure_class"] == "control_plane_tamper"
     assert (settings.data_dir / "control-plane" / "tamper-detected.json").is_file()

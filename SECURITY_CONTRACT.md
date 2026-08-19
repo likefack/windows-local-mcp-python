@@ -151,9 +151,13 @@ staging からの除外、stdout／stderr の redaction、network deny は補助
   audit DB、approval state、CAS、journal、worker context、transfer state、runtime、policy generation の
   通常の改変は検出します。
 - 改変または検証不能を検出した場合は tamper／recovery marker を残し、後続処理を停止します。
-- Windows では親を一時停止して Job Object へ割り当ててから再開し、全子孫が終了したことを確認するまで
-  control-plane の事後検査へ進みません。実行期限を超えた子孫は Job 全体で終了し、終了確認不能時は
-  tamper 検査境界を検証不能として fail closed します。
+- Windows では親を一時停止して Job Object へ割り当ててから再開し、Job の全 descendant が終了したことを
+  確認します。通常の `CreateProcess` の子は Job に入りますが、`Win32_Process.Create` が作る process は
+  この Job の active-process 集計から外れるため、起動前に同一 user の process identity を記録し、Job が
+  empty になった後も実行中に新しく観測された同一 user process が終了するまで control-plane の事後検査へ
+  進みません。process の identity を列挙できない、または期限内に終了しない場合は tamper 検査境界を
+  検証不能として fail closed します。これは同一 principal に対する OS 権限分離ではなく、guarded interval
+  中の Job 外 process を検出する補助境界です。
 - Host の device、network、external service、process side effect を workspace rollback 可能とは表示しません。
 
 ### F. Approval integrity
@@ -324,6 +328,8 @@ MCP ADB E2E、Tunnel、deployment の代替にしません。
 - trusted runtime／dependency environment が起動前から完全 compromise されている状態
 - security boundary 外で同等以上の Windows user authority が既に完全奪取されている状態
 - Approved Host と同一 principal で別 service／SID を導入しなければ防げない瞬間的な完全復元型改変
+- Approved Host の guarded interval が終わった後に同一 principal が新しい process を作ること、または
+  同一 user process の列挙能力そのものを失わせること
 - hardware power loss の全 timing に対する完全 ACID durability
 - 通常の validation／resource bound で防止不能な third-party parser の未知の 0-day
 - 別 kernel component、専用 service、別 user principal を必須とし、個人利用 v1 として cost が明らかに

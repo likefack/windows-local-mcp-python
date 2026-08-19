@@ -2,6 +2,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -9,7 +10,11 @@ import pytest
 from windows_local_mcp.audit import AuditStore
 from windows_local_mcp.config import Settings
 from windows_local_mcp.executor import Executor
-from windows_local_mcp.process_utils import ProcessIdentity, terminate_process_tree
+from windows_local_mcp.process_utils import (
+    ProcessIdentity,
+    terminate_process_tree,
+    wait_for_untracked_current_user_processes,
+)
 from windows_local_mcp.resources import (
     BoundedStreamCapture,
     WorkspaceExecutionLock,
@@ -57,6 +62,41 @@ def test_pid_reuse_identity_mismatch_never_terminates_current_process() -> None:
         nonce="wrong",
     )
     assert terminate_process_tree(fake) is False
+
+
+def test_wait_for_untracked_current_user_processes_waits_for_new_process_to_exit(
+    monkeypatch,
+) -> None:
+    baseline = {(1, 1.0)}
+    snapshots = iter(({(1, 1.0), (2, 2.0)}, baseline))
+    monkeypatch.setattr(
+        "windows_local_mcp.process_utils.capture_current_user_processes",
+        lambda: next(snapshots),
+    )
+
+    assert (
+        wait_for_untracked_current_user_processes(
+            baseline,
+            deadline=time.monotonic() + 1,
+        )
+        == set()
+    )
+
+
+def test_wait_for_untracked_current_user_processes_fails_closed_at_deadline(
+    monkeypatch,
+) -> None:
+    baseline = {(1, 1.0)}
+    untracked = {(1, 1.0), (2, 2.0)}
+    monkeypatch.setattr(
+        "windows_local_mcp.process_utils.capture_current_user_processes",
+        lambda: untracked,
+    )
+
+    assert wait_for_untracked_current_user_processes(
+        baseline,
+        deadline=time.monotonic() - 1,
+    ) == {(2, 2.0)}
 
 
 def test_stale_job_is_reconciled_without_pid_only_termination(tmp_path: Path) -> None:
