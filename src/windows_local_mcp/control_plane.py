@@ -10,13 +10,14 @@ from pathlib import Path
 from typing import Any
 
 from .config import Settings
+from .config_binding import export_config_binding, restore_config_binding
 from .control_plane_guard import assert_control_plane_healthy
 from .resources import NamedControlPlaneLock
 from .util import canonical_json, sha256_bytes, sha256_text, utc_now_iso
 
 ARCHITECTURE_VERSION = "broker-centered-sandboxed-processing-v1"
-POLICY_GENERATION_VERSION = 1
-WORKER_CONTEXT_VERSION = 1
+POLICY_GENERATION_VERSION = 2
+WORKER_CONTEXT_VERSION = 2
 
 
 def _worker_context_serialized(function: Any) -> Any:
@@ -97,6 +98,7 @@ def filesystem_identity(path: Path) -> dict[str, Any]:
 def control_plane_generation(settings: Settings) -> dict[str, Any]:
     assert_control_plane_healthy(settings)
     package = assert_trusted_runtime(settings)
+    config_binding = export_config_binding(settings)
     build = {
         "architecture": ARCHITECTURE_VERSION,
         "runtime_root": str(package),
@@ -108,6 +110,7 @@ def control_plane_generation(settings: Settings) -> dict[str, Any]:
         "version": POLICY_GENERATION_VERSION,
         "build_digest": build_digest,
         "settings": settings.model_dump(mode="json"),
+        "configuration": config_binding,
         "workspace": filesystem_identity(settings.workspace_root),
         "data_dir": filesystem_identity(settings.data_dir),
         "sandbox_scratch": filesystem_identity(settings.sandbox_scratch_dir)
@@ -131,8 +134,8 @@ def verify_control_plane_generation(settings: Settings, expected: object) -> Non
     current = control_plane_generation(settings)
     if current != expected:
         raise RuntimeError(
-            "WLMCP build, security policy, settings, workspace, or data_dir changed "
-            "after the operation was created"
+            "WLMCP build, active configuration, security policy, settings, workspace, or "
+            "data_dir changed after the operation was created"
         )
 
 
@@ -148,11 +151,13 @@ def create_worker_context(
     root = settings.data_dir / "worker-contexts"
     root.mkdir(parents=True, exist_ok=True)
     destination = root / f"{operation_id}.json"
+    config_binding = export_config_binding(settings)
     payload = {
         "version": WORKER_CONTEXT_VERSION,
         "operation_id": operation_id,
         "created_at": utc_now_iso(),
         "settings": settings.model_dump(mode="json"),
+        "config_binding": config_binding,
         "generation": control_plane_generation(settings),
     }
     data = canonical_json(payload).encode("utf-8")
@@ -186,6 +191,7 @@ def load_worker_context(
     ):
         raise RuntimeError("immutable worker context identity mismatch")
     settings = Settings.model_validate(payload.get("settings"))
+    restore_config_binding(settings, payload.get("config_binding"))
     expected_root = (settings.data_dir / "worker-contexts").resolve(strict=True)
     path.relative_to(expected_root)
     verify_control_plane_generation(settings, payload.get("generation"))

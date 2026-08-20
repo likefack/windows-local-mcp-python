@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import Settings
+from .config_binding import export_config_binding
 from .util import canonical_json, sha256_bytes, sha256_text, utc_now_iso
 from .windows_system import windows_system_executable
 
@@ -35,6 +36,7 @@ def assert_control_plane_healthy(settings: Settings) -> None:
 
 def capture_critical_state(settings: Settings, operation_id: str) -> dict[str, Any]:
     """Capture state that an Approved Host child is never allowed to mutate."""
+    config_binding = export_config_binding(settings)
     roots = [
         settings.data_dir / "approval-staging",
         settings.data_dir / "binary-transfers",
@@ -52,8 +54,9 @@ def capture_critical_state(settings: Settings, operation_id: str) -> dict[str, A
                 for child in runs.iterdir()
                 if child.name != operation_id
             )
-    if settings._config_path:
-        roots.append(Path(settings._config_path).resolve(strict=True))
+    config_path = config_binding.get("config_path")
+    if config_path:
+        roots.append(Path(str(config_path)).resolve(strict=True))
     records: list[dict[str, Any]] = []
     total_bytes = 0
     for root in roots:
@@ -104,11 +107,13 @@ def capture_critical_state(settings: Settings, operation_id: str) -> dict[str, A
                     "files": records,
                     "audit_digest": audit_digest,
                     "acl_digest": acl_digest,
+                    "config_binding": config_binding,
                 }
             )
         ),
         "audit_digest": audit_digest,
         "acl_digest": acl_digest,
+        "config_binding": config_binding,
     }
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import threading
 from pathlib import Path
@@ -9,6 +10,7 @@ import pytest
 
 from windows_local_mcp.audit import AuditStore
 from windows_local_mcp.config import Settings
+from windows_local_mcp.config_binding import export_config_binding
 from windows_local_mcp.control_plane import (
     control_plane_generation,
     create_worker_context,
@@ -37,6 +39,35 @@ def settings_for(tmp_path: Path) -> Settings:
     return settings
 
 
+def settings_with_active_config(tmp_path: Path) -> tuple[Settings, Path]:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    settings = Settings(
+        workspace_root=workspace,
+        data_dir=tmp_path / "data",
+        protect_data_dir_acl=False,
+        git_enabled=False,
+    )
+    config = tmp_path / "config.toml"
+    config.write_text(
+        "\n".join(
+            [
+                f'workspace_root = "{settings.workspace_root.as_posix()}"',
+                f'data_dir = "{settings.data_dir.as_posix()}"',
+                "protect_data_dir_acl = false",
+                "git_enabled = false",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    settings._config_selection_source = "LOCAL_MCP_CONFIG"
+    settings._config_path = str(config.resolve(strict=True))
+    settings._workspace_selection_source = "explicit_config"
+    settings._ambient_root_present = False
+    settings.ensure_directories()
+    return settings, config
+
+
 def test_worker_context_is_digest_bound_and_ignores_ambient_workspace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -56,6 +87,72 @@ def test_worker_context_is_digest_bound_and_ignores_ambient_workspace(
     path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(RuntimeError, match="digest mismatch"):
         load_worker_context(str(path), digest, "worker-context-test")
+
+
+def test_worker_context_preserves_active_config_identity(tmp_path: Path) -> None:
+    settings, config = settings_with_active_config(tmp_path)
+    expected_binding = export_config_binding(settings)
+    path, digest = create_worker_context(settings, "active-config-worker-context")
+
+    loaded = load_worker_context(str(path), digest, "active-config-worker-context")
+
+    assert export_config_binding(loaded) == expected_binding
+    selection = loaded.selection_info()
+    assert selection["config_source"] == "LOCAL_MCP_CONFIG"
+    assert selection["config_path"] == str(config.resolve(strict=True))
+    assert selection["workspace_source"] == "explicit_config"
+
+
+def test_worker_context_rejects_same_content_active_config_replacement(tmp_path: Path) -> None:
+    settings, config = settings_with_active_config(tmp_path)
+    path, digest = create_worker_context(settings, "active-config-replacement")
+    replacement = tmp_path / "replacement.toml"
+    replacement.write_bytes(config.read_bytes())
+    os.replace(replacement, config)
+
+    with pytest.raises(RuntimeError, match="file identity changed before use"):
+        load_worker_context(str(path), digest, "active-config-replacement")
+
+
+def test_approved_host_guard_rejects_active_config_content_tamper(tmp_path: Path) -> None:
+    settings, config = settings_with_active_config(tmp_path)
+    audit = AuditStore(settings)
+    operation = audit.create_operation(
+        tool_name="host-config-tamper",
+        tier="approved_host",
+        status="running",
+        cwd=str(settings.workspace_root),
+        request={"normalized_command": {"program_key": "python"}},
+        request_hash="a" * 64,
+        approval_status="approved",
+    )
+    before = capture_critical_state(settings, operation)
+    assert before["config_binding"]["config_path"] == str(config.resolve(strict=True))
+
+    config.write_text(
+        config.read_text(encoding="utf-8") + "\nfilesystem_enabled = false\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises((PermissionError, RuntimeError)):
+        capture_critical_state(settings, operation)
+
+
+def test_environment_only_worker_context_does_not_require_config_file(tmp_path: Path) -> None:
+    settings = settings_for(tmp_path)
+    settings._config_selection_source = "environment_only"
+    settings._config_path = None
+    settings._workspace_selection_source = "LOCAL_MCP_ROOT"
+    settings._ambient_root_present = True
+    path, digest = create_worker_context(settings, "environment-only-worker-context")
+
+    loaded = load_worker_context(str(path), digest, "environment-only-worker-context")
+    binding = export_config_binding(loaded)
+
+    assert binding["config_source"] == "environment_only"
+    assert binding["config_path"] is None
+    assert binding["config_file_identity"] is None
+    assert loaded.selection_info()["workspace_source"] == "LOCAL_MCP_ROOT"
 
 
 def test_build_or_policy_change_invalidates_generation(
