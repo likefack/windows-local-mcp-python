@@ -17,6 +17,7 @@ from .process_utils import (
     process_identity_matches,
     terminate_process_tree,
 )
+from .runtime_immutability import assert_approved_host_runtime_immutable
 from .util import utc_now_iso
 
 
@@ -30,6 +31,30 @@ class Executor:
         # The operation being launched is already queued and therefore included in this count.
         if len(self.audit.list_active_operations()) > self.settings.max_concurrent_jobs:
             raise RuntimeError("concurrent job admission limit exceeded")
+        operation = self.audit.get_operation(operation_id, include_events=False)
+        tier = {
+            "host_approval": "approved_host",
+        }.get(str(operation.get("tier")), str(operation.get("tier")))
+        if tier == "approved_host":
+            try:
+                runtime_trust = assert_approved_host_runtime_immutable()
+            except Exception as error:  # noqa: BLE001 - host launch must fail closed
+                self.audit.add_event(
+                    operation_id,
+                    "approved_host_runtime_immutability_failed",
+                    {"error": f"{type(error).__name__}: {error}"[:1000]},
+                )
+                raise
+            self.audit.add_event(
+                operation_id,
+                "approved_host_runtime_immutability_verified",
+                {
+                    "version": runtime_trust["version"],
+                    "digest": runtime_trust["digest"],
+                    "file_count": runtime_trust["file_count"],
+                    "directory_count": runtime_trust["directory_count"],
+                },
+            )
         nonce = uuid.uuid4().hex
         child_env = build_worker_environment(
             os.environ,
