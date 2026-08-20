@@ -34,7 +34,7 @@ from .control_plane import (
 from .control_plane_guard import assert_control_plane_healthy
 from .executor import Executor
 from .git_snapshot import capture_git_snapshot
-from .paths import Workspace
+from .paths import PathIdentity, Workspace, release_verified_hold
 from .policy import CommandPolicy, NormalizedCommand, approved_request_hash
 from .redaction import redact_command_args, redact_text
 from .resources import NamedControlPlaneLock, WorkspaceExecutionLock, enforce_data_quota
@@ -223,6 +223,100 @@ def _require_workspace_mutation_ready() -> None:
         raise RuntimeError(
             "workspace mutation is blocked because an interrupted restore requires recovery"
         )
+
+
+def _native_identity(identity: PathIdentity | None) -> tuple[int, int] | None:
+    if (
+        identity is None
+        or identity.windows_volume_serial is None
+        or identity.windows_file_index is None
+    ):
+        return None
+    return identity.windows_volume_serial, identity.windows_file_index
+
+
+def _same_committed_identity(
+    current: PathIdentity,
+    committed: PathIdentity | None,
+    committed_native: tuple[int, int] | None,
+) -> bool:
+    if committed_native is not None:
+        return _native_identity(current) == committed_native
+    if committed is None:
+        return False
+    return (current.device, current.inode) == (committed.device, committed.inode)
+
+
+def _hold_committed_target(
+    path: str,
+    expected: bytes,
+    committed_native: tuple[int, int] | None,
+) -> tuple[Path, PathIdentity]:
+    verified = runtime.workspace.resolve_existing(
+        path, allow_directory=False, access="write"
+    )
+    try:
+        identity = runtime.workspace.identity(verified)
+        if identity is None:
+            raise RuntimeError("committed target disappeared before post-write verification")
+        if committed_native is not None and _native_identity(identity) != committed_native:
+            raise RuntimeError("committed target identity changed before post-write verification")
+        if identity.size != len(expected) or verified.read_bytes() != expected:
+            raise RuntimeError("post-write content verification failed")
+        return verified, identity
+    except Exception:
+        release_verified_hold(verified)
+        raise
+
+
+def _recover_single_file_commit(
+    path: str,
+    *,
+    before: bytes,
+    after: bytes,
+    before_identity: PathIdentity | None,
+    committed_identity: PathIdentity | None,
+    committed_native: tuple[int, int] | None,
+) -> None:
+    current = runtime.workspace.resolve_for_write(path)
+    parent_identity = runtime.workspace.identity(current.parent)
+    current_identity = runtime.workspace.identity(current)
+    if parent_identity is None or current_identity is None:
+        raise RuntimeError("automatic recovery refused because the committed target disappeared")
+    if not _same_committed_identity(current_identity, committed_identity, committed_native):
+        raise RuntimeError("automatic recovery refused a third-party target replacement")
+    if current_identity.size != len(after) or current.read_bytes() != after:
+        raise RuntimeError("automatic recovery refused to overwrite a concurrent target change")
+    after_sha = sha256_bytes(after)
+    if before_identity is None:
+        runtime.workspace.commit_delete(
+            current,
+            parent_identity=parent_identity,
+            target_identity=current_identity,
+            expected_sha256=after_sha,
+        )
+        if Path(str(current)).exists():
+            raise RuntimeError("write recovery verification failed")
+        return
+    restored_native = runtime.workspace.commit_bytes(
+        current,
+        before,
+        parent_identity=parent_identity,
+        target_identity=current_identity,
+        expected_sha256=after_sha,
+    )
+    original_native = _native_identity(before_identity)
+    if original_native is not None and restored_native != original_native:
+        raise RuntimeError("write recovery restored the wrong Windows file identity")
+    restored = runtime.workspace.resolve_existing(path, allow_directory=False, access="write")
+    try:
+        restored_identity = runtime.workspace.identity(restored)
+        if restored_identity is None or restored.read_bytes() != before:
+            raise RuntimeError("write recovery verification failed")
+        if original_native is not None and _native_identity(restored_identity) != original_native:
+            raise RuntimeError("write recovery verification found a replaced target")
+    finally:
+        release_verified_hold(restored)
 
 
 def _codex_sandbox_capability() -> dict[str, Any]:
@@ -551,12 +645,7 @@ def _atomic_binary_mutation(
     require_expected_for_existing: bool = False,
     source_bindings: tuple[tuple[str, str], ...] = (),
 ) -> dict[str, Any]:
-    """Apply one verified binary replacement through the normal workspace journal.
-
-    The transform passed here must be a completed, bounded artifact operation. Expensive parsing
-    and transformation happens before this commit boundary. Source bindings are checked again
-    while the workspace mutation lock is held.
-    """
+    """Apply one CAS-bound binary replacement through the normal workspace journal."""
     _require_filesystem()
     _require_workspace_mutation_ready()
     operation_id: str | None = None
@@ -609,15 +698,6 @@ def _atomic_binary_mutation(
                 raise TypeError("binary mutation transform must return bytes")
             if len(after) > runtime.settings.max_structured_file_bytes:
                 raise ValueError("result exceeds max_structured_file_bytes")
-            current_exists = target.exists()
-            if current_exists != (target_identity is not None):
-                raise RuntimeError("structured file changed concurrently before commit")
-            if current_exists:
-                current_size = target.stat().st_size
-                if current_size > runtime.settings.max_structured_file_bytes:
-                    raise RuntimeError("structured file changed beyond the configured size limit")
-                if sha256_bytes(target.read_bytes()) != before_sha:
-                    raise RuntimeError("source is stale or concurrently modified")
             after_sha = sha256_bytes(after)
             request = {
                 "path": runtime.workspace.relative(target),
@@ -634,7 +714,8 @@ def _atomic_binary_mutation(
                 cwd=str(runtime.settings.workspace_root),
                 request=_safe_request(request),
             )
-            checkpoint_paths = {runtime.workspace.relative(target)}
+            relative_target = runtime.workspace.relative(target)
+            checkpoint_paths = {relative_target}
             pre_workspace = capture_workspace_state(
                 runtime.settings,
                 operation_id,
@@ -646,34 +727,27 @@ def _atomic_binary_mutation(
                 runtime.settings,
                 operation_id,
                 pre_workspace.manifest_path,
-                runtime.workspace.relative(target),
+                relative_target,
                 before_sha if target_identity is not None else None,
                 after_sha,
             )
-            temp_path: Path | None = None
             workspace_changed = False
+            committed_native: tuple[int, int] | None = None
+            committed_identity: PathIdentity | None = None
+            committed_target: Path | None = None
             try:
-                with tempfile.NamedTemporaryFile(
-                    mode="wb", delete=False, dir=target.parent, prefix=f".{target.name}.", suffix=".tmp"
-                ) as temp:
-                    temp.write(after)
-                    temp.flush()
-                    os.fsync(temp.fileno())
-                    temp_path = Path(temp.name)
-                runtime.workspace.revalidate_for_replace(
-                    target, parent_identity=parent_identity, target_identity=target_identity
-                )
-                current_exists = target.exists()
-                if current_exists != (target_identity is not None):
-                    raise RuntimeError("structured file changed concurrently before replacement")
-                if current_exists and sha256_bytes(target.read_bytes()) != before_sha:
-                    raise RuntimeError("source is stale or concurrently modified")
                 _verify_binary_source_bindings(source_bindings)
-                os.replace(temp_path, target)
-                temp_path = None
+                committed_native = runtime.workspace.commit_bytes(
+                    target,
+                    after,
+                    parent_identity=parent_identity,
+                    target_identity=target_identity,
+                    expected_sha256=before_sha if target_identity is not None else None,
+                )
                 workspace_changed = True
-                if target.read_bytes() != after:
-                    raise RuntimeError("post-write content verification failed")
+                committed_target, committed_identity = _hold_committed_target(
+                    path, after, committed_native
+                )
                 _verify_binary_source_bindings(independent_source_bindings)
                 post_workspace = capture_workspace_state(
                     runtime.settings,
@@ -681,14 +755,22 @@ def _atomic_binary_mutation(
                     "after",
                     paths=checkpoint_paths,
                 )
+                post_hashes = verify_checkpoint_integrity(
+                    runtime.settings, post_workspace.manifest_path
+                )
+                if post_hashes.get(relative_target) != after_sha:
+                    raise RuntimeError("target changed before the post-write checkpoint")
                 workspace_change = compare_workspace_states(
-                    runtime.settings, pre_workspace.manifest_path, post_workspace.manifest_path, operation_id
+                    runtime.settings,
+                    pre_workspace.manifest_path,
+                    post_workspace.manifest_path,
+                    operation_id,
                 )
                 result = {
                     "operation_id": operation_id,
                     "status": "succeeded",
                     "execution_path": "broker_direct",
-                    "path": runtime.workspace.relative(target),
+                    "path": relative_target,
                     "before_sha256": before_sha,
                     "after_sha256": after_sha,
                     "before_bytes": len(before),
@@ -698,7 +780,10 @@ def _atomic_binary_mutation(
                     **workspace_change,
                 }
                 update_single_file_write_transaction(
-                    runtime.settings, operation_id, state="applied_verified", target_manifest=post_workspace.manifest_path
+                    runtime.settings,
+                    operation_id,
+                    state="applied_verified",
+                    target_manifest=post_workspace.manifest_path,
                 )
                 runtime.audit.transition_operation(
                     operation_id,
@@ -715,29 +800,25 @@ def _atomic_binary_mutation(
                 runtime.audit.add_event(operation_id, "structured_file_written", _safe_request(result))
                 return result
             except Exception as error:
+                if committed_target is not None:
+                    release_verified_hold(committed_target)
+                    committed_target = None
                 if workspace_changed:
                     try:
-                        live_exists = target.exists()
-                        live_bytes = target.read_bytes() if live_exists else b""
-                        if not live_exists or live_bytes != after:
-                            raise RuntimeError(
-                                "automatic recovery refused to overwrite a concurrent target change"
-                            )
-                        if target_identity is None:
-                            target.unlink(missing_ok=True)
-                        else:
-                            with tempfile.NamedTemporaryFile(mode="wb", delete=False, dir=target.parent) as recovery:
-                                recovery.write(before)
-                                recovery.flush()
-                                os.fsync(recovery.fileno())
-                                recovery_path = Path(recovery.name)
-                            os.replace(recovery_path, target)
-                        restored = target.read_bytes() if target.exists() else b""
-                        if restored != before or target.exists() != (target_identity is not None):
-                            raise RuntimeError("binary mutation recovery verification failed")
+                        _recover_single_file_commit(
+                            path,
+                            before=before,
+                            after=after,
+                            before_identity=target_identity,
+                            committed_identity=committed_identity,
+                            committed_native=committed_native,
+                        )
                     except Exception as recovery_error:
                         journal = update_single_file_write_transaction(
-                            runtime.settings, operation_id, state="recovery_required", error=recovery_error
+                            runtime.settings,
+                            operation_id,
+                            state="recovery_required",
+                            error=recovery_error,
                         )
                         runtime.audit.transition_operation(
                             operation_id,
@@ -748,31 +829,44 @@ def _atomic_binary_mutation(
                             error=f"{type(recovery_error).__name__}: {recovery_error}",
                         )
                         raise WorkspaceMutationError(
-                            "structured file mutation failed and automatic recovery failed",
-                            recovery_state="recovery_required", journal_path=journal,
+                            "structured file mutation failed and automatic recovery refused an unsafe overwrite",
+                            recovery_state="recovery_required",
+                            journal_path=journal,
                         ) from recovery_error
                     update_single_file_write_transaction(
-                        runtime.settings, operation_id, state="failed_recovered", error=error
+                        runtime.settings,
+                        operation_id,
+                        state="failed_recovered",
+                        error=error,
                     )
                     raise WorkspaceMutationError(
                         f"structured file mutation failed; starting state recovered: {error}",
                         recovery_state="failed_recovered",
-                        journal_path=str(runtime.settings.data_dir / "workspace-history" / "transactions" / operation_id / "journal.json"),
+                        journal_path=str(
+                            runtime.settings.data_dir
+                            / "workspace-history"
+                            / "transactions"
+                            / operation_id
+                            / "journal.json"
+                        ),
                     ) from error
                 update_single_file_write_transaction(
-                    runtime.settings, operation_id, state="failed_recovered", error=error
+                    runtime.settings,
+                    operation_id,
+                    state="failed_recovered",
+                    error=error,
                 )
                 raise
             finally:
-                if temp_path is not None:
-                    temp_path.unlink(missing_ok=True)
+                if committed_target is not None:
+                    release_verified_hold(committed_target)
                 if operation_id is not None:
                     transitioned = runtime.audit.transition_operation(
                         operation_id,
                         from_statuses={"running"},
                         status="failed",
                         finished_at=utc_now_iso(),
-                        error="structured mutation failed before replacement",
+                        error="structured mutation failed before verified completion",
                     )
                     if transitioned:
                         runtime.audit.add_event(operation_id, "failed", {"path": path})
@@ -1733,7 +1827,8 @@ def write_file(
                 cwd=str(runtime.settings.workspace_root),
                 request=request,
             )
-            checkpoint_paths = {runtime.workspace.relative(target)}
+            relative_target = runtime.workspace.relative(target)
+            checkpoint_paths = {relative_target}
             pre_workspace = capture_workspace_state(
                 runtime.settings,
                 operation_id,
@@ -1747,7 +1842,7 @@ def write_file(
             added, removed, diff_bytes = _write_bounded_diff(
                 previous_text=previous_text,
                 content=content,
-                relative=runtime.workspace.relative(target),
+                relative=relative_target,
                 destination=diff_path,
             )
             enforce_data_quota(runtime.settings, incoming_bytes=diff_bytes + len(previous_bytes))
@@ -1759,36 +1854,30 @@ def write_file(
                 shutil.copy2(target, backup_file)
                 backup_path = str(backup_file)
 
-            temp_path: Path | None = None
             workspace_changed = False
+            committed_native: tuple[int, int] | None = None
+            committed_identity: PathIdentity | None = None
+            committed_target: Path | None = None
             begin_single_file_write_transaction(
                 runtime.settings,
                 operation_id,
                 pre_workspace.manifest_path,
-                runtime.workspace.relative(target),
+                relative_target,
                 before_sha if target_identity is not None else None,
                 sha256_bytes(content_bytes),
             )
             try:
-                with tempfile.NamedTemporaryFile(
-                    mode="wb",
-                    delete=False,
-                    dir=target.parent,
-                    prefix=f".{target.name}.",
-                    suffix=".tmp",
-                ) as temp:
-                    temp.write(content_bytes)
-                    temp.flush()
-                    os.fsync(temp.fileno())
-                    temp_path = Path(temp.name)
-                runtime.workspace.revalidate_for_replace(
+                committed_native = runtime.workspace.commit_bytes(
                     target,
+                    content_bytes,
                     parent_identity=parent_identity,
                     target_identity=target_identity,
+                    expected_sha256=before_sha if target_identity is not None else None,
                 )
-                os.replace(temp_path, target)
-                temp_path = None
                 workspace_changed = True
+                committed_target, committed_identity = _hold_committed_target(
+                    path, content_bytes, committed_native
+                )
             except Exception as write_error:
                 if not workspace_changed:
                     update_single_file_write_transaction(
@@ -1798,19 +1887,24 @@ def write_file(
                         error=write_error,
                     )
                 raise
-            finally:
-                if temp_path is not None:
-                    temp_path.unlink(missing_ok=True)
 
             try:
-                after_bytes = target.read_bytes()
-                after_sha = sha256_bytes(after_bytes)
-                if after_sha != sha256_bytes(content_bytes):
-                    raise RuntimeError("post-write content verification failed")
+                after_sha = sha256_bytes(content_bytes)
+                post_workspace = capture_workspace_state(
+                    runtime.settings,
+                    operation_id,
+                    "after",
+                    paths=checkpoint_paths,
+                )
+                post_hashes = verify_checkpoint_integrity(
+                    runtime.settings, post_workspace.manifest_path
+                )
+                if post_hashes.get(relative_target) != after_sha:
+                    raise RuntimeError("target changed before the post-write checkpoint")
                 result = {
                     "operation_id": operation_id,
                     "status": "succeeded",
-                    "path": runtime.workspace.relative(target),
+                    "path": relative_target,
                     "before_sha256": before_sha,
                     "after_sha256": after_sha,
                     "diff_path": str(diff_path),
@@ -1818,12 +1912,6 @@ def write_file(
                     "added_lines": added,
                     "removed_lines": removed,
                 }
-                post_workspace = capture_workspace_state(
-                    runtime.settings,
-                    operation_id,
-                    "after",
-                    paths=checkpoint_paths,
-                )
                 workspace_change = compare_workspace_states(
                     runtime.settings,
                     pre_workspace.manifest_path,
@@ -1854,36 +1942,20 @@ def write_file(
                 runtime.audit.add_event(operation_id, "file_written", result)
                 return result
             except Exception as post_error:
+                if committed_target is not None:
+                    release_verified_hold(committed_target)
+                    committed_target = None
                 if not workspace_changed:
                     raise
                 try:
-                    live_exists = target.exists()
-                    live_bytes = target.read_bytes() if live_exists else b""
-                    if not live_exists or live_bytes != content_bytes:
-                        raise RuntimeError(
-                            "automatic recovery refused to overwrite a concurrent target change"
-                        )
-                    if target_identity is None:
-                        target.unlink(missing_ok=True)
-                    else:
-                        recovery_temp: Path | None = None
-                        try:
-                            with tempfile.NamedTemporaryFile(
-                                mode="wb", delete=False, dir=target.parent
-                            ) as recovery:
-                                recovery.write(previous_bytes)
-                                recovery.flush()
-                                os.fsync(recovery.fileno())
-                                recovery_temp = Path(recovery.name)
-                            os.replace(recovery_temp, target)
-                            recovery_temp = None
-                        finally:
-                            if recovery_temp is not None:
-                                recovery_temp.unlink(missing_ok=True)
-                    recovered = target.read_bytes() if target.exists() else b""
-                    existed_before = target_identity is not None
-                    if recovered != previous_bytes or target.exists() != existed_before:
-                        raise RuntimeError("write recovery verification failed")
+                    _recover_single_file_commit(
+                        path,
+                        before=previous_bytes,
+                        after=content_bytes,
+                        before_identity=target_identity,
+                        committed_identity=committed_identity,
+                        committed_native=committed_native,
+                    )
                 except Exception as recovery_error:
                     recovery_journal = update_single_file_write_transaction(
                         runtime.settings,
@@ -1897,7 +1969,7 @@ def write_file(
                         pre_workspace_path=pre_workspace.manifest_path,
                     )
                     raise WorkspaceMutationError(
-                        "write_file failed after replacement and automatic recovery failed",
+                        "write_file failed after commit and automatic recovery refused an unsafe overwrite",
                         recovery_state="recovery_required",
                         journal_path=recovery_journal,
                     ) from recovery_error
@@ -1917,6 +1989,9 @@ def write_file(
                     recovery_state="failed_recovered",
                     journal_path=recovery_journal,
                 ) from post_error
+            finally:
+                if committed_target is not None:
+                    release_verified_hold(committed_target)
     except Exception as error:
         if operation_id is None:
             _audit_rejection("write_file", request_input, error)
