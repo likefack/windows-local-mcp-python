@@ -538,8 +538,8 @@ class Workspace:
         parent_identity: PathIdentity,
         target_identity: PathIdentity | None,
         expected_sha256: str | None,
-    ) -> None:
-        """Validate and commit bytes without a validation-to-commit namespace race on Windows."""
+    ) -> tuple[int, int] | None:
+        """CAS-validate and atomically commit bytes at the workspace mutation boundary."""
         actual_target = Path(str(target))
         if os.name == "nt":
             release_write_intent_hold(target)
@@ -552,6 +552,7 @@ class Workspace:
                 ) != (parent_identity.device, parent_identity.inode):
                     raise RuntimeError("write target parent changed during operation")
                 expected_native = None
+                expected_size = None
                 if target_identity is not None:
                     if (
                         target_identity.windows_volume_serial is None
@@ -563,17 +564,19 @@ class Workspace:
                         target_identity.windows_volume_serial,
                         target_identity.windows_file_index,
                     )
+                    expected_size = target_identity.size
                 elif expected_sha256 is not None:
                     raise ValueError("missing target must not have an expected digest")
-                transactional_write_bytes(
+                committed = transactional_write_bytes(
                     actual_target,
                     data,
                     expected_identity=expected_native,
+                    expected_size=expected_size,
                     expected_sha256=expected_sha256,
                 )
+                return committed.volume_serial, committed.file_index
             finally:
                 release_write_intent_hold(parent_hold)
-            return
 
         temporary: Path | None = None
         try:
@@ -589,6 +592,7 @@ class Workspace:
             )
             os.replace(temporary, actual_target)
             temporary = None
+            return None
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
@@ -601,7 +605,7 @@ class Workspace:
         target_identity: PathIdentity,
         expected_sha256: str,
     ) -> None:
-        """Validate and delete a file without a validation-to-delete race on Windows."""
+        """CAS-validate and atomically delete a workspace file."""
         actual_target = Path(str(target))
         if os.name == "nt":
             release_write_intent_hold(target)
@@ -624,6 +628,7 @@ class Workspace:
                         target_identity.windows_volume_serial,
                         target_identity.windows_file_index,
                     ),
+                    expected_size=target_identity.size,
                     expected_sha256=expected_sha256,
                 )
             finally:
