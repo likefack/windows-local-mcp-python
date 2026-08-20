@@ -4,6 +4,7 @@ import os
 import sqlite3
 import stat
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -33,6 +34,101 @@ def assert_control_plane_healthy(settings: Settings) -> None:
             "control-plane tampering was previously detected; operations are unavailable "
             "until the operator performs an explicit recovery"
         )
+
+
+def _runtime_startup_candidate_paths() -> list[Path]:
+    """Return present and absent path-configuration locations that can affect next startup."""
+    directories: set[Path] = set()
+    candidates: set[Path] = set()
+    for value in (sys.executable, getattr(sys, "_base_executable", None)):
+        if not value:
+            continue
+        executable = Path(str(value)).absolute()
+        if executable.exists():
+            executable = executable.resolve(strict=True)
+        directories.add(executable.parent)
+    for prefix_value in (sys.prefix, sys.base_prefix):
+        prefix = Path(prefix_value).absolute()
+        if prefix.exists():
+            prefix = prefix.resolve(strict=True)
+        directories.add(prefix)
+
+    version_stem = f"python{sys.version_info.major}{sys.version_info.minor}"
+    for directory in directories:
+        candidates.add(directory / "pyvenv.cfg")
+        candidates.add(directory / "python._pth")
+        candidates.add(directory / f"{version_stem}._pth")
+        candidates.add(directory / f"{version_stem}.zip")
+        if directory.is_dir():
+            for library in directory.glob("python*.dll"):
+                if library.is_file():
+                    candidates.add(library.with_suffix("._pth"))
+
+    for value in sys.path:
+        if value:
+            candidates.add(Path(value).absolute())
+    return sorted(candidates, key=lambda item: os.path.normcase(str(item)))
+
+
+def _startup_path_acl_digest(path: Path) -> str | None:
+    if os.name != "nt":
+        return None
+    completed = subprocess.run(
+        [windows_system_executable("icacls.exe"), str(path), "/C"],
+        capture_output=True,
+        timeout=10,
+        check=False,
+        shell=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(f"could not inspect Python startup path ACL: {path}")
+    return sha256_bytes(completed.stdout + completed.stderr)
+
+
+def _capture_runtime_startup_state(paths: list[Path] | None = None) -> dict[str, Any]:
+    records: list[dict[str, Any]] = []
+    for candidate in paths or _runtime_startup_candidate_paths():
+        absolute = candidate.absolute()
+        if not absolute.exists():
+            records.append({"path": str(absolute), "kind": "missing"})
+            continue
+        if _is_reparse(absolute):
+            raise RuntimeError(f"Python startup path is a reparse point: {absolute}")
+        resolved = absolute.resolve(strict=True)
+        details = resolved.stat()
+        if resolved.is_file():
+            if details.st_nlink > 1:
+                raise RuntimeError(f"Python startup path is hard-linked: {resolved}")
+            data = resolved.read_bytes()
+            records.append(
+                {
+                    "path": str(resolved),
+                    "kind": "file",
+                    "bytes": len(data),
+                    "sha256": sha256_bytes(data),
+                    "device": int(details.st_dev),
+                    "inode": int(details.st_ino),
+                    "acl_sha256": _startup_path_acl_digest(resolved),
+                }
+            )
+            continue
+        if resolved.is_dir():
+            records.append(
+                {
+                    "path": str(resolved),
+                    "kind": "directory",
+                    "device": int(details.st_dev),
+                    "inode": int(details.st_ino),
+                    "acl_sha256": _startup_path_acl_digest(resolved),
+                }
+            )
+            continue
+        raise RuntimeError(f"Python startup path has unsupported type: {resolved}")
+    records.sort(key=lambda item: os.path.normcase(str(item["path"])))
+    return {
+        "count": len(records),
+        "digest": sha256_text(canonical_json(records)),
+    }
 
 
 def capture_critical_state(settings: Settings, operation_id: str) -> dict[str, Any]:
@@ -105,10 +201,16 @@ def capture_critical_state(settings: Settings, operation_id: str) -> dict[str, A
         if os.name == "nt"
         else None
     )
+    runtime_startup_state = _capture_runtime_startup_state() if os.name == "nt" else None
     audit_digest, audit_bytes = _audit_state_digest(settings, operation_id)
     acl_digest, acl_bytes = _acl_state_digest(settings, roots)
     runtime_bytes = int(runtime_state["bytes"]) if runtime_state is not None else 0
     runtime_digest = str(runtime_state["digest"]) if runtime_state is not None else None
+    runtime_startup_digest = (
+        str(runtime_startup_state["digest"])
+        if runtime_startup_state is not None
+        else None
+    )
     return {
         "file_count": len(records),
         "bytes": total_bytes + audit_bytes + acl_bytes + runtime_bytes,
@@ -119,6 +221,7 @@ def capture_critical_state(settings: Settings, operation_id: str) -> dict[str, A
                     "audit_digest": audit_digest,
                     "acl_digest": acl_digest,
                     "runtime_digest": runtime_digest,
+                    "runtime_startup_digest": runtime_startup_digest,
                     "config_binding": config_binding,
                 }
             )
@@ -128,6 +231,12 @@ def capture_critical_state(settings: Settings, operation_id: str) -> dict[str, A
         "runtime_digest": runtime_digest,
         "runtime_file_count": (
             int(runtime_state["file_count"]) if runtime_state is not None else 0
+        ),
+        "runtime_startup_digest": runtime_startup_digest,
+        "runtime_startup_path_count": (
+            int(runtime_startup_state["count"])
+            if runtime_startup_state is not None
+            else 0
         ),
         "config_binding": config_binding,
     }
