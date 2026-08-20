@@ -31,5 +31,5 @@ if ($Config -ne "") {
     Remove-Item Env:LOCAL_MCP_ROOT -ErrorAction SilentlyContinue
 }
 
-& $Python -m windows_local_mcp.cli server
+& $Python -I -B -m windows_local_mcp.cli server
 exit $LASTEXITCODE

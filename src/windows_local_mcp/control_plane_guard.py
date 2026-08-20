@@ -10,6 +10,7 @@ from typing import Any
 
 from .config import Settings
 from .config_binding import export_config_binding
+from .runtime_trust import capture_runtime_dependency_state
 from .util import canonical_json, sha256_bytes, sha256_text, utc_now_iso
 from .windows_system import windows_system_executable
 
@@ -43,7 +44,7 @@ def capture_critical_state(settings: Settings, operation_id: str) -> dict[str, A
         settings.data_dir / "worker-contexts" / f"{operation_id}.json",
         settings.data_dir / "control-plane",
         settings.data_dir / "workspace-history",
-        Path(__file__).resolve(strict=True).parent,
+        Path(__file__).resolve(strict=True).parent.parent,
     ]
     if settings.sandbox_scratch_dir is not None:
         roots.append(settings.sandbox_scratch_dir / "approval-inputs")
@@ -96,23 +97,38 @@ def capture_critical_state(settings: Settings, operation_id: str) -> dict[str, A
                     "sha256": sha256_bytes(data),
                 }
             )
+    runtime_state = (
+        capture_runtime_dependency_state(
+            max_files=settings.approval_manifest_max_files,
+            max_bytes=settings.approval_manifest_max_bytes,
+        )
+        if os.name == "nt"
+        else None
+    )
     audit_digest, audit_bytes = _audit_state_digest(settings, operation_id)
     acl_digest, acl_bytes = _acl_state_digest(settings, roots)
+    runtime_bytes = int(runtime_state["bytes"]) if runtime_state is not None else 0
+    runtime_digest = str(runtime_state["digest"]) if runtime_state is not None else None
     return {
         "file_count": len(records),
-        "bytes": total_bytes + audit_bytes + acl_bytes,
+        "bytes": total_bytes + audit_bytes + acl_bytes + runtime_bytes,
         "digest": sha256_text(
             canonical_json(
                 {
                     "files": records,
                     "audit_digest": audit_digest,
                     "acl_digest": acl_digest,
+                    "runtime_digest": runtime_digest,
                     "config_binding": config_binding,
                 }
             )
         ),
         "audit_digest": audit_digest,
         "acl_digest": acl_digest,
+        "runtime_digest": runtime_digest,
+        "runtime_file_count": (
+            int(runtime_state["file_count"]) if runtime_state is not None else 0
+        ),
         "config_binding": config_binding,
     }
 

@@ -13,10 +13,11 @@ from .config import Settings
 from .config_binding import export_config_binding, restore_config_binding
 from .control_plane_guard import assert_control_plane_healthy
 from .resources import NamedControlPlaneLock
+from .runtime_trust import runtime_generation_identity
 from .util import canonical_json, sha256_bytes, sha256_text, utc_now_iso
 
 ARCHITECTURE_VERSION = "broker-centered-sandboxed-processing-v1"
-POLICY_GENERATION_VERSION = 2
+POLICY_GENERATION_VERSION = 3
 WORKER_CONTEXT_VERSION = 2
 
 
@@ -104,6 +105,7 @@ def control_plane_generation(settings: Settings) -> dict[str, Any]:
         "runtime_root": str(package),
         "runtime_sha256": _tree_digest(package),
         "python": filesystem_identity(Path(sys.executable)),
+        "runtime_environment": runtime_generation_identity(package),
     }
     build_digest = sha256_text(canonical_json(build))
     policy = {
@@ -215,6 +217,7 @@ def isolated_worker_argv(
     return [
         sys.executable,
         "-I",
+        "-B",
         "-c",
         bootstrap,
         "--operation-id",
