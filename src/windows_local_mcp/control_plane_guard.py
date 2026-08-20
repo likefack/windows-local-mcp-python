@@ -6,14 +6,22 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from .config import Settings
 from .config_binding import export_config_binding
 from .runtime_trust import capture_runtime_dependency_state
 from .util import canonical_json, sha256_bytes, sha256_text, utc_now_iso
 from .windows_system import windows_system_executable
+
+
+_ORIGINAL_SQLITE_CONNECT = sqlite3.connect
+_AUDIT_GUARDS_LOCK = threading.RLock()
+_ACTIVE_AUDIT_GUARDS: dict[str, _AuditMutationGuard] = {}
+_SQLITE_CONNECT_PATCHED = False
 
 
 def _is_reparse(path: Path) -> bool:
@@ -133,6 +141,12 @@ def _capture_runtime_startup_state(paths: list[Path] | None = None) -> dict[str,
 
 def capture_critical_state(settings: Settings, operation_id: str) -> dict[str, Any]:
     """Capture state that an Approved Host child is never allowed to mutate."""
+    database_identity = _database_identity(settings.data_dir / "audit.db")
+    with _AUDIT_GUARDS_LOCK:
+        active_guard = _ACTIVE_AUDIT_GUARDS.get(database_identity)
+        if active_guard is not None and active_guard.operation_id != operation_id:
+            raise RuntimeError("another Approved Host audit guard is already active")
+
     config_binding = export_config_binding(settings)
     roots = [
         settings.data_dir / "approval-staging",
@@ -202,7 +216,7 @@ def capture_critical_state(settings: Settings, operation_id: str) -> dict[str, A
         else None
     )
     runtime_startup_state = _capture_runtime_startup_state() if os.name == "nt" else None
-    audit_digest, audit_bytes = _audit_state_digest(settings, operation_id)
+    audit_snapshot, audit_bytes = _audit_state_snapshot(settings)
     acl_digest, acl_bytes = _acl_state_digest(settings, roots)
     runtime_bytes = int(runtime_state["bytes"]) if runtime_state is not None else 0
     runtime_digest = str(runtime_state["digest"]) if runtime_state is not None else None
@@ -211,35 +225,277 @@ def capture_critical_state(settings: Settings, operation_id: str) -> dict[str, A
         if runtime_startup_state is not None
         else None
     )
-    return {
-        "file_count": len(records),
-        "bytes": total_bytes + audit_bytes + acl_bytes + runtime_bytes,
-        "digest": sha256_text(
-            canonical_json(
-                {
-                    "files": records,
-                    "audit_digest": audit_digest,
-                    "acl_digest": acl_digest,
-                    "runtime_digest": runtime_digest,
-                    "runtime_startup_digest": runtime_startup_digest,
-                    "config_binding": config_binding,
-                }
-            )
-        ),
-        "audit_digest": audit_digest,
+    runtime_file_count = (
+        int(runtime_state["file_count"]) if runtime_state is not None else 0
+    )
+    runtime_startup_path_count = (
+        int(runtime_startup_state["count"])
+        if runtime_startup_state is not None
+        else 0
+    )
+    static_bytes = total_bytes + acl_bytes + runtime_bytes
+    base_digest_payload = {
+        "files": records,
         "acl_digest": acl_digest,
         "runtime_digest": runtime_digest,
-        "runtime_file_count": (
-            int(runtime_state["file_count"]) if runtime_state is not None else 0
-        ),
         "runtime_startup_digest": runtime_startup_digest,
-        "runtime_startup_path_count": (
-            int(runtime_startup_state["count"])
-            if runtime_startup_state is not None
-            else 0
-        ),
         "config_binding": config_binding,
     }
+    state = _critical_state_summary(
+        file_count=len(records),
+        static_bytes=static_bytes,
+        base_digest_payload=base_digest_payload,
+        audit_snapshot=audit_snapshot,
+        audit_bytes=audit_bytes,
+        runtime_file_count=runtime_file_count,
+        runtime_startup_path_count=runtime_startup_path_count,
+    )
+
+    if active_guard is not None:
+        tracking_error = active_guard.tracking_error
+        _deactivate_audit_guard(database_identity)
+        if tracking_error is not None:
+            raise RuntimeError(
+                "trusted audit mutation tracking failed during Approved Host execution: "
+                f"{tracking_error}"
+            )
+        return state
+
+    mirror = _build_audit_mirror(settings)
+    try:
+        mirror_snapshot = _audit_snapshot_from_connection(mirror)
+        if _snapshot_digest(mirror_snapshot) != _snapshot_digest(audit_snapshot):
+            raise RuntimeError("audit mirror did not match the Approved Host preflight state")
+        guard = _AuditMutationGuard(
+            database_identity=database_identity,
+            operation_id=operation_id,
+            mirror=mirror,
+            expected_state=state,
+            file_count=len(records),
+            static_bytes=static_bytes,
+            base_digest_payload=base_digest_payload,
+            max_snapshot_bytes=settings.max_data_dir_bytes,
+            runtime_file_count=runtime_file_count,
+            runtime_startup_path_count=runtime_startup_path_count,
+        )
+        _activate_audit_guard(guard)
+    except Exception:
+        mirror.close()
+        raise
+    return state
+
+
+def _critical_state_summary(
+    *,
+    file_count: int,
+    static_bytes: int,
+    base_digest_payload: dict[str, Any],
+    audit_snapshot: dict[str, Any],
+    audit_bytes: int,
+    runtime_file_count: int,
+    runtime_startup_path_count: int,
+) -> dict[str, Any]:
+    audit_digest = _snapshot_digest(audit_snapshot)
+    digest_payload = dict(base_digest_payload)
+    digest_payload["audit_digest"] = audit_digest
+    return {
+        "file_count": file_count,
+        "bytes": static_bytes + audit_bytes,
+        "digest": sha256_text(canonical_json(digest_payload)),
+        "audit_digest": audit_digest,
+        "audit_bytes": audit_bytes,
+        "audit_operation_count": len(audit_snapshot["operations"]),
+        "audit_event_count": len(audit_snapshot["events"]),
+        "acl_digest": base_digest_payload["acl_digest"],
+        "runtime_digest": base_digest_payload["runtime_digest"],
+        "runtime_file_count": runtime_file_count,
+        "runtime_startup_digest": base_digest_payload["runtime_startup_digest"],
+        "runtime_startup_path_count": runtime_startup_path_count,
+        "config_binding": base_digest_payload["config_binding"],
+    }
+
+
+def _database_identity(database: object) -> str:
+    value = os.fspath(database)
+    if isinstance(value, bytes):
+        value = os.fsdecode(value)
+    if value.startswith("file:"):
+        value = unquote(value[5:].split("?", 1)[0])
+    return os.path.normcase(os.path.abspath(value))
+
+
+def _guarded_sqlite_connect(database: object, *args: Any, **kwargs: Any) -> sqlite3.Connection:
+    connection = _ORIGINAL_SQLITE_CONNECT(database, *args, **kwargs)
+    try:
+        identity = _database_identity(database)
+    except (TypeError, ValueError, OSError):
+        return connection
+    with _AUDIT_GUARDS_LOCK:
+        guard = _ACTIVE_AUDIT_GUARDS.get(identity)
+    if guard is not None:
+        connection.set_trace_callback(guard.record_statement)
+    return connection
+
+
+def _activate_audit_guard(guard: _AuditMutationGuard) -> None:
+    # Only this trusted worker process receives the trace callback. The Approved Host child
+    # is a separate process, so its direct SQLite writes cannot advance the expected mirror.
+    global _SQLITE_CONNECT_PATCHED
+    with _AUDIT_GUARDS_LOCK:
+        if guard.database_identity in _ACTIVE_AUDIT_GUARDS:
+            guard.mirror.close()
+            raise RuntimeError("Approved Host audit guard was armed twice")
+        _ACTIVE_AUDIT_GUARDS[guard.database_identity] = guard
+        if not _SQLITE_CONNECT_PATCHED:
+            sqlite3.connect = _guarded_sqlite_connect
+            _SQLITE_CONNECT_PATCHED = True
+
+
+def _deactivate_audit_guard(database_identity: str) -> None:
+    global _SQLITE_CONNECT_PATCHED
+    with _AUDIT_GUARDS_LOCK:
+        guard = _ACTIVE_AUDIT_GUARDS.pop(database_identity, None)
+        if guard is not None:
+            guard.mirror.close()
+        if _SQLITE_CONNECT_PATCHED and not _ACTIVE_AUDIT_GUARDS:
+            sqlite3.connect = _ORIGINAL_SQLITE_CONNECT
+            _SQLITE_CONNECT_PATCHED = False
+
+
+def _snapshot_rows(cursor: sqlite3.Cursor) -> list[dict[str, Any]]:
+    columns = [str(item[0]) for item in cursor.description or ()]
+    return [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
+
+
+def _audit_snapshot_from_connection(connection: sqlite3.Connection) -> dict[str, Any]:
+    integrity = connection.execute("PRAGMA quick_check").fetchone()
+    if integrity != ("ok",):
+        raise RuntimeError("audit database integrity check failed")
+    schema = _snapshot_rows(
+        connection.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master "
+            "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+        )
+    )
+    operations = _snapshot_rows(connection.execute("SELECT * FROM operations ORDER BY id"))
+    events = _snapshot_rows(connection.execute("SELECT * FROM events ORDER BY id"))
+    try:
+        event_sequence = _snapshot_rows(
+            connection.execute("SELECT name, seq FROM sqlite_sequence ORDER BY name")
+        )
+    except sqlite3.OperationalError:
+        event_sequence = []
+    return {
+        "schema": schema,
+        "operations": operations,
+        "events": events,
+        "sqlite_sequence": event_sequence,
+    }
+
+
+def _snapshot_digest(snapshot: dict[str, Any]) -> str:
+    return sha256_text(canonical_json(snapshot))
+
+
+def _snapshot_bytes(snapshot: dict[str, Any], max_bytes: int) -> int:
+    size = len(canonical_json(snapshot).encode("utf-8"))
+    if size > max_bytes:
+        raise RuntimeError("audit state exceeds the control-plane verification bound")
+    return size
+
+
+def _audit_state_snapshot(settings: Settings) -> tuple[dict[str, Any], int]:
+    database = settings.data_dir / "audit.db"
+    if not database.is_file():
+        raise RuntimeError("audit database disappeared before Approved Host execution")
+    connection = _ORIGINAL_SQLITE_CONNECT(f"file:{database}?mode=ro", uri=True, timeout=10)
+    try:
+        snapshot = _audit_snapshot_from_connection(connection)
+        return snapshot, _snapshot_bytes(snapshot, settings.max_data_dir_bytes)
+    finally:
+        connection.close()
+
+
+def _build_audit_mirror(settings: Settings) -> sqlite3.Connection:
+    database = settings.data_dir / "audit.db"
+    source = _ORIGINAL_SQLITE_CONNECT(f"file:{database}?mode=ro", uri=True, timeout=10)
+    mirror = _ORIGINAL_SQLITE_CONNECT(":memory:")
+    try:
+        source.backup(mirror)
+        mirror.execute("PRAGMA foreign_keys = ON")
+        return mirror
+    except Exception:
+        mirror.close()
+        raise
+    finally:
+        source.close()
+
+
+class _AuditMutationGuard:
+    """Advance the expected audit state only for SQL issued by the trusted worker process."""
+
+    def __init__(
+        self,
+        *,
+        database_identity: str,
+        operation_id: str,
+        mirror: sqlite3.Connection,
+        expected_state: dict[str, Any],
+        file_count: int,
+        static_bytes: int,
+        base_digest_payload: dict[str, Any],
+        max_snapshot_bytes: int,
+        runtime_file_count: int,
+        runtime_startup_path_count: int,
+    ) -> None:
+        self.database_identity = database_identity
+        self.operation_id = operation_id
+        self.mirror = mirror
+        self.expected_state = expected_state
+        self.file_count = file_count
+        self.static_bytes = static_bytes
+        self.base_digest_payload = base_digest_payload
+        self.max_snapshot_bytes = max_snapshot_bytes
+        self.runtime_file_count = runtime_file_count
+        self.runtime_startup_path_count = runtime_startup_path_count
+        self.tracking_error: str | None = None
+        self._lock = threading.RLock()
+
+    def record_statement(self, statement: str) -> None:
+        stripped = statement.lstrip()
+        if not stripped:
+            return
+        keyword = stripped.split(None, 1)[0].casefold()
+        folded = stripped.casefold()
+        tracked_dml = keyword in {"insert", "update", "delete", "replace"} and (
+            "operations" in folded or "events" in folded
+        )
+        transaction_control = keyword in {"begin", "commit", "rollback"}
+        if not tracked_dml and not transaction_control:
+            return
+        with self._lock:
+            if self.tracking_error is not None:
+                return
+            try:
+                self.mirror.execute(statement)
+                self._refresh_expected_state()
+            except Exception as error:  # noqa: BLE001 - tracking uncertainty must fail closed
+                self.tracking_error = f"{type(error).__name__}: {error}"
+
+    def _refresh_expected_state(self) -> None:
+        snapshot = _audit_snapshot_from_connection(self.mirror)
+        audit_bytes = _snapshot_bytes(snapshot, self.max_snapshot_bytes)
+        refreshed = _critical_state_summary(
+            file_count=self.file_count,
+            static_bytes=self.static_bytes,
+            base_digest_payload=self.base_digest_payload,
+            audit_snapshot=snapshot,
+            audit_bytes=audit_bytes,
+            runtime_file_count=self.runtime_file_count,
+            runtime_startup_path_count=self.runtime_startup_path_count,
+        )
+        self.expected_state.clear()
+        self.expected_state.update(refreshed)
 
 
 def _acl_state_digest(settings: Settings, roots: list[Path]) -> tuple[str | None, int]:
@@ -268,44 +524,9 @@ def _acl_state_digest(settings: Settings, roots: list[Path]) -> tuple[str | None
 
 
 def _audit_state_digest(settings: Settings, operation_id: str) -> tuple[str, int]:
-    database = settings.data_dir / "audit.db"
-    if not database.is_file():
-        raise RuntimeError("audit database disappeared before Approved Host execution")
-    connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=10)
-    try:
-        integrity = connection.execute("PRAGMA quick_check").fetchone()
-        if integrity != ("ok",):
-            raise RuntimeError("audit database integrity check failed")
-        rows: list[object] = []
-        schema = connection.execute(
-            "SELECT type, name, tbl_name, sql FROM sqlite_master "
-            "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
-        ).fetchall()
-        rows.append(schema)
-        rows.append(
-            connection.execute(
-                "SELECT id, session_id, tool_name, tier, cwd, request_json, request_hash, "
-                "approval_status, approval_by, approved_at, approval_expires_at, claimed_at "
-                "FROM operations WHERE id = ?",
-                (operation_id,),
-            ).fetchall()
-        )
-        rows.append(
-            connection.execute(
-                "SELECT * FROM operations WHERE id <> ? ORDER BY id", (operation_id,)
-            ).fetchall()
-        )
-        rows.append(
-            connection.execute(
-                "SELECT * FROM events WHERE operation_id <> ? ORDER BY id", (operation_id,)
-            ).fetchall()
-        )
-        payload = canonical_json(rows).encode("utf-8")
-        if len(payload) > settings.max_data_dir_bytes:
-            raise RuntimeError("audit state exceeds the control-plane verification bound")
-        return sha256_bytes(payload), len(payload)
-    finally:
-        connection.close()
+    del operation_id
+    snapshot, size = _audit_state_snapshot(settings)
+    return _snapshot_digest(snapshot), size
 
 
 def mark_control_plane_tamper(
@@ -314,6 +535,7 @@ def mark_control_plane_tamper(
     before: dict[str, Any],
     after: dict[str, Any],
 ) -> str:
+    _deactivate_audit_guard(_database_identity(settings.data_dir / "audit.db"))
     marker = _tamper_marker(settings)
     marker.parent.mkdir(parents=True, exist_ok=True)
     payload = canonical_json(
