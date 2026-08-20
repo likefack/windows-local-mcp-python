@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import os
+from collections.abc import Callable
 from ctypes import get_last_error, wintypes
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,6 +24,7 @@ _FILE_ATTRIBUTE_DIRECTORY = 0x00000010
 _FILE_BEGIN = 0
 _FILE_DISPOSITION_INFO_CLASS = 4
 _TRANSACTION_DO_NOT_PROMOTE = 0x00000001
+_READ_CHUNK_BYTES = 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -190,6 +192,7 @@ def _validate_regular_identity(
     handle: Any,
     *,
     expected_identity: tuple[int, int] | None,
+    expected_size: int | None,
     path: Path,
 ) -> WindowsFileIdentity:
     identity = _identity_from_handle(handle)
@@ -204,6 +207,8 @@ def _validate_regular_identity(
         identity.file_index,
     ) != expected_identity:
         raise RuntimeError("write target changed before transactional commit")
+    if expected_size is not None and identity.size != expected_size:
+        raise RuntimeError("write target size changed before transactional commit")
     return identity
 
 
@@ -212,20 +217,24 @@ def _seek_start(handle: Any) -> None:
         _raise_last_error("SetFilePointerEx")
 
 
-def _hash_handle(handle: Any) -> tuple[str, int]:
+def _hash_handle(handle: Any, *, max_bytes: int) -> tuple[str, int]:
+    if max_bytes < 0:
+        raise ValueError("max_bytes must be non-negative")
     kernel32 = _kernel32()
     _seek_start(handle)
     digest = hashlib.sha256()
     total = 0
-    buffer = ctypes.create_string_buffer(1024 * 1024)
+    buffer = ctypes.create_string_buffer(_READ_CHUNK_BYTES)
     while True:
         read = wintypes.DWORD()
         if not kernel32.ReadFile(handle, buffer, len(buffer), ctypes.byref(read), None):
             _raise_last_error("ReadFile")
         if not read.value:
             return digest.hexdigest(), total
-        digest.update(buffer.raw[: read.value])
         total += int(read.value)
+        if total > max_bytes:
+            raise RuntimeError("transaction target exceeded its expected size while hashing")
+        digest.update(buffer.raw[: read.value])
 
 
 def _write_handle(handle: Any, data: bytes) -> None:
@@ -235,7 +244,7 @@ def _write_handle(handle: Any, data: bytes) -> None:
         _raise_last_error("SetEndOfFile")
     offset = 0
     while offset < len(data):
-        chunk = data[offset : offset + 1024 * 1024]
+        chunk = data[offset : offset + _READ_CHUNK_BYTES]
         buffer = ctypes.create_string_buffer(chunk)
         written = wintypes.DWORD()
         if not kernel32.WriteFile(handle, buffer, len(chunk), ctypes.byref(written), None):
@@ -302,32 +311,47 @@ def transactional_write_bytes(
     data: bytes,
     *,
     expected_identity: tuple[int, int] | None,
+    expected_size: int | None,
     expected_sha256: str | None,
+    _before_commit: Callable[[], None] | None = None,
 ) -> None:
-    """Atomically validate and replace one local NTFS file inside one TxF transaction."""
+    """CAS-style single-file commit inside one TxF transaction.
+
+    The existing target identity, exact size, and SHA-256 are checked on the same transacted
+    writer handle that receives the new bytes.  TxF keeps external writers from modifying that
+    file until CommitTransaction finishes.  ``_before_commit`` exists only for deterministic
+    race tests and startup probes; production callers leave it unset.
+    """
     if os.name != "nt":
         raise OSError("transactional workspace commit requires Windows")
-    if (expected_identity is None) != (expected_sha256 is None):
-        raise ValueError("existing target identity and digest must be supplied together")
+    existing_fields = (expected_identity, expected_size, expected_sha256)
+    if any(value is None for value in existing_fields) and any(
+        value is not None for value in existing_fields
+    ):
+        raise ValueError("existing target identity, size, and digest must be supplied together")
     kernel32 = _kernel32()
     transaction = _create_transaction("Windows Local MCP workspace write")
     handle: Any | None = None
     committed = False
     try:
-        handle = _open_transacted(
-            path,
-            transaction,
-            exists=expected_identity is not None,
-            delete=False,
+        exists = expected_identity is not None
+        handle = _open_transacted(path, transaction, exists=exists, delete=False)
+        identity = _validate_regular_identity(
+            handle,
+            expected_identity=expected_identity,
+            expected_size=expected_size,
+            path=path,
         )
-        if expected_identity is not None:
-            _validate_regular_identity(handle, expected_identity=expected_identity, path=path)
-            digest, _size = _hash_handle(handle)
-            if digest != expected_sha256:
+        if exists:
+            assert expected_size is not None
+            digest, size = _hash_handle(handle, max_bytes=expected_size)
+            if size != expected_size or digest != expected_sha256:
                 raise RuntimeError("write target content changed before transactional commit")
-        else:
-            _validate_regular_identity(handle, expected_identity=None, path=path)
+        elif identity.size != 0:
+            raise RuntimeError("new transactional target was not created empty")
         _write_handle(handle, data)
+        if _before_commit is not None:
+            _before_commit()
         kernel32.CloseHandle(handle)
         handle = None
         _finish_transaction(transaction, commit=True)
@@ -344,9 +368,11 @@ def transactional_delete(
     path: Path,
     *,
     expected_identity: tuple[int, int],
+    expected_size: int,
     expected_sha256: str,
+    _before_commit: Callable[[], None] | None = None,
 ) -> None:
-    """Atomically validate and delete one local NTFS file inside one TxF transaction."""
+    """CAS-style single-file delete inside one TxF transaction."""
     if os.name != "nt":
         raise OSError("transactional workspace delete requires Windows")
     kernel32 = _kernel32()
@@ -355,9 +381,14 @@ def transactional_delete(
     committed = False
     try:
         handle = _open_transacted(path, transaction, exists=True, delete=True)
-        _validate_regular_identity(handle, expected_identity=expected_identity, path=path)
-        digest, _size = _hash_handle(handle)
-        if digest != expected_sha256:
+        _validate_regular_identity(
+            handle,
+            expected_identity=expected_identity,
+            expected_size=expected_size,
+            path=path,
+        )
+        digest, size = _hash_handle(handle, max_bytes=expected_size)
+        if size != expected_size or digest != expected_sha256:
             raise RuntimeError("delete target content changed before transactional commit")
         disposition = _FileDispositionInfo(True)
         if not kernel32.SetFileInformationByHandle(
@@ -367,6 +398,8 @@ def transactional_delete(
             ctypes.sizeof(disposition),
         ):
             _raise_last_error("SetFileInformationByHandle(FileDispositionInfo)", path)
+        if _before_commit is not None:
+            _before_commit()
         kernel32.CloseHandle(handle)
         handle = None
         _finish_transaction(transaction, commit=True)
@@ -392,6 +425,7 @@ def probe_transactional_workspace_commit(directory: Path) -> None:
             first,
             b"after",
             expected_identity=(identity.volume_serial, identity.file_index),
+            expected_size=identity.size,
             expected_sha256=hashlib.sha256(b"before").hexdigest(),
         )
         if first.read_bytes() != b"after":
@@ -400,6 +434,7 @@ def probe_transactional_workspace_commit(directory: Path) -> None:
             created,
             b"created",
             expected_identity=None,
+            expected_size=None,
             expected_sha256=None,
         )
         if created.read_bytes() != b"created":
@@ -408,6 +443,7 @@ def probe_transactional_workspace_commit(directory: Path) -> None:
         transactional_delete(
             created,
             expected_identity=(created_identity.volume_serial, created_identity.file_index),
+            expected_size=created_identity.size,
             expected_sha256=hashlib.sha256(b"created").hexdigest(),
         )
         if created.exists():
