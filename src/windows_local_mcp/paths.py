@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from ctypes import get_last_error, wintypes
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
-from typing import Any
+from typing import Any, Self
 
 from .config import Settings
 from .windows_transaction import (
@@ -73,21 +73,21 @@ class _WindowsHandleLease:
             return
         try:
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-            kernel32.CloseHandle.restype = wintypes.BOOL
-            for handle in reversed(handles):
-                kernel32.CloseHandle(handle)
-        except Exception:
-            pass
+        except OSError:
+            return
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        for handle in reversed(handles):
+            kernel32.CloseHandle(handle)
 
 
 _PathBase = type(Path())
 
 
 class _HeldPath(_PathBase):
-    __slots__ = ("_lease_finalizer", "_write_intent", "__weakref__")
+    __slots__ = ("__weakref__", "_lease_finalizer", "_write_intent")
 
-    def __new__(cls, *parts: Any) -> "_HeldPath":
+    def __new__(cls, *parts: Any) -> Self:
         instance = super().__new__(cls, *parts)
         instance._lease_finalizer = None
         instance._write_intent = False
@@ -100,7 +100,7 @@ class _HeldPath(_PathBase):
         lease: _WindowsHandleLease,
         *,
         write_intent: bool = False,
-    ) -> "_HeldPath":
+    ) -> Self:
         instance = cls(path)
         instance._write_intent = write_intent
         instance._lease_finalizer = weakref.finalize(instance, lease.close)
@@ -110,15 +110,15 @@ class _HeldPath(_PathBase):
 class _MissingWritePath(_PathBase):
     """A lexical write target that was absent at validation time."""
 
-    __slots__ = ("_snapshot_active", "__weakref__")
+    __slots__ = ("__weakref__", "_snapshot_active")
 
-    def __new__(cls, *parts: Any) -> "_MissingWritePath":
+    def __new__(cls, *parts: Any) -> Self:
         instance = super().__new__(cls, *parts)
         instance._snapshot_active = True
         return instance
 
     @classmethod
-    def attach(cls, path: Path) -> "_MissingWritePath":
+    def attach(cls, path: Path) -> Self:
         return cls(path)
 
     def exists(self) -> bool:
