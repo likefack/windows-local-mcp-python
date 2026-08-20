@@ -1,4 +1,5 @@
 import importlib
+import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -262,3 +263,42 @@ def test_backup_and_diff_limits_fail_before_replacement(
             expected_sha256=sha256_bytes(target.read_bytes()),
         )
     assert target.read_text(encoding="utf-8") == original
+
+
+def test_post_commit_failure_refuses_recovery_over_third_party_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, root = load_server(tmp_path, monkeypatch)
+    target = root / "race.txt"
+    target.write_bytes(b"before")
+    replacement = root / "third-party.bin"
+    replacement.write_bytes(b"after")
+
+    expected = sha256_bytes(b"before")
+    real_capture = server.capture_workspace_state
+    real_release = server.release_verified_hold
+    swapped = False
+
+    def fail_after_checkpoint(settings, operation_id, stage, *, paths=None):
+        if stage == "after":
+            raise RuntimeError("forced post-write failure")
+        return real_capture(settings, operation_id, stage, paths=paths)
+
+    def release_then_replace(path: Path) -> None:
+        nonlocal swapped
+        real_release(path)
+        if not swapped and Path(str(path)).resolve() == target.resolve():
+            os.replace(replacement, target)
+            swapped = True
+
+    monkeypatch.setattr(server, "capture_workspace_state", fail_after_checkpoint)
+    monkeypatch.setattr(server, "release_verified_hold", release_then_replace)
+
+    with pytest.raises(server.WorkspaceMutationError) as captured:
+        server.write_file("race.txt", "after", expected_sha256=expected)
+
+    assert swapped is True
+    assert captured.value.recovery_state == "recovery_required"
+    assert "automatic recovery failed" in str(captured.value)
+    assert target.read_bytes() == b"after"
+    assert not replacement.exists()
