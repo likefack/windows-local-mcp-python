@@ -460,7 +460,10 @@ def _stage_dart_package_dependencies(
         access="read",
     )
     try:
-        payload = json.loads(checked_config.read_text(encoding="utf-8"))
+        config_bytes = read_verified_bytes(
+            checked_config, settings.approval_manifest_max_bytes
+        )
+        payload = json.loads(config_bytes.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("invalid Dart package_config.json") from error
     packages = payload.get("packages")

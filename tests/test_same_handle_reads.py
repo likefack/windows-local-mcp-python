@@ -108,6 +108,30 @@ def test_broker_workspace_read_sinks_do_not_reopen_verified_paths(
     )
     assert records
 
+    dart_tool = root / ".dart_tool"
+    dart_tool.mkdir()
+    package_config = dart_tool / "package_config.json"
+    package_config.write_text('{"packages": []}', encoding="utf-8")
+    guarded.add(package_config.resolve(strict=False))
+    staged_cwd = tmp_path / "dart-staged-cwd"
+    (staged_cwd / ".dart_tool").mkdir(parents=True)
+    staged_config = staged_cwd / ".dart_tool" / "package_config.json"
+    staged_config.write_text('{"packages": []}', encoding="utf-8")
+    dependency_stage = tmp_path / "dart-dependency-stage"
+    dependency_stage.mkdir()
+    dart_records = [approval._file_record(staged_config)]
+    dart_records[0].update(
+        {"source_path": str(package_config), "staged_path": str(staged_config)}
+    )
+    assert approval._stage_dart_package_dependencies(
+        source_cwd=root,
+        staged_cwd=staged_cwd,
+        stage_root=dependency_stage,
+        settings=server.runtime.settings,
+        workspace=server.runtime.workspace,
+        records=dart_records,
+    ) == []
+
 
 def test_session_info_names_actual_read_and_commit_boundaries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
