@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator,
 from .child_env import normalize_extra_environment_names, sanitize_process_environment
 from .git_env import strip_git_ambient_environment
 from .windows_system import physical_filesystem_path, windows_system_executable
+from .windows_transaction import probe_transactional_workspace_commit
 
 
 class Settings(BaseModel):
@@ -375,6 +376,7 @@ class Settings(BaseModel):
         _probe_filesystem_semantics(self.sandbox_scratch_dir)
         if self.filesystem_enabled:
             _probe_filesystem_semantics(self.workspace_root)
+            probe_transactional_workspace_commit(self.workspace_root)
 
     def selection_info(self) -> dict[str, object]:
         return {
@@ -601,7 +603,7 @@ def _protect_windows_acl(path: Path) -> None:
     )
     if isolation.returncode != 0:
         raise PermissionError(
-            f"failed to isolate data_dir ACL inheritance: {isolation.stderr.strip()}"
+            "failed to isolate data_dir ACL inheritance: " + isolation.stderr.strip()
         )
     result = subprocess.run(
         [
@@ -625,13 +627,7 @@ def _protect_windows_acl(path: Path) -> None:
         raise PermissionError(f"failed to protect data_dir ACL: {result.stderr.strip()}")
     inheritance = subprocess.run(
         [
-            windows_system_executable("icacls.exe"),
-            str(path),
-            "/grant",
-            f"*{sid}:(OI)(CI)(IO)F",
-            "SYSTEM:(OI)(CI)(IO)F",
-            "/T",
-            "/C",
+            windows_system_executable("icacls.exe"), str(path), "/grant", f"*{sid}:(OI)(CI)(IO)F", "SYSTEM:(OI)(CI)(IO)F", "/T", "/C"
         ],
         capture_output=True,
         text=True,
@@ -643,7 +639,7 @@ def _protect_windows_acl(path: Path) -> None:
     )
     if inheritance.returncode != 0:
         raise PermissionError(
-            f"failed to provision inherited data_dir ACL: {inheritance.stderr.strip()}"
+            "failed to provision inherited data_dir ACL: " + inheritance.stderr.strip()
         )
     verified = subprocess.run(
         [windows_system_executable("icacls.exe"), str(path)],
