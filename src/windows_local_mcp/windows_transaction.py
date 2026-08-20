@@ -206,9 +206,13 @@ def _validate_regular_identity(
         identity.volume_serial,
         identity.file_index,
     ) != expected_identity:
-        raise RuntimeError("write target changed before transactional commit")
+        raise RuntimeError(
+            "write target changed before transactional commit; target is stale or concurrently modified"
+        )
     if expected_size is not None and identity.size != expected_size:
-        raise RuntimeError("write target size changed before transactional commit")
+        raise RuntimeError(
+            "write target size changed before transactional commit; target is stale or concurrently modified"
+        )
     return identity
 
 
@@ -347,7 +351,9 @@ def transactional_write_bytes(
             assert expected_size is not None
             digest, size = _hash_handle(handle, max_bytes=expected_size)
             if size != expected_size or digest != expected_sha256:
-                raise RuntimeError("write target content changed before transactional commit")
+                raise RuntimeError(
+                    "write target content changed before transactional commit; target is stale or concurrently modified"
+                )
         elif identity.size != 0:
             raise RuntimeError("new transactional target was not created empty")
         _write_handle(handle, data)
