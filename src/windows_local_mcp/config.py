@@ -603,7 +603,7 @@ def _protect_windows_acl(path: Path) -> None:
     )
     if isolation.returncode != 0:
         raise PermissionError(
-            "failed to isolate data_dir ACL inheritance: " + isolation.stderr.strip()
+            f"failed to isolate data_dir ACL inheritance: {isolation.stderr.strip()}"
         )
     result = subprocess.run(
         [
@@ -627,7 +627,13 @@ def _protect_windows_acl(path: Path) -> None:
         raise PermissionError(f"failed to protect data_dir ACL: {result.stderr.strip()}")
     inheritance = subprocess.run(
         [
-            windows_system_executable("icacls.exe"), str(path), "/grant", f"*{sid}:(OI)(CI)(IO)F", "SYSTEM:(OI)(CI)(IO)F", "/T", "/C"
+            windows_system_executable("icacls.exe"),
+            str(path),
+            "/grant",
+            f"*{sid}:(OI)(CI)(IO)F",
+            "SYSTEM:(OI)(CI)(IO)F",
+            "/T",
+            "/C",
         ],
         capture_output=True,
         text=True,
@@ -639,7 +645,7 @@ def _protect_windows_acl(path: Path) -> None:
     )
     if inheritance.returncode != 0:
         raise PermissionError(
-            "failed to provision inherited data_dir ACL: " + inheritance.stderr.strip()
+            f"failed to provision inherited data_dir ACL: {inheritance.stderr.strip()}"
         )
     verified = subprocess.run(
         [windows_system_executable("icacls.exe"), str(path)],
