@@ -77,18 +77,72 @@ _PathBase = type(Path())
 
 
 class _HeldPath(_PathBase):
-    __slots__ = ("_lease_finalizer", "__weakref__")
+    __slots__ = ("_lease_finalizer", "_write_intent", "__weakref__")
 
     def __new__(cls, *parts: Any) -> "_HeldPath":
         instance = super().__new__(cls, *parts)
         instance._lease_finalizer = None
+        instance._write_intent = False
         return instance
 
     @classmethod
-    def attach(cls, path: Path, lease: _WindowsHandleLease) -> "_HeldPath":
+    def attach(
+        cls,
+        path: Path,
+        lease: _WindowsHandleLease,
+        *,
+        write_intent: bool = False,
+    ) -> "_HeldPath":
         instance = cls(path)
+        instance._write_intent = write_intent
         instance._lease_finalizer = weakref.finalize(instance, lease.close)
         return instance
+
+
+class _MissingWritePath(_PathBase):
+    """A lexical write target that was absent at validation time."""
+
+    __slots__ = ("_snapshot_active", "__weakref__")
+
+    def __new__(cls, *parts: Any) -> "_MissingWritePath":
+        instance = super().__new__(cls, *parts)
+        instance._snapshot_active = True
+        return instance
+
+    @classmethod
+    def attach(cls, path: Path) -> "_MissingWritePath":
+        return cls(path)
+
+    def exists(self) -> bool:
+        if self._snapshot_active:
+            return False
+        return super().exists()
+
+    @property
+    def parent(self) -> Path:
+        return Path(super().parent)
+
+    def resolve(self, strict: bool = False) -> Path:
+        return Path(super().resolve(strict=strict))
+
+
+def _release_held_path(path: Path) -> None:
+    if not isinstance(path, _HeldPath):
+        return
+    finalizer = path._lease_finalizer
+    if finalizer is not None and finalizer.alive:
+        finalizer()
+
+
+def release_write_intent_hold(path: Path) -> None:
+    """Release only a write-target snapshot; read-validation leases stay pinned."""
+
+    if isinstance(path, _HeldPath):
+        if path._write_intent:
+            _release_held_path(path)
+        return
+    if isinstance(path, _MissingWritePath):
+        path._snapshot_active = False
 
 
 def _windows_component_handles(
@@ -96,6 +150,7 @@ def _windows_component_handles(
     *,
     allow_directory: bool,
     allow_hardlinks: bool,
+    write_intent: bool = False,
 ) -> Path:
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateFileW.argtypes = [
@@ -167,7 +222,7 @@ def _windows_component_handles(
             raise ValueError(f"path must identify a filesystem entry: {lexical}")
         lease = _WindowsHandleLease(handles)
         handles = []
-        return _HeldPath.attach(lexical, lease)
+        return _HeldPath.attach(lexical, lease, write_intent=write_intent)
     finally:
         for handle in reversed(handles):
             kernel32.CloseHandle(handle)
@@ -210,6 +265,17 @@ def hold_verified_path(
     elif not allow_hardlinks and details.st_nlink > 1:
         raise PermissionError(f"files with multiple hard links are denied: {resolved}")
     return resolved
+
+
+def _hold_write_target(path: Path) -> Path:
+    if os.name == "nt":
+        return _windows_component_handles(
+            path,
+            allow_directory=False,
+            allow_hardlinks=False,
+            write_intent=True,
+        )
+    return hold_verified_path(path, allow_directory=False, allow_hardlinks=False)
 
 
 class Workspace:
@@ -339,7 +405,8 @@ class Workspace:
             if not target.is_file():
                 raise IsADirectoryError(f"write target is not a regular file: {target}")
             self._reject_hardlink(target)
-        return target
+            return _hold_write_target(target)
+        return _MissingWritePath.attach(target)
 
     def resolve_planned_write(self, user_path: str) -> Path:
         """Validate a future regular-file target without creating missing parents."""
@@ -357,7 +424,9 @@ class Workspace:
                     raise NotADirectoryError(f"planned write parent is not a directory: {current}")
                 self._check_inside(current.resolve(strict=True))
         if lexical.exists():
-            return self.resolve_for_write(user_path)
+            target = self.resolve_for_write(user_path)
+            release_write_intent_hold(target)
+            return Path(str(target))
         return lexical
 
     def ensure_directory_for_write(self, user_path: str) -> Path:
@@ -405,20 +474,28 @@ class Workspace:
         target_identity: PathIdentity | None,
     ) -> None:
         fresh = self.resolve_for_write(self.relative(target))
-        if fresh != target:
-            raise RuntimeError("write target changed during operation")
-        current_parent = self.identity(target.parent)
-        if current_parent is None or (
-            current_parent.device,
-            current_parent.inode,
-        ) != (parent_identity.device, parent_identity.inode):
-            raise RuntimeError("write target parent changed during operation")
-        if self.identity(target) != target_identity:
-            raise RuntimeError("write target changed during operation")
+        try:
+            if fresh != target:
+                raise RuntimeError("write target changed during operation")
+            actual_target = Path(str(target))
+            current_parent = self.identity(actual_target.parent)
+            if current_parent is None or (
+                current_parent.device,
+                current_parent.inode,
+            ) != (parent_identity.device, parent_identity.inode):
+                raise RuntimeError("write target parent changed during operation")
+            if self.identity(actual_target) != target_identity:
+                raise RuntimeError("write target changed during operation")
+        except Exception:
+            release_write_intent_hold(fresh)
+            raise
+        release_write_intent_hold(fresh)
+        release_write_intent_hold(target)
 
     @contextmanager
     def lock_target(self, target: Path) -> Iterator[None]:
         canonical = os.path.normcase(str(target.resolve(strict=False)))
+        release_write_intent_hold(target)
         with self._locks_guard:
             lock = self._target_locks.setdefault(canonical, threading.RLock())
         with lock:

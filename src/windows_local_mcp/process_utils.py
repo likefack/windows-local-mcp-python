@@ -8,9 +8,21 @@ from pathlib import Path
 
 import psutil
 
+from .paths import hold_verified_path
 from .windows_system import windows_system_executable
 
 CMD_META = set("&|<>^%!`\r\n")
+_SAFE_GIT_PREFIX = (
+    "--no-pager",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.untrackedCache=false",
+    "-c",
+    "diff.external=",
+    "-c",
+    "credential.helper=",
+)
 
 
 @dataclass(frozen=True)
@@ -24,20 +36,70 @@ class ProcessIdentity:
 ProcessKey = tuple[int, float]
 
 
+class _HeldArgv(list[str]):
+    """Keep validated filesystem leases alive for the child-process lifetime."""
+
+    def __init__(self, values: list[str], holds: list[Path]) -> None:
+        super().__init__(values)
+        self._holds = tuple(holds)
+
+
 def _quote_cmd_arg(value: str) -> str:
     if any(character in CMD_META for character in value):
         raise ValueError(f"unsafe cmd.exe metacharacter in argument: {value}")
     return subprocess.list2cmdline([value])
 
 
+def _program_key(executable: str) -> str:
+    key = Path(executable).name.casefold()
+    for suffix in (".exe", ".bat", ".cmd"):
+        key = key.removesuffix(suffix)
+    return key
+
+
+def _hold_broker_git_pathspecs(executable: str, args: list[str]) -> list[Path]:
+    """Re-open validated broker Git pathspecs and pin them until Git exits."""
+
+    if (
+        _program_key(executable) != "git"
+        or tuple(args[: len(_SAFE_GIT_PREFIX)]) != _SAFE_GIT_PREFIX
+    ):
+        return []
+    try:
+        separator = args.index("--")
+    except ValueError:
+        return []
+
+    holds: list[Path] = []
+    try:
+        for value in args[separator + 1 :]:
+            candidate = Path(value)
+            if not candidate.is_absolute():
+                raise RuntimeError("validated broker Git pathspec is no longer absolute")
+            holds.append(
+                hold_verified_path(
+                    candidate,
+                    allow_directory=True,
+                    allow_hardlinks=False,
+                )
+            )
+        return holds
+    except Exception:
+        holds.clear()
+        raise
+
+
 def build_process_argv(executable: str, args: list[str]) -> list[str]:
+    holds = _hold_broker_git_pathspecs(executable, args)
     suffix = Path(executable).suffix.casefold()
     if os.name == "nt" and suffix in {".bat", ".cmd"}:
         command_line = " ".join(
             [_quote_cmd_arg(executable), *(_quote_cmd_arg(arg) for arg in args)]
         )
-        return [windows_system_executable("cmd.exe"), "/d", "/s", "/c", command_line]
-    return [executable, *args]
+        values = [windows_system_executable("cmd.exe"), "/d", "/s", "/c", command_line]
+    else:
+        values = [executable, *args]
+    return _HeldArgv(values, holds)
 
 
 def creation_flags() -> int:

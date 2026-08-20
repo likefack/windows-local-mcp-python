@@ -6,6 +6,8 @@ import pytest
 
 from windows_local_mcp.config import Settings
 from windows_local_mcp.paths import Workspace
+from windows_local_mcp.process_utils import build_process_argv
+from windows_local_mcp.resources import WorkspaceExecutionLock
 
 
 def make_workspace(tmp_path: Path) -> Workspace:
@@ -100,6 +102,59 @@ def test_rejects_hardlinked_file(tmp_path: Path) -> None:
         workspace.resolve_existing("linked.txt", allow_directory=False)
 
 
+def test_missing_write_target_is_a_stable_snapshot_until_revalidation(tmp_path: Path) -> None:
+    workspace = make_workspace(tmp_path)
+    planned = workspace.resolve_for_write("new.txt")
+    parent_identity = workspace.identity(planned.parent)
+    target_identity = workspace.identity(planned)
+    assert parent_identity is not None
+    assert target_identity is None
+
+    raced = workspace.root / "new.txt"
+    raced.write_text("raced", encoding="utf-8")
+    assert not planned.exists()
+
+    with pytest.raises(RuntimeError, match="write target changed"):
+        workspace.revalidate_for_replace(
+            planned,
+            parent_identity=parent_identity,
+            target_identity=target_identity,
+        )
+
+
+_SAFE_GIT_ARGS = [
+    "--no-pager",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.untrackedCache=false",
+    "-c",
+    "diff.external=",
+    "-c",
+    "credential.helper=",
+    "diff",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--patch",
+]
+
+
+def test_broker_git_argv_rejects_hardlinked_pathspec(tmp_path: Path) -> None:
+    source = tmp_path / "source.txt"
+    source.write_text("secret", encoding="utf-8")
+    linked = tmp_path / "linked.txt"
+    try:
+        linked.hardlink_to(source)
+    except OSError:
+        pytest.skip("hard links are unavailable on this filesystem")
+
+    with pytest.raises(PermissionError, match="hard links"):
+        build_process_argv(
+            "git.exe",
+            [*_SAFE_GIT_ARGS, "--", str(linked.resolve())],
+        )
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows file-share semantics are the security boundary")
 def test_verified_path_blocks_replacement_until_reader_releases_it(tmp_path: Path) -> None:
     workspace = make_workspace(tmp_path)
@@ -114,6 +169,58 @@ def test_verified_path_blocks_replacement_until_reader_releases_it(tmp_path: Pat
     assert verified.read_text(encoding="utf-8") == "safe"
 
     del verified
+    gc.collect()
+    os.replace(replacement, target)
+    assert target.read_text(encoding="utf-8") == "replacement"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows file-share semantics are the security boundary")
+def test_write_target_is_pinned_until_replace_revalidation(tmp_path: Path) -> None:
+    workspace = make_workspace(tmp_path)
+    target = workspace.root / "safe.txt"
+    target.write_text("safe", encoding="utf-8")
+    replacement = workspace.root / "replacement.txt"
+    replacement.write_text("replacement", encoding="utf-8")
+
+    outer = workspace.resolve_for_write("safe.txt")
+    with WorkspaceExecutionLock(
+        workspace.settings, target=outer
+    ), workspace.lock_target(outer):
+        current = workspace.resolve_for_write("safe.txt")
+        parent_identity = workspace.identity(current.parent)
+        target_identity = workspace.identity(current)
+        assert parent_identity is not None
+        assert target_identity is not None
+
+        with pytest.raises(OSError):
+            os.replace(replacement, target)
+        assert current.read_text(encoding="utf-8") == "safe"
+
+        workspace.revalidate_for_replace(
+            current,
+            parent_identity=parent_identity,
+            target_identity=target_identity,
+        )
+        os.replace(replacement, target)
+
+    assert target.read_text(encoding="utf-8") == "replacement"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows file-share semantics are the security boundary")
+def test_broker_git_argv_pins_pathspec_until_child_argv_is_released(tmp_path: Path) -> None:
+    target = tmp_path / "safe.txt"
+    target.write_text("safe", encoding="utf-8")
+    replacement = tmp_path / "replacement.txt"
+    replacement.write_text("replacement", encoding="utf-8")
+
+    argv = build_process_argv(
+        "git.exe",
+        [*_SAFE_GIT_ARGS, "--", str(target.resolve())],
+    )
+    with pytest.raises(OSError):
+        os.replace(replacement, target)
+
+    del argv
     gc.collect()
     os.replace(replacement, target)
     assert target.read_text(encoding="utf-8") == "replacement"
