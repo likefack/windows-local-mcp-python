@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import os
 import stat
+import tempfile
 import threading
 import weakref
 from collections.abc import Iterator
@@ -13,6 +14,11 @@ from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from .config import Settings
+from .windows_transaction import (
+    transactional_delete,
+    transactional_write_bytes,
+    windows_file_identity,
+)
 
 _WINDOWS_DEVICES = {
     "CON",
@@ -38,6 +44,8 @@ class PathIdentity:
     inode: int
     size: int
     modified_ns: int
+    windows_volume_serial: int | None = None
+    windows_file_index: int | None = None
 
 
 class _ByHandleFileInformation(ctypes.Structure):
@@ -151,6 +159,7 @@ def _windows_component_handles(
     allow_directory: bool,
     allow_hardlinks: bool,
     write_intent: bool = False,
+    final_share_write: bool = False,
 ) -> Path:
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateFileW.argtypes = [
@@ -181,7 +190,13 @@ def _windows_component_handles(
         for index, part in enumerate(parts):
             current /= part
             final = index == len(parts) - 1
-            share_mode = _FILE_SHARE_READ if final else (_FILE_SHARE_READ | _FILE_SHARE_WRITE)
+            share_mode = (
+                _FILE_SHARE_READ | _FILE_SHARE_WRITE
+                if final and final_share_write
+                else _FILE_SHARE_READ
+                if final
+                else _FILE_SHARE_READ | _FILE_SHARE_WRITE
+            )
             handle = kernel32.CreateFileW(
                 str(current),
                 _FILE_READ_ATTRIBUTES,
@@ -276,6 +291,16 @@ def _hold_write_target(path: Path) -> Path:
             write_intent=True,
         )
     return hold_verified_path(path, allow_directory=False, allow_hardlinks=False)
+
+
+def _hold_commit_parent(path: Path) -> Path:
+    return _windows_component_handles(
+        path,
+        allow_directory=True,
+        allow_hardlinks=True,
+        write_intent=True,
+        final_share_write=True,
+    )
 
 
 class Workspace:
@@ -464,7 +489,20 @@ class Workspace:
         if not path.exists():
             return None
         info = path.stat()
-        return PathIdentity(info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+        windows_volume_serial = None
+        windows_file_index = None
+        if os.name == "nt" and path.is_file():
+            native = windows_file_identity(Path(str(path)))
+            windows_volume_serial = native.volume_serial
+            windows_file_index = native.file_index
+        return PathIdentity(
+            info.st_dev,
+            info.st_ino,
+            info.st_size,
+            info.st_mtime_ns,
+            windows_volume_serial,
+            windows_file_index,
+        )
 
     def revalidate_for_replace(
         self,
@@ -491,6 +529,113 @@ class Workspace:
             raise
         release_write_intent_hold(fresh)
         release_write_intent_hold(target)
+
+    def commit_bytes(
+        self,
+        target: Path,
+        data: bytes,
+        *,
+        parent_identity: PathIdentity,
+        target_identity: PathIdentity | None,
+        expected_sha256: str | None,
+    ) -> None:
+        """Validate and commit bytes without a validation-to-commit namespace race on Windows."""
+        actual_target = Path(str(target))
+        if os.name == "nt":
+            release_write_intent_hold(target)
+            parent_hold = _hold_commit_parent(actual_target.parent)
+            try:
+                current_parent = self.identity(actual_target.parent)
+                if current_parent is None or (
+                    current_parent.device,
+                    current_parent.inode,
+                ) != (parent_identity.device, parent_identity.inode):
+                    raise RuntimeError("write target parent changed during operation")
+                expected_native = None
+                if target_identity is not None:
+                    if (
+                        target_identity.windows_volume_serial is None
+                        or target_identity.windows_file_index is None
+                        or expected_sha256 is None
+                    ):
+                        raise RuntimeError("Windows target has no stable transactional identity")
+                    expected_native = (
+                        target_identity.windows_volume_serial,
+                        target_identity.windows_file_index,
+                    )
+                elif expected_sha256 is not None:
+                    raise ValueError("missing target must not have an expected digest")
+                transactional_write_bytes(
+                    actual_target,
+                    data,
+                    expected_identity=expected_native,
+                    expected_sha256=expected_sha256,
+                )
+            finally:
+                release_write_intent_hold(parent_hold)
+            return
+
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="wb", delete=False, dir=actual_target.parent) as out:
+                out.write(data)
+                out.flush()
+                os.fsync(out.fileno())
+                temporary = Path(out.name)
+            self.revalidate_for_replace(
+                target,
+                parent_identity=parent_identity,
+                target_identity=target_identity,
+            )
+            os.replace(temporary, actual_target)
+            temporary = None
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+    def commit_delete(
+        self,
+        target: Path,
+        *,
+        parent_identity: PathIdentity,
+        target_identity: PathIdentity,
+        expected_sha256: str,
+    ) -> None:
+        """Validate and delete a file without a validation-to-delete race on Windows."""
+        actual_target = Path(str(target))
+        if os.name == "nt":
+            release_write_intent_hold(target)
+            parent_hold = _hold_commit_parent(actual_target.parent)
+            try:
+                current_parent = self.identity(actual_target.parent)
+                if current_parent is None or (
+                    current_parent.device,
+                    current_parent.inode,
+                ) != (parent_identity.device, parent_identity.inode):
+                    raise RuntimeError("delete target parent changed during operation")
+                if (
+                    target_identity.windows_volume_serial is None
+                    or target_identity.windows_file_index is None
+                ):
+                    raise RuntimeError("Windows target has no stable transactional identity")
+                transactional_delete(
+                    actual_target,
+                    expected_identity=(
+                        target_identity.windows_volume_serial,
+                        target_identity.windows_file_index,
+                    ),
+                    expected_sha256=expected_sha256,
+                )
+            finally:
+                release_write_intent_hold(parent_hold)
+            return
+
+        self.revalidate_for_replace(
+            target,
+            parent_identity=parent_identity,
+            target_identity=target_identity,
+        )
+        actual_target.unlink()
 
     @contextmanager
     def lock_target(self, target: Path) -> Iterator[None]:
