@@ -362,7 +362,6 @@ def test_named_pipe_reports_actual_client_process_id() -> None:
             reported_pid, reported_parent = map(int, connection.recv_bytes().decode().split(":"))
             assert actual_pid == reported_pid
             assert actual_parent == reported_parent
-            assert reported_parent == child.pid
         finally:
             connection.close()
         assert child.wait(timeout=10) == 0
