@@ -403,7 +403,6 @@ def restore_workspace_state(
         current_manifest = _load_manifest(settings, current.manifest_path)
         changed = _changed_paths(current_manifest, target_manifest)
         _stage_manifest_files(settings, target_path, changed, transaction / "staged-target")
-        # Re-hash staged bytes as the final preflight step.
         _verify_staged_files(target_manifest, transaction / "staged-target", changed)
         journal.update(
             state="staged",
@@ -888,9 +887,6 @@ def mark_workspace_transaction_recovery_required(
 
 
 def workspace_recovery_required(settings: Settings) -> bool:
-    # Another already-running server/worker may acquire the mutation lock after the process
-    # that owned an applying journal crashed. Every nonterminal journal must therefore block,
-    # not only journals already promoted to the explicit recovery_required state.
     return bool(incomplete_workspace_transactions(settings))
 
 
@@ -1005,7 +1001,13 @@ def _selective_target(
             continue
         if old_entry is None or operation_entry is None or current_entry is None:
             conflicts.append(
-                _conflict(relative, "file lifecycle changed after the target operation", old_entry, operation_entry, current_entry)
+                _conflict(
+                    relative,
+                    "file lifecycle changed after the target operation",
+                    old_entry,
+                    operation_entry,
+                    current_entry,
+                )
             )
             continue
         try:
@@ -1017,7 +1019,13 @@ def _selective_target(
             current_text = current_bytes.decode("utf-8")
         except UnicodeDecodeError:
             conflicts.append(
-                _conflict(relative, "binary content changed after the target operation", old_entry, operation_entry, current_entry)
+                _conflict(
+                    relative,
+                    "binary content changed after the target operation",
+                    old_entry,
+                    operation_entry,
+                    current_entry,
+                )
             )
             continue
         merged = _reverse_text_change(old, operation, current_text)
@@ -1122,18 +1130,23 @@ def _apply_manifest(
         else set(current.keys()) | set(target_map.keys())
     )
     workspace = Workspace(settings)
+
     for relative in sorted((set(current) - set(target_map)) & changed, reverse=True):
         destination = workspace.resolve_for_write(relative)
         _verify_destination_digest(destination, current.get(relative), relative)
         parent_identity = workspace.identity(destination.parent)
         target_identity = workspace.identity(destination)
-        if parent_identity is None:
-            raise RuntimeError(f"restore delete parent disappeared: {relative}")
-        workspace.revalidate_for_replace(
-            destination, parent_identity=parent_identity, target_identity=target_identity
+        expected = current.get(relative)
+        if parent_identity is None or target_identity is None or expected is None:
+            raise RuntimeError(f"restore delete target changed before commit: {relative}")
+        workspace.commit_delete(
+            destination,
+            parent_identity=parent_identity,
+            target_identity=target_identity,
+            expected_sha256=expected,
         )
-        destination.unlink(missing_ok=True)
         _journal_applied(journal, journal_path, relative)
+
     for relative in sorted(set(target_map) & changed):
         parent_relative = str(PurePosixPath(relative).parent)
         parent_path = workspace.root / Path(parent_relative)
@@ -1164,22 +1177,15 @@ def _apply_manifest(
         target_identity = workspace.identity(destination)
         if parent_identity is None:
             raise RuntimeError(f"restore parent disappeared: {relative}")
-        temporary: Path | None = None
-        try:
-            with tempfile.NamedTemporaryFile(mode="wb", delete=False, dir=destination.parent) as out:
-                out.write(data)
-                out.flush()
-                os.fsync(out.fileno())
-                temporary = Path(out.name)
-            _verify_destination_digest(destination, current.get(relative), relative)
-            workspace.revalidate_for_replace(
-                destination, parent_identity=parent_identity, target_identity=target_identity
-            )
-            os.replace(temporary, destination)
-            temporary = None
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
+        expected = current.get(relative)
+        _verify_destination_digest(destination, expected, relative)
+        workspace.commit_bytes(
+            destination,
+            data,
+            parent_identity=parent_identity,
+            target_identity=target_identity,
+            expected_sha256=expected if target_identity is not None else None,
+        )
         _journal_applied(journal, journal_path, relative)
 
 
@@ -1187,7 +1193,11 @@ def _remove_created_directories(settings: Settings, directories: object) -> None
     if not isinstance(directories, list):
         return
     workspace = Workspace(settings)
-    for relative in sorted((str(item) for item in directories), key=lambda item: item.count("/"), reverse=True):
+    for relative in sorted(
+        (str(item) for item in directories),
+        key=lambda item: item.count("/"),
+        reverse=True,
+    ):
         try:
             directory = workspace.resolve_directory(relative, access="write")
             directory.rmdir()
@@ -1402,7 +1412,6 @@ def _entry_source(settings: Settings, manifest_path: Path, entry: dict[str, Any]
         source = _blob_root(settings) / f"{blob}.blob"
         source.resolve(strict=True).relative_to(_blob_root(settings).resolve(strict=True))
         return source
-    # Version 1 compatibility for checkpoints created before content-addressed storage.
     source = manifest_path.parent / "files" / Path(str(entry["path"]))
     source.resolve(strict=True).relative_to((manifest_path.parent / "files").resolve(strict=True))
     return source
@@ -1505,13 +1514,19 @@ def _journal_applied(
 
 
 def _operation_root(settings: Settings, operation_id: str) -> Path:
-    if not operation_id or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_." for character in operation_id):
+    if not operation_id or any(
+        character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
+        for character in operation_id
+    ):
         raise ValueError("invalid workspace history operation id")
     return settings.data_dir / "workspace-history" / "operations" / operation_id
 
 
 def _transaction_root(settings: Settings, operation_id: str) -> Path:
-    if not operation_id or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_." for character in operation_id):
+    if not operation_id or any(
+        character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
+        for character in operation_id
+    ):
         raise ValueError("invalid workspace transaction id")
     return settings.data_dir / "workspace-history" / "transactions" / operation_id
 
