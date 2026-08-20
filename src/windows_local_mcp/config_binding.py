@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import os
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 from .tool_safety import capture_file_identity, hold_file_identity
 
-CONFIG_BINDING_VERSION = 1
+CONFIG_BINDING_VERSION = 2
 _FILE_CONFIG_SOURCE = "LOCAL_MCP_CONFIG"
 _CONFIG_SOURCES = {_FILE_CONFIG_SOURCE, "environment_only", "direct_settings"}
 
@@ -39,6 +40,21 @@ def _verify_bound_file(path: Path, identity: dict[str, Any]) -> dict[str, Any]:
     return deepcopy(identity)
 
 
+def _bound_selector_path(settings: Any, config_path: Path) -> Path:
+    selector_value = getattr(settings, "_config_selector_path", None)
+    if selector_value is None:
+        selector_value = os.environ.get("LOCAL_MCP_CONFIG", "").strip() or str(config_path)
+    selector = Path(str(selector_value)).expanduser().absolute()
+    try:
+        selected = selector.resolve(strict=True)
+    except OSError as error:
+        raise RuntimeError("active config selector can no longer be resolved") from error
+    if selected != config_path:
+        raise RuntimeError("active config selector no longer resolves to the bound config file")
+    setattr(settings, "_config_selector_path", str(selector))
+    return selector
+
+
 def export_config_binding(settings: Any) -> dict[str, object]:
     """Return and verify the configuration provenance bound to this Settings instance."""
 
@@ -49,15 +65,17 @@ def export_config_binding(settings: Any) -> dict[str, object]:
     ambient_root_present = bool(getattr(settings, "_ambient_root_present", False))
     path_value = getattr(settings, "_config_path", None)
     expected_identity = getattr(settings, "_config_file_identity", None)
+    selector_value = getattr(settings, "_config_selector_path", None)
 
     if path_value is None:
         if config_source == _FILE_CONFIG_SOURCE:
             raise RuntimeError("LOCAL_MCP_CONFIG selection lost its active config path")
-        if expected_identity is not None:
+        if expected_identity is not None or selector_value is not None:
             raise RuntimeError("configuration identity exists without an active config path")
         return {
             "version": CONFIG_BINDING_VERSION,
             "config_source": config_source,
+            "config_selector_path": None,
             "config_path": None,
             "config_file_identity": None,
             "workspace_source": workspace_source,
@@ -67,6 +85,7 @@ def export_config_binding(settings: Any) -> dict[str, object]:
     if config_source != _FILE_CONFIG_SOURCE:
         raise RuntimeError("an active config path must originate from LOCAL_MCP_CONFIG")
     path = Path(str(path_value)).resolve(strict=True)
+    selector = _bound_selector_path(settings, path)
     workspace = Path(settings.workspace_root).resolve(strict=True)
     if _is_inside(path, workspace):
         raise RuntimeError("the active config path moved inside workspace_root")
@@ -82,6 +101,7 @@ def export_config_binding(settings: Any) -> dict[str, object]:
     return {
         "version": CONFIG_BINDING_VERSION,
         "config_source": config_source,
+        "config_selector_path": str(selector),
         "config_path": str(path),
         "config_file_identity": deepcopy(identity),
         "workspace_source": workspace_source,
@@ -104,21 +124,34 @@ def restore_config_binding(settings: Any, binding: object) -> None:
     if not isinstance(ambient_root_present, bool):
         raise RuntimeError("immutable worker context has an invalid ambient-root binding")
 
+    selector_value = binding.get("config_selector_path")
     path_value = binding.get("config_path")
     identity_value = binding.get("config_file_identity")
     if path_value is None:
-        if config_source == _FILE_CONFIG_SOURCE or identity_value is not None:
+        if (
+            config_source == _FILE_CONFIG_SOURCE
+            or selector_value is not None
+            or identity_value is not None
+        ):
             raise RuntimeError("immutable worker context has an inconsistent config binding")
         setattr(settings, "_config_selection_source", config_source)
+        setattr(settings, "_config_selector_path", None)
         setattr(settings, "_config_path", None)
         setattr(settings, "_config_file_identity", None)
         setattr(settings, "_workspace_selection_source", workspace_source)
         setattr(settings, "_ambient_root_present", ambient_root_present)
         return
 
-    if config_source != _FILE_CONFIG_SOURCE:
+    if config_source != _FILE_CONFIG_SOURCE or selector_value is None:
         raise RuntimeError("immutable worker context has a file path for a non-file config source")
     path = Path(str(path_value)).resolve(strict=True)
+    selector = Path(str(selector_value)).expanduser().absolute()
+    try:
+        selected = selector.resolve(strict=True)
+    except OSError as error:
+        raise RuntimeError("immutable worker context config selector cannot be resolved") from error
+    if selected != path:
+        raise RuntimeError("immutable worker context config selector was retargeted")
     workspace = Path(settings.workspace_root).resolve(strict=True)
     if _is_inside(path, workspace):
         raise RuntimeError("immutable worker context moved the active config inside workspace_root")
@@ -126,6 +159,7 @@ def restore_config_binding(settings: Any, binding: object) -> None:
     identity = _verify_bound_file(path, identity)
 
     setattr(settings, "_config_selection_source", config_source)
+    setattr(settings, "_config_selector_path", str(selector))
     setattr(settings, "_config_path", str(path))
     setattr(settings, "_config_file_identity", deepcopy(identity))
     setattr(settings, "_workspace_selection_source", workspace_source)
