@@ -299,6 +299,6 @@ def test_post_commit_failure_refuses_recovery_over_third_party_replacement(
 
     assert swapped is True
     assert captured.value.recovery_state == "recovery_required"
-    assert "automatic recovery failed" in str(captured.value)
+    assert "automatic recovery refused" in str(captured.value)
     assert target.read_bytes() == b"after"
     assert not replacement.exists()
