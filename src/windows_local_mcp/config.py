@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator,
 
 from .child_env import normalize_extra_environment_names, sanitize_process_environment
 from .git_env import strip_git_ambient_environment
+from .tool_safety import capture_file_identity, hold_file_identity
 from .windows_system import physical_filesystem_path, windows_system_executable
 from .windows_transaction import probe_transactional_workspace_commit
 
@@ -145,7 +146,9 @@ class Settings(BaseModel):
     approved_host_enabled: bool = True
 
     _config_selection_source: str = PrivateAttr(default="direct_settings")
+    _config_selector_path: str | None = PrivateAttr(default=None)
     _config_path: str | None = PrivateAttr(default=None)
+    _config_file_identity: dict[str, object] | None = PrivateAttr(default=None)
     _workspace_selection_source: str = PrivateAttr(default="settings")
     _ambient_root_present: bool = PrivateAttr(default=False)
 
@@ -687,6 +690,31 @@ def _protect_windows_acl(path: Path) -> None:
     )
 
 
+def _load_file_backed_config(
+    config_path_value: str,
+) -> tuple[Path, Path, dict[str, object], dict[str, object]]:
+    """Parse the exact config object whose content and stable identity are security-bound."""
+    selector = Path(config_path_value).expanduser().absolute()
+    config_path = selector.resolve(strict=True)
+    identity = capture_file_identity(config_path, provenance="active-config")
+    with hold_file_identity(identity) as held_path:
+        try:
+            selected = selector.resolve(strict=True)
+        except OSError as error:
+            raise RuntimeError("active config selector changed during load") from error
+        if selected != held_path:
+            raise RuntimeError("active config selector changed during load")
+        with held_path.open("rb") as file:
+            payload = tomllib.load(file)
+        try:
+            selected_after_parse = selector.resolve(strict=True)
+        except OSError as error:
+            raise RuntimeError("active config selector changed during load") from error
+        if selected_after_parse != held_path:
+            raise RuntimeError("active config selector changed during load")
+    return selector, config_path, identity, payload
+
+
 def _default_data_dir(workspace_root: Path, config_path: Path | None) -> Path:
     local_app_data = os.environ.get("LOCALAPPDATA")
     if local_app_data:
@@ -715,11 +743,16 @@ def load_settings() -> Settings:
     config_path_value = os.environ.get("LOCAL_MCP_CONFIG", "").strip()
     payload: dict[str, object] = {}
 
+    config_selector_path: Path | None = None
     config_path: Path | None = None
+    config_file_identity: dict[str, object] | None = None
     if config_path_value:
-        config_path = Path(config_path_value).expanduser().resolve(strict=True)
-        with config_path.open("rb") as file:
-            payload = tomllib.load(file)
+        (
+            config_selector_path,
+            config_path,
+            config_file_identity,
+            payload,
+        ) = _load_file_backed_config(config_path_value)
         if "safe_network_readable_paths" in payload:
             if "sandbox_dependency_readable_paths" in payload:
                 raise ValueError(
@@ -772,7 +805,11 @@ def load_settings() -> Settings:
     settings._config_selection_source = (
         "LOCAL_MCP_CONFIG" if config_path is not None else "environment_only"
     )
+    settings._config_selector_path = (
+        str(config_selector_path) if config_selector_path is not None else None
+    )
     settings._config_path = str(config_path) if config_path is not None else None
+    settings._config_file_identity = config_file_identity
     settings._workspace_selection_source = (
         "explicit_config" if config_path is not None else "LOCAL_MCP_ROOT"
     )
