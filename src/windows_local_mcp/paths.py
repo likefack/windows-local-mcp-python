@@ -153,6 +153,11 @@ def release_write_intent_hold(path: Path) -> None:
         path._snapshot_active = False
 
 
+def release_verified_hold(path: Path) -> None:
+    """Release any explicit verified-path lease after its guarded interval ends."""
+    _release_held_path(path)
+
+
 def _windows_component_handles(
     path: Path,
     *,
