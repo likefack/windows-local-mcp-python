@@ -314,13 +314,13 @@ def transactional_write_bytes(
     expected_size: int | None,
     expected_sha256: str | None,
     _before_commit: Callable[[], None] | None = None,
-) -> None:
+) -> WindowsFileIdentity:
     """CAS-style single-file commit inside one TxF transaction.
 
     The existing target identity, exact size, and SHA-256 are checked on the same transacted
-    writer handle that receives the new bytes.  TxF keeps external writers from modifying that
-    file until CommitTransaction finishes.  ``_before_commit`` exists only for deterministic
-    race tests and startup probes; production callers leave it unset.
+    writer handle that receives the new bytes. TxF transactionally locks that file against
+    external writers until CommitTransaction finishes. ``_before_commit`` exists only for
+    deterministic race tests and startup probes; production callers leave it unset.
     """
     if os.name != "nt":
         raise OSError("transactional workspace commit requires Windows")
@@ -333,6 +333,7 @@ def transactional_write_bytes(
     transaction = _create_transaction("Windows Local MCP workspace write")
     handle: Any | None = None
     committed = False
+    committed_identity: WindowsFileIdentity | None = None
     try:
         exists = expected_identity is not None
         handle = _open_transacted(path, transaction, exists=exists, delete=False)
@@ -350,12 +351,20 @@ def transactional_write_bytes(
         elif identity.size != 0:
             raise RuntimeError("new transactional target was not created empty")
         _write_handle(handle, data)
+        committed_identity = WindowsFileIdentity(
+            volume_serial=identity.volume_serial,
+            file_index=identity.file_index,
+            size=len(data),
+            link_count=identity.link_count,
+            attributes=identity.attributes,
+        )
         if _before_commit is not None:
             _before_commit()
         kernel32.CloseHandle(handle)
         handle = None
         _finish_transaction(transaction, commit=True)
         committed = True
+        return committed_identity
     finally:
         if handle is not None:
             kernel32.CloseHandle(handle)
@@ -412,43 +421,64 @@ def transactional_delete(
         kernel32.CloseHandle(transaction)
 
 
+def _require_nontransacted_writer_blocked(path: Path, payload: bytes) -> None:
+    try:
+        path.write_bytes(payload)
+    except OSError:
+        return
+    raise RuntimeError("TxF writer did not block a competing non-transacted writer")
+
+
 def probe_transactional_workspace_commit(directory: Path) -> None:
-    """Require usable TxF semantics for the workspace mutation boundary on Windows."""
+    """Require usable TxF commit and isolation semantics for workspace mutation on Windows."""
     if os.name != "nt":
         return
-    first = directory / f".wlmcp-txf-probe-{os.getpid()}.existing"
-    created = directory / f".wlmcp-txf-probe-{os.getpid()}.created"
+    token = f"{os.getpid()}-{id(directory)}"
+    first = directory / f".wlmcp-txf-probe-{token}.existing"
+    created = directory / f".wlmcp-txf-probe-{token}.created"
     try:
         first.write_bytes(b"before")
         identity = windows_file_identity(first)
-        transactional_write_bytes(
+        committed = transactional_write_bytes(
             first,
             b"after",
             expected_identity=(identity.volume_serial, identity.file_index),
             expected_size=identity.size,
             expected_sha256=hashlib.sha256(b"before").hexdigest(),
+            _before_commit=lambda: _require_nontransacted_writer_blocked(first, b"intruder"),
         )
-        if first.read_bytes() != b"after":
-            raise RuntimeError("TxF existing-file commit did not become visible")
-        transactional_write_bytes(
+        if (
+            first.read_bytes() != b"after"
+            or (committed.volume_serial, committed.file_index)
+            != (identity.volume_serial, identity.file_index)
+        ):
+            raise RuntimeError("TxF existing-file commit did not preserve the validated target")
+        created_identity = transactional_write_bytes(
             created,
             b"created",
             expected_identity=None,
             expected_size=None,
             expected_sha256=None,
+            _before_commit=lambda: _require_nontransacted_writer_blocked(created, b"intruder"),
         )
         if created.read_bytes() != b"created":
             raise RuntimeError("TxF create commit did not become visible")
-        created_identity = windows_file_identity(created)
+        live_created = windows_file_identity(created)
+        if (live_created.volume_serial, live_created.file_index) != (
+            created_identity.volume_serial,
+            created_identity.file_index,
+        ):
+            raise RuntimeError("TxF create commit changed file identity after commit")
         transactional_delete(
             created,
             expected_identity=(created_identity.volume_serial, created_identity.file_index),
             expected_size=created_identity.size,
             expected_sha256=hashlib.sha256(b"created").hexdigest(),
+            _before_commit=lambda: _require_nontransacted_writer_blocked(created, b"intruder"),
         )
         if created.exists():
             raise RuntimeError("TxF delete commit did not become visible")
-    except OSError as error:
+    except (OSError, AttributeError) as error:
         raise RuntimeError(
             "workspace filesystem does not provide required Transactional NTFS commit semantics"
         ) from error
