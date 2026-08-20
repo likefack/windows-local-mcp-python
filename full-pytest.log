@@ -1,0 +1,42 @@
+============================= test session starts =============================
+platform win32 -- Python 3.12.10, pytest-8.4.2, pluggy-1.6.0
+rootdir: D:\a\windows-local-mcp-python\windows-local-mcp-python
+configfile: pyproject.toml
+testpaths: tests
+plugins: anyio-4.14.2
+collected 319 items
+
+tests\test_approval.py ................                                  [  5%]
+tests\test_approval_execution_integration.py ........                    [  7%]
+tests\test_audit.py .                                                    [  7%]
+tests\test_broker_architecture.py .........                              [ 10%]
+tests\test_child_environment.py ............                             [ 14%]
+tests\test_command_traits.py ..                                          [ 15%]
+tests\test_config.py ...............                                     [ 19%]
+tests\test_directory_limit_integration.py .                              [ 20%]
+tests\test_git_environment.py ..................                         [ 25%]
+tests\test_host_capabilities.py .............                            [ 29%]
+tests\test_live_activity.py ..                                           [ 30%]
+tests\test_mcp_stdio_integration.py .                                    [ 30%]
+tests\test_paths.py ................                                     [ 35%]
+tests\test_policy.py ..........................                          [ 43%]
+tests\test_resources_and_processes.py ...............                    [ 48%]
+tests\test_same_handle_reads.py ...                                      [ 49%]
+tests\test_sandbox_architecture.py ..................................... [ 61%]
+..                                                                       [ 61%]
+tests\test_sandbox_contract_residual_risks.py ..                         [ 62%]
+tests\test_server_operations.py ..........                               [ 65%]
+tests\test_structured_files.py ..........................                [ 73%]
+tests\test_timeline_and_rollback.py ...................                  [ 79%]
+tests\test_tool_safety.py ...                                            [ 80%]
+tests\test_transfer_timeline.py ...                                      [ 81%]
+tests\test_wfp_guard.py ....................                             [ 87%]
+tests\test_wfp_guard_identity.py ...                                     [ 88%]
+tests\test_wfp_guard_runtime.py ...........                              [ 92%]
+tests\test_windows_transaction.py ....                                   [ 93%]
+tests\test_windows_wfp.py .....                                          [ 94%]
+tests\test_worker_lock_policy.py .....                                   [ 96%]
+tests\test_worker_runtime_storage_preflight.py ..                        [ 97%]
+tests\test_worker_wfp_guard.py .........                                 [100%]
+
+============================ 319 passed in 36.75s =============================

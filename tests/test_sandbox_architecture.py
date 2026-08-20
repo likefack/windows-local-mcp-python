@@ -984,14 +984,16 @@ def test_checkpoint_read_failure_is_fail_closed(
     settings = _settings(tmp_path)
     target = settings.workspace_root / "locked.txt"
     target.write_text("important", encoding="utf-8")
-    original = Path.read_bytes
+    from windows_local_mcp import workspace_history
 
-    def fail_target(path: Path) -> bytes:
-        if path == target:
+    original = workspace_history.read_verified_bytes
+
+    def fail_target(path: Path, max_bytes: int) -> bytes:
+        if Path(str(path)) == target:
             raise PermissionError("sharing violation")
-        return original(path)
+        return original(path, max_bytes)
 
-    monkeypatch.setattr(Path, "read_bytes", fail_target)
+    monkeypatch.setattr(workspace_history, "read_verified_bytes", fail_target)
     with pytest.raises(RuntimeError, match="could not capture locked.txt"):
         capture_workspace_state(settings, "capture-failure", "before")
 

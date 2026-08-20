@@ -30,8 +30,11 @@ _WINDOWS_DEVICES = {
 }
 _REPARSE_ATTRIBUTE = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 _DIRECTORY_ATTRIBUTE = getattr(stat, "FILE_ATTRIBUTE_DIRECTORY", 0x10)
+_GENERIC_READ = 0x80000000
 _FILE_READ_ATTRIBUTES = 0x00000080
 _FILE_SHARE_READ = 0x00000001
+_FILE_BEGIN = 0
+_READ_CHUNK_BYTES = 1024 * 1024
 _FILE_SHARE_WRITE = 0x00000002
 _OPEN_EXISTING = 3
 _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
@@ -64,8 +67,56 @@ class _ByHandleFileInformation(ctypes.Structure):
 
 
 class _WindowsHandleLease:
-    def __init__(self, handles: list[Any]) -> None:
+    def __init__(self, handles: list[Any], *, readable_final: bool = False) -> None:
         self._handles = handles
+        self._readable_final = readable_final
+
+    def read_final_bytes(self, max_bytes: int) -> bytes:
+        if max_bytes < 0:
+            raise ValueError("max_bytes must be non-negative")
+        if os.name != "nt" or not self._handles or not self._readable_final:
+            raise RuntimeError("verified Windows file handle is not readable")
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetFileInformationByHandle.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(_ByHandleFileInformation),
+        ]
+        kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+        kernel32.SetFilePointerEx.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_longlong,
+            ctypes.POINTER(ctypes.c_longlong),
+            wintypes.DWORD,
+        ]
+        kernel32.SetFilePointerEx.restype = wintypes.BOOL
+        kernel32.ReadFile.argtypes = [
+            wintypes.HANDLE,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD),
+            wintypes.LPVOID,
+        ]
+        kernel32.ReadFile.restype = wintypes.BOOL
+        handle = self._handles[-1]
+        information = _ByHandleFileInformation()
+        if not kernel32.GetFileInformationByHandle(handle, ctypes.byref(information)):
+            raise OSError(get_last_error(), "GetFileInformationByHandle failed")
+        size = (int(information.nFileSizeHigh) << 32) | int(information.nFileSizeLow)
+        if size > max_bytes:
+            raise ValueError(f"file exceeds byte limit: {size} > {max_bytes}")
+        if not kernel32.SetFilePointerEx(handle, 0, None, _FILE_BEGIN):
+            raise OSError(get_last_error(), "SetFilePointerEx failed")
+        output = bytearray()
+        buffer = ctypes.create_string_buffer(_READ_CHUNK_BYTES)
+        while True:
+            read = wintypes.DWORD()
+            if not kernel32.ReadFile(handle, buffer, len(buffer), ctypes.byref(read), None):
+                raise OSError(get_last_error(), "ReadFile failed")
+            if not read.value:
+                return bytes(output)
+            output.extend(buffer.raw[: read.value])
+            if len(output) > max_bytes:
+                raise RuntimeError("verified file exceeded its byte bound while reading")
 
     def close(self) -> None:
         handles, self._handles = self._handles, []
@@ -85,10 +136,11 @@ _PathBase = type(Path())
 
 
 class _HeldPath(_PathBase):
-    __slots__ = ("__weakref__", "_lease_finalizer", "_write_intent")
+    __slots__ = ("__weakref__", "_lease", "_lease_finalizer", "_write_intent")
 
     def __new__(cls, *parts: Any) -> Self:
         instance = super().__new__(cls, *parts)
+        instance._lease = None
         instance._lease_finalizer = None
         instance._write_intent = False
         return instance
@@ -102,6 +154,7 @@ class _HeldPath(_PathBase):
         write_intent: bool = False,
     ) -> Self:
         instance = cls(path)
+        instance._lease = lease
         instance._write_intent = write_intent
         instance._lease_finalizer = weakref.finalize(instance, lease.close)
         return instance
@@ -158,6 +211,41 @@ def release_verified_hold(path: Path) -> None:
     _release_held_path(path)
 
 
+def read_verified_bytes(path: Path, max_bytes: int) -> bytes:
+    """Read workspace bytes from the exact file object validated on Windows."""
+    if max_bytes < 0:
+        raise ValueError("max_bytes must be non-negative")
+    if os.name == "nt":
+        if not isinstance(path, _HeldPath) or path._lease is None:
+            raise RuntimeError("Windows workspace read requires a verified file handle")
+        return path._lease.read_final_bytes(max_bytes)
+
+    # Non-Windows support exists for tests and development only. Windows is the
+    # security-supported production route for this project.
+    size = path.stat().st_size
+    if size > max_bytes:
+        raise ValueError(f"file exceeds byte limit: {size} > {max_bytes}")
+    with path.open("rb") as source:
+        data = source.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise ValueError(f"file exceeds byte limit: {len(data)} > {max_bytes}")
+    return data
+
+
+def read_verified_path_bytes(path: Path, max_bytes: int) -> bytes:
+    """Validate and read one path through the same short-lived Windows file HANDLE."""
+    verified = hold_verified_path(
+        Path(str(path)),
+        allow_directory=False,
+        allow_hardlinks=False,
+        readable=True,
+    )
+    try:
+        return read_verified_bytes(verified, max_bytes)
+    finally:
+        release_verified_hold(verified)
+
+
 def _windows_component_handles(
     path: Path,
     *,
@@ -165,6 +253,7 @@ def _windows_component_handles(
     allow_hardlinks: bool,
     write_intent: bool = False,
     final_share_write: bool = False,
+    final_read_data: bool = False,
 ) -> Path:
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.CreateFileW.argtypes = [
@@ -202,9 +291,12 @@ def _windows_component_handles(
                 if final
                 else _FILE_SHARE_READ | _FILE_SHARE_WRITE
             )
+            desired_access = _FILE_READ_ATTRIBUTES
+            if final and final_read_data:
+                desired_access |= _GENERIC_READ
             handle = kernel32.CreateFileW(
                 str(current),
-                _FILE_READ_ATTRIBUTES,
+                desired_access,
                 share_mode,
                 None,
                 _OPEN_EXISTING,
@@ -240,7 +332,7 @@ def _windows_component_handles(
 
         if not parts:
             raise ValueError(f"path must identify a filesystem entry: {lexical}")
-        lease = _WindowsHandleLease(handles)
+        lease = _WindowsHandleLease(handles, readable_final=final_read_data)
         handles = []
         return _HeldPath.attach(lexical, lease, write_intent=write_intent)
     finally:
@@ -253,13 +345,15 @@ def hold_verified_path(
     *,
     allow_directory: bool = False,
     allow_hardlinks: bool = False,
+    readable: bool = False,
 ) -> Path:
     """Return a path whose Windows namespace/file identity remains locked while referenced.
 
     On Windows, every path component is opened with reparse-point semantics and retained
-    without FILE_SHARE_DELETE. The final regular file also denies FILE_SHARE_WRITE. This
-    prevents a same-user process from replacing a validated path, any parent directory, or
-    the file itself before a caller later opens the returned path.
+    without FILE_SHARE_DELETE. A readable final handle is consumed directly by ReadFile; a
+    path-only lease is retained for external-process bindings and write-intent identity checks.
+    This prevents namespace replacement while avoiding pathname re-open as the Broker read
+    security boundary.
     """
 
     lexical = Path(os.path.abspath(os.path.normpath(os.fspath(path))))
@@ -268,6 +362,7 @@ def hold_verified_path(
             lexical,
             allow_directory=allow_directory,
             allow_hardlinks=allow_hardlinks,
+            final_read_data=readable,
         )
 
     resolved = lexical.resolve(strict=True)
@@ -393,6 +488,7 @@ class Workspace:
         allow_directory: bool = True,
         access: str = "read",
         hold_identity: bool = True,
+        readable: bool | None = None,
     ) -> Path:
         self.validate_windows_syntax(user_path)
         candidate = self.root / user_path
@@ -410,6 +506,7 @@ class Workspace:
                     resolved,
                     allow_directory=False,
                     allow_hardlinks=False,
+                    readable=access == "read" if readable is None else readable,
                 )
         return resolved
 
@@ -583,6 +680,8 @@ class Workspace:
             finally:
                 release_write_intent_hold(parent_hold)
 
+        # Non-Windows os.replace fallback is retained only for test portability;
+        # Windows TxF is the security-supported production commit boundary.
         temporary: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(mode="wb", delete=False, dir=actual_target.parent) as out:

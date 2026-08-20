@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import difflib
-import hashlib
 import json
 import os
 import re
@@ -34,7 +33,13 @@ from .control_plane import (
 from .control_plane_guard import assert_control_plane_healthy
 from .executor import Executor
 from .git_snapshot import capture_git_snapshot
-from .paths import PathIdentity, Workspace, release_verified_hold
+from .paths import (
+    PathIdentity,
+    Workspace,
+    read_verified_bytes,
+    read_verified_path_bytes,
+    release_verified_hold,
+)
 from .policy import CommandPolicy, NormalizedCommand, approved_request_hash
 from .redaction import redact_command_args, redact_text
 from .resources import NamedControlPlaneLock, WorkspaceExecutionLock, enforce_data_quota
@@ -253,7 +258,7 @@ def _hold_committed_target(
     committed_native: tuple[int, int] | None,
 ) -> tuple[Path, PathIdentity]:
     verified = runtime.workspace.resolve_existing(
-        path, allow_directory=False, access="write"
+        path, allow_directory=False, access="write", readable=True
     )
     try:
         identity = runtime.workspace.identity(verified)
@@ -261,7 +266,7 @@ def _hold_committed_target(
             raise RuntimeError("committed target disappeared before post-write verification")
         if committed_native is not None and _native_identity(identity) != committed_native:
             raise RuntimeError("committed target identity changed before post-write verification")
-        if identity.size != len(expected) or verified.read_bytes() != expected:
+        if identity.size != len(expected) or read_verified_bytes(verified, len(expected)) != expected:
             raise RuntimeError("post-write content verification failed")
         return verified, identity
     except Exception:
@@ -285,7 +290,7 @@ def _recover_single_file_commit(
         raise RuntimeError("automatic recovery refused because the committed target disappeared")
     if not _same_committed_identity(current_identity, committed_identity, committed_native):
         raise RuntimeError("automatic recovery refused a third-party target replacement")
-    if current_identity.size != len(after) or current.read_bytes() != after:
+    if current_identity.size != len(after) or read_verified_path_bytes(current, len(after)) != after:
         raise RuntimeError("automatic recovery refused to overwrite a concurrent target change")
     after_sha = sha256_bytes(after)
     if before_identity is None:
@@ -308,10 +313,12 @@ def _recover_single_file_commit(
     original_native = _native_identity(before_identity)
     if original_native is not None and restored_native != original_native:
         raise RuntimeError("write recovery restored the wrong Windows file identity")
-    restored = runtime.workspace.resolve_existing(path, allow_directory=False, access="write")
+    restored = runtime.workspace.resolve_existing(
+        path, allow_directory=False, access="write", readable=True
+    )
     try:
         restored_identity = runtime.workspace.identity(restored)
-        if restored_identity is None or restored.read_bytes() != before:
+        if restored_identity is None or read_verified_bytes(restored, len(before)) != before:
             raise RuntimeError("write recovery verification failed")
         if original_native is not None and _native_identity(restored_identity) != original_native:
             raise RuntimeError("write recovery verification found a replaced target")
@@ -431,9 +438,23 @@ def session_info() -> dict[str, Any]:
                     "live_verified": False,
                     "windows_live_verified": False,
                     "properties": {
-                        "filesystem_identity_lock_replace": {
-                            "status": "verified",
-                            "evidence": "startup filesystem identity/lock/replace probe",
+                        "same_handle_workspace_read": {
+                            "status": "verified" if os.name == "nt" else "unsupported",
+                            "production_supported": os.name == "nt",
+                            "evidence": (
+                                "validated Windows file HANDLE is retained and consumed directly by ReadFile"
+                                if os.name == "nt"
+                                else "non-Windows pathname read fallback is test-only"
+                            ),
+                        },
+                        "transactional_workspace_commit": {
+                            "status": "verified" if os.name == "nt" else "unsupported",
+                            "production_supported": os.name == "nt",
+                            "evidence": (
+                                "startup TxF isolation/commit probe plus CAS-bound transactional writer"
+                                if os.name == "nt"
+                                else "non-Windows os.replace fallback is test-only"
+                            ),
                         },
                         "complete_broker_boundary": {"status": "unverified"},
                     },
@@ -568,8 +589,8 @@ def read_file(
     try:
         _require_filesystem()
         file_path = runtime.workspace.resolve_existing(path, allow_directory=False)
-        text = read_text_limited(file_path, runtime.settings.max_text_file_bytes)
-        raw = text.encode("utf-8")
+        raw = read_verified_bytes(file_path, runtime.settings.max_text_file_bytes)
+        text = raw.decode("utf-8")
         lines = text.splitlines()
         start = 1 if start_line is None else max(1, start_line)
         end = len(lines) if end_line is None else min(len(lines), max(start, end_line))
@@ -607,9 +628,6 @@ def get_image(path: str) -> Image:
     try:
         _require_filesystem()
         image_path = runtime.workspace.resolve_existing(path, allow_directory=False)
-        size = image_path.stat().st_size
-        if size > runtime.settings.max_image_bytes:
-            raise ValueError("image byte limit exceeded")
         image_format = {
             ".png": "png",
             ".jpg": "jpeg",
@@ -619,9 +637,7 @@ def get_image(path: str) -> Image:
         }.get(image_path.suffix.casefold())
         if image_format is None:
             raise ValueError("unsupported image format")
-        data = image_path.read_bytes()
-        if len(data) != size:
-            raise RuntimeError("image changed while reading")
+        data = read_verified_bytes(image_path, runtime.settings.max_image_bytes)
         _log_simple(
             tool_name="get_image",
             request=request,
@@ -658,7 +674,9 @@ def _atomic_binary_mutation(
             hold_identity=False,
         )
         if source != target:
-            source = runtime.workspace.resolve_existing(source_path, allow_directory=False)
+            source = runtime.workspace.resolve_existing(
+                source_path, allow_directory=False, readable=False
+            )
         bound_sources.append(source)
     independent_source_bindings = tuple(
         binding
@@ -679,10 +697,13 @@ def _atomic_binary_mutation(
                 raise RuntimeError("write parent disappeared")
             target_identity = runtime.workspace.identity(target)
             if target.exists():
-                source_size = target.stat().st_size
-                if source_size > runtime.settings.max_structured_file_bytes:
+                if target_identity is None:
+                    raise RuntimeError("structured source disappeared before read")
+                if target_identity.size > runtime.settings.max_structured_file_bytes:
                     raise ValueError("structured file exceeds max_structured_file_bytes")
-                before = target.read_bytes()
+                before = read_verified_path_bytes(
+                    target, runtime.settings.max_structured_file_bytes
+                )
             else:
                 before = b""
             before_sha = sha256_bytes(before)
@@ -889,26 +910,28 @@ def _read_bounded_binary(
         parent_identity = runtime.workspace.identity(target.parent)
         if parent_identity is None:
             raise RuntimeError("source parent disappeared")
-        size = target.stat().st_size
-        if size > runtime.settings.max_structured_file_bytes:
+        if identity is None:
+            raise RuntimeError("source disappeared before processing read")
+        if identity.size > runtime.settings.max_structured_file_bytes:
             raise ValueError("structured file exceeds max_structured_file_bytes")
-        data = target.read_bytes()
+        data = read_verified_path_bytes(target, runtime.settings.max_structured_file_bytes)
         runtime.workspace.revalidate_for_replace(
             target,
             parent_identity=parent_identity,
             target_identity=identity,
         )
-        if target.read_bytes() != data:
-            raise RuntimeError("source changed while preparing the processing artifact")
         return target, data, True
 
 
 def _verify_binary_source_bindings(bindings: tuple[tuple[str, str], ...]) -> None:
     for path, expected in bindings:
         source = runtime.workspace.resolve_existing(path, allow_directory=False)
-        if source.stat().st_size > runtime.settings.max_structured_file_bytes:
+        identity = runtime.workspace.identity(source)
+        if identity is None or identity.size > runtime.settings.max_structured_file_bytes:
             raise RuntimeError("bound source exceeds max_structured_file_bytes")
-        if sha256_bytes(source.read_bytes()) != expected:
+        if sha256_bytes(
+            read_verified_bytes(source, runtime.settings.max_structured_file_bytes)
+        ) != expected:
             raise RuntimeError(f"bound source changed before commit: {path}")
 
 
@@ -921,9 +944,10 @@ def structured_file_inspect(
     try:
         _require_filesystem()
         source = runtime.workspace.resolve_existing(path, allow_directory=False)
-        if source.stat().st_size > runtime.settings.max_structured_file_bytes:
+        identity = runtime.workspace.identity(source)
+        if identity is None or identity.size > runtime.settings.max_structured_file_bytes:
             raise ValueError("structured file exceeds max_structured_file_bytes")
-        data = source.read_bytes()
+        data = read_verified_bytes(source, runtime.settings.max_structured_file_bytes)
         result = inspect_structured(data, runtime.workspace.relative(source), runtime.settings, format=format, range_ref=range_ref)
         result["path"] = runtime.workspace.relative(source)
         result["execution_paths"] = ["broker_direct", "transfer"]
@@ -1034,9 +1058,14 @@ def zip_entry_read(path: str, entry: str) -> dict[str, Any]:
         archive = runtime.workspace.resolve_existing(path, allow_directory=False)
         if infer_format(runtime.workspace.relative(archive)) != "zip":
             raise ValueError("path must be a ZIP file")
-        if archive.stat().st_size > runtime.settings.max_structured_file_bytes:
+        archive_identity = runtime.workspace.identity(archive)
+        if archive_identity is None or archive_identity.size > runtime.settings.max_structured_file_bytes:
             raise ValueError("structured file exceeds max_structured_file_bytes")
-        payload = read_zip_entry(archive.read_bytes(), entry, runtime.settings)
+        payload = read_zip_entry(
+            read_verified_bytes(archive, runtime.settings.max_structured_file_bytes),
+            entry,
+            runtime.settings,
+        )
         if len(payload) > runtime.settings.max_transfer_chunk_bytes:
             raise ValueError(
                 "ZIP entry exceeds max_transfer_chunk_bytes; use zip_entry_extract for local extraction"
@@ -1299,21 +1328,14 @@ def _validated_transfer_payload(
 
 
 def _copy_source_to_reserved_snapshot(source: Path, destination: Path) -> tuple[str, int]:
-    digest = hashlib.sha256()
-    total = 0
-    limit = runtime.settings.max_structured_file_bytes
-    with source.open("rb") as input_file, destination.open("r+b") as output_file:
+    data = read_verified_bytes(source, runtime.settings.max_structured_file_bytes)
+    with destination.open("r+b") as output_file:
         output_file.seek(0)
-        while chunk := input_file.read(1024 * 1024):
-            total += len(chunk)
-            if total > limit:
-                raise ValueError("structured file exceeds max_structured_file_bytes")
-            output_file.write(chunk)
-            digest.update(chunk)
-        output_file.truncate(total)
+        output_file.write(data)
+        output_file.truncate(len(data))
         output_file.flush()
         os.fsync(output_file.fileno())
-    return digest.hexdigest(), total
+    return sha256_bytes(data), len(data)
 
 
 def _admit_transfer() -> None:
@@ -1478,9 +1500,10 @@ def artifact_download_begin(path: str, chunk_bytes: int | None = None) -> dict[s
             current = runtime.workspace.resolve_existing(path, allow_directory=False)
             if current != source or runtime.workspace.identity(current) != source_identity:
                 raise RuntimeError("source changed while preparing download snapshot")
-            current_sha, current_bytes = sha256_file(
-                current, max_bytes=runtime.settings.max_structured_file_bytes
+            current_data = read_verified_bytes(
+                current, runtime.settings.max_structured_file_bytes
             )
+            current_sha, current_bytes = sha256_bytes(current_data), len(current_data)
             if (
                 runtime.workspace.identity(current) != source_identity
                 or current_bytes != snapshot_bytes
@@ -1554,9 +1577,14 @@ def artifact_download_chunk(transfer_id: str, offset: int) -> dict[str, Any]:
             source = runtime.workspace.resolve_existing(
                 str(manifest["path"]), allow_directory=False
             )
-            if source.stat().st_size != size or size > runtime.settings.max_structured_file_bytes:
+            source_identity = runtime.workspace.identity(source)
+            if (
+                source_identity is None
+                or source_identity.size != size
+                or size > runtime.settings.max_structured_file_bytes
+            ):
                 raise RuntimeError("source changed during transfer; begin a new download")
-            data = source.read_bytes()
+            data = read_verified_bytes(source, runtime.settings.max_structured_file_bytes)
             if len(data) != size or sha256_bytes(data) != manifest["sha256"]:
                 raise RuntimeError("source changed during transfer; begin a new download")
             payload = data[offset : offset + int(manifest["chunk_bytes"])]
@@ -1593,9 +1621,12 @@ def artifact_upload_begin(
         if target.exists() and expected_sha256 is None:
             raise ValueError("expected_sha256 is required when replacing an existing file")
         if target.exists():
-            if target.stat().st_size > runtime.settings.max_structured_file_bytes:
+            target_identity = runtime.workspace.identity(target)
+            if target_identity is None or target_identity.size > runtime.settings.max_structured_file_bytes:
                 raise ValueError("structured file exceeds max_structured_file_bytes")
-            if sha256_bytes(target.read_bytes()) != expected_sha256:
+            if sha256_bytes(
+                read_verified_path_bytes(target, runtime.settings.max_structured_file_bytes)
+            ) != expected_sha256:
                 raise RuntimeError("expected_sha256 mismatch; target is stale or concurrently modified")
         source_binding = None
         if source_transfer_id is not None:
@@ -1798,7 +1829,17 @@ def write_file(
             if parent_identity is None:
                 raise RuntimeError("write parent disappeared")
             target_identity = runtime.workspace.identity(target)
-            previous_bytes = target.read_bytes() if target.exists() else b""
+            previous_bytes = (
+                read_verified_path_bytes(
+                    target,
+                    max(
+                        runtime.settings.max_text_file_bytes,
+                        runtime.settings.max_backup_bytes,
+                    ),
+                )
+                if target.exists()
+                else b""
+            )
             if len(previous_bytes) > runtime.settings.max_text_file_bytes:
                 raise ValueError("existing file exceeds max_text_file_bytes")
             if len(previous_bytes) > runtime.settings.max_backup_bytes:
@@ -1851,7 +1892,7 @@ def write_file(
                 backup_dir = runtime.settings.data_dir / "backups" / operation_id
                 backup_dir.mkdir(parents=True)
                 backup_file = backup_dir / target.name
-                shutil.copy2(target, backup_file)
+                backup_file.write_bytes(previous_bytes)
                 backup_path = str(backup_file)
 
             workspace_changed = False

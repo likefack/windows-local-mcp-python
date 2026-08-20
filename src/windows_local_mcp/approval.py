@@ -10,7 +10,7 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from .config import Settings
-from .paths import Workspace, hold_verified_path
+from .paths import Workspace, hold_verified_path, read_verified_bytes
 from .policy import NormalizedCommand
 from .resources import (
     NamedControlPlaneLock,
@@ -432,7 +432,10 @@ def _copy_tree_bounded(
             if initial_data_bytes + total > settings.max_data_dir_bytes:
                 raise RuntimeError("data_dir quota exceeded while staging approval inputs")
             target = destination / relative_root / name
-            shutil.copy2(checked, target)
+            target.write_bytes(
+                read_verified_bytes(checked, settings.approval_manifest_max_bytes)
+            )
+            shutil.copystat(checked, target, follow_symlinks=False)
             record = _file_record(target)
             record.update({"source_path": str(checked), "staged_path": str(target)})
             records.append(record)
@@ -549,7 +552,9 @@ def _copy_external_tree_bounded(
                 raise PermissionError(
                     f"external dependency contains a non-regular file: {source_file}"
                 )
-            checked = hold_verified_path(source_file, allow_directory=False)
+            checked = hold_verified_path(
+                source_file, allow_directory=False, readable=True
+            )
             info = checked.stat()
             if info.st_nlink > 1:
                 raise PermissionError(
@@ -563,7 +568,10 @@ def _copy_external_tree_bounded(
             if initial_data_bytes + total > settings.max_data_dir_bytes:
                 raise RuntimeError("data_dir quota exceeded while staging dependencies")
             target = destination / relative_root / name
-            shutil.copy2(checked, target)
+            target.write_bytes(
+                read_verified_bytes(checked, settings.approval_manifest_max_bytes)
+            )
+            shutil.copystat(checked, target, follow_symlinks=False)
             record = _file_record(target)
             record.update({"source_path": str(checked), "staged_path": str(target)})
             records.append(record)
@@ -623,13 +631,16 @@ def _file_record(
         path,
         allow_directory=False,
         allow_hardlinks=allow_hardlinks,
+        readable=True,
     )
     info = path.stat()
     if not allow_hardlinks and info.st_nlink > 1:
         raise PermissionError(f"approval input with multiple hard links is denied: {path}")
     if max_bytes is not None and info.st_size > max_bytes:
         raise ValueError(f"approval input exceeds byte limit: {path}")
-    data = path.read_bytes()
+    data = read_verified_bytes(
+        path, max_bytes if max_bytes is not None else info.st_size
+    )
     return {
         "path": str(path.resolve()),
         "size": len(data),
@@ -743,7 +754,12 @@ def _source_inventory(
                 raise ValueError("workspace inventory exceeds approval_manifest_max_files")
             if total > settings.approval_manifest_max_bytes:
                 raise ValueError("workspace inventory exceeds approval_manifest_max_bytes")
-            inventory[str(checked)] = (sha256_bytes(checked.read_bytes()), size)
+            inventory[str(checked)] = (
+                sha256_bytes(
+                    read_verified_bytes(checked, settings.approval_manifest_max_bytes)
+                ),
+                size,
+            )
     return inventory
 
 

@@ -12,7 +12,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 from .config import Settings
-from .paths import Workspace
+from .paths import Workspace, read_verified_bytes, read_verified_path_bytes
 from .resources import NamedControlPlaneLock, directory_size, enforce_data_quota
 from .util import canonical_json, sha256_bytes, utc_now_iso
 
@@ -114,7 +114,9 @@ def capture_workspace_state(
                     )
                     continue
                 try:
-                    verified = workspace.resolve_existing(str(relative), access="write")
+                    verified = workspace.resolve_existing(
+                        str(relative), access="write", readable=True
+                    )
                     stat = verified.stat()
                     if not verified.is_file():
                         excluded.append(
@@ -126,7 +128,9 @@ def capture_workspace_state(
                             {"path": relative.as_posix(), "reason": "policy_hardlink"}
                         )
                         continue
-                    data = verified.read_bytes()
+                    data = read_verified_bytes(
+                        verified, settings.approval_manifest_max_bytes
+                    )
                 except (FileNotFoundError, PermissionError, OSError, ValueError) as error:
                     raise RuntimeError(
                         f"workspace checkpoint could not capture {relative.as_posix()}: "
@@ -190,7 +194,7 @@ def _capture_scoped_workspace_state(
             if not destination.exists():
                 continue
             verified = workspace.resolve_existing(
-                relative, allow_directory=False, access="write"
+                relative, allow_directory=False, access="write", readable=True
             )
             parent_identity = workspace.identity(verified.parent)
             target_identity = workspace.identity(verified)
@@ -201,13 +205,13 @@ def _capture_scoped_workspace_state(
                 raise PermissionError(
                     f"scoped checkpoint target must be a unique regular file: {relative}"
                 )
-            data = verified.read_bytes()
+            data = read_verified_bytes(verified, settings.approval_manifest_max_bytes)
             workspace.revalidate_for_replace(
                 verified,
                 parent_identity=parent_identity,
                 target_identity=target_identity,
             )
-            if verified.stat().st_size != len(data) or verified.read_bytes() != data:
+            if target_identity.size != len(data):
                 raise RuntimeError(f"scoped checkpoint target changed while read: {relative}")
             total += len(data)
             if len(entries) + 1 > settings.approval_manifest_max_files:
@@ -1221,7 +1225,7 @@ def _scan_current_hashes(
             if not candidate.exists():
                 continue
             verified = workspace.resolve_existing(
-                normalized, allow_directory=False, access="write"
+                normalized, allow_directory=False, access="write", readable=True
             )
             details = verified.stat()
             if not verified.is_file() or details.st_nlink > 1:
@@ -1234,16 +1238,12 @@ def _scan_current_hashes(
                 raise RuntimeError(
                     f"scoped workspace verification target disappeared: {normalized}"
                 )
-            data = verified.read_bytes()
+            data = read_verified_bytes(verified, settings.approval_manifest_max_bytes)
             workspace.revalidate_for_replace(
                 verified,
                 parent_identity=parent_identity,
                 target_identity=before_identity,
             )
-            if verified.read_bytes() != data:
-                raise RuntimeError(
-                    f"scoped workspace verification target changed while read: {normalized}"
-                )
             result[normalized] = sha256_bytes(data)
         return result
     denied = {name.casefold() for name in settings.write_denied_directories}
@@ -1273,10 +1273,14 @@ def _scan_current_hashes(
             ):
                 continue
             try:
-                path = workspace.resolve_existing(str(relative), access="write")
+                path = workspace.resolve_existing(
+                    str(relative), access="write", readable=True
+                )
                 if not path.is_file() or path.stat().st_nlink > 1:
                     continue
-                result[relative.as_posix()] = sha256_bytes(path.read_bytes())
+                result[relative.as_posix()] = sha256_bytes(
+                    read_verified_bytes(path, settings.approval_manifest_max_bytes)
+                )
             except (FileNotFoundError, OSError, PermissionError, ValueError) as error:
                 raise RuntimeError(
                     f"workspace verification could not read {relative.as_posix()}: "
@@ -1287,7 +1291,8 @@ def _scan_current_hashes(
 
 def _verify_destination_digest(path: Path, expected: str | None, relative: str) -> None:
     if path.exists():
-        if not path.is_file() or sha256_bytes(path.read_bytes()) != expected:
+        size = path.stat().st_size
+        if not path.is_file() or sha256_bytes(read_verified_path_bytes(path, size)) != expected:
             raise RuntimeError(f"workspace file changed during restore: {relative}")
     elif expected is not None:
         raise RuntimeError(f"workspace file disappeared during restore: {relative}")
