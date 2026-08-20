@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import ctypes
 import os
 import stat
 import threading
+import weakref
 from collections.abc import Iterator
 from contextlib import contextmanager
+from ctypes import get_last_error, wintypes
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
+from typing import Any
 
 from .config import Settings
 
@@ -19,6 +23,13 @@ _WINDOWS_DEVICES = {
     *(f"LPT{number}" for number in range(1, 10)),
 }
 _REPARSE_ATTRIBUTE = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+_DIRECTORY_ATTRIBUTE = getattr(stat, "FILE_ATTRIBUTE_DIRECTORY", 0x10)
+_FILE_READ_ATTRIBUTES = 0x00000080
+_FILE_SHARE_READ = 0x00000001
+_FILE_SHARE_WRITE = 0x00000002
+_OPEN_EXISTING = 3
+_FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
 
 
 @dataclass(frozen=True)
@@ -27,6 +38,178 @@ class PathIdentity:
     inode: int
     size: int
     modified_ns: int
+
+
+class _ByHandleFileInformation(ctypes.Structure):
+    _fields_ = [
+        ("dwFileAttributes", wintypes.DWORD),
+        ("ftCreationTime", wintypes.FILETIME),
+        ("ftLastAccessTime", wintypes.FILETIME),
+        ("ftLastWriteTime", wintypes.FILETIME),
+        ("dwVolumeSerialNumber", wintypes.DWORD),
+        ("nFileSizeHigh", wintypes.DWORD),
+        ("nFileSizeLow", wintypes.DWORD),
+        ("nNumberOfLinks", wintypes.DWORD),
+        ("nFileIndexHigh", wintypes.DWORD),
+        ("nFileIndexLow", wintypes.DWORD),
+    ]
+
+
+class _WindowsHandleLease:
+    def __init__(self, handles: list[Any]) -> None:
+        self._handles = handles
+
+    def close(self) -> None:
+        handles, self._handles = self._handles, []
+        if not handles or os.name != "nt":
+            return
+        try:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            for handle in reversed(handles):
+                kernel32.CloseHandle(handle)
+        except Exception:
+            pass
+
+
+_PathBase = type(Path())
+
+
+class _HeldPath(_PathBase):
+    __slots__ = ("_lease_finalizer", "__weakref__")
+
+    def __new__(cls, *parts: Any) -> "_HeldPath":
+        instance = super().__new__(cls, *parts)
+        instance._lease_finalizer = None
+        return instance
+
+    @classmethod
+    def attach(cls, path: Path, lease: _WindowsHandleLease) -> "_HeldPath":
+        instance = cls(path)
+        instance._lease_finalizer = weakref.finalize(instance, lease.close)
+        return instance
+
+
+def _windows_component_handles(
+    path: Path,
+    *,
+    allow_directory: bool,
+    allow_hardlinks: bool,
+) -> Path:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.GetFileInformationByHandle.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(_ByHandleFileInformation),
+    ]
+    kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    invalid = wintypes.HANDLE(-1).value
+
+    lexical = Path(os.path.abspath(os.path.normpath(path)))
+    anchor = Path(lexical.anchor)
+    parts = lexical.parts[1:] if lexical.anchor else lexical.parts
+    current = anchor
+    handles: list[Any] = []
+    try:
+        for index, part in enumerate(parts):
+            current /= part
+            final = index == len(parts) - 1
+            share_mode = _FILE_SHARE_READ if final else (_FILE_SHARE_READ | _FILE_SHARE_WRITE)
+            handle = kernel32.CreateFileW(
+                str(current),
+                _FILE_READ_ATTRIBUTES,
+                share_mode,
+                None,
+                _OPEN_EXISTING,
+                _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT,
+                None,
+            )
+            if handle in (None, invalid):
+                raise PermissionError(
+                    f"could not lock path component: {current} (WinError {get_last_error()})"
+                )
+            handles.append(handle)
+
+            information = _ByHandleFileInformation()
+            if not kernel32.GetFileInformationByHandle(handle, ctypes.byref(information)):
+                raise PermissionError(
+                    f"could not inspect path component: {current} (WinError {get_last_error()})"
+                )
+            attributes = int(information.dwFileAttributes)
+            is_directory = bool(attributes & _DIRECTORY_ATTRIBUTE)
+            if attributes & _REPARSE_ATTRIBUTE:
+                raise PermissionError(f"symlink, junction, or reparse point is denied: {current}")
+            if not final and not is_directory:
+                raise NotADirectoryError(f"path parent is not a directory: {current}")
+            if final:
+                if is_directory and not allow_directory:
+                    raise IsADirectoryError(f"not a regular file: {current}")
+                if (
+                    not is_directory
+                    and not allow_hardlinks
+                    and int(information.nNumberOfLinks) > 1
+                ):
+                    raise PermissionError(f"files with multiple hard links are denied: {current}")
+
+        if not parts:
+            raise ValueError(f"path must identify a filesystem entry: {lexical}")
+        lease = _WindowsHandleLease(handles)
+        handles = []
+        return _HeldPath.attach(lexical, lease)
+    finally:
+        for handle in reversed(handles):
+            kernel32.CloseHandle(handle)
+
+
+def hold_verified_path(
+    path: str | Path,
+    *,
+    allow_directory: bool = False,
+    allow_hardlinks: bool = False,
+) -> Path:
+    """Return a path whose Windows namespace/file identity remains locked while referenced.
+
+    On Windows, every path component is opened with reparse-point semantics and retained
+    without FILE_SHARE_DELETE. The final regular file also denies FILE_SHARE_WRITE. This
+    prevents a same-user process from replacing a validated path, any parent directory, or
+    the file itself before a caller later opens the returned path.
+    """
+
+    lexical = Path(os.path.abspath(os.path.normpath(os.fspath(path))))
+    if os.name == "nt":
+        return _windows_component_handles(
+            lexical,
+            allow_directory=allow_directory,
+            allow_hardlinks=allow_hardlinks,
+        )
+
+    resolved = lexical.resolve(strict=True)
+    current = Path(resolved.anchor)
+    for part in resolved.parts[1:] if resolved.anchor else resolved.parts:
+        current /= part
+        if current.is_symlink():
+            raise PermissionError(f"symlink, junction, or reparse point is denied: {current}")
+    details = resolved.stat()
+    if resolved.is_dir():
+        if not allow_directory:
+            raise IsADirectoryError(f"not a regular file: {resolved}")
+    elif not resolved.is_file():
+        raise PermissionError(f"path is not a regular file or directory: {resolved}")
+    elif not allow_hardlinks and details.st_nlink > 1:
+        raise PermissionError(f"files with multiple hard links are denied: {resolved}")
+    return resolved
 
 
 class Workspace:
@@ -113,6 +296,7 @@ class Workspace:
         *,
         allow_directory: bool = True,
         access: str = "read",
+        hold_identity: bool = True,
     ) -> Path:
         self.validate_windows_syntax(user_path)
         candidate = self.root / user_path
@@ -125,6 +309,12 @@ class Workspace:
             raise IsADirectoryError(f"not a regular file: {resolved}")
         if resolved.is_file():
             self._reject_hardlink(resolved)
+            if hold_identity:
+                return hold_verified_path(
+                    resolved,
+                    allow_directory=False,
+                    allow_hardlinks=False,
+                )
         return resolved
 
     def resolve_directory(self, user_path: str, *, access: str = "read") -> Path:

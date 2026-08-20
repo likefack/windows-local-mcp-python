@@ -516,12 +516,24 @@ def get_image(path: str) -> Image:
         size = image_path.stat().st_size
         if size > runtime.settings.max_image_bytes:
             raise ValueError("image byte limit exceeded")
+        image_format = {
+            ".png": "png",
+            ".jpg": "jpeg",
+            ".jpeg": "jpeg",
+            ".gif": "gif",
+            ".webp": "webp",
+        }.get(image_path.suffix.casefold())
+        if image_format is None:
+            raise ValueError("unsupported image format")
+        data = image_path.read_bytes()
+        if len(data) != size:
+            raise RuntimeError("image changed while reading")
         _log_simple(
             tool_name="get_image",
             request=request,
-            result={"path": runtime.workspace.relative(image_path), "bytes": size},
+            result={"path": runtime.workspace.relative(image_path), "bytes": len(data)},
         )
-        return Image(path=image_path)
+        return Image(data=data, format=image_format)
     except Exception as error:
         _audit_rejection("get_image", request, error)
         raise
@@ -549,10 +561,16 @@ def _atomic_binary_mutation(
     _require_workspace_mutation_ready()
     operation_id: str | None = None
     target = runtime.workspace.resolve_for_write(path)
-    bound_sources = [
-        runtime.workspace.resolve_existing(source_path, allow_directory=False)
-        for source_path, _expected_sha256 in source_bindings
-    ]
+    bound_sources: list[Path] = []
+    for source_path, _expected_sha256 in source_bindings:
+        source = runtime.workspace.resolve_existing(
+            source_path,
+            allow_directory=False,
+            hold_identity=False,
+        )
+        if source != target:
+            source = runtime.workspace.resolve_existing(source_path, allow_directory=False)
+        bound_sources.append(source)
     independent_source_bindings = tuple(
         binding
         for binding, source in zip(source_bindings, bound_sources, strict=True)

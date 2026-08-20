@@ -10,7 +10,7 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from .config import Settings
-from .paths import Workspace
+from .paths import Workspace, hold_verified_path
 from .policy import NormalizedCommand
 from .resources import (
     NamedControlPlaneLock,
@@ -549,10 +549,11 @@ def _copy_external_tree_bounded(
                 raise PermissionError(
                     f"external dependency contains a non-regular file: {source_file}"
                 )
-            info = source_file.stat()
+            checked = hold_verified_path(source_file, allow_directory=False)
+            info = checked.stat()
             if info.st_nlink > 1:
                 raise PermissionError(
-                    f"external dependency contains a hard-linked file: {source_file}"
+                    f"external dependency contains a hard-linked file: {checked}"
                 )
             total += info.st_size
             if len(records) + 1 > settings.approval_manifest_max_files:
@@ -562,9 +563,9 @@ def _copy_external_tree_bounded(
             if initial_data_bytes + total > settings.max_data_dir_bytes:
                 raise RuntimeError("data_dir quota exceeded while staging dependencies")
             target = destination / relative_root / name
-            shutil.copy2(source_file, target)
+            shutil.copy2(checked, target)
             record = _file_record(target)
-            record.update({"source_path": str(source_file), "staged_path": str(target)})
+            record.update({"source_path": str(checked), "staged_path": str(target)})
             records.append(record)
     return records
 
@@ -618,6 +619,11 @@ def _file_record(
 ) -> dict[str, Any]:
     if path.is_symlink() or not path.is_file():
         raise PermissionError(f"approval input must be a regular non-reparse file: {path}")
+    path = hold_verified_path(
+        path,
+        allow_directory=False,
+        allow_hardlinks=allow_hardlinks,
+    )
     info = path.stat()
     if not allow_hardlinks and info.st_nlink > 1:
         raise PermissionError(f"approval input with multiple hard links is denied: {path}")

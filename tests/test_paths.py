@@ -1,3 +1,5 @@
+import gc
+import os
 from pathlib import Path
 
 import pytest
@@ -96,3 +98,22 @@ def test_rejects_hardlinked_file(tmp_path: Path) -> None:
         pytest.skip("hard links are unavailable on this filesystem")
     with pytest.raises(PermissionError, match="hard links"):
         workspace.resolve_existing("linked.txt", allow_directory=False)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows file-share semantics are the security boundary")
+def test_verified_path_blocks_replacement_until_reader_releases_it(tmp_path: Path) -> None:
+    workspace = make_workspace(tmp_path)
+    target = workspace.root / "safe.txt"
+    target.write_text("safe", encoding="utf-8")
+    replacement = workspace.root / "replacement.txt"
+    replacement.write_text("replacement", encoding="utf-8")
+
+    verified = workspace.resolve_existing("safe.txt", allow_directory=False)
+    with pytest.raises(OSError):
+        os.replace(replacement, target)
+    assert verified.read_text(encoding="utf-8") == "safe"
+
+    del verified
+    gc.collect()
+    os.replace(replacement, target)
+    assert target.read_text(encoding="utf-8") == "replacement"
