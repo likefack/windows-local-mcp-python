@@ -18,6 +18,7 @@ def _trusted_runtime_evidence() -> dict[str, Any]:
         "path_count": 0,
         "file_count": 0,
         "directory_count": 0,
+        "ancestor_directory_count": 0,
         "digest": "0" * 64,
         "distributions": [],
     }

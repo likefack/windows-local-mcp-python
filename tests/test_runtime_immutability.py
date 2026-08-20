@@ -123,14 +123,28 @@ def test_root_identity_rejects_replaceable_runtime_ancestor(tmp_path: Path) -> N
         )
 
 
+def test_ancestor_sibling_creation_does_not_false_positive(tmp_path: Path) -> None:
+    inventory, paths = _inventory(tmp_path)
+    repository_parent = paths["repository"].resolve(strict=True).parent
+
+    result = assert_approved_host_runtime_immutable(
+        paths["package"],
+        inventory=inventory,
+        access_resolver=lambda path: 0x00000002 if path == repository_parent else 0,
+    )
+
+    assert result["scope"] == "complete-runtime"
+
+
 def test_runtime_paths_include_editable_launchers_and_repository(tmp_path: Path) -> None:
     inventory, paths = _inventory(tmp_path)
-    directories, files, _versions = _runtime_paths(
+    directories, ancestors, files, _versions = _runtime_paths(
         paths["package"],
         inventory=inventory,
     )
 
     assert paths["repository"].resolve(strict=True) in directories
+    assert paths["repository"].resolve(strict=True).parent in ancestors
     assert (paths["repository"] / "run-server.ps1").resolve(strict=True) in files
     assert (paths["repository"] / "run-approvals.ps1").resolve(strict=True) in files
     assert paths["startup"].resolve(strict=True) in files

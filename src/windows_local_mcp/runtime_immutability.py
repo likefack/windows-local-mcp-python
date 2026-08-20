@@ -28,6 +28,7 @@ _MUTATING_ACCESS_MASK = (
     | 0x00040000
     | 0x00080000
 )
+_REPLACEMENT_ACCESS_MASK = 0x00000040 | 0x00010000 | 0x00040000 | 0x00080000
 _MAXIMUM_ALLOWED = 0x02000000
 _TOKEN_QUERY = 0x0008
 _TOKEN_DUPLICATE = 0x0002
@@ -141,7 +142,12 @@ def _runtime_paths(
     package_root: Path | None = None,
     *,
     inventory: RuntimeTrustInventory | None = None,
-) -> tuple[tuple[Path, ...], tuple[Path, ...], tuple[tuple[str, str], ...]]:
+) -> tuple[
+    tuple[Path, ...],
+    tuple[Path, ...],
+    tuple[Path, ...],
+    tuple[tuple[str, str], ...],
+]:
     package = (package_root or Path(__file__).resolve(strict=True).parent).resolve(strict=True)
     supplied_inventory = inventory is not None
     inventory = inventory or build_runtime_trust_inventory(package)
@@ -179,13 +185,18 @@ def _runtime_paths(
             if candidate.is_file():
                 files.add(candidate.resolve(strict=True))
 
-    # Prevent replacement of an otherwise read-only child by requiring every ancestor
-    # directory up to the volume root to deny create/delete/ACL mutation to this token.
+    # A runtime directory itself must deny creation as well as replacement. More distant
+    # ancestors only need to deny deleting/replacing the protected child or changing ACL
+    # authority; harmless creation of an unrelated sibling at a volume root is not enough
+    # to compromise the runtime.
+    ancestor_directories: set[Path] = set()
     for path in tuple(directories) + tuple(files):
-        directories.update(_ancestor_directories(path))
+        ancestor_directories.update(_ancestor_directories(path))
+    ancestor_directories.difference_update(directories)
 
     return (
         tuple(sorted(directories, key=lambda item: os.path.normcase(str(item)))),
+        tuple(sorted(ancestor_directories, key=lambda item: os.path.normcase(str(item)))),
         tuple(sorted(files, key=lambda item: os.path.normcase(str(item)))),
         inventory.distributions,
     )
@@ -367,15 +378,21 @@ def _identity_record(
 
 def _verify_paths_immutable(
     directories: tuple[Path, ...],
+    ancestor_directories: tuple[Path, ...],
     files: tuple[Path, ...],
     *,
     access_resolver: Callable[[Path], int] | None = None,
     max_paths: int = 100_000,
 ) -> list[dict[str, Any]]:
-    if len(directories) + len(files) > max_paths:
+    if len(directories) + len(ancestor_directories) + len(files) > max_paths:
         raise RuntimeError("Approved Host runtime closure exceeds the immutability path limit")
     records: list[dict[str, Any]] = []
-    for kind, paths in (("directory", directories), ("file", files)):
+    groups = (
+        ("directory", directories, _MUTATING_ACCESS_MASK),
+        ("ancestor", ancestor_directories, _REPLACEMENT_ACCESS_MASK),
+        ("file", files, _MUTATING_ACCESS_MASK),
+    )
+    for kind, paths, denied_mask in groups:
         for path in paths:
             resolved = _resolved_existing(path)
             descriptor: bytes | None = None
@@ -383,7 +400,7 @@ def _verify_paths_immutable(
                 descriptor, access = _windows_security_descriptor(resolved)
             else:
                 access = int(access_resolver(resolved))
-            mutating = access & _MUTATING_ACCESS_MASK
+            mutating = access & denied_mask
             if mutating:
                 raise PermissionError(
                     "Approved Host requires an immutable Python/WLMCP runtime; "
@@ -409,9 +426,12 @@ def assert_approved_host_runtime_immutable(
     """Fail closed unless every startup-active runtime file and namespace is user-immutable."""
     if os.name != "nt" and access_resolver is None:
         raise RuntimeError("Approved Host runtime immutability is supported only on Windows")
-    directories, files, distributions = _runtime_paths(package_root, inventory=inventory)
+    directories, ancestor_directories, files, distributions = _runtime_paths(
+        package_root, inventory=inventory
+    )
     records = _verify_paths_immutable(
         directories,
+        ancestor_directories,
         files,
         access_resolver=access_resolver,
     )
@@ -429,6 +449,7 @@ def assert_approved_host_runtime_immutable(
         "path_count": len(records),
         "file_count": len(files),
         "directory_count": len(directories),
+        "ancestor_directory_count": len(ancestor_directories),
         "digest": sha256_text(canonical_json(payload)),
         "distributions": payload["distributions"],
     }
