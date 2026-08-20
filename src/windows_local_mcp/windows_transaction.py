@@ -1,0 +1,421 @@
+from __future__ import annotations
+
+import ctypes
+import hashlib
+import os
+from ctypes import get_last_error, wintypes
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+_GENERIC_READ = 0x80000000
+_GENERIC_WRITE = 0x40000000
+_DELETE = 0x00010000
+_FILE_SHARE_READ = 0x00000001
+_FILE_SHARE_WRITE = 0x00000002
+_FILE_SHARE_DELETE = 0x00000004
+_CREATE_NEW = 1
+_OPEN_EXISTING = 3
+_FILE_ATTRIBUTE_NORMAL = 0x00000080
+_FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+_FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+_FILE_ATTRIBUTE_DIRECTORY = 0x00000010
+_FILE_BEGIN = 0
+_FILE_DISPOSITION_INFO_CLASS = 4
+_TRANSACTION_DO_NOT_PROMOTE = 0x00000001
+
+
+@dataclass(frozen=True)
+class WindowsFileIdentity:
+    volume_serial: int
+    file_index: int
+    size: int
+    link_count: int
+    attributes: int
+
+
+class _ByHandleFileInformation(ctypes.Structure):
+    _fields_ = [
+        ("dwFileAttributes", wintypes.DWORD),
+        ("ftCreationTime", wintypes.FILETIME),
+        ("ftLastAccessTime", wintypes.FILETIME),
+        ("ftLastWriteTime", wintypes.FILETIME),
+        ("dwVolumeSerialNumber", wintypes.DWORD),
+        ("nFileSizeHigh", wintypes.DWORD),
+        ("nFileSizeLow", wintypes.DWORD),
+        ("nNumberOfLinks", wintypes.DWORD),
+        ("nFileIndexHigh", wintypes.DWORD),
+        ("nFileIndexLow", wintypes.DWORD),
+    ]
+
+
+class _FileDispositionInfo(ctypes.Structure):
+    _fields_ = [("DeleteFile", wintypes.BOOL)]
+
+
+def _kernel32() -> Any:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.CreateFileTransactedW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.USHORT),
+        wintypes.LPVOID,
+    ]
+    kernel32.CreateFileTransactedW.restype = wintypes.HANDLE
+    kernel32.GetFileInformationByHandle.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(_ByHandleFileInformation),
+    ]
+    kernel32.GetFileInformationByHandle.restype = wintypes.BOOL
+    kernel32.SetFilePointerEx.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_longlong,
+        ctypes.POINTER(ctypes.c_longlong),
+        wintypes.DWORD,
+    ]
+    kernel32.SetFilePointerEx.restype = wintypes.BOOL
+    kernel32.SetEndOfFile.argtypes = [wintypes.HANDLE]
+    kernel32.SetEndOfFile.restype = wintypes.BOOL
+    kernel32.ReadFile.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPVOID,
+    ]
+    kernel32.ReadFile.restype = wintypes.BOOL
+    kernel32.WriteFile.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPCVOID,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPVOID,
+    ]
+    kernel32.WriteFile.restype = wintypes.BOOL
+    kernel32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
+    kernel32.FlushFileBuffers.restype = wintypes.BOOL
+    kernel32.SetFileInformationByHandle.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    ]
+    kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    return kernel32
+
+
+def _ktm() -> Any:
+    ktm = ctypes.WinDLL("KtmW32", use_last_error=True)
+    ktm.CreateTransaction.argtypes = [
+        wintypes.LPVOID,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPWSTR,
+    ]
+    ktm.CreateTransaction.restype = wintypes.HANDLE
+    ktm.CommitTransaction.argtypes = [wintypes.HANDLE]
+    ktm.CommitTransaction.restype = wintypes.BOOL
+    ktm.RollbackTransaction.argtypes = [wintypes.HANDLE]
+    ktm.RollbackTransaction.restype = wintypes.BOOL
+    return ktm
+
+
+def _invalid_handle() -> int:
+    return int(wintypes.HANDLE(-1).value)
+
+
+def _raise_last_error(action: str, path: Path | None = None) -> None:
+    error = get_last_error()
+    suffix = f": {path}" if path is not None else ""
+    raise OSError(error, f"{action} failed{suffix}")
+
+
+def _identity_from_handle(handle: Any) -> WindowsFileIdentity:
+    information = _ByHandleFileInformation()
+    kernel32 = _kernel32()
+    if not kernel32.GetFileInformationByHandle(handle, ctypes.byref(information)):
+        _raise_last_error("GetFileInformationByHandle")
+    return WindowsFileIdentity(
+        volume_serial=int(information.dwVolumeSerialNumber),
+        file_index=(int(information.nFileIndexHigh) << 32) | int(information.nFileIndexLow),
+        size=(int(information.nFileSizeHigh) << 32) | int(information.nFileSizeLow),
+        link_count=int(information.nNumberOfLinks),
+        attributes=int(information.dwFileAttributes),
+    )
+
+
+def windows_file_identity(path: Path) -> WindowsFileIdentity:
+    if os.name != "nt":
+        raise OSError("Windows file identity is available only on Windows")
+    kernel32 = _kernel32()
+    handle = kernel32.CreateFileW(
+        str(path),
+        0x00000080,
+        _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
+        None,
+        _OPEN_EXISTING,
+        _FILE_FLAG_OPEN_REPARSE_POINT,
+        None,
+    )
+    if handle in (None, _invalid_handle()):
+        _raise_last_error("CreateFileW", path)
+    try:
+        return _identity_from_handle(handle)
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _validate_regular_identity(
+    handle: Any,
+    *,
+    expected_identity: tuple[int, int] | None,
+    path: Path,
+) -> WindowsFileIdentity:
+    identity = _identity_from_handle(handle)
+    if identity.attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+        raise PermissionError(f"transaction target became a reparse point: {path}")
+    if identity.attributes & _FILE_ATTRIBUTE_DIRECTORY:
+        raise IsADirectoryError(f"transaction target is not a regular file: {path}")
+    if identity.link_count != 1:
+        raise PermissionError(f"transaction target has multiple hard links: {path}")
+    if expected_identity is not None and (
+        identity.volume_serial,
+        identity.file_index,
+    ) != expected_identity:
+        raise RuntimeError("write target changed before transactional commit")
+    return identity
+
+
+def _seek_start(handle: Any) -> None:
+    if not _kernel32().SetFilePointerEx(handle, 0, None, _FILE_BEGIN):
+        _raise_last_error("SetFilePointerEx")
+
+
+def _hash_handle(handle: Any) -> tuple[str, int]:
+    kernel32 = _kernel32()
+    _seek_start(handle)
+    digest = hashlib.sha256()
+    total = 0
+    buffer = ctypes.create_string_buffer(1024 * 1024)
+    while True:
+        read = wintypes.DWORD()
+        if not kernel32.ReadFile(handle, buffer, len(buffer), ctypes.byref(read), None):
+            _raise_last_error("ReadFile")
+        if not read.value:
+            return digest.hexdigest(), total
+        digest.update(buffer.raw[: read.value])
+        total += int(read.value)
+
+
+def _write_handle(handle: Any, data: bytes) -> None:
+    kernel32 = _kernel32()
+    _seek_start(handle)
+    if not kernel32.SetEndOfFile(handle):
+        _raise_last_error("SetEndOfFile")
+    offset = 0
+    while offset < len(data):
+        chunk = data[offset : offset + 1024 * 1024]
+        buffer = ctypes.create_string_buffer(chunk)
+        written = wintypes.DWORD()
+        if not kernel32.WriteFile(handle, buffer, len(chunk), ctypes.byref(written), None):
+            _raise_last_error("WriteFile")
+        if written.value != len(chunk):
+            raise OSError("short WriteFile during transactional commit")
+        offset += int(written.value)
+    if not kernel32.FlushFileBuffers(handle):
+        _raise_last_error("FlushFileBuffers")
+
+
+def _create_transaction(description: str) -> Any:
+    transaction = _ktm().CreateTransaction(
+        None,
+        None,
+        _TRANSACTION_DO_NOT_PROMOTE,
+        0,
+        0,
+        0,
+        description,
+    )
+    if transaction in (None, _invalid_handle()):
+        _raise_last_error("CreateTransaction")
+    return transaction
+
+
+def _open_transacted(
+    path: Path,
+    transaction: Any,
+    *,
+    exists: bool,
+    delete: bool,
+) -> Any:
+    kernel32 = _kernel32()
+    desired_access = _GENERIC_READ | _GENERIC_WRITE | (_DELETE if delete else 0)
+    handle = kernel32.CreateFileTransactedW(
+        str(path),
+        desired_access,
+        _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE,
+        None,
+        _OPEN_EXISTING if exists else _CREATE_NEW,
+        _FILE_ATTRIBUTE_NORMAL | _FILE_FLAG_OPEN_REPARSE_POINT,
+        None,
+        transaction,
+        None,
+        None,
+    )
+    if handle in (None, _invalid_handle()):
+        _raise_last_error("CreateFileTransactedW", path)
+    return handle
+
+
+def _finish_transaction(transaction: Any, *, commit: bool) -> None:
+    ktm = _ktm()
+    if commit:
+        if not ktm.CommitTransaction(transaction):
+            _raise_last_error("CommitTransaction")
+    else:
+        ktm.RollbackTransaction(transaction)
+
+
+def transactional_write_bytes(
+    path: Path,
+    data: bytes,
+    *,
+    expected_identity: tuple[int, int] | None,
+    expected_sha256: str | None,
+) -> None:
+    """Atomically validate and replace one local NTFS file inside one TxF transaction."""
+    if os.name != "nt":
+        raise OSError("transactional workspace commit requires Windows")
+    if (expected_identity is None) != (expected_sha256 is None):
+        raise ValueError("existing target identity and digest must be supplied together")
+    kernel32 = _kernel32()
+    transaction = _create_transaction("Windows Local MCP workspace write")
+    handle: Any | None = None
+    committed = False
+    try:
+        handle = _open_transacted(
+            path,
+            transaction,
+            exists=expected_identity is not None,
+            delete=False,
+        )
+        if expected_identity is not None:
+            _validate_regular_identity(handle, expected_identity=expected_identity, path=path)
+            digest, _size = _hash_handle(handle)
+            if digest != expected_sha256:
+                raise RuntimeError("write target content changed before transactional commit")
+        else:
+            _validate_regular_identity(handle, expected_identity=None, path=path)
+        _write_handle(handle, data)
+        kernel32.CloseHandle(handle)
+        handle = None
+        _finish_transaction(transaction, commit=True)
+        committed = True
+    finally:
+        if handle is not None:
+            kernel32.CloseHandle(handle)
+        if not committed:
+            _finish_transaction(transaction, commit=False)
+        kernel32.CloseHandle(transaction)
+
+
+def transactional_delete(
+    path: Path,
+    *,
+    expected_identity: tuple[int, int],
+    expected_sha256: str,
+) -> None:
+    """Atomically validate and delete one local NTFS file inside one TxF transaction."""
+    if os.name != "nt":
+        raise OSError("transactional workspace delete requires Windows")
+    kernel32 = _kernel32()
+    transaction = _create_transaction("Windows Local MCP workspace delete")
+    handle: Any | None = None
+    committed = False
+    try:
+        handle = _open_transacted(path, transaction, exists=True, delete=True)
+        _validate_regular_identity(handle, expected_identity=expected_identity, path=path)
+        digest, _size = _hash_handle(handle)
+        if digest != expected_sha256:
+            raise RuntimeError("delete target content changed before transactional commit")
+        disposition = _FileDispositionInfo(True)
+        if not kernel32.SetFileInformationByHandle(
+            handle,
+            _FILE_DISPOSITION_INFO_CLASS,
+            ctypes.byref(disposition),
+            ctypes.sizeof(disposition),
+        ):
+            _raise_last_error("SetFileInformationByHandle(FileDispositionInfo)", path)
+        kernel32.CloseHandle(handle)
+        handle = None
+        _finish_transaction(transaction, commit=True)
+        committed = True
+    finally:
+        if handle is not None:
+            kernel32.CloseHandle(handle)
+        if not committed:
+            _finish_transaction(transaction, commit=False)
+        kernel32.CloseHandle(transaction)
+
+
+def probe_transactional_workspace_commit(directory: Path) -> None:
+    """Require usable TxF semantics for the workspace mutation boundary on Windows."""
+    if os.name != "nt":
+        return
+    first = directory / f".wlmcp-txf-probe-{os.getpid()}.existing"
+    created = directory / f".wlmcp-txf-probe-{os.getpid()}.created"
+    try:
+        first.write_bytes(b"before")
+        identity = windows_file_identity(first)
+        transactional_write_bytes(
+            first,
+            b"after",
+            expected_identity=(identity.volume_serial, identity.file_index),
+            expected_sha256=hashlib.sha256(b"before").hexdigest(),
+        )
+        if first.read_bytes() != b"after":
+            raise RuntimeError("TxF existing-file commit did not become visible")
+        transactional_write_bytes(
+            created,
+            b"created",
+            expected_identity=None,
+            expected_sha256=None,
+        )
+        if created.read_bytes() != b"created":
+            raise RuntimeError("TxF create commit did not become visible")
+        created_identity = windows_file_identity(created)
+        transactional_delete(
+            created,
+            expected_identity=(created_identity.volume_serial, created_identity.file_index),
+            expected_sha256=hashlib.sha256(b"created").hexdigest(),
+        )
+        if created.exists():
+            raise RuntimeError("TxF delete commit did not become visible")
+    except OSError as error:
+        raise RuntimeError(
+            "workspace filesystem does not provide required Transactional NTFS commit semantics"
+        ) from error
+    finally:
+        first.unlink(missing_ok=True)
+        created.unlink(missing_ok=True)
