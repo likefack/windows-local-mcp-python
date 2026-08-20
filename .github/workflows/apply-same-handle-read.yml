@@ -36,6 +36,8 @@ jobs:
         shell: pwsh
         run: |
           python tools/_same_handle_read_fix.py 2>&1 | Tee-Object -FilePath patch.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python tools/_same_handle_read_correction.py 2>&1 | Tee-Object -FilePath patch.log -Append
           exit $LASTEXITCODE
 
       - name: Install package and dev checks
@@ -82,7 +84,7 @@ jobs:
         continue-on-error: true
         shell: pwsh
         run: |
-          python -m compileall -q src tests tools/_same_handle_read_fix.py 2>&1 | Tee-Object -FilePath compileall.log
+          python -m compileall -q src tests tools/_same_handle_read_fix.py tools/_same_handle_read_correction.py 2>&1 | Tee-Object -FilePath compileall.log
           exit $LASTEXITCODE
 
       - name: Diff whitespace check
@@ -105,6 +107,7 @@ jobs:
         shell: pwsh
         run: |
           Remove-Item tools/_same_handle_read_fix.py
+          Remove-Item tools/_same_handle_read_correction.py
           Remove-Item .github/workflows/apply-same-handle-read.yml
           git add -A
           git config user.name "github-actions[bot]"
