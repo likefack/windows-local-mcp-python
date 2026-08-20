@@ -32,7 +32,9 @@ jobs:
           python-version: "3.12"
 
       - name: Apply deterministic atomic-commit patch
-        run: python tools/_finalize_atomic_commit.py
+        run: |
+          python tools/_finalize_atomic_commit.py
+          python tools/_fix_wfp_test_assertion.py
 
       - name: Install package and dev checks
         run: |
@@ -40,7 +42,7 @@ jobs:
           python -m pip install -e ".[dev]"
 
       - name: Focused workspace race and recovery tests
-        run: python -m pytest -q tests/test_workspace_transaction_commit.py tests/test_server_operations.py tests/test_timeline_and_rollback.py
+        run: python -m pytest -q tests/test_workspace_transaction_commit.py tests/test_server_operations.py tests/test_timeline_and_rollback.py tests/test_wfp_guard_runtime.py::test_named_pipe_reports_actual_client_process_id
 
       - name: Full pytest
         run: python -m pytest
@@ -59,6 +61,7 @@ jobs:
         shell: bash
         run: |
           git rm tools/_finalize_atomic_commit.py
+          git rm tools/_fix_wfp_test_assertion.py
           git rm .github/workflows/finalize-atomic-commit.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
