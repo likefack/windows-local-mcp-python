@@ -109,7 +109,8 @@ def _tree_paths(tree: RuntimeTree) -> tuple[set[Path], set[Path]]:
     return directories, files
 
 
-def _add_lexical_runtime_ancestors(directories: set[Path], files: set[Path]) -> None:
+def _validate_lexical_runtime_ancestors() -> None:
+    """Reject lexical reparse ancestry without over-scoping unrelated parent creation rights."""
     values = [
         Path(__file__).absolute(),
         Path(sys.executable).absolute(),
@@ -123,16 +124,10 @@ def _add_lexical_runtime_ancestors(directories: set[Path], files: set[Path]) -> 
     for value in values:
         current = value
         while True:
-            if current.exists():
-                if _is_reparse(current):
-                    raise RuntimeError(
-                        f"Approved Host runtime lexical path contains a reparse point: {current}"
-                    )
-                resolved = current.resolve(strict=True)
-                if current.is_file():
-                    files.add(resolved)
-                elif current.is_dir():
-                    directories.add(resolved)
+            if current.exists() and _is_reparse(current):
+                raise RuntimeError(
+                    f"Approved Host runtime lexical path contains a reparse point: {current}"
+                )
             if current == Path(current.anchor):
                 break
             current = current.parent
@@ -156,7 +151,7 @@ def _runtime_paths(
     directories.update(inventory.security_paths)
     files: set[Path] = set(inventory.files)
     if not supplied_inventory:
-        _add_lexical_runtime_ancestors(directories, files)
+        _validate_lexical_runtime_ancestors()
 
     # The postflight digest intentionally hashes only the declared dependency closure for
     # performance. Approved Host needs a stronger invariant: every existing file under an
