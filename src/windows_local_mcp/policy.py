@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import ClassVar
 
-from pydantic import BaseModel
+from pydantic import BaseModel, PrivateAttr
 
 from .config import Settings
 from .paths import Workspace
@@ -22,6 +22,7 @@ class NormalizedCommand(BaseModel):
     program_key: str
     network_expected: bool = False
     executable_identity: dict[str, object] | None = None
+    _cwd_hold: Path | None = PrivateAttr(default=None)
 
 
 class CommandPolicy:
@@ -146,7 +147,7 @@ class CommandPolicy:
         identity = capture_executable_identity(
             executable, provenance="approval-request"
         )
-        return NormalizedCommand(
+        normalized = NormalizedCommand(
             executable=str(identity["path"]),
             args=list(command[1:]),
             cwd=str(cwd_path),
@@ -155,6 +156,8 @@ class CommandPolicy:
             network_expected=network_expected,
             executable_identity=identity,
         )
+        normalized._cwd_hold = cwd_path
+        return normalized
 
     def _require_host_capability(self, key: str) -> None:
         if key == "git":
@@ -385,7 +388,7 @@ class CommandPolicy:
         cwd: Path,
         program_key: str,
     ) -> NormalizedCommand:
-        return NormalizedCommand(
+        normalized = NormalizedCommand(
             executable=str(executable_identity["path"]),
             args=args,
             cwd=str(cwd),
@@ -394,6 +397,8 @@ class CommandPolicy:
             network_expected=False,
             executable_identity=executable_identity,
         )
+        normalized._cwd_hold = cwd
+        return normalized
 
 
 def approval_hash(

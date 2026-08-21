@@ -508,11 +508,22 @@ class Workspace:
                     allow_hardlinks=False,
                     readable=access == "read" if readable is None else readable,
                 )
-        return resolved
+            return resolved
+        if resolved.is_dir():
+            if hold_identity:
+                return hold_verified_path(
+                    resolved,
+                    allow_directory=True,
+                    allow_hardlinks=True,
+                    readable=False,
+                )
+            return resolved
+        raise PermissionError(f"path is not a regular file or directory: {resolved}")
 
     def resolve_directory(self, user_path: str, *, access: str = "read") -> Path:
         path = self.resolve_existing(user_path, allow_directory=True, access=access)
         if not path.is_dir():
+            release_verified_hold(path)
             raise NotADirectoryError(f"not a directory: {path}")
         return path
 

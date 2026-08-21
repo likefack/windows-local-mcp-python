@@ -10,6 +10,7 @@ from pathlib import Path
 from .child_env import build_command_environment
 from .config import Settings
 from .network_isolation import apply_safe_network_environment
+from .paths import hold_verified_path, release_verified_hold
 from .process_utils import capture_process_identity, creation_flags, terminate_process_tree
 from .resources import BoundedStreamCapture
 from .tool_safety import hold_executable_identity, trusted_helper_identity
@@ -22,6 +23,18 @@ class SafeProcessResult:
     stderr: bytes
     stdout_truncated: bool
     stderr_truncated: bool
+
+
+def _hold_cwd(path: str) -> Path:
+    held = hold_verified_path(
+        Path(path),
+        allow_directory=True,
+        allow_hardlinks=True,
+    )
+    if not held.is_dir():
+        release_verified_hold(held)
+        raise NotADirectoryError(f"safe subprocess cwd is not a directory: {path}")
+    return held
 
 
 def run_safe_process(
@@ -71,7 +84,10 @@ def run_safe_process(
     process: subprocess.Popen[bytes] | None = None
     stdout_capture: BoundedStreamCapture | None = None
     stderr_capture: BoundedStreamCapture | None = None
+    cwd_hold: Path | None = None
     try:
+        cwd_hold = _hold_cwd(effective_cwd)
+        effective_cwd = str(cwd_hold)
         hold = (
             nullcontext(Path(str(executable_identity["path"])))
             if executable_already_held
@@ -119,6 +135,8 @@ def run_safe_process(
             stderr_capture.join()
         if process is not None and hasattr(process, "close"):
             process.close()
+        if cwd_hold is not None:
+            release_verified_hold(cwd_hold)
         stdout_path.unlink(missing_ok=True)
         stderr_path.unlink(missing_ok=True)
         if runtime_root is not None:
@@ -138,7 +156,7 @@ def run_safe_process_batch(
     executable_identity: dict[str, object] | None = None,
     executable_already_held: bool = False,
 ) -> list[SafeProcessResult]:
-    """Run a fixed helper batch under one executable replacement-denial hold."""
+    """Run a fixed helper batch under one executable and cwd replacement-denial hold."""
     if not commands:
         return []
     if executable_already_held and executable_identity is None:
@@ -152,17 +170,21 @@ def run_safe_process_batch(
         if executable_already_held
         else hold_executable_identity(identity)
     )
-    with hold:
-        return [
-            run_safe_process(
-                settings=settings,
-                program_key=program_key,
-                command=command,
-                cwd=cwd,
-                timeout=timeout,
-                output_limit=output_limit,
-                executable_identity=identity,
-                executable_already_held=True,
-            )
-            for command in commands
-        ]
+    cwd_hold = _hold_cwd(cwd)
+    try:
+        with hold:
+            return [
+                run_safe_process(
+                    settings=settings,
+                    program_key=program_key,
+                    command=command,
+                    cwd=str(cwd_hold),
+                    timeout=timeout,
+                    output_limit=output_limit,
+                    executable_identity=identity,
+                    executable_already_held=True,
+                )
+                for command in commands
+            ]
+    finally:
+        release_verified_hold(cwd_hold)
