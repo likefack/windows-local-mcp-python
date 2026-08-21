@@ -368,7 +368,6 @@ def run_operation(operation_id: str, settings: Settings) -> int:
                 host_control_locks.close()
             return 1
 
-    argv = build_process_argv(executable, args)
     child: Any | None = None
     child_identity: ProcessIdentity | None = None
     child_write_baseline: int | None = None
@@ -498,6 +497,7 @@ def run_operation(operation_id: str, settings: Settings) -> int:
             pass
         if operation["tier"] == "broker" and normalized.get("program_key") == "adb":
             cwd = str(runtime_root)
+        argv = build_process_argv(executable, args, cwd=cwd)
         runtime_limit = min(
             settings.approval_manifest_max_bytes + settings.max_write_bytes,
             settings.max_data_dir_bytes // 2,

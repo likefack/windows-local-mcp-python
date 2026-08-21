@@ -12,6 +12,7 @@ from windows_local_mcp.config import Settings
 from windows_local_mcp.git_snapshot import capture_git_snapshot
 from windows_local_mcp.paths import Workspace
 from windows_local_mcp.policy import CommandPolicy
+from windows_local_mcp.process_utils import build_process_argv
 from windows_local_mcp.safe_process import SafeProcessResult, run_safe_process
 
 
@@ -81,6 +82,22 @@ def test_normalized_broker_command_keeps_cwd_hold_alive(
         os.rename(target, moved)
 
     del normalized
+    gc.collect()
+    os.rename(target, moved)
+    assert moved.is_dir()
+
+
+def test_process_argv_pins_cwd_until_argv_is_released(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    target = settings.workspace_root / "safe"
+    target.mkdir()
+    moved = settings.workspace_root / "moved"
+
+    argv = build_process_argv("tool.exe", [], cwd=target)
+    with pytest.raises(OSError):
+        os.rename(target, moved)
+
+    del argv
     gc.collect()
     os.rename(target, moved)
     assert moved.is_dir()

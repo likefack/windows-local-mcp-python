@@ -89,17 +89,39 @@ def _hold_broker_git_pathspecs(executable: str, args: list[str]) -> list[Path]:
         raise
 
 
-def build_process_argv(executable: str, args: list[str]) -> list[str]:
+def _hold_process_cwd(cwd: str | Path) -> Path:
+    held = hold_verified_path(
+        Path(cwd),
+        allow_directory=True,
+        allow_hardlinks=True,
+    )
+    if not held.is_dir():
+        raise NotADirectoryError(f"process cwd is not a directory: {cwd}")
+    return held
+
+
+def build_process_argv(
+    executable: str,
+    args: list[str],
+    *,
+    cwd: str | Path | None = None,
+) -> list[str]:
     holds = _hold_broker_git_pathspecs(executable, args)
-    suffix = Path(executable).suffix.casefold()
-    if os.name == "nt" and suffix in {".bat", ".cmd"}:
-        command_line = " ".join(
-            [_quote_cmd_arg(executable), *(_quote_cmd_arg(arg) for arg in args)]
-        )
-        values = [windows_system_executable("cmd.exe"), "/d", "/s", "/c", command_line]
-    else:
-        values = [executable, *args]
-    return _HeldArgv(values, holds)
+    try:
+        if cwd is not None:
+            holds.append(_hold_process_cwd(cwd))
+        suffix = Path(executable).suffix.casefold()
+        if os.name == "nt" and suffix in {".bat", ".cmd"}:
+            command_line = " ".join(
+                [_quote_cmd_arg(executable), *(_quote_cmd_arg(arg) for arg in args)]
+            )
+            values = [windows_system_executable("cmd.exe"), "/d", "/s", "/c", command_line]
+        else:
+            values = [executable, *args]
+        return _HeldArgv(values, holds)
+    except Exception:
+        holds.clear()
+        raise
 
 
 def creation_flags() -> int:
