@@ -18,6 +18,12 @@
 - 以前のタスクで有効だったローカルの skill path が、別タスクや別実行環境でも有効だと仮定しない。
 - skill path の探索失敗は、リポジトリ本体の問題や対象機能の失敗として扱わない。
 
+## 開発用一時出力
+
+- 開発・テスト用の一時出力は、原則としてリポジトリルートの `.dev-tmp/` 配下に置く。
+- pytest で明示的な `--basetemp` が必要な場合は `.dev-tmp/pytest/<purpose>` を使い、リポジトリルート直下へ新しい `.pytest-tmp-*` を作らない。
+- 一時ファイルやキャッシュの整理を目的として ACL や owner を変更せず、`takeown` や `icacls` による権限取得を行わない。
+
 ## Windows Sandbox 実機検証
 
 - Codex Desktop 自身の Sandbox 内から、さらに Codex Windows Sandbox を起動した入れ子実行の結果を、通常 Windows host 上の実機検証結果として扱わない。

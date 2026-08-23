@@ -30,9 +30,10 @@ packages = ["src/windows_local_mcp"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-addopts = ["--basetemp=.pytest-tmp-default", "-p", "no:cacheprovider"]
+addopts = ["--basetemp=.dev-tmp/pytest/default", "-p", "no:cacheprovider"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-extend-exclude = [".pytest-tmp-*"]
+cache-dir = ".dev-tmp/ruff"
+extend-exclude = [".dev-tmp", ".pytest-tmp-*"]
