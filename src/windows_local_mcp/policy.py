@@ -276,10 +276,13 @@ class CommandPolicy:
 
         return [
             "--no-pager",
+            "--no-optional-locks",
             "-c",
             "core.fsmonitor=false",
             "-c",
             "core.untrackedCache=false",
+            "-c",
+            "diff.autoRefreshIndex=false",
             "-c",
             "diff.external=",
             "-c",

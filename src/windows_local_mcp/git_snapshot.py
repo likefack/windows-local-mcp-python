@@ -37,10 +37,13 @@ def capture_git_snapshot(
         git_base = [
             git,
             "--no-pager",
+            "--no-optional-locks",
             "-c",
             "core.fsmonitor=false",
             "-c",
             "core.untrackedCache=false",
+            "-c",
+            "diff.autoRefreshIndex=false",
             "-c",
             "diff.external=",
             "-c",
