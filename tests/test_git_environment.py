@@ -8,6 +8,8 @@ import pytest
 from windows_local_mcp.config import Settings, load_settings
 from windows_local_mcp.git_env import sanitized_git_environment
 from windows_local_mcp.git_snapshot import capture_git_snapshot
+from windows_local_mcp.paths import Workspace
+from windows_local_mcp.policy import CommandPolicy
 from windows_local_mcp.util import sha256_file
 
 
@@ -81,9 +83,7 @@ def test_load_settings_strips_unapproved_process_environment(
     assert os.environ["LOCAL_MCP_CONFIG"] == str(config)
 
 
-def test_git_snapshot_ignores_hostile_repository_environment(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_git_snapshot_is_disabled_even_with_trusted_git_executable(tmp_path: Path) -> None:
     git = shutil.which("git.exe") or shutil.which("git")
     if git is None:
         pytest.skip("Git is not installed")
@@ -97,59 +97,6 @@ def test_git_snapshot_ignores_hostile_repository_environment(
         check=True,
         shell=False,
     )
-    data = tmp_path / "data"
-    settings = Settings(
-        workspace_root=workspace,
-        data_dir=data,
-        protect_data_dir_acl=False,
-        git_enabled=True,
-        git_executable_path=Path(git),
-        git_executable_sha256=sha256_file(Path(git))[0],
-    )
-    settings.ensure_directories()
-
-    monkeypatch.setenv("GIT_DIR", str(tmp_path / "not-a-repository"))
-    monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path / "outside-worktree"))
-    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
-    monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.bare")
-    monkeypatch.setenv("GIT_CONFIG_VALUE_0", "true")
-    from windows_local_mcp import tool_safety
-
-    real_hash = tool_safety._sha256_file
-    helper_hash_count = 0
-
-    def counted_hash(path: Path) -> str:
-        nonlocal helper_hash_count
-        helper_hash_count += 1
-        return real_hash(path)
-
-    monkeypatch.setattr(tool_safety, "_sha256_file", counted_hash)
-
-    snapshot = capture_git_snapshot(settings=settings, operation_id="git-env", stage="test")
-
-    assert snapshot is not None
-    content = Path(snapshot).read_text(encoding="utf-8")
-    assert "===== status exit=0 =====" in content
-    assert "===== branch exit=0 =====" in content
-    assert helper_hash_count == (2 if os.name == "nt" else 3)
-
-
-def test_git_snapshot_does_not_climb_to_parent_repository(tmp_path: Path) -> None:
-    git = shutil.which("git.exe") or shutil.which("git")
-    if git is None:
-        pytest.skip("Git is not installed")
-
-    parent = tmp_path / "parent"
-    parent.mkdir()
-    subprocess.run(
-        [git, "init", str(parent)],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        check=True,
-        shell=False,
-    )
-    workspace = parent / "nested-workspace"
-    workspace.mkdir()
     settings = Settings(
         workspace_root=workspace,
         data_dir=tmp_path / "data",
@@ -162,8 +109,52 @@ def test_git_snapshot_does_not_climb_to_parent_repository(tmp_path: Path) -> Non
 
     snapshot = capture_git_snapshot(
         settings=settings,
-        operation_id="nested-parent",
+        operation_id="git-disabled",
         stage="test",
     )
 
+    assert snapshot is None
+
+
+def test_automatic_git_rejects_workspace_gitfile_pointing_outside(tmp_path: Path) -> None:
+    git = shutil.which("git.exe") or shutil.which("git")
+    if git is None:
+        pytest.skip("Git is not installed")
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    subprocess.run(
+        [git, "init", str(outside)],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        check=True,
+        shell=False,
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / ".git").write_text(
+        f"gitdir: {outside / '.git'}\n",
+        encoding="utf-8",
+    )
+    settings = Settings(
+        workspace_root=workspace,
+        data_dir=tmp_path / "data",
+        protect_data_dir_acl=False,
+        git_enabled=True,
+        git_executable_path=Path(git),
+        git_executable_sha256=sha256_file(Path(git))[0],
+    )
+    settings.ensure_directories()
+
+    policy = CommandPolicy(settings, Workspace(settings))
+    with pytest.raises(
+        PermissionError, match="automatic Git broker execution is disabled"
+    ):
+        policy.normalize_safe(program="git", args=["status", "--short"], cwd=".")
+
+    snapshot = capture_git_snapshot(
+        settings=settings,
+        operation_id="external-gitdir",
+        stage="test",
+    )
     assert snapshot is None
