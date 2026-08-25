@@ -187,6 +187,12 @@ def trusted_helper_identity(settings: Any, program_key: str) -> dict[str, Any]:
             f"{program_key} is enabled but unavailable: configure both "
             f"{program_key}_executable_path and {program_key}_executable_sha256"
         )
+    if program_key == "git":
+        raise PermissionError(
+            "automatic Git broker execution is disabled because workspace-controlled "
+            "repository metadata cannot be safely confined to workspace_root; "
+            "use an explicitly human-approved execution route"
+        )
     executable = ensure_external_tool_executable(
         configured_path,
         workspace_root=settings.workspace_root,

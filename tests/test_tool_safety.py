@@ -28,13 +28,29 @@ def make_settings(tmp_path: Path, executable: Path, digest: str) -> Settings:
     return settings
 
 
-def test_broker_helper_requires_matching_explicit_hash(tmp_path: Path) -> None:
+def test_automatic_git_broker_helper_is_disabled_with_valid_trust_anchor(
+    tmp_path: Path,
+) -> None:
     executable = tmp_path / "git.exe"
     executable.write_bytes(b"trusted-git")
     digest = sha256(executable.read_bytes()).hexdigest()
     settings = make_settings(tmp_path, executable, digest)
 
-    identity = trusted_helper_identity(settings, "git")
+    with pytest.raises(
+        PermissionError, match="automatic Git broker execution is disabled"
+    ):
+        trusted_helper_identity(settings, "git")
+
+
+def test_adb_broker_helper_requires_matching_explicit_hash(tmp_path: Path) -> None:
+    executable = tmp_path / "adb.exe"
+    executable.write_bytes(b"trusted-adb")
+    digest = sha256(executable.read_bytes()).hexdigest()
+    settings = make_settings(tmp_path, executable, digest)
+    settings.adb_executable_path = executable
+    settings.adb_executable_sha256 = digest
+
+    identity = trusted_helper_identity(settings, "adb")
     assert identity["path"] == str(executable.resolve())
     assert identity["sha256"] == digest
     assert identity["provenance"] == "explicit-local-config"
@@ -44,9 +60,9 @@ def test_broker_helper_requires_matching_explicit_hash(tmp_path: Path) -> None:
         assert stable_identity["volume_serial_number"] >= 0
         assert stable_identity["file_index"] > 0
 
-    settings.git_executable_sha256 = "0" * 64
+    settings.adb_executable_sha256 = "0" * 64
     with pytest.raises(PermissionError, match="SHA-256"):
-        trusted_helper_identity(settings, "git")
+        trusted_helper_identity(settings, "adb")
 
 
 def test_stale_executable_identity_is_rejected(tmp_path: Path) -> None:

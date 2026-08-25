@@ -10,7 +10,12 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from .config import Settings
-from .paths import Workspace, hold_verified_path, read_verified_bytes
+from .paths import (
+    Workspace,
+    hold_verified_path,
+    read_verified_bytes,
+    release_verified_hold,
+)
 from .policy import NormalizedCommand
 from .resources import (
     NamedControlPlaneLock,
@@ -18,7 +23,6 @@ from .resources import (
     enforce_data_quota,
     scan_directory_bounded,
 )
-from .safe_process import run_safe_process_batch
 from .util import canonical_json, sha256_bytes, sha256_text
 
 _CODE_LOADERS = {
@@ -37,6 +41,53 @@ _CODE_LOADERS = {
     "bash",
     "sh",
 }
+
+
+class _EntryBudget:
+    """Bound every traversed filesystem entry across one approval staging operation."""
+
+    def __init__(self, settings: Settings) -> None:
+        self.limit = max(128, settings.approval_manifest_max_files * 4)
+        self.count = 0
+
+    def consume(self) -> None:
+        self.count += 1
+        if self.count > self.limit:
+            raise ValueError("approval staging filesystem entry count exceeds limit")
+
+
+def _sandbox_scratch_entry_limit(settings: Settings) -> int:
+    # Charge at least one 4 KiB allocation unit per directory/file entry so empty directory
+    # trees cannot bypass the byte-oriented scratch quota through filesystem metadata alone.
+    return max(1024, settings.max_sandbox_scratch_bytes // 4096)
+
+
+def _enforce_sandbox_scratch_quota(
+    settings: Settings, *, admission: bool = False
+) -> None:
+    assert settings.sandbox_scratch_dir is not None
+    entry_limit = _sandbox_scratch_entry_limit(settings)
+    usage = scan_directory_bounded(
+        settings.sandbox_scratch_dir,
+        stop_after_bytes=settings.max_sandbox_scratch_bytes,
+        stop_after_entries=entry_limit,
+        reject_alternate_streams=True,
+        reject_reparse_points=True,
+    )
+    if admission:
+        exceeded = (
+            usage.total_bytes >= settings.max_sandbox_scratch_bytes
+            or usage.entry_count >= entry_limit
+        )
+        message = "sandbox scratch admission limit reached"
+    else:
+        exceeded = (
+            usage.total_bytes > settings.max_sandbox_scratch_bytes
+            or usage.entry_count > entry_limit
+        )
+        message = "approval staging exceeds sandbox scratch resource limits"
+    if exceeded:
+        raise RuntimeError(message)
 
 
 def _approval_staging_serialized(function: Any) -> Any:
@@ -63,11 +114,7 @@ def prepare_approval_bundle(
     """Bind approval to executable bytes and immutable copies of behavior inputs."""
     manifest_root = settings.data_dir / "approval-staging" / operation_id
     assert settings.sandbox_scratch_dir is not None
-    if directory_size(
-        settings.sandbox_scratch_dir,
-        stop_after=settings.max_sandbox_scratch_bytes,
-    ) >= settings.max_sandbox_scratch_bytes:
-        raise RuntimeError("sandbox scratch admission limit reached")
+    _enforce_sandbox_scratch_quota(settings, admission=True)
     stage_root = settings.sandbox_scratch_dir / "approval-inputs" / operation_id
     if manifest_root.exists() or stage_root.exists():
         raise RuntimeError("approval staging directory already exists")
@@ -91,6 +138,7 @@ def prepare_approval_bundle(
         "execution_staging_root": str(stage_root),
     }
     execution = normalized.model_copy(deep=True)
+    entry_budget = _EntryBudget(settings)
 
     try:
         manifest["external_inputs"] = _validate_external_arguments(
@@ -109,6 +157,7 @@ def prepare_approval_bundle(
                 destination=staged_cwd,
                 settings=settings,
                 workspace=workspace,
+                entry_budget=entry_budget,
             )
             manifest["mode"] = (
                 "staged-workspace-write" if workspace_write else "staged-cwd"
@@ -129,6 +178,7 @@ def prepare_approval_bundle(
                     settings=settings,
                     workspace=workspace,
                     records=records,
+                    entry_budget=entry_budget,
                 )
                 records.extend(dependency_records)
                 manifest["inputs"] = records
@@ -145,6 +195,7 @@ def prepare_approval_bundle(
                 destination=staged_workspace,
                 settings=settings,
                 workspace=workspace,
+                entry_budget=entry_budget,
             )
             manifest["inputs"] = records
             manifest["source_workspace"] = str(workspace.root)
@@ -163,11 +214,7 @@ def prepare_approval_bundle(
         _make_read_only(stage_root)
         _make_read_only(manifest_root)
         enforce_data_quota(settings)
-        if directory_size(
-            settings.sandbox_scratch_dir,
-            stop_after=settings.max_sandbox_scratch_bytes,
-        ) > settings.max_sandbox_scratch_bytes:
-            raise RuntimeError("approval staging exceeds max_sandbox_scratch_bytes")
+        _enforce_sandbox_scratch_quota(settings)
         return execution, manifest, digest
     except Exception:
         shutil.rmtree(stage_root, ignore_errors=True)
@@ -254,7 +301,7 @@ def verify_approval_bundle(
             settings=settings,
         )
         if current_state != manifest.get("git_state"):
-            raise RuntimeError("Git HEAD, index, or working tree changed after approval")
+            raise RuntimeError("Git metadata changed after approval")
     return NormalizedCommand.model_validate(manifest["execution"])
 
 
@@ -272,39 +319,58 @@ def materialize_execution_copy(
     expected_cwd = Path(str(manifest.get("staged_cwd", stage_root / "cwd")))
     if immutable_cwd != expected_cwd.resolve(strict=True):
         return normalized
+    _enforce_sandbox_scratch_quota(settings, admission=True)
     run_root = settings.sandbox_scratch_dir / "runs" / operation_id
     if run_root.exists():
         shutil.rmtree(run_root)
     run_root.mkdir(parents=True)
     run_cwd = run_root / "cwd"
-    shutil.copytree(immutable_cwd, run_cwd, symlinks=False)
-    _make_writable(run_cwd)
-    immutable_dependencies = stage_root / "dependencies"
-    if immutable_dependencies.exists():
-        run_dependencies = run_root / "dependencies"
-        shutil.copytree(immutable_dependencies, run_dependencies, symlinks=False)
-        package_config = run_cwd / ".dart_tool" / "package_config.json"
-        if package_config.exists():
-            payload = json.loads(package_config.read_text(encoding="utf-8"))
-            for item in payload.get("packages", []):
-                root_uri = str(item.get("rootUri", ""))
-                parsed = urlparse(root_uri)
-                if parsed.scheme != "file":
-                    continue
-                staged_dependency = Path(unquote(parsed.path.lstrip("/")))
-                if os.name == "nt" and parsed.path.startswith("/"):
-                    staged_dependency = Path(unquote(parsed.path[1:]))
-                staged_dependency = staged_dependency.resolve(strict=True)
-                try:
-                    relative_dependency = staged_dependency.relative_to(
-                        immutable_dependencies.resolve(strict=True)
+    entry_budget = _EntryBudget(settings)
+    try:
+        _copy_external_tree_bounded(
+            source=immutable_cwd,
+            destination=run_cwd,
+            settings=settings,
+            entry_budget=entry_budget,
+            charge_data_dir=False,
+        )
+        _make_writable(run_cwd)
+        immutable_dependencies = stage_root / "dependencies"
+        if immutable_dependencies.exists():
+            run_dependencies = run_root / "dependencies"
+            _copy_external_tree_bounded(
+                source=immutable_dependencies,
+                destination=run_dependencies,
+                settings=settings,
+                entry_budget=entry_budget,
+                charge_data_dir=False,
+            )
+            package_config = run_cwd / ".dart_tool" / "package_config.json"
+            if package_config.exists():
+                payload = json.loads(package_config.read_text(encoding="utf-8"))
+                for item in payload.get("packages", []):
+                    root_uri = str(item.get("rootUri", ""))
+                    parsed = urlparse(root_uri)
+                    if parsed.scheme != "file":
+                        continue
+                    staged_dependency = Path(unquote(parsed.path.lstrip("/")))
+                    if os.name == "nt" and parsed.path.startswith("/"):
+                        staged_dependency = Path(unquote(parsed.path[1:]))
+                    staged_dependency = staged_dependency.resolve(strict=True)
+                    try:
+                        relative_dependency = staged_dependency.relative_to(
+                            immutable_dependencies.resolve(strict=True)
+                        )
+                    except ValueError:
+                        continue
+                    item["rootUri"] = (
+                        (run_dependencies / relative_dependency).as_uri().rstrip("/") + "/"
                     )
-                except ValueError:
-                    continue
-                item["rootUri"] = (
-                    (run_dependencies / relative_dependency).as_uri().rstrip("/") + "/"
-                )
-            package_config.write_text(canonical_json(payload), encoding="utf-8")
+                package_config.write_text(canonical_json(payload), encoding="utf-8")
+        _enforce_sandbox_scratch_quota(settings)
+    except Exception:
+        shutil.rmtree(run_root, ignore_errors=True)
+        raise
     result = normalized.model_copy(deep=True)
     result.args = [
         _rewrite_workspace_argument(value, immutable_cwd, run_cwd)
@@ -387,9 +453,11 @@ def _copy_tree_bounded(
     destination: Path,
     settings: Settings,
     workspace: Workspace,
+    entry_budget: _EntryBudget | None = None,
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     total = 0
+    budget = entry_budget or _EntryBudget(settings)
     initial_data_bytes = directory_size(
         settings.data_dir, stop_after=settings.max_data_dir_bytes
     )
@@ -404,6 +472,7 @@ def _copy_tree_bounded(
         relative_root = root_path.relative_to(source)
         filtered: list[str] = []
         for name in directories:
+            budget.consume()
             candidate = root_path / name
             if _is_reparse(candidate):
                 raise PermissionError(f"approval input contains a reparse point: {candidate}")
@@ -413,6 +482,7 @@ def _copy_tree_bounded(
         directories[:] = filtered
         (destination / relative_root).mkdir(parents=True, exist_ok=True)
         for name in files:
+            budget.consume()
             folded = name.casefold()
             if folded in blocked_files or (
                 folded.startswith(".env.") and folded != ".env.example"
@@ -450,6 +520,7 @@ def _stage_dart_package_dependencies(
     settings: Settings,
     workspace: Workspace,
     records: list[dict[str, Any]],
+    entry_budget: _EntryBudget,
 ) -> list[dict[str, Any]]:
     source_config = source_cwd / ".dart_tool" / "package_config.json"
     if not source_config.exists():
@@ -509,6 +580,7 @@ def _stage_dart_package_dependencies(
                     destination=staged_dependency,
                     settings=settings,
                     workspace=workspace,
+                    entry_budget=entry_budget,
                 )
             else:
                 if not any(
@@ -523,6 +595,7 @@ def _stage_dart_package_dependencies(
                     source=dependency,
                     destination=staged_dependency,
                     settings=settings,
+                    entry_budget=entry_budget,
                 )
             dependency_records.extend(new_records)
             copied[dependency] = staged_dependency
@@ -534,22 +607,32 @@ def _stage_dart_package_dependencies(
 
 
 def _copy_external_tree_bounded(
-    *, source: Path, destination: Path, settings: Settings
+    *,
+    source: Path,
+    destination: Path,
+    settings: Settings,
+    entry_budget: _EntryBudget | None = None,
+    charge_data_dir: bool = True,
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     total = 0
-    initial_data_bytes = directory_size(
-        settings.data_dir, stop_after=settings.max_data_dir_bytes
+    budget = entry_budget or _EntryBudget(settings)
+    initial_data_bytes = (
+        directory_size(settings.data_dir, stop_after=settings.max_data_dir_bytes)
+        if charge_data_dir
+        else 0
     )
     for root, directories, files in os.walk(source, followlinks=False):
         root_path = Path(root)
         relative_root = root_path.relative_to(source)
         for name in directories:
+            budget.consume()
             candidate = root_path / name
             if _is_reparse(candidate):
                 raise PermissionError(f"external dependency contains a reparse point: {candidate}")
         (destination / relative_root).mkdir(parents=True, exist_ok=True)
         for name in files:
+            budget.consume()
             source_file = root_path / name
             if _is_reparse(source_file) or not source_file.is_file():
                 raise PermissionError(
@@ -568,7 +651,7 @@ def _copy_external_tree_bounded(
                 raise ValueError("external dependencies exceed approval_manifest_max_files")
             if total > settings.approval_manifest_max_bytes:
                 raise ValueError("external dependencies exceed approval_manifest_max_bytes")
-            if initial_data_bytes + total > settings.max_data_dir_bytes:
+            if charge_data_dir and initial_data_bytes + total > settings.max_data_dir_bytes:
                 raise RuntimeError("data_dir quota exceeded while staging dependencies")
             target = destination / relative_root / name
             target.write_bytes(
@@ -723,6 +806,7 @@ def _source_inventory(
     inventory: dict[str, tuple[str, int]] = {}
     total = 0
     count = 0
+    entry_budget = _EntryBudget(settings)
     excluded_directories = {
         name.casefold()
         for name in settings.hidden_directories
@@ -731,6 +815,8 @@ def _source_inventory(
     blocked_files = {name.casefold() for name in settings.blocked_file_names}
     for root, directories, files in os.walk(source, followlinks=False):
         root_path = Path(root)
+        for _name in directories:
+            entry_budget.consume()
         directories[:] = [
             name
             for name in directories
@@ -740,6 +826,7 @@ def _source_inventory(
             if (root_path / name).is_symlink():
                 raise PermissionError("workspace inventory contains a reparse point")
         for name in files:
+            entry_budget.consume()
             folded = name.casefold()
             if folded in blocked_files or (
                 folded.startswith(".env.") and folded != ".env.example"
@@ -817,70 +904,107 @@ def _make_writable(root: Path) -> None:
             (Path(current) / name).chmod(0o644)
 
 
+def _git_metadata_root(
+    *, normalized: NormalizedCommand, settings: Settings
+) -> Path:
+    workspace_root = settings.workspace_root.resolve(strict=True)
+    current = Path(normalized.cwd).resolve(strict=True)
+    try:
+        current.relative_to(workspace_root)
+    except ValueError as error:
+        raise PermissionError("Git approval cwd escapes workspace_root") from error
+
+    while True:
+        marker = current / ".git"
+        if os.path.lexists(marker):
+            if _is_reparse(marker) or not marker.is_dir():
+                raise PermissionError(
+                    "Git approval requires repository metadata to be an in-workspace .git directory; "
+                    "gitfiles and reparse points are denied"
+                )
+            held = hold_verified_path(
+                marker,
+                allow_directory=True,
+                allow_hardlinks=True,
+            )
+            try:
+                Path(str(held)).relative_to(workspace_root)
+            except ValueError:
+                release_verified_hold(held)
+                raise PermissionError("Git repository metadata escapes workspace_root") from None
+            return held
+        if current == workspace_root:
+            break
+        current = current.parent
+    raise PermissionError("Git approval requires repository metadata inside workspace_root")
+
+
+def _git_metadata_inventory_once(
+    metadata_root: Path, settings: Settings
+) -> dict[str, tuple[str, int]]:
+    inventory: dict[str, tuple[str, int]] = {}
+    total = 0
+    count = 0
+    entry_budget = _EntryBudget(settings)
+    for root, directories, files in os.walk(metadata_root, followlinks=False):
+        root_path = Path(root)
+        for name in directories:
+            entry_budget.consume()
+            candidate = root_path / name
+            if _is_reparse(candidate):
+                raise PermissionError(
+                    f"Git repository metadata contains a reparse point: {candidate}"
+                )
+        for name in files:
+            entry_budget.consume()
+            source_file = root_path / name
+            if _is_reparse(source_file) or not source_file.is_file():
+                raise PermissionError(
+                    f"Git repository metadata contains a non-regular file: {source_file}"
+                )
+            checked = hold_verified_path(
+                source_file,
+                allow_directory=False,
+                allow_hardlinks=False,
+                readable=True,
+            )
+            try:
+                info = checked.stat()
+                total += info.st_size
+                count += 1
+                if count > settings.approval_manifest_max_files:
+                    raise ValueError(
+                        "Git repository metadata exceeds approval_manifest_max_files"
+                    )
+                if total > settings.approval_manifest_max_bytes:
+                    raise ValueError(
+                        "Git repository metadata exceeds approval_manifest_max_bytes"
+                    )
+                data = read_verified_bytes(
+                    checked, settings.approval_manifest_max_bytes
+                )
+                relative = Path(str(checked)).relative_to(metadata_root).as_posix()
+                inventory[relative] = (sha256_bytes(data), len(data))
+            finally:
+                release_verified_hold(checked)
+    return inventory
+
+
 def _capture_git_state(
     *, normalized: NormalizedCommand, settings: Settings
 ) -> dict[str, str]:
-    base = [
-        normalized.executable,
-        "--no-pager",
-        "-c",
-        "core.fsmonitor=false",
-        "-c",
-        "core.untrackedCache=false",
-        "-c",
-        "diff.external=",
-        "-c",
-        "credential.helper=",
-    ]
-    commands = {
-        "head": [*base, "-C", normalized.cwd, "rev-parse", "HEAD"],
-        "status": [
-            *base,
-            "-C",
-            normalized.cwd,
-            "status",
-            "--porcelain=v1",
-            "--untracked-files=all",
-        ],
-        "diff": [
-            *base,
-            "-C",
-            normalized.cwd,
-            "diff",
-            "--binary",
-            "--no-ext-diff",
-            "--no-textconv",
-        ],
-        "staged": [
-            *base,
-            "-C",
-            normalized.cwd,
-            "diff",
-            "--cached",
-            "--binary",
-            "--no-ext-diff",
-            "--no-textconv",
-        ],
-    }
-    per_stream = max(4096, settings.approval_manifest_max_bytes // (len(commands) * 2))
-    result: dict[str, str] = {}
-    captures = run_safe_process_batch(
-        settings=settings,
-        program_key="git",
-        commands=list(commands.values()),
-        cwd=normalized.cwd,
-        timeout=30,
-        output_limit=per_stream,
-    )
-    for (name, _command), captured in zip(
-        commands.items(), captures, strict=True
-    ):
-        if captured.returncode != 0:
-            raise RuntimeError(
-                "Git approval-state capture failed: "
-                + captured.stderr.decode("utf-8", errors="replace")[:2000]
-            )
-        if captured.stdout_truncated or captured.stderr_truncated:
-            raise ValueError("Git approval state exceeds approval_manifest_max_bytes")
-        result[name] = sha256_bytes(captured.stdout)
-    return result
+    """Bind Git metadata without executing Git or following repository indirections."""
+    metadata_root = _git_metadata_root(normalized=normalized, settings=settings)
+    try:
+        first = _git_metadata_inventory_once(metadata_root, settings)
+        second = _git_metadata_inventory_once(metadata_root, settings)
+        if first != second:
+            raise RuntimeError("Git repository metadata changed while approval state was captured")
+        return {
+            "metadata_root": Path(str(metadata_root))
+            .relative_to(settings.workspace_root.resolve(strict=True))
+            .as_posix(),
+            "metadata_digest": sha256_text(canonical_json(first)),
+        }
+    finally:
+        release_verified_hold(metadata_root)
