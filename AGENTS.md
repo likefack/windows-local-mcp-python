@@ -10,6 +10,14 @@
 - 文字化けした出力を内容判断、差分判断、セキュリティ判断に使用しない。文字化けを検出した場合は、その出力を破棄して UTF-8 を明示して読み直す。
 - Python で読む場合も `encoding="utf-8"` を明示する。
 
+## Codex Security scan の `userContext`
+
+- Windows 上で Codex Security scan を開始する場合、MCP へ渡す `userContext` は ASCII 文字だけで構成する。
+- 日本語の依頼内容を省略・弱化せず、同じ要件を ASCII の英語要約へ変換して渡す。詳細は UTF-8 の `SECURITY_CONTRACT.md`、`WFP_GUARD_VALIDATION.md`、`VERIFICATION.md` など、対象の正本文書を相対 path で参照させる。
+- `userContext` の文字数を減らす目的で security invariant、fail-closed 条件、禁止事項、検証範囲を落とさない。
+- この回避策は Windows の Codex Security helper が標準入力を CP932 として読む場合の文字化けと単独 surrogate の生成を避けるためのものであり、repository の UTF-8 文書や通常の日本語応答を ASCII 化する指示ではない。
+- Codex Security plugin の更新後は、現在インストールされている版の Windows launcher が `PYTHONIOENCODING=utf-8` を設定しているか確認する。更新でこのPC固有の修正が消えていた場合は、同じ設定を復元して Codex を再起動してから scan する。
+
 ## Codex skills の解決
 
 - skill の絶対パスを過去の実行環境から推測して決め打ちしない。
