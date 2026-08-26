@@ -213,6 +213,16 @@ def _distribution_closure() -> tuple[metadata.Distribution, ...]:
                     f"trusted runtime dependency is not installed: {requested}"
                 ) from error
             continue
+        name = distribution.metadata.get("Name")
+        if not isinstance(name, str) or not name.strip():
+            raise RuntimeError(
+                f"trusted runtime dependency has no valid distribution name: {requested}"
+            )
+        if _canonical_distribution_name(name) != canonical:
+            raise RuntimeError(
+                "trusted runtime dependency identity mismatch: "
+                f"requested={requested!r}, metadata_name={name!r}"
+            )
         result.append(distribution)
         for requirement in distribution.requires or ():
             match = _REQUIREMENT_NAME.match(requirement)
