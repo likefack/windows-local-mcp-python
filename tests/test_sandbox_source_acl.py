@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -106,3 +107,24 @@ def test_source_workspace_acl_guard_rejects_invalid_sid(tmp_path: Path) -> None:
 
     with pytest.raises(SourceWorkspaceAclError, match="SID is invalid"):
         ensure_source_workspace_read_deny(workspace, "not-a-sid")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows ACLs")
+def test_source_workspace_acl_guard_converges_on_real_windows_dacl(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    synthetic_sid = "S-1-5-21-111111111-222222222-333333333-444444444"
+
+    first = ensure_source_workspace_read_deny(workspace, synthetic_sid)
+    second = ensure_source_workspace_read_deny(workspace, synthetic_sid)
+
+    assert first["explicit_deny_read"] is True
+    assert first["inheritable_to_files"] is True
+    assert first["inheritable_to_directories"] is True
+    assert first["added"] is True
+    assert second["explicit_deny_read"] is True
+    assert second["inheritable_to_files"] is True
+    assert second["inheritable_to_directories"] is True
+    assert second["added"] is False
