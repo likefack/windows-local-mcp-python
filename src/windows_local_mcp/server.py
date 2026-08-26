@@ -23,6 +23,7 @@ from .approval import (
     prepare_approval_bundle,
     settings_digest,
 )
+from .approved_host_policy import require_approved_host_target
 from .audit import AuditStore
 from .command_traits import (
     SafeExecutionKind,
@@ -2440,6 +2441,8 @@ def _request_approved_command(
             except ValueError:
                 return False
 
+        if execution_tier == "approved_host":
+            require_approved_host_target(runtime.settings, normalized)
         if execution_tier == "approved_host" and (
             is_project_controlled_code_loader(normalized.program_key)
             or executable_inside(runtime.settings.workspace_root)
