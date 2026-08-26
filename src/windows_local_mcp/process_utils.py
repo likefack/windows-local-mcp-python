@@ -200,17 +200,24 @@ def wait_for_untracked_current_user_processes(
         time.sleep(min(0.05, remaining))
 
 
-def process_identity_matches(identity: ProcessIdentity) -> bool:
+def _verified_process(identity: ProcessIdentity) -> psutil.Process | None:
+    """Return the process object that was verified against the durable identity."""
     try:
         process = psutil.Process(identity.pid)
         if abs(process.create_time() - identity.create_time) > 0.01:
-            return False
+            return None
         executable = os.path.normcase(str(Path(process.exe()).resolve()))
         if executable != identity.executable:
-            return False
-        return _process_has_nonce(process, identity.nonce)
+            return None
+        if not _process_has_nonce(process, identity.nonce):
+            return None
+        return process
     except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
-        return False
+        return None
+
+
+def process_identity_matches(identity: ProcessIdentity) -> bool:
+    return _verified_process(identity) is not None
 
 
 def _process_has_nonce(process: psutil.Process, nonce: str) -> bool:
@@ -221,13 +228,10 @@ def _process_has_nonce(process: psutil.Process, nonce: str) -> bool:
 
 
 def terminate_process_tree(identity: ProcessIdentity, timeout: float = 8.0) -> bool:
-    """Terminate only when PID, creation time, executable, and nonce still match."""
-    if not process_identity_matches(identity):
+    """Terminate only the process object whose durable identity was verified."""
+    process = _verified_process(identity)
+    if process is None:
         return False
-    try:
-        process = psutil.Process(identity.pid)
-    except psutil.NoSuchProcess:
-        return True
 
     children = process.children(recursive=True)
     for child in children:
