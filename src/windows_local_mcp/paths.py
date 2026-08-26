@@ -142,8 +142,8 @@ class _HeldPath(_PathBase):
         "__weakref__",
         "_lease",
         "_lease_finalizer",
-        "_write_intent",
         "_listed_is_directory",
+        "_write_intent",
     )
 
     def __new__(cls, *parts: Any) -> Self:

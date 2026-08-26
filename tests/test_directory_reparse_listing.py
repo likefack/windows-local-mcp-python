@@ -41,8 +41,7 @@ def create_junction(link: Path, target: Path) -> None:
     subprocess.run(
         ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
         check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
     )
 
 
