@@ -2,8 +2,7 @@ from pathlib import Path
 
 import pytest
 
-import windows_local_mcp.approved_host_policy as approved_host_policy
-from windows_local_mcp import runtime_immutability
+from windows_local_mcp import approved_host_policy, runtime_immutability
 from windows_local_mcp.approved_host_policy import APPROVED_HOST_UNAVAILABLE_REASON
 from windows_local_mcp.audit import AuditStore
 from windows_local_mcp.config import Settings
