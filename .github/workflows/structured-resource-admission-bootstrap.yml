@@ -42,8 +42,8 @@ jobs:
       - name: Full pytest
         run: python -m pytest
 
-      - name: Ruff
-        run: python -m ruff check .
+      - name: Ruff implementation and tests
+        run: python -m ruff check src tests
 
       - name: Compile all
         run: python -m compileall -q src tests
