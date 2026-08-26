@@ -18,6 +18,7 @@ _CONTAINER_INHERIT_ACE = 0x02
 _INHERIT_ONLY_ACE = 0x08
 _INHERITED_ACE = 0x10
 _ACCESS_DENIED_ACE_TYPE = 0x01
+_FILE_READ_REQUIRED = 0x00020089
 _FILE_GENERIC_READ = 0x00120089
 _FILE_GENERIC_WRITE = 0x00120116
 _FILE_GENERIC_EXECUTE = 0x001200A0
@@ -274,7 +275,7 @@ def _inspect_source_workspace_read_deny(
             if not advapi32.EqualSid(sid_pointer, target):
                 continue
             mapped_mask = _mapped_file_read_mask(advapi32, int(ace.Mask))
-            if (mapped_mask & _FILE_GENERIC_READ) != _FILE_GENERIC_READ:
+            if (mapped_mask & _FILE_READ_REQUIRED) != _FILE_READ_REQUIRED:
                 continue
             return _ReadDenyState(
                 explicit_deny_read=True,
