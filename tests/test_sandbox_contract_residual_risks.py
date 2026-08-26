@@ -83,14 +83,15 @@ def _accepted_residual_risk_evidence(
     properties = {
         name: {"status": "verified"} for name in SANDBOX_SECURITY_PROPERTIES
     }
+    properties["protected_information_read"] = {"status": "failed"}
     properties["lan"] = {"status": "failed"}
     properties["descendant_containment"] = {"status": "failed"}
     checks = {name: True for name in MANDATORY_DESCENDANT_CHECKS}
     checks.update(
         {
-            "child_protected_information_denied": True,
+            "child_protected_information_denied": False,
             "child_lan_denied": False,
-            "grandchild_protected_information_denied": True,
+            "grandchild_protected_information_denied": False,
             "grandchild_lan_denied": False,
         }
     )
@@ -122,7 +123,7 @@ def _accepted_residual_risk_evidence(
     }
 
 
-def test_only_accepted_lan_failures_do_not_block_route(
+def test_accepted_workspace_protected_and_lan_failures_do_not_block_route(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = _settings(tmp_path)
@@ -139,8 +140,10 @@ def test_only_accepted_lan_failures_do_not_block_route(
     marker = settings.data_dir / "control-plane" / "sandbox-live-verification.json"
     marker.write_text(canonical_json(evidence), encoding="utf-8")
     accepted = require_codex_sandbox_live_verification(settings, backend)
-    assert accepted["properties"]["protected_information_read"]["status"] == "verified"
+    assert accepted["properties"]["protected_information_read"]["status"] == "failed"
     assert accepted["properties"]["lan"]["status"] == "failed"
+    assert accepted["checks"]["child_protected_information_denied"] is False
+    assert accepted["checks"]["grandchild_protected_information_denied"] is False
 
 
 def test_mandatory_descendant_failure_still_fails_closed(
@@ -165,8 +168,9 @@ def test_mandatory_descendant_failure_still_fails_closed(
         require_codex_sandbox_live_verification(settings, backend)
 
 
-def test_workspace_protected_information_failure_blocks_route(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("status", ["failed", "unverified"])
+def test_workspace_protected_information_is_accepted_residual_risk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str
 ) -> None:
     settings = _settings(tmp_path)
     monkeypatch.setattr(
@@ -177,11 +181,12 @@ def test_workspace_protected_information_failure_blocks_route(
     evidence = _accepted_residual_risk_evidence(settings, backend)
     properties = evidence["properties"]
     assert isinstance(properties, dict)
-    properties["protected_information_read"] = {"status": "failed"}
+    properties["protected_information_read"] = {"status": status}
+    properties["lan"] = {"status": "verified"}
 
-    assert sandbox_live_verification_route_eligible(evidence) is False
+    assert sandbox_live_verification_route_eligible(evidence) is True
 
     marker = settings.data_dir / "control-plane" / "sandbox-live-verification.json"
     marker.write_text(canonical_json(evidence), encoding="utf-8")
-    with pytest.raises(ApprovedSandboxUnavailable, match="missing, failed, or stale"):
-        require_codex_sandbox_live_verification(settings, backend)
+    accepted = require_codex_sandbox_live_verification(settings, backend)
+    assert accepted["properties"]["protected_information_read"]["status"] == status

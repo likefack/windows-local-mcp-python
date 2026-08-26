@@ -1,5 +1,13 @@
 # 検証記録
 
+## 2026-08-27 Sandbox workspace protected-read residual-risk policy correction
+
+- trusted operator の設計判断として、2026-08-14 に実機確認した workspace 内 protected information の direct-read failure は current v1 の受容済み残存 risk とする。2026-08-26 の snapshot-only source isolation は defense-in-depth として維持するが、この残存 risk を解消した保証とは扱わない。
+- `sandbox-state` の original workspace deny、immutable snapshot／operation 固有 run projection、protected file の staging exclusion、parent／child／grandchild の direct-read probe は維持する。probe の `failed`／`unverified` は削除・成功化せず evidence と capability 表示へ残す。
+- route gate では `protected_information_read` と対応する child／grandchild protected-information denial を LAN と同様の accepted residual risk として分離する。それらだけが `failed`／`unverified` でも、その他の mandatory property／descendant check が成立すれば `execution_route_available` を妨げない。
+- 一般 source-workspace read/write、workspace 外 user／protected read、control-plane read/write、Internet、未許可 loopback、termination、resource bound 等は引き続き mandatory であり、今回の受容範囲を拡張しない。
+- 下記 2026-08-26 記録の「protected-information denial を必須 property とする」という分類は、その時点の実装判断の履歴として残すが、この 2026-08-27 correction により current policy としては superseded された。snapshot-only mechanism 自体は supersede されない。
+
 ## 2026-08-27 Approved Host capability verification truthfulness
 
 - 修正前の `session_info()` は `assert_approved_host_runtime_immutable()` の成功だけで Approved Host capability 全体の `live_verified=true`、Windows では `windows_live_verified=true` を返していた。これは current runtime の immutability preflight という限定された evidence を、control-plane tamper detection、approval integrity、Job descendant handling、Job 外 same-user process detection、timeout termination を含む capability 全体の live verification へ拡張して表示していた。
@@ -12,7 +20,7 @@
 - Codex Sandbox の filesystem policy から original `workspace_root` の read capability を除去し、source workspace／`data_dir` を明示 deny、operation 固有 run projection だけを write root とする設計へ変更した。
 - open-ended Sandbox request は code-loader 名に依存せず bounded な full workspace projection を承認時に snapshot 化し、worker は immutable projection の検証後に writable run copy へ materialize する。workspace-relative cwd／sibling layout を維持する。
 - Approved Host は project-controlled code-loader と workspace 内 primary executable を request 時点で拒否する。
-- Sandbox isolation/state policy generation と isolation-context version を更新したため、旧 live-verification marker は意図的に stale になる。新 route は通常 Windows user 文脈で `verify-codex-sandbox` を再実行し、parent／child／grandchild の `source_workspace_read_denied`、source write denial、protected-information denialを含む必須 property が実測されるまで fail closed のままとする。
+- Sandbox isolation/state policy generation と isolation-context version を更新したため、旧 live-verification marker は意図的に stale になる。新 route は通常 Windows user 文脈で `verify-codex-sandbox` を再実行し、parent／child／grandchild の `source_workspace_read_denied`、source write denial、protected-information denialを含む必須 property が実測されるまで fail closed のままとする。この protected-information mandatory 分類は 2026-08-27 correction により current policy として superseded され、現在は direct-read probe を維持した accepted residual risk として扱う。
 - GitHub Hosted Windows で unit／integration／policy regression、Ruff、compileall を実行する。Hosted runner は installed production Codex Windows Sandbox の通常 user 実機境界ではないため、新しい source-read denial の OS-level 成立をそこで証明したとは扱わない。
 
 
