@@ -189,4 +189,16 @@ def test_approved_host_job_terminates_descendants_at_runtime_limit(tmp_path: Pat
     time.sleep(2.1)
     assert not late_write.exists()'''
 text = regex_once(text, pattern, replacement, "Approved Host Job termination regression")
+text = replace_once(
+    text,
+    '    assert result["status"] == "succeeded", operation\n    assert "SNAPSHOT RUNS INDEPENDENTLY" in result["stdout_preview"]',
+    '    assert result["status"] == "succeeded", {\n        "error": operation.get("error"),\n        "result": operation.get("result"),\n        "events": [event["event_type"] for event in operation["events"]],\n    }\n    assert "SNAPSHOT RUNS INDEPENDENTLY" in result["stdout_preview"]',
+    "snapshot positive diagnostic",
+)
+text = replace_once(
+    text,
+    '    assert result["status"] == "succeeded", operation\n    assert time.monotonic() - started >= 0.4',
+    '    assert result["status"] == "succeeded", {\n        "error": operation.get("error"),\n        "result": operation.get("result"),\n        "events": [event["event_type"] for event in operation["events"]],\n    }\n    assert time.monotonic() - started >= 0.4',
+    "descendant positive diagnostic",
+)
 write(path, text)
