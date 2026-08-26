@@ -55,3 +55,37 @@ append = '''\n\ndef test_workspace_protected_information_failure_blocks_route(\n
 if "def test_workspace_protected_information_failure_blocks_route(" not in text:
     text += append
 path.write_text(text, encoding="utf-8", newline="\n")
+
+
+path = Path("tests/test_mcp_stdio_integration.py")
+text = path.read_text(encoding="utf-8")
+old = '''            approval = await session.call_tool(
+                "request_host_command",
+                {
+                    "command": [sys.executable, "-c", "print('approval request only')"],
+                    "reason": "verify request-only MCP behavior",
+                    "risk_summary": "test request must not launch a child process",
+                },
+            )
+'''
+new = '''            rejected_project_host = await session.call_tool(
+                "request_host_command",
+                {
+                    "command": [sys.executable, "-c", "print('must stay sandboxed')"],
+                    "reason": "verify project-controlled code is rejected from Approved Host",
+                    "risk_summary": "test request must fail before approval creation",
+                },
+            )
+            assert rejected_project_host.is_error
+
+            approval = await session.call_tool(
+                "request_host_command",
+                {
+                    "command": [git, "status", "--short"],
+                    "reason": "verify explicit approved Git request-only MCP behavior",
+                    "risk_summary": "test request must not launch a child process",
+                },
+            )
+'''
+text = replace_once(text, old, new, "stdio Approved Host route")
+path.write_text(text, encoding="utf-8", newline="\n")
