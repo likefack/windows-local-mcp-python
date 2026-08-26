@@ -56,6 +56,7 @@ jobs:
             'src/windows_local_mcp/sandbox_live_verify.py',
             'src/windows_local_mcp/server.py',
             'tests/test_approval.py',
+            'tests/test_approval_execution_integration.py',
             'tests/test_mcp_stdio_integration.py',
             'tests/test_sandbox_architecture.py',
             'tests/test_sandbox_contract_residual_risks.py',
@@ -92,7 +93,7 @@ jobs:
       - name: Static checks for changed code
         shell: pwsh
         run: |
-          python -m ruff check src/windows_local_mcp/approval.py src/windows_local_mcp/config.py src/windows_local_mcp/sandbox_backend.py src/windows_local_mcp/sandbox_live_verify.py src/windows_local_mcp/server.py tests/test_approval.py tests/test_mcp_stdio_integration.py tests/test_sandbox_architecture.py tests/test_sandbox_contract_residual_risks.py tests/test_server_operations.py
+          python -m ruff check src/windows_local_mcp/approval.py src/windows_local_mcp/config.py src/windows_local_mcp/sandbox_backend.py src/windows_local_mcp/sandbox_live_verify.py src/windows_local_mcp/server.py tests/test_approval.py tests/test_approval_execution_integration.py tests/test_mcp_stdio_integration.py tests/test_sandbox_architecture.py tests/test_sandbox_contract_residual_risks.py tests/test_server_operations.py
           python -m compileall -q src tests
           git diff --check
 
@@ -113,7 +114,7 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git rm .github/fix_snapshot_only.py .github/fix_snapshot_only_followup.py .github/workflows/snapshot-only-finalize-main.yml
-          git add README.md SECURITY_CONTRACT.md SPEC.md VERIFICATION.md src/windows_local_mcp/approval.py src/windows_local_mcp/config.py src/windows_local_mcp/sandbox_backend.py src/windows_local_mcp/sandbox_live_verify.py src/windows_local_mcp/server.py tests/test_approval.py tests/test_mcp_stdio_integration.py tests/test_sandbox_architecture.py tests/test_sandbox_contract_residual_risks.py tests/test_server_operations.py
+          git add README.md SECURITY_CONTRACT.md SPEC.md VERIFICATION.md src/windows_local_mcp/approval.py src/windows_local_mcp/config.py src/windows_local_mcp/sandbox_backend.py src/windows_local_mcp/sandbox_live_verify.py src/windows_local_mcp/server.py tests/test_approval.py tests/test_approval_execution_integration.py tests/test_mcp_stdio_integration.py tests/test_sandbox_architecture.py tests/test_sandbox_contract_residual_risks.py tests/test_server_operations.py
           git diff --cached --check
           if (git status --porcelain | Select-String '^\?\?') { throw 'unexpected untracked files before final commit' }
           git commit -m 'Sandbox実行をsnapshotに隔離'
