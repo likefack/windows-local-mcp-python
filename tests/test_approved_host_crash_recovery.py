@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import os
 import sqlite3
 import subprocess
@@ -7,9 +5,11 @@ import sys
 import time
 from pathlib import Path
 
-from windows_local_mcp import control_plane
+import pytest
+
 from windows_local_mcp.audit import AuditStore
 from windows_local_mcp.config import Settings
+from windows_local_mcp.control_plane import control_plane_generation
 from windows_local_mcp.control_plane_guard import assert_control_plane_healthy
 from windows_local_mcp.executor import Executor
 
@@ -28,14 +28,14 @@ def _write_config(workspace: Path, data: Path, config: Path) -> None:
     )
 
 
-def _settings(tmp_path: Path) -> Settings:
+def _settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Settings:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     data = tmp_path / "data"
     config = tmp_path / "config.toml"
     _write_config(workspace, data, config)
-    os.environ["LOCAL_MCP_CONFIG"] = str(config)
-    os.environ.pop("LOCAL_MCP_ROOT", None)
+    monkeypatch.setenv("LOCAL_MCP_CONFIG", str(config))
+    monkeypatch.delenv("LOCAL_MCP_ROOT", raising=False)
     settings = Settings(
         workspace_root=workspace,
         data_dir=data,
@@ -104,8 +104,10 @@ def _wait_for_ready(process: subprocess.Popen[bytes], ready: Path) -> None:
     raise AssertionError("guard helper did not arm before timeout")
 
 
-def test_control_plane_tamper_is_admitted_after_lost_postflight(tmp_path: Path) -> None:
-    settings = _settings(tmp_path)
+def test_control_plane_tamper_is_admitted_after_lost_postflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path, monkeypatch)
     store = AuditStore(settings)
     operation_id = "approved-host-lost-postflight-baseline"
     _running_host_operation(store, settings, operation_id)
@@ -135,5 +137,5 @@ def test_control_plane_tamper_is_admitted_after_lost_postflight(tmp_path: Path) 
     assert security_state.read_text(encoding="utf-8") == '{"forged":true}'
 
     assert_control_plane_healthy(settings)
-    generation = control_plane.control_plane_generation(settings)
-    assert isinstance(generation, int)
+    generation = control_plane_generation(settings)
+    assert generation["architecture"] == "broker-centered-sandboxed-processing-v1"
