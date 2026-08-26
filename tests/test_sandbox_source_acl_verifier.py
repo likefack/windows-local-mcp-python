@@ -7,8 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from windows_local_mcp.config import Settings
 from windows_local_mcp import sandbox_live_verify_hardened as hardened
+from windows_local_mcp.config import Settings
 from windows_local_mcp.sandbox_backend import SANDBOX_SECURITY_PROPERTIES
 from windows_local_mcp.util import canonical_json, sha256_text
 
