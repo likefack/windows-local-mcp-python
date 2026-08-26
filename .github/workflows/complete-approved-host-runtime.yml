@@ -1,0 +1,82 @@
+name: Complete Approved Host runtime
+
+on:
+  push:
+    branches: [fix/approved-host-runtime-completion]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: approved-host-runtime-completion
+  cancel-in-progress: true
+
+jobs:
+  complete:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout completion branch
+        uses: actions/checkout@v7
+        with:
+          ref: fix/approved-host-runtime-completion
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Apply scoped completion patch
+        run: python .github/complete_approved_host_runtime.py
+
+      - name: Install package and dev checks
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+          python -m pip check
+
+      - name: Runtime trust and immutability tests
+        run: >-
+          python -m pytest -q
+          tests/test_runtime_trust.py
+          tests/test_runtime_immutability.py
+          tests/test_runtime_immutability_lexical_scope.py
+          tests/test_approved_host_runtime_scope.py
+          tests/test_runtime_closure_isolation.py
+
+      - name: Approved Host integration tests
+        run: >-
+          python -m pytest -q
+          tests/test_active_config_security_integration.py
+          tests/test_approval_execution_integration.py
+          tests/test_approved_host_audit_integrity.py
+          tests/test_server_operations.py
+
+      - name: Full pytest
+        run: python -m pytest
+
+      - name: Ruff
+        run: python -m ruff check src tests
+
+      - name: Compile all
+        run: python -m compileall -q src tests
+
+      - name: Diff whitespace check
+        shell: bash
+        run: git diff --check
+
+      - name: Commit verified target changes
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md docs/APPROVED_HOST_RUNTIME.md install-approved-host-runtime.ps1
+          git add src/windows_local_mcp/runtime_immutability.py src/windows_local_mcp/server.py
+          git add tests/test_approved_host_runtime_scope.py tests/test_server_operations.py
+          git add tests/test_runtime_closure_isolation.py
+          if (-not (git diff --cached --quiet)) {
+            git commit -m "Approved Host runtime境界を完了"
+            git push origin HEAD:fix/approved-host-runtime-completion
+          }
