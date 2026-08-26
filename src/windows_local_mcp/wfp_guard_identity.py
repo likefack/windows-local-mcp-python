@@ -10,10 +10,11 @@ from .tool_safety import capture_file_identity, hold_file_identity
 from .util import canonical_json, sha256_text
 from .wfp_guard import GUARD_POLICY_GENERATION, GUARD_VERSION, WfpGuardError
 
-_IDENTITY_SCHEMA_VERSION = 1
+_IDENTITY_SCHEMA_VERSION = 2
 _IMPLEMENTATION_MODULES = (
     "windows_local_mcp.tool_safety",
     "windows_local_mcp.util",
+    "windows_local_mcp.sandbox_source_acl",
     "windows_local_mcp.wfp_guard",
     "windows_local_mcp.wfp_guard_identity",
     "windows_local_mcp.wfp_guard_runtime",
@@ -22,14 +23,14 @@ _IMPLEMENTATION_MODULES = (
 
 
 def capture_wfp_guard_implementation_identity() -> dict[str, Any]:
-    """Bind the exact imported files that implement and verify the WFP Guard."""
+    """Bind the exact imported files that implement the Sandbox host-side guards."""
 
     modules: list[dict[str, Any]] = []
     for name in _IMPLEMENTATION_MODULES:
         module = importlib.import_module(name)
         origin = getattr(getattr(module, "__spec__", None), "origin", None)
         if not origin or origin in {"built-in", "frozen"}:
-            raise WfpGuardError(f"WFP Guard module has no regular-file origin: {name}")
+            raise WfpGuardError(f"Sandbox Guard module has no regular-file origin: {name}")
         captured = capture_file_identity(
             Path(origin),
             provenance="imported-wfp-guard-module",

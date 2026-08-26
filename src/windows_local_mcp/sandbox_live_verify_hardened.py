@@ -21,7 +21,9 @@ from .sandbox_live_verify import (
 from .sandbox_live_verify import (
     verify_codex_sandbox_live as _base_verify_codex_sandbox_live,
 )
+from .sandbox_source_acl import ensure_source_workspace_read_deny
 from .util import canonical_json, sha256_text
+from .wfp_guard import resolve_sandbox_account_identity
 
 _BROKERED_CHECK = "brokered_process_creation_denied"
 _BROKERED_PROPERTIES = ("termination", "resource_bound")
@@ -103,12 +105,22 @@ def _apply_brokered_process_result(
 
 @_sandbox_verification_serialized
 def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
-    """Run base live verification plus the non-spawning WMI brokered-process probe."""
+    """Provision the source read boundary, then run all live Sandbox probes."""
 
     base = getattr(_base_verify_codex_sandbox_live, "__wrapped__", None)
     if base is None:
         raise RuntimeError("base Sandbox verifier cannot be invoked under the shared lock")
+
+    account = resolve_sandbox_account_identity()
+    source_guard_before = ensure_source_workspace_read_deny(
+        settings.workspace_root, account.sid
+    )
     result = base(settings)
+    marker_account = result.get("sandbox_account_identity")
+    if not isinstance(marker_account, dict) or marker_account.get("sid") != account.sid:
+        raise RuntimeError(
+            "Codex Sandbox account changed after source-workspace ACL provisioning"
+        )
 
     backend = resolve_codex_sandbox_backend(settings)
     assert settings.sandbox_scratch_dir is not None
@@ -154,6 +166,13 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
         shutil.rmtree(root, ignore_errors=True)
 
     _apply_brokered_process_result(result, value, reason)
+    source_guard_after = ensure_source_workspace_read_deny(
+        settings.workspace_root, account.sid
+    )
+    source_guard_after["added_before_verification"] = bool(
+        source_guard_before.get("added")
+    )
+    result["source_workspace_read_acl_guard"] = source_guard_after
     marker = settings.data_dir / "control-plane" / "sandbox-live-verification.json"
     _write_evidence(marker, result)
     return result
