@@ -28,7 +28,9 @@ immutable snapshot/run projection だけから実行する境界へ強化しま�
 Sandbox parent／child／grandchild から read／write とも OS capability で到達不能であることを必須とし、
 trusted toolchain と明示設定した external dependency だけを追加 read capability として許可します。
 Approved Host は同一 Windows user authority のためこの filesystem isolation を提供できず、project-controlled
-code-loader または workspace 内 executable を Approved Host で実行しません。
+code-loader または workspace 内 executable を Approved Host で実行しません。この強化により、2026-08-14
+改訂で受容済み残存 risk とした workspace 内 protected-information read は必須遮断境界へ移行し、current v1 で
+受容済み残存 risk として残る Sandbox property は LAN access のみです。
 
 ## 1. 適用範囲と信頼モデル
 
@@ -172,12 +174,12 @@ Sandbox route の必須境界は少なくとも次です。
 unavailable にしません。source workspace／workspace 内 protected information の direct read は受容済み risk
 ではなく必須遮断境界です。
 
-これらは安全、遮断済み、`verified` とは表示しません。実機で境界突破を確認した場合は property を
+LAN access が実機で成立した場合も、安全、遮断済み、`verified` とは表示しません。`lan` property を
 `failed` のまま保存・表示し、受容済み残存 risk として route 判定から分離します。
 
-workspace 外 protected information の read、Internet access、未許可 loopback／localhost access はこの受容に
-含みません。これらの必須境界が `failed` または `unverified` の場合、Sandbox route は unavailable として
-fail closed します。
+source workspace／workspace 内 protected information の direct read、workspace 外 protected information の read、
+Internet access、未許可 loopback／localhost access はこの受容に含みません。これらの必須境界が `failed` または
+`unverified` の場合、Sandbox route は unavailable として fail closed します。
 
 staging からの除外、stdout／stderr の redaction、network deny は補助防御です。受容済み残存 risk の存在を
 隠したり `verified` に書き換えたりする根拠にはしません。現在の installed Codex Sandbox で必須境界を
@@ -284,8 +286,9 @@ admission／runtime bound を設けます。
 
 - `.venv`、`node_modules`、build tree、cache の存在だけで、不要な全量 copy／scan／hash を繰り返さない設計を
   優先します。
-- Broker／staging は protected `.env` や secret を test／build へ自動注入しません。Sandbox が workspace 内の
-  protected information を直接読み取れる受容済み残存 risk は、秘密情報を意図的に追加提供する根拠にはしません。
+- Broker／staging は protected `.env` や secret を test／build へ自動注入しません。workspace 内 protected
+  information の direct read denial は必須遮断境界であり、snapshot から除外した secret を live workspace から
+  補って test／build へ意図的に追加提供しません。
 - 既知 target の operation で全 workspace checkpoint が不要なら、対象限定を優先します。ただし manual／
   concurrent change detection を失う shortcut は使いません。
 - 性能改善のために workspace 外 protected-information boundary、rollback correctness、approval integrity、
@@ -322,10 +325,11 @@ admission／runtime bound を設けます。
 protected-information read、Internet、LAN、loopback、descendant containment、termination、resource bound を
 必要に応じて個別に `verified`／`failed`／`unverified`／`not-applicable` と記録します。
 
-property の実測結果と Sandbox route の利用可否は分離します。workspace 内 protected-information read と LAN が
-`failed` でも、受容済み残存 risk としてその事実を保持・表示し、その他の必須境界がすべて `verified` なら
-Sandbox route は利用可能として構いません。受容済み risk を `verified` に書き換えたり検証結果から削除したり
-しません。必須境界が `failed` または `unverified` の状態を capability 全体の
+property の実測結果と Sandbox route の利用可否は分離します。LAN が `failed` でも、受容済み残存 risk として
+その事実を保持・表示し、その他の必須境界が route eligibility を満たすなら Sandbox route は利用可能として
+構いません。workspace 内 protected-information read は `protected_information_read` と source／descendant denial の
+必須境界であり、`failed` または `unverified` を受容済み risk として route 判定から除外しません。受容済み risk を
+`verified` に書き換えたり検証結果から削除したりせず、必須境界が `failed` または `unverified` の状態を capability 全体の
 `Windows live-verified=true` または execution-route-available へ丸めません。
 
 transport も capability truthfulness の対象です。stdio／HTTP 等の各 transport について、`configured`、
@@ -353,7 +357,7 @@ MCP ADB E2E、Tunnel、deployment の代替にしません。
 - crash／timeout／cancellation、stale source／destination、path／filesystem race
 - Broker helper の PATH shadowing、差し替え、stale executable identity
 - Git automatic execution を再有効化する場合の repository metadata confinement と capability 表示の不一致
-- Codex Sandbox の workspace 外 read／write／Internet／loopback／control-plane／必須 descendant boundary 不足
+- Codex Sandbox の source workspace／workspace 内外 protected information の direct read、workspace 外 read／write／Internet／loopback／control-plane／必須 descendant boundary 不足
 - ordinary non-admin Windows user 権限で成立する現実的な攻撃
 - common project layout で起こる機能破綻、通常操作での重大 UX 破綻
 - 容易に trigger できる resource exhaustion、過剰 copy／scan／hash／lock／approval
@@ -365,8 +369,9 @@ MCP ADB E2E、Tunnel、deployment の代替にしません。
 ただし同じ技術分類でも、ここで明示していないものや通常の project code／一般入力から別の必須境界を
 破るものは対象内です。
 
-- workspace 内に存在する `.env`、credential、secret 等を Codex Sandbox process またはその descendant が
-  直接読み取れること。workspace 外 protected information の read は含まない
+Codex Sandbox からの source workspace／workspace 内 protected information の direct read は Section D／K の
+必須遮断境界であり、ここで受容する残存 risk には含めません。
+
 - Codex Sandbox process またはその descendant が LAN／private network endpoint へ接続できること。
   Internet と未許可 loopback／localhost access は含まない
 - Windows kernel、hardware、firmware、Windows security model 自体の compromise
@@ -393,7 +398,7 @@ MCP ADB E2E、Tunnel、deployment の代替にしません。
 | automatic Git Broker の repository metadata confinement と fail-closed capability 表示 | B, K, O |
 | legacy `:workspace` と `workspace_write=false` の実効 filesystem boundary | C, D, O |
 | workspace 外 protected information の read denial | D, K, O |
-| workspace 内 `.env`／credential／secret の直接 read は受容済み残存 risk として正確に表示されるか | D, K, O |
+| workspace 内 `.env`／credential／secret の direct read denial が必須境界として fail closed するか | D, K, O |
 | `.env`／dependency tree を含む過剰 staging | K, L |
 | known-path operation の full workspace checkpoint | G, H, L |
 | artifact chunk ごとの全 file 再hash | I, L |
@@ -419,8 +424,9 @@ MCP ADB E2E、Tunnel、deployment の代替にしません。
 release candidate と判断するには、少なくとも次を満たします。
 
 1. 対象内の既知または新規 Security Contract violation と release-blocking な実用性回帰が残っていない。
-   Section 5 で明示的に受容した workspace 内 protected-information read と LAN access は、それ自体では blocker
-   としないが、実測結果と残存 risk を隠してはならない。
+   Section 5 で明示的に受容した LAN access は、それ自体では blocker としないが、実測結果と残存 risk を
+   隠してはならない。source workspace／workspace 内 protected-information read の必須境界が `failed` または
+   `unverified` の route は release-blocking Security Contract violation とする。
 2. 修正後に security、practicality／performance、regression の独立 pass を繰り返し、2 回連続で新しい
    対象内 blocker を発見しない。
 3. full pytest、Ruff、compileall、`git diff --check` と、該当する security／structured-file／race／approval／
