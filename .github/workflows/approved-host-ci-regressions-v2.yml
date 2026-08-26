@@ -28,13 +28,13 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Apply scoped patch and diagnostic
+      - name: Apply scoped patches
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           python .github/apply_approved_host_ci_regressions_v2.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python .github/diagnose_snapshot_completion_v3.py
+          python .github/apply_approved_host_ci_regressions_v3.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           git diff --check
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -45,8 +45,8 @@ jobs:
           python -m pip install -e ".[dev]"
           python -m pip check
 
-      - name: Diagnose snapshot completion
+      - name: Verify remaining Approved Host regressions
         run: >-
           python -m pytest -q
           tests/test_approval_execution_integration.py
-          -k snapshot_execution_succeeds_when_bound_workspace_is_unchanged
+          -k "snapshot_execution_succeeds_when_bound_workspace_is_unchanged or approved_host_preflight_deadline_is_terminal or approved_host_terminates_descendants_at_runtime_limit"
