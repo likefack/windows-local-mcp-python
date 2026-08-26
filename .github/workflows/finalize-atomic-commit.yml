@@ -15,8 +15,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  quality:
-    name: Ruff and compile checks
+  lint:
+    name: Ruff
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
@@ -39,12 +39,38 @@ jobs:
       - name: Ruff
         run: python -m ruff check .
 
+  compile:
+    name: Compile all
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout tested revision
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
       - name: Compile all
         run: python -m compileall -q src tests
 
+  whitespace:
+    name: Diff whitespace
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout tested revision
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+
       - name: Diff whitespace check
         shell: bash
-        run: git diff --check
+        run: git diff --check HEAD^ HEAD
 
   tests:
     name: Pytest
