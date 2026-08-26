@@ -1,11 +1,37 @@
 from pathlib import Path
 
+import pytest
+
+from windows_local_mcp import runtime_trust
 from windows_local_mcp.runtime_trust import (
     RuntimeTree,
     RuntimeTrustInventory,
     capture_runtime_dependency_state,
     runtime_generation_identity,
 )
+
+
+class _FakeDistribution:
+    def __init__(self, name: str | None) -> None:
+        self.metadata = {} if name is None else {"Name": name}
+        self.requires: tuple[str, ...] = ()
+
+
+def _patch_distribution_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    requested_name: str,
+    metadata_name: str | None,
+) -> _FakeDistribution:
+    distribution = _FakeDistribution(metadata_name)
+    monkeypatch.setattr(runtime_trust, "_ROOT_DISTRIBUTIONS", (requested_name,))
+
+    def resolve(requested: str) -> _FakeDistribution:
+        assert requested == requested_name
+        return distribution
+
+    monkeypatch.setattr(runtime_trust.metadata, "distribution", resolve)
+    return distribution
 
 
 def _inventory(tmp_path: Path) -> tuple[RuntimeTrustInventory, dict[str, Path]]:
@@ -52,6 +78,44 @@ def _capture(inventory: RuntimeTrustInventory) -> dict[str, object]:
         max_bytes=1024 * 1024,
         inventory=inventory,
     )
+
+
+def test_distribution_closure_accepts_canonical_equivalent_metadata_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    distribution = _patch_distribution_lookup(
+        monkeypatch,
+        requested_name="python_docx",
+        metadata_name="python-docx",
+    )
+
+    assert runtime_trust._distribution_closure() == (distribution,)
+
+
+def test_distribution_closure_rejects_metadata_name_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_distribution_lookup(
+        monkeypatch,
+        requested_name="pydantic",
+        metadata_name="attacker-name",
+    )
+
+    with pytest.raises(RuntimeError, match="identity mismatch"):
+        runtime_trust._distribution_closure()
+
+
+def test_distribution_closure_rejects_missing_metadata_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_distribution_lookup(
+        monkeypatch,
+        requested_name="pydantic",
+        metadata_name=None,
+    )
+
+    with pytest.raises(RuntimeError, match="no valid distribution name"):
+        runtime_trust._distribution_closure()
 
 
 def test_runtime_dependency_state_detects_import_shadow_and_startup_hook(
