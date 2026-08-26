@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import stat
@@ -13,6 +14,7 @@ from urllib.parse import unquote
 
 from .config import Settings
 from .config_binding import export_config_binding
+from .tool_safety import capture_file_identity, hold_file_identity
 from .util import canonical_json, sha256_bytes, sha256_text, utc_now_iso
 from .windows_system import windows_system_executable
 
@@ -34,11 +36,81 @@ def _tamper_marker(settings: Settings) -> Path:
     return settings.data_dir / "control-plane" / "tamper-detected.json"
 
 
+def _approved_host_postflight_marker(settings: Settings) -> Path:
+    return settings.data_dir / "control-plane" / "approved-host-postflight-pending.json"
+
+
+def _arm_approved_host_postflight_guard(settings: Settings, operation_id: str) -> Any:
+    marker = _approved_host_postflight_marker(settings)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    payload = canonical_json(
+        {
+            "version": 1,
+            "armed_at": utc_now_iso(),
+            "operation_id": operation_id,
+            "state": "postflight_pending",
+            "recovery": "manual operator review required",
+        }
+    ).encode("utf-8")
+    try:
+        descriptor = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError as error:
+        raise RuntimeError(
+            "a previous Approved Host postflight verification is incomplete; "
+            "explicit recovery is required"
+        ) from error
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+    except Exception:
+        marker.unlink(missing_ok=True)
+        raise
+
+    identity = capture_file_identity(
+        marker,
+        provenance="approved-host-postflight-guard",
+    )
+    hold = hold_file_identity(identity)
+    try:
+        hold.__enter__()
+    except Exception:
+        marker.unlink(missing_ok=True)
+        raise
+    return hold
+
+
+def _clear_approved_host_postflight_guard(
+    settings: Settings,
+    operation_id: str,
+    *,
+    missing_ok: bool = False,
+) -> None:
+    marker = _approved_host_postflight_marker(settings)
+    if not marker.exists():
+        if missing_ok:
+            return
+        raise RuntimeError("Approved Host postflight recovery marker disappeared")
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise RuntimeError("Approved Host postflight recovery marker is unreadable") from error
+    if payload.get("version") != 1 or payload.get("operation_id") != operation_id:
+        raise RuntimeError("Approved Host postflight recovery marker binding changed")
+    marker.unlink()
+
+
 def assert_control_plane_healthy(settings: Settings) -> None:
     if _tamper_marker(settings).exists():
         raise RuntimeError(
             "control-plane tampering was previously detected; operations are unavailable "
             "until the operator performs an explicit recovery"
+        )
+    if _approved_host_postflight_marker(settings).exists():
+        raise RuntimeError(
+            "Approved Host postflight verification was not durably completed; operations are "
+            "unavailable until the operator performs an explicit recovery"
         )
 
 
@@ -144,137 +216,164 @@ def capture_critical_state(settings: Settings, operation_id: str) -> dict[str, A
         active_guard = _ACTIVE_AUDIT_GUARDS.get(database_identity)
         if active_guard is not None and active_guard.operation_id != operation_id:
             raise RuntimeError("another Approved Host audit guard is already active")
+    if active_guard is None:
+        assert_control_plane_healthy(settings)
 
-    config_binding = export_config_binding(settings)
-    roots = [
-        settings.data_dir / "approval-staging",
-        settings.data_dir / "binary-transfers",
-        settings.data_dir / "worker-contexts" / f"{operation_id}.json",
-        settings.data_dir / "control-plane",
-        settings.data_dir / "workspace-history",
-        Path(__file__).resolve(strict=True).parent.parent,
-    ]
-    if settings.sandbox_scratch_dir is not None:
-        roots.append(settings.sandbox_scratch_dir / "approval-inputs")
-        runs = settings.sandbox_scratch_dir / "runs"
-        if runs.is_dir():
-            roots.extend(
-                child
-                for child in runs.iterdir()
-                if child.name != operation_id
-            )
-    config_path = config_binding.get("config_path")
-    if config_path:
-        roots.append(Path(str(config_path)).resolve(strict=True))
-    records: list[dict[str, Any]] = []
-    total_bytes = 0
-    for root in roots:
-        if not root.exists():
-            continue
-        candidates: list[Path] = []
-        if root.is_file():
-            candidates.append(root)
-        else:
-            for current, directories, files in os.walk(root, followlinks=False):
-                current_path = Path(current)
-                for name in directories:
-                    if _is_reparse(current_path / name):
-                        raise RuntimeError(
-                            "control-plane state contains a reparse directory"
-                        )
-                candidates.extend(current_path / name for name in files)
-        for path in sorted(candidates, key=lambda item: str(item).casefold()):
-            if path == _tamper_marker(settings):
-                continue
-            if _is_reparse(path) or not path.is_file() or path.stat().st_nlink > 1:
-                raise RuntimeError("control-plane state contains an unsafe file identity")
-            data = path.read_bytes()
-            total_bytes += len(data)
-            if len(records) + 1 > settings.approval_manifest_max_files:
-                raise RuntimeError("control-plane state exceeds the file admission limit")
-            if total_bytes > settings.approval_manifest_max_bytes:
-                raise RuntimeError("control-plane state exceeds the byte admission limit")
-            try:
-                record_path = str(path.relative_to(settings.data_dir)).replace("\\", "/")
-            except ValueError:
-                record_path = str(path.resolve(strict=True))
-            records.append(
-                {
-                    "path": record_path,
-                    "bytes": len(data),
-                    "sha256": sha256_bytes(data),
-                }
-            )
-    # Approved Host runtime content is admitted by the execution-time immutable-runtime
-    # gate before this worker is launched. Re-hashing that complete dependency closure here
-    # would duplicate the gate and can consume the command runtime budget before child start.
-    # This guard therefore protects mutable control-plane state and Python startup state.
-    runtime_startup_state = _capture_runtime_startup_state() if os.name == "nt" else None
-    audit_snapshot, audit_bytes = _audit_state_snapshot(settings)
-    acl_digest, acl_bytes = _acl_state_digest(settings, roots)
-    runtime_bytes = 0
-    runtime_digest = None
-    runtime_startup_digest = (
-        str(runtime_startup_state["digest"])
-        if runtime_startup_state is not None
-        else None
-    )
-    runtime_file_count = 0
-    runtime_startup_path_count = (
-        int(runtime_startup_state["count"])
-        if runtime_startup_state is not None
-        else 0
-    )
-    static_bytes = total_bytes + acl_bytes + runtime_bytes
-    base_digest_payload = {
-        "files": records,
-        "acl_digest": acl_digest,
-        "runtime_digest": runtime_digest,
-        "runtime_startup_digest": runtime_startup_digest,
-        "config_binding": config_binding,
-    }
-    state = _critical_state_summary(
-        file_count=len(records),
-        static_bytes=static_bytes,
-        base_digest_payload=base_digest_payload,
-        audit_snapshot=audit_snapshot,
-        audit_bytes=audit_bytes,
-        runtime_file_count=runtime_file_count,
-        runtime_startup_path_count=runtime_startup_path_count,
-    )
-
-    if active_guard is not None:
-        tracking_error = active_guard.tracking_error
-        _deactivate_audit_guard(database_identity)
-        if tracking_error is not None:
-            raise RuntimeError(
-                "trusted audit mutation tracking failed during Approved Host execution: "
-                f"{tracking_error}"
-            )
-        return state
-
-    mirror = _build_audit_mirror(settings)
+    pending_hold: Any | None = None
     try:
-        mirror_snapshot = _audit_snapshot_from_connection(mirror)
-        if _snapshot_digest(mirror_snapshot) != _snapshot_digest(audit_snapshot):
-            raise RuntimeError("audit mirror did not match the Approved Host preflight state")
-        guard = _AuditMutationGuard(
-            database_identity=database_identity,
-            operation_id=operation_id,
-            mirror=mirror,
-            expected_state=dict(state),
+        config_binding = export_config_binding(settings)
+        roots = [
+            settings.data_dir / "approval-staging",
+            settings.data_dir / "binary-transfers",
+            settings.data_dir / "worker-contexts" / f"{operation_id}.json",
+            settings.data_dir / "control-plane",
+            settings.data_dir / "workspace-history",
+            Path(__file__).resolve(strict=True).parent.parent,
+        ]
+        if settings.sandbox_scratch_dir is not None:
+            roots.append(settings.sandbox_scratch_dir / "approval-inputs")
+            runs = settings.sandbox_scratch_dir / "runs"
+            if runs.is_dir():
+                roots.extend(
+                    child
+                    for child in runs.iterdir()
+                    if child.name != operation_id
+                )
+        config_path = config_binding.get("config_path")
+        if config_path:
+            roots.append(Path(str(config_path)).resolve(strict=True))
+        records: list[dict[str, Any]] = []
+        total_bytes = 0
+        for root in roots:
+            if not root.exists():
+                continue
+            candidates: list[Path] = []
+            if root.is_file():
+                candidates.append(root)
+            else:
+                for current, directories, files in os.walk(root, followlinks=False):
+                    current_path = Path(current)
+                    for name in directories:
+                        if _is_reparse(current_path / name):
+                            raise RuntimeError(
+                                "control-plane state contains a reparse directory"
+                            )
+                    candidates.extend(current_path / name for name in files)
+            for path in sorted(candidates, key=lambda item: str(item).casefold()):
+                if path in {
+                    _tamper_marker(settings),
+                    _approved_host_postflight_marker(settings),
+                }:
+                    continue
+                if _is_reparse(path) or not path.is_file() or path.stat().st_nlink > 1:
+                    raise RuntimeError("control-plane state contains an unsafe file identity")
+                data = path.read_bytes()
+                total_bytes += len(data)
+                if len(records) + 1 > settings.approval_manifest_max_files:
+                    raise RuntimeError("control-plane state exceeds the file admission limit")
+                if total_bytes > settings.approval_manifest_max_bytes:
+                    raise RuntimeError("control-plane state exceeds the byte admission limit")
+                try:
+                    record_path = str(path.relative_to(settings.data_dir)).replace("\\", "/")
+                except ValueError:
+                    record_path = str(path.resolve(strict=True))
+                records.append(
+                    {
+                        "path": record_path,
+                        "bytes": len(data),
+                        "sha256": sha256_bytes(data),
+                    }
+                )
+        # Approved Host runtime content is admitted by the execution-time immutable-runtime
+        # gate before this worker is launched. Re-hashing that complete dependency closure here
+        # would duplicate the gate and can consume the command runtime budget before child start.
+        # This guard therefore protects mutable control-plane state and Python startup state.
+        runtime_startup_state = _capture_runtime_startup_state() if os.name == "nt" else None
+        audit_snapshot, audit_bytes = _audit_state_snapshot(settings)
+        if active_guard is None:
+            pending_hold = _arm_approved_host_postflight_guard(settings, operation_id)
+        acl_digest, acl_bytes = _acl_state_digest(settings, roots)
+        runtime_bytes = 0
+        runtime_digest = None
+        runtime_startup_digest = (
+            str(runtime_startup_state["digest"])
+            if runtime_startup_state is not None
+            else None
+        )
+        runtime_file_count = 0
+        runtime_startup_path_count = (
+            int(runtime_startup_state["count"])
+            if runtime_startup_state is not None
+            else 0
+        )
+        static_bytes = total_bytes + acl_bytes + runtime_bytes
+        base_digest_payload = {
+            "files": records,
+            "acl_digest": acl_digest,
+            "runtime_digest": runtime_digest,
+            "runtime_startup_digest": runtime_startup_digest,
+            "config_binding": config_binding,
+        }
+        state = _critical_state_summary(
             file_count=len(records),
             static_bytes=static_bytes,
             base_digest_payload=base_digest_payload,
-            max_snapshot_bytes=settings.max_data_dir_bytes,
+            audit_snapshot=audit_snapshot,
+            audit_bytes=audit_bytes,
             runtime_file_count=runtime_file_count,
             runtime_startup_path_count=runtime_startup_path_count,
         )
-        _activate_audit_guard(guard)
+
+        if active_guard is not None:
+            tracking_error = active_guard.tracking_error
+            verified = tracking_error is None and state == active_guard.expected_state
+            _deactivate_audit_guard(database_identity)
+            if tracking_error is not None:
+                raise RuntimeError(
+                    "trusted audit mutation tracking failed during Approved Host execution: "
+                    f"{tracking_error}"
+                )
+            if verified:
+                _clear_approved_host_postflight_guard(settings, operation_id)
+            return state
+
+        mirror = _build_audit_mirror(settings)
+        try:
+            mirror_snapshot = _audit_snapshot_from_connection(mirror)
+            if _snapshot_digest(mirror_snapshot) != _snapshot_digest(audit_snapshot):
+                raise RuntimeError("audit mirror did not match the Approved Host preflight state")
+            guard = _AuditMutationGuard(
+                database_identity=database_identity,
+                operation_id=operation_id,
+                mirror=mirror,
+                expected_state=dict(state),
+                file_count=len(records),
+                static_bytes=static_bytes,
+                base_digest_payload=base_digest_payload,
+                max_snapshot_bytes=settings.max_data_dir_bytes,
+                runtime_file_count=runtime_file_count,
+                runtime_startup_path_count=runtime_startup_path_count,
+                postflight_marker_hold=pending_hold,
+            )
+            _activate_audit_guard(guard)
+            pending_hold = None
+        except Exception:
+            mirror.close()
+            raise
+        return state
     except Exception:
-        mirror.close()
+        if active_guard is not None:
+            _deactivate_audit_guard(database_identity)
+        if pending_hold is not None:
+            try:
+                pending_hold.__exit__(None, None, None)
+            finally:
+                _clear_approved_host_postflight_guard(
+                    settings,
+                    operation_id,
+                    missing_ok=True,
+                )
         raise
-    return state
 
 
 def _critical_state_summary(
@@ -365,7 +464,7 @@ def _deactivate_audit_guard(database_identity: str) -> None:
     with _AUDIT_GUARDS_LOCK:
         guard = _ACTIVE_AUDIT_GUARDS.pop(database_identity, None)
         if guard is not None:
-            guard.mirror.close()
+            guard.close()
         if _SQLITE_CONNECT_PATCHED and not _ACTIVE_AUDIT_GUARDS:
             sqlite3.connect = _ORIGINAL_SQLITE_CONNECT
             _SQLITE_CONNECT_PATCHED = False
@@ -456,6 +555,7 @@ class _AuditMutationGuard:
         max_snapshot_bytes: int,
         runtime_file_count: int,
         runtime_startup_path_count: int,
+        postflight_marker_hold: Any,
     ) -> None:
         self.database_identity = database_identity
         self.operation_id = operation_id
@@ -467,8 +567,17 @@ class _AuditMutationGuard:
         self.max_snapshot_bytes = max_snapshot_bytes
         self.runtime_file_count = runtime_file_count
         self.runtime_startup_path_count = runtime_startup_path_count
+        self.postflight_marker_hold = postflight_marker_hold
         self.tracking_error: str | None = None
         self._lock = threading.RLock()
+
+    def close(self) -> None:
+        try:
+            self.mirror.close()
+        finally:
+            if self.postflight_marker_hold is not None:
+                self.postflight_marker_hold.__exit__(None, None, None)
+                self.postflight_marker_hold = None
 
     def record_statement(self, statement: str) -> None:
         stripped = statement.lstrip()
@@ -569,4 +678,10 @@ def mark_control_plane_tamper(
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+    try:
+        _clear_approved_host_postflight_guard(settings, operation_id, missing_ok=True)
+    except (OSError, RuntimeError):
+        # The canonical tamper marker is already durable. Keeping an unreadable or mismatched
+        # pending marker is safer than allowing cleanup uncertainty to weaken the latch.
+        return str(marker)
     return str(marker)
