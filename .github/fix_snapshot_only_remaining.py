@@ -206,7 +206,7 @@ text = replace_once(
 )
 text = replace_once(
     text,
-    '    assert result["status"] == "succeeded"\n    assert "SNAPSHOT RUNS INDEPENDENTLY" in result["stdout_preview"]',
+    '    assert result["status"] == "succeeded", operation\n    assert "SNAPSHOT RUNS INDEPENDENTLY" in result["stdout_preview"]',
     '''    marker = settings.data_dir / "control-plane" / "tamper-detected.json"
     marker_payload = json.loads(marker.read_text(encoding="utf-8")) if marker.is_file() else None
     assert result["status"] == "succeeded", {
@@ -234,7 +234,7 @@ text = replace_once(
 )
 text = replace_once(
     text,
-    '    assert result["status"] == "succeeded"\n    assert time.monotonic() - started >= 0.4',
+    '    assert result["status"] == "succeeded", operation\n    assert time.monotonic() - started >= 0.4',
     '''    marker = settings.data_dir / "control-plane" / "tamper-detected.json"
     marker_payload = json.loads(marker.read_text(encoding="utf-8")) if marker.is_file() else None
     assert result["status"] == "succeeded", {
