@@ -3,6 +3,8 @@ name: fix-snapshot-only-diagnose-v2
 on:
   push:
     branches: [fix-snapshot-only-runner]
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: read
