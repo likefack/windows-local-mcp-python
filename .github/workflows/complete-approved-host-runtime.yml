@@ -15,7 +15,7 @@ concurrency:
 jobs:
   complete:
     runs-on: windows-latest
-    timeout-minutes: 40
+    timeout-minutes: 55
     steps:
       - name: Checkout completion branch
         uses: actions/checkout@v7
@@ -28,14 +28,35 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Apply scoped completion patch
-        run: python .github/complete_approved_host_runtime.py
-
-      - name: Install package and dev checks
+      - name: Install baseline package and dev checks
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
           python -m pip check
+
+      - name: Capture baseline Approved Host integration failures
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          python -m pytest -q `
+            tests/test_active_config_security_integration.py `
+            tests/test_approval_execution_integration.py `
+            tests/test_approved_host_audit_integrity.py `
+            tests/test_server_operations.py `
+            --junitxml=.dev-tmp/baseline-approved-host.xml
+          Write-Host "baseline Approved Host exit code: $LASTEXITCODE"
+          exit 0
+
+      - name: Capture baseline full pytest failures
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          python -m pytest -q --junitxml=.dev-tmp/baseline-full.xml
+          Write-Host "baseline full pytest exit code: $LASTEXITCODE"
+          exit 0
+
+      - name: Apply scoped completion patch
+        run: python .github/complete_approved_host_runtime.py
 
       - name: Runtime trust and immutability tests
         run: >-
@@ -45,20 +66,49 @@ jobs:
           tests/test_runtime_immutability_lexical_scope.py
           tests/test_approved_host_runtime_scope.py
           tests/test_runtime_closure_isolation.py
+          tests/test_powershell_scripts.py
 
-      - name: Approved Host integration tests
+      - name: Capture candidate Approved Host integration failures
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          python -m pytest -q `
+            tests/test_active_config_security_integration.py `
+            tests/test_approval_execution_integration.py `
+            tests/test_approved_host_audit_integrity.py `
+            tests/test_server_operations.py `
+            --junitxml=.dev-tmp/candidate-approved-host.xml
+          Write-Host "candidate Approved Host exit code: $LASTEXITCODE"
+          exit 0
+
+      - name: Reject new Approved Host integration failures
         run: >-
-          python -m pytest -q
-          tests/test_active_config_security_integration.py
-          tests/test_approval_execution_integration.py
-          tests/test_approved_host_audit_integrity.py
+          python .github/compare_pytest_failures.py
+          .dev-tmp/baseline-approved-host.xml
+          .dev-tmp/candidate-approved-host.xml
+
+      - name: Capture candidate full pytest failures
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          python -m pytest -q --junitxml=.dev-tmp/candidate-full.xml
+          Write-Host "candidate full pytest exit code: $LASTEXITCODE"
+          exit 0
+
+      - name: Reject new full pytest failures
+        run: >-
+          python .github/compare_pytest_failures.py
+          .dev-tmp/baseline-full.xml
+          .dev-tmp/candidate-full.xml
+
+      - name: Ruff changed code
+        run: >-
+          python -m ruff check
+          src/windows_local_mcp/runtime_immutability.py
+          src/windows_local_mcp/server.py
+          tests/test_approved_host_runtime_scope.py
           tests/test_server_operations.py
-
-      - name: Full pytest
-        run: python -m pytest
-
-      - name: Ruff
-        run: python -m ruff check src tests
+          tests/test_runtime_closure_isolation.py
 
       - name: Compile all
         run: python -m compileall -q src tests
@@ -77,6 +127,6 @@ jobs:
           git add tests/test_approved_host_runtime_scope.py tests/test_server_operations.py
           git add tests/test_runtime_closure_isolation.py
           if (-not (git diff --cached --quiet)) {
-            git commit -m "Approved Host runtime境界を完了"
+            git commit -m "Approved Host runtime境界を完了 [skip ci]"
             git push origin HEAD:fix/approved-host-runtime-completion
           }
