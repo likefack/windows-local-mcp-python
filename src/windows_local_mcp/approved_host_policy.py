@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from typing import Any
-
-from .config import Settings
+from functools import wraps
+from typing import Any, Callable
 
 APPROVED_HOST_UNAVAILABLE_REASON = (
     "Approved Host execution is unavailable in current v1 because its same-user child can "
@@ -11,30 +10,31 @@ APPROVED_HOST_UNAVAILABLE_REASON = (
 )
 
 
-def approved_host_capability_status(settings: Settings) -> dict[str, Any]:
-    """Report configured intent separately from the deliberately unavailable route."""
+def install_approved_host_fail_closed_gate() -> None:
+    """Make every production Approved Host runtime check reject before worker creation."""
 
-    if not settings.approved_host_enabled:
-        reason = "disabled by configuration"
-    else:
-        reason = APPROVED_HOST_UNAVAILABLE_REASON
-    return {
-        "configured": settings.approved_host_enabled,
-        "enabled": False,
-        "available": False,
-        "execution_route_available": False,
-        "unit_tested": True,
-        "live_verified": False,
-        "windows_live_verified": False,
-        "verification_scope": "capability_reduced_fail_closed",
-        "execution_time_recheck": True,
-        "unavailable_reason": reason,
-    }
+    from . import runtime_immutability
 
+    original = runtime_immutability.assert_approved_host_runtime_immutable
+    if bool(getattr(original, "__wlmcp_approved_host_fail_closed__", False)):
+        return
 
-def assert_approved_host_route_available(settings: Settings) -> None:
-    """Reject every Approved Host creation or launch until a real OS boundary exists."""
+    @wraps(original)
+    def fail_closed(
+        package_root: Any = None,
+        *,
+        inventory: Any = None,
+        access_resolver: Callable[[Any], int] | None = None,
+    ) -> dict[str, Any]:
+        # access_resolver is an explicit test-only seam used to verify the lower-level
+        # immutability algorithm without claiming that Approved Host itself is available.
+        if access_resolver is not None:
+            return original(
+                package_root,
+                inventory=inventory,
+                access_resolver=access_resolver,
+            )
+        raise PermissionError(APPROVED_HOST_UNAVAILABLE_REASON)
 
-    if not settings.approved_host_enabled:
-        raise PermissionError("Approved Host is disabled by configuration")
-    raise PermissionError(APPROVED_HOST_UNAVAILABLE_REASON)
+    fail_closed.__wlmcp_approved_host_fail_closed__ = True  # type: ignore[attr-defined]
+    runtime_immutability.assert_approved_host_runtime_immutable = fail_closed
