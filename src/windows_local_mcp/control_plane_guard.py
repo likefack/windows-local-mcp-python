@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
@@ -29,6 +30,20 @@ def _is_reparse(path: Path) -> bool:
     return path.is_symlink() or bool(
         attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
     )
+
+
+def _check_deadline(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError("Approved Host control-plane capture exceeded operation deadline")
+
+
+def _remaining_timeout(deadline: float | None, maximum: float) -> float:
+    if deadline is None:
+        return maximum
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Approved Host control-plane capture exceeded operation deadline")
+    return max(0.001, min(maximum, remaining))
 
 
 def _tamper_marker(settings: Settings) -> Path:
@@ -77,24 +92,35 @@ def _runtime_startup_candidate_paths() -> list[Path]:
     return sorted(candidates, key=lambda item: os.path.normcase(str(item)))
 
 
-def _startup_path_acl_digest(path: Path) -> str | None:
+def _startup_path_acl_digest(
+    path: Path, *, deadline: float | None = None
+) -> str | None:
     if os.name != "nt":
         return None
-    completed = subprocess.run(
-        [windows_system_executable("icacls.exe"), str(path), "/C"],
-        capture_output=True,
-        timeout=10,
-        check=False,
-        shell=False,
-    )
+    _check_deadline(deadline)
+    try:
+        completed = subprocess.run(
+            [windows_system_executable("icacls.exe"), str(path), "/C"],
+            capture_output=True,
+            timeout=_remaining_timeout(deadline, 10),
+            check=False,
+            shell=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(
+            "Approved Host control-plane capture exceeded operation deadline"
+        ) from exc
     if completed.returncode != 0:
         raise RuntimeError(f"could not inspect Python startup path ACL: {path}")
     return sha256_bytes(completed.stdout + completed.stderr)
 
 
-def _capture_runtime_startup_state(paths: list[Path] | None = None) -> dict[str, Any]:
+def _capture_runtime_startup_state(
+    paths: list[Path] | None = None, *, deadline: float | None = None
+) -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     for candidate in paths or _runtime_startup_candidate_paths():
+        _check_deadline(deadline)
         absolute = candidate.absolute()
         if not absolute.exists():
             records.append({"path": str(absolute), "kind": "missing"})
@@ -115,7 +141,9 @@ def _capture_runtime_startup_state(paths: list[Path] | None = None) -> dict[str,
                     "sha256": sha256_bytes(data),
                     "device": int(details.st_dev),
                     "inode": int(details.st_ino),
-                    "acl_sha256": _startup_path_acl_digest(resolved),
+                    "acl_sha256": _startup_path_acl_digest(
+                        resolved, deadline=deadline
+                    ),
                 }
             )
             continue
@@ -126,7 +154,9 @@ def _capture_runtime_startup_state(paths: list[Path] | None = None) -> dict[str,
                     "kind": "directory",
                     "device": int(details.st_dev),
                     "inode": int(details.st_ino),
-                    "acl_sha256": _startup_path_acl_digest(resolved),
+                    "acl_sha256": _startup_path_acl_digest(
+                        resolved, deadline=deadline
+                    ),
                 }
             )
             continue
@@ -138,8 +168,11 @@ def _capture_runtime_startup_state(paths: list[Path] | None = None) -> dict[str,
     }
 
 
-def capture_critical_state(settings: Settings, operation_id: str) -> dict[str, Any]:
+def capture_critical_state(
+    settings: Settings, operation_id: str, *, deadline: float | None = None
+) -> dict[str, Any]:
     """Capture state that an Approved Host child is never allowed to mutate."""
+    _check_deadline(deadline)
     database_identity = _database_identity(settings.data_dir / "audit.db")
     with _AUDIT_GUARDS_LOCK:
         active_guard = _ACTIVE_AUDIT_GUARDS.get(database_identity)
@@ -170,6 +203,7 @@ def capture_critical_state(settings: Settings, operation_id: str) -> dict[str, A
     records: list[dict[str, Any]] = []
     total_bytes = 0
     for root in roots:
+        _check_deadline(deadline)
         if not root.exists():
             continue
         candidates: list[Path] = []
@@ -177,6 +211,7 @@ def capture_critical_state(settings: Settings, operation_id: str) -> dict[str, A
             candidates.append(root)
         else:
             for current, directories, files in os.walk(root, followlinks=False):
+                _check_deadline(deadline)
                 current_path = Path(current)
                 for name in directories:
                     if _is_reparse(current_path / name):
@@ -185,6 +220,7 @@ def capture_critical_state(settings: Settings, operation_id: str) -> dict[str, A
                         )
                 candidates.extend(current_path / name for name in files)
         for path in sorted(candidates, key=lambda item: str(item).casefold()):
+            _check_deadline(deadline)
             if path == _tamper_marker(settings):
                 continue
             if _is_reparse(path) or not path.is_file() or path.stat().st_nlink > 1:
@@ -210,13 +246,18 @@ def capture_critical_state(settings: Settings, operation_id: str) -> dict[str, A
         capture_runtime_dependency_state(
             max_files=settings.approval_manifest_max_files,
             max_bytes=settings.approval_manifest_max_bytes,
+            deadline=deadline,
         )
         if os.name == "nt"
         else None
     )
-    runtime_startup_state = _capture_runtime_startup_state() if os.name == "nt" else None
+    runtime_startup_state = (
+        _capture_runtime_startup_state(deadline=deadline) if os.name == "nt" else None
+    )
+    _check_deadline(deadline)
     audit_snapshot, audit_bytes = _audit_state_snapshot(settings)
-    acl_digest, acl_bytes = _acl_state_digest(settings, roots)
+    _check_deadline(deadline)
+    acl_digest, acl_bytes = _acl_state_digest(settings, roots, deadline=deadline)
     runtime_bytes = int(runtime_state["bytes"]) if runtime_state is not None else 0
     runtime_digest = str(runtime_state["digest"]) if runtime_state is not None else None
     runtime_startup_digest = (
@@ -260,7 +301,9 @@ def capture_critical_state(settings: Settings, operation_id: str) -> dict[str, A
             )
         return state
 
-    mirror = _build_audit_mirror(settings)
+    _check_deadline(deadline)
+    mirror = _build_audit_mirror(settings, deadline=deadline)
+    _check_deadline(deadline)
     try:
         mirror_snapshot = _audit_snapshot_from_connection(mirror)
         if _snapshot_digest(mirror_snapshot) != _snapshot_digest(audit_snapshot):
@@ -366,6 +409,18 @@ def _snapshot_rows(cursor: sqlite3.Cursor) -> list[dict[str, Any]]:
     return [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
 
 
+def _canonicalize_process_creation_times(rows: list[dict[str, Any]]) -> None:
+    # sqlite3's trace callback expands bound REAL parameters through SQL text and can
+    # discard insignificant low-order digits. The Approved Host process identity uses
+    # a 10 ms create-time tolerance, so retaining 15 significant digits here preserves
+    # substantially more precision while preventing trusted mirror false positives.
+    for row in rows:
+        for field in ("worker_create_time", "child_create_time"):
+            value = row.get(field)
+            if value is not None:
+                row[field] = float(format(float(value), ".15g"))
+
+
 def _audit_snapshot_from_connection(connection: sqlite3.Connection) -> dict[str, Any]:
     integrity = connection.execute("PRAGMA quick_check").fetchone()
     if integrity != ("ok",):
@@ -377,6 +432,7 @@ def _audit_snapshot_from_connection(connection: sqlite3.Connection) -> dict[str,
         )
     )
     operations = _snapshot_rows(connection.execute("SELECT * FROM operations ORDER BY id"))
+    _canonicalize_process_creation_times(operations)
     events = _snapshot_rows(connection.execute("SELECT * FROM events ORDER BY id"))
     try:
         event_sequence = _snapshot_rows(
@@ -415,12 +471,24 @@ def _audit_state_snapshot(settings: Settings) -> tuple[dict[str, Any], int]:
         connection.close()
 
 
-def _build_audit_mirror(settings: Settings) -> sqlite3.Connection:
+def _build_audit_mirror(
+    settings: Settings, *, deadline: float | None = None
+) -> sqlite3.Connection:
+    _check_deadline(deadline)
     database = settings.data_dir / "audit.db"
-    source = _ORIGINAL_SQLITE_CONNECT(f"file:{database}?mode=ro", uri=True, timeout=10)
+    source = _ORIGINAL_SQLITE_CONNECT(
+        f"file:{database}?mode=ro",
+        uri=True,
+        timeout=_remaining_timeout(deadline, 10),
+    )
     mirror = _ORIGINAL_SQLITE_CONNECT(":memory:")
     try:
-        source.backup(mirror)
+        source.backup(
+            mirror,
+            pages=64,
+            progress=lambda _status, _remaining, _total: _check_deadline(deadline),
+        )
+        _check_deadline(deadline)
         mirror.execute("PRAGMA foreign_keys = ON")
         return mirror
     except Exception:
@@ -497,21 +565,29 @@ class _AuditMutationGuard:
         self.expected_state.update(refreshed)
 
 
-def _acl_state_digest(settings: Settings, roots: list[Path]) -> tuple[str | None, int]:
+def _acl_state_digest(
+    settings: Settings, roots: list[Path], *, deadline: float | None = None
+) -> tuple[str | None, int]:
     if os.name != "nt":
         return None, 0
     chunks: list[bytes] = []
     total = 0
     for root in roots:
+        _check_deadline(deadline)
         if not root.exists():
             continue
-        completed = subprocess.run(
-            [windows_system_executable("icacls.exe"), str(root), "/T", "/C"],
-            capture_output=True,
-            timeout=30,
-            check=False,
-            shell=False,
-        )
+        try:
+            completed = subprocess.run(
+                [windows_system_executable("icacls.exe"), str(root), "/T", "/C"],
+                capture_output=True,
+                timeout=_remaining_timeout(deadline, 30),
+                check=False,
+                shell=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError(
+                "Approved Host control-plane capture exceeded operation deadline"
+            ) from exc
         if completed.returncode != 0:
             raise RuntimeError(f"could not inspect control-plane ACL: {root}")
         payload = completed.stdout + completed.stderr

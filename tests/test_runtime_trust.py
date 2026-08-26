@@ -1,3 +1,4 @@
+import time
 from pathlib import Path
 
 import pytest
@@ -161,6 +162,40 @@ def test_runtime_dependency_state_does_not_hash_unrelated_nested_site_package_co
     after = _capture(inventory)
 
     assert after["digest"] == before["digest"]
+
+
+def test_runtime_dependency_state_stops_when_deadline_expires(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = tmp_path / "a.py"
+    second = tmp_path / "b.py"
+    first.write_text("A = 1\n", encoding="utf-8")
+    second.write_text("B = 1\n", encoding="utf-8")
+    inventory = RuntimeTrustInventory(
+        trees=(),
+        namespace_roots=(),
+        security_paths=(),
+        files=(first, second),
+        distributions=(),
+    )
+
+    original = runtime_trust._security_descriptor_sha256
+
+    def slow_security_descriptor(path: Path) -> str | None:
+        time.sleep(0.03)
+        return original(path)
+
+    monkeypatch.setattr(
+        runtime_trust, "_security_descriptor_sha256", slow_security_descriptor
+    )
+
+    with pytest.raises(TimeoutError, match="operation deadline"):
+        capture_runtime_dependency_state(
+            max_files=10,
+            max_bytes=1024,
+            inventory=inventory,
+            deadline=time.monotonic() + 0.01,
+        )
 
 
 def test_runtime_generation_identity_binds_source_namespace(tmp_path: Path) -> None:

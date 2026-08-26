@@ -340,12 +340,56 @@ def run_operation(operation_id: str, settings: Settings) -> int:
                 "approval_status": operation.get("approval_status"),
                 "request": operation["request"],
             }
-            host_control_state = capture_critical_state(settings, operation_id)
+            host_control_state = capture_critical_state(
+                settings, operation_id, deadline=deadline
+            )
             audit.add_event(
                 operation_id,
                 "approved_host_control_plane_guard_armed",
                 host_control_state,
             )
+        except TimeoutError as guard_error:
+            preflight_error = (
+                f"Approved Host control-plane preflight exceeded deadline: {guard_error}"
+            )
+            preflight_duration_ms = int((time.monotonic() - operation_started) * 1000)
+            preflight_result = {
+                "operation_id": operation_id,
+                "status": "timed_out",
+                "exit_code": None,
+                "duration_ms": preflight_duration_ms,
+                "stdout_preview": "",
+                "stderr_preview": "",
+                "stdout_total_bytes": 0,
+                "stderr_total_bytes": 0,
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+                "stdout_path": str(stdout_path),
+                "stderr_path": str(stderr_path),
+                "execution_tier": operation["tier"],
+                "failure_class": "operation_deadline",
+                "postflight_error": None,
+                "host_fallback_performed": False,
+            }
+            audit.transition_operation(
+                operation_id,
+                from_statuses={"running"},
+                status="timed_out",
+                finished_at=utc_now_iso(),
+                result_json=canonical_json(preflight_result),
+                error=preflight_error,
+                duration_ms=preflight_duration_ms,
+            )
+            audit.add_event(
+                operation_id,
+                "operation_deadline_exceeded",
+                {"error": str(guard_error)[:1000], "phase": "approved_host_preflight"},
+            )
+            if workspace_lock is not None:
+                workspace_lock.__exit__(None, None, None)
+            if host_control_locks is not None:
+                host_control_locks.close()
+            return 1
         except Exception as guard_error:  # noqa: BLE001 - host must not launch unguarded
             audit.transition_operation(
                 operation_id,
@@ -840,6 +884,13 @@ def run_operation(operation_id: str, settings: Settings) -> int:
                 raise RuntimeError("Approved Host forged operation result fields")
             if int(fresh_operation.get("worker_pid") or 0) != os.getpid():
                 raise RuntimeError("Approved Host changed the worker process binding")
+            if (
+                float(fresh_operation.get("worker_create_time") or 0)
+                != worker_identity.create_time
+                or str(fresh_operation.get("worker_executable") or "")
+                != worker_identity.executable
+            ):
+                raise RuntimeError("Approved Host changed the worker process identity")
             if str(fresh_operation.get("process_nonce") or "") != nonce:
                 raise RuntimeError("Approved Host changed the process nonce binding")
             if child_identity is not None and (

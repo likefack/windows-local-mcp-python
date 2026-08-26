@@ -194,9 +194,10 @@ def test_snapshot_execution_succeeds_when_bound_workspace_is_unchanged(
         data=data,
         operation_id="snapshot-bound-workspace",
         script_text="print('SNAPSHOT RUNS INDEPENDENTLY')",
+        max_runtime_seconds=60,
     )
     store.approve_and_claim("snapshot-bound-workspace", approver="integration-test")
-    result = executor.launch("snapshot-bound-workspace", 30)
+    result = executor.launch("snapshot-bound-workspace", 70)
 
     assert result["status"] == "succeeded"
     assert "SNAPSHOT RUNS INDEPENDENTLY" in result["stdout_preview"]
@@ -399,6 +400,37 @@ def test_approved_host_allows_legitimate_descendant_to_finish(tmp_path: Path, mo
     assert output.read_text(encoding="utf-8") == "finished"
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Approved Host preflight deadline is Windows-only")
+def test_approved_host_preflight_deadline_is_terminal(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    data = tmp_path / "data"
+    config = tmp_path / "config.toml"
+    _write_config(workspace, data, config)
+    monkeypatch.setenv("LOCAL_MCP_CONFIG", str(config))
+    monkeypatch.delenv("LOCAL_MCP_ROOT", raising=False)
+    marker = data / "control-plane" / "preflight-deadline-child-started.txt"
+
+    _, store, executor = _prepare_operation(
+        workspace=workspace,
+        data=data,
+        operation_id="approved-host-preflight-deadline",
+        script_text=(
+            "from pathlib import Path\n"
+            f"Path({str(marker)!r}).write_text('started', encoding='utf-8')\n"
+        ),
+        max_runtime_seconds=1,
+    )
+    store.approve_and_claim("approved-host-preflight-deadline", approver="integration-test")
+    result = executor.launch("approved-host-preflight-deadline", 10)
+    operation = store.get_operation("approved-host-preflight-deadline")
+
+    assert result["status"] == "timed_out"
+    assert result["failure_class"] == "operation_deadline"
+    assert operation["child_pid"] is None
+    assert not marker.exists()
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Approved Host descendant Job Object is Windows-only")
 def test_approved_host_terminates_descendants_at_runtime_limit(tmp_path: Path, monkeypatch) -> None:
     workspace = tmp_path / "workspace"
@@ -412,7 +444,7 @@ def test_approved_host_terminates_descendants_at_runtime_limit(tmp_path: Path, m
     descendant = (
         "import time\n"
         "from pathlib import Path\n"
-        "time.sleep(2.0)\n"
+        "time.sleep(90.0)\n"
         f"Path({str(late_write)!r}).write_text('escaped', encoding='utf-8')\n"
     )
     script = (
@@ -428,11 +460,11 @@ def test_approved_host_terminates_descendants_at_runtime_limit(tmp_path: Path, m
         data=data,
         operation_id="approved-host-descendant-timeout",
         script_text=script,
-        max_runtime_seconds=1,
+        max_runtime_seconds=35,
     )
     store.approve_and_claim("approved-host-descendant-timeout", approver="integration-test")
-    result = executor.launch("approved-host-descendant-timeout", 10)
-    time.sleep(1.5)
+    result = executor.launch("approved-host-descendant-timeout", 75)
+    time.sleep(1.0)
 
     assert result["status"] == "timed_out"
     assert result["failure_class"] == "runtime_limit"

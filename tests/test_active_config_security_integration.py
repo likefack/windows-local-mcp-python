@@ -134,8 +134,9 @@ def test_real_approved_host_config_tamper_fails_closed(
     operation = store.get_operation(operation_id)
     marker = settings.data_dir / "control-plane" / "tamper-detected.json"
 
-    assert config.read_text(encoding="utf-8").find("git_enabled = true") >= 0
-    assert result["status"] == "failed"
+    diagnostic = {"result": result, "operation": operation}
+    assert config.read_text(encoding="utf-8").find("git_enabled = true") >= 0, diagnostic
+    assert result["status"] == "failed", diagnostic
     assert operation["result"]["failure_class"] == "control_plane_tamper_unknown"
     assert marker.is_file()
     with pytest.raises(RuntimeError, match="tampering was previously detected"):

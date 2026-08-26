@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import shutil
@@ -216,7 +217,29 @@ def test_terminal_state_cannot_be_rewound_by_completion_race(tmp_path: Path) -> 
     assert audit.get_operation(operation, include_events=False)["status"] == "cancelled"
 
 
-def test_host_guard_binds_current_operation_approval_state(tmp_path: Path) -> None:
+def test_host_guard_tracks_trusted_operation_approval_state(tmp_path: Path) -> None:
+    settings = settings_for(tmp_path)
+    audit = AuditStore(settings)
+    operation = audit.create_operation(
+        tool_name="host",
+        tier="approved_host",
+        status="running",
+        cwd=str(settings.workspace_root),
+        request={"normalized_command": {"program_key": "python"}},
+        request_hash="a" * 64,
+        approval_status="approved",
+    )
+    before = capture_critical_state(settings, operation)
+    original = copy.deepcopy(before)
+
+    audit.update_operation(operation, request_hash="b" * 64)
+    after = capture_critical_state(settings, operation)
+
+    assert after == before
+    assert after != original
+
+
+def test_host_guard_canonicalizes_trusted_process_creation_time(tmp_path: Path) -> None:
     settings = settings_for(tmp_path)
     audit = AuditStore(settings)
     operation = audit.create_operation(
@@ -230,9 +253,10 @@ def test_host_guard_binds_current_operation_approval_state(tmp_path: Path) -> No
     )
     before = capture_critical_state(settings, operation)
 
-    audit.update_operation(operation, request_hash="b" * 64)
+    audit.update_operation(operation, child_create_time=1787771479.1627915)
+    after = capture_critical_state(settings, operation)
 
-    assert capture_critical_state(settings, operation) != before
+    assert after == before
 
 
 def test_secret_redaction_keeps_command_shape() -> None:

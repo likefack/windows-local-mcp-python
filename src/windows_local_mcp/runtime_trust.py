@@ -7,6 +7,7 @@ import site
 import stat
 import sys
 import sysconfig
+import time
 from dataclasses import dataclass
 from importlib import machinery, metadata
 from pathlib import Path
@@ -51,6 +52,11 @@ class RuntimeTrustInventory:
     security_paths: tuple[Path, ...]
     files: tuple[Path, ...]
     distributions: tuple[tuple[str, str], ...]
+
+
+def _check_deadline(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError("trusted runtime dependency capture exceeded operation deadline")
 
 
 def _canonical_distribution_name(value: str) -> str:
@@ -397,7 +403,10 @@ def build_runtime_trust_inventory(package_root: Path | None = None) -> RuntimeTr
     )
 
 
-def _tree_entries(tree: RuntimeTree) -> tuple[list[Path], list[Path]]:
+def _tree_entries(
+    tree: RuntimeTree, *, deadline: float | None = None
+) -> tuple[list[Path], list[Path]]:
+    _check_deadline(deadline)
     root = _resolved_existing(tree.root)
     excluded = tuple(path.resolve(strict=True) for path in tree.excluded_roots)
     if root.is_file():
@@ -405,9 +414,11 @@ def _tree_entries(tree: RuntimeTree) -> tuple[list[Path], list[Path]]:
     files: list[Path] = []
     directories_seen: list[Path] = [root]
     for current, directories, names in os.walk(root, followlinks=False):
+        _check_deadline(deadline)
         current_path = Path(current)
         retained: list[str] = []
         for name in directories:
+            _check_deadline(deadline)
             candidate = current_path / name
             if any(
                 candidate == excluded_root or _is_inside(candidate, excluded_root)
@@ -422,6 +433,7 @@ def _tree_entries(tree: RuntimeTree) -> tuple[list[Path], list[Path]]:
             directories_seen.append(candidate.resolve(strict=True))
         directories[:] = retained
         for name in names:
+            _check_deadline(deadline)
             candidate = current_path / name
             if any(
                 candidate == excluded_root or _is_inside(candidate, excluded_root)
@@ -436,14 +448,18 @@ def _tree_entries(tree: RuntimeTree) -> tuple[list[Path], list[Path]]:
     return files, directories_seen
 
 
-def _namespace_records(roots: tuple[Path, ...]) -> list[dict[str, Any]]:
+def _namespace_records(
+    roots: tuple[Path, ...], *, deadline: float | None = None
+) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for root in roots:
+        _check_deadline(deadline)
         resolved = _resolved_existing(root)
         if not resolved.is_dir():
             continue
         entries: list[dict[str, Any]] = []
         for child in sorted(resolved.iterdir(), key=lambda item: item.name.casefold()):
+            _check_deadline(deadline)
             kind = _namespace_entry_kind(child)
             if kind is None:
                 continue
@@ -478,17 +494,22 @@ def capture_runtime_dependency_state(
     max_files: int,
     max_bytes: int,
     inventory: RuntimeTrustInventory | None = None,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
+    _check_deadline(deadline)
     inventory = inventory or build_runtime_trust_inventory()
+    _check_deadline(deadline)
     candidates: set[Path] = set(inventory.files)
     directories: set[Path] = set()
     for tree in inventory.trees:
-        tree_files, tree_directories = _tree_entries(tree)
+        _check_deadline(deadline)
+        tree_files, tree_directories = _tree_entries(tree, deadline=deadline)
         candidates.update(tree_files)
         directories.update(tree_directories)
     records: list[dict[str, Any]] = []
     total_bytes = 0
     for path in sorted(candidates, key=lambda item: os.path.normcase(str(item))):
+        _check_deadline(deadline)
         resolved = _resolved_existing(path)
         if not resolved.is_file():
             raise RuntimeError(f"trusted runtime dependency is not a regular file: {resolved}")
@@ -517,6 +538,7 @@ def capture_runtime_dependency_state(
     for directory in sorted(
         directories, key=lambda item: os.path.normcase(str(item))
     ):
+        _check_deadline(deadline)
         details = directory.stat()
         directory_records.append(
             {
@@ -528,6 +550,7 @@ def capture_runtime_dependency_state(
         )
     security_records: list[dict[str, Any]] = []
     for path in inventory.security_paths:
+        _check_deadline(deadline)
         resolved = _resolved_existing(path)
         details = resolved.stat()
         security_records.append(
@@ -538,7 +561,9 @@ def capture_runtime_dependency_state(
                 "security_sha256": _security_descriptor_sha256(resolved),
             }
         )
-    namespace = _namespace_records(inventory.namespace_roots)
+    _check_deadline(deadline)
+    namespace = _namespace_records(inventory.namespace_roots, deadline=deadline)
+    _check_deadline(deadline)
     payload = {
         "version": RUNTIME_TRUST_VERSION,
         "distributions": [
