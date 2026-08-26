@@ -33,7 +33,7 @@ C:\Program Files\WindowsLocalMCP\
 
 既存 install を置換する場合だけ `-Replace` を付けます。
 
-installer は wheel を `.dev-tmp\approved-host-runtime` に build し、staging directory へ非 editable install した後、staging 全体の owner／ACL を固定してから active `InstallRoot` へ移します。通常 runtime user には RX、SYSTEM と Administrators には Full Control を与えます。
+installer は `InstallRoot`、`BasePython`、`sys.base_prefix` が Windows の Program Files 配下であることを admission 時に要求します。そのうえで wheel を `.dev-tmp\approved-host-runtime` に build し、staging directory へ非 editable install した後、staging 全体の owner／ACL を固定してから active `InstallRoot` へ移します。通常 runtime user には RX、SYSTEM と Administrators には Full Control を与えます。Program Files 配下という名前だけを immutability の証拠にはせず、base Python を含む実効 access は後段の non-elevated verification で再検証します。
 
 ## Non-elevated verification
 

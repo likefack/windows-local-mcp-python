@@ -45,7 +45,7 @@ def test_namespace_ignores_non_importable_reparse_file(
 
 @pytest.mark.parametrize(
     "name",
-    ["shadow.py", f"native{machinery.EXTENSION_SUFFIXES[0]}"],
+    ["shadow.py", "startup.pth", f"native{machinery.EXTENSION_SUFFIXES[0]}"],
 )
 def test_namespace_rejects_importable_reparse_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
@@ -102,7 +102,7 @@ def test_security_path_is_not_recursively_promoted_to_runtime_tree(tmp_path: Pat
     assert result["file_count"] == 0
 
 
-def test_existing_optional_namespace_package_remains_immutable(
+def test_existing_regular_package_remains_immutable(
     tmp_path: Path,
 ) -> None:
     package_root = tmp_path / "package"

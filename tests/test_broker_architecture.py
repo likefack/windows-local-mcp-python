@@ -17,7 +17,10 @@ from windows_local_mcp.control_plane import (
     load_worker_context,
     verify_control_plane_generation,
 )
-from windows_local_mcp.control_plane_guard import capture_critical_state
+from windows_local_mcp.control_plane_guard import (
+    capture_critical_state,
+    expected_critical_state,
+)
 from windows_local_mcp.redaction import redact_command_args, redact_text, redact_value
 from windows_local_mcp.resources import prune_artifacts
 from windows_local_mcp.workspace_history import (
@@ -232,7 +235,9 @@ def test_host_guard_binds_current_operation_approval_state(tmp_path: Path) -> No
 
     audit.update_operation(operation, request_hash="b" * 64)
 
-    assert capture_critical_state(settings, operation) != before
+    expected = expected_critical_state(settings, operation)
+    assert before != expected
+    assert capture_critical_state(settings, operation) == expected
 
 
 def test_secret_redaction_keeps_command_shape() -> None:

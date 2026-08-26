@@ -24,9 +24,9 @@ ChatGPT から、指定した 1 つの Windows 作業領域を安全に読み書
 
 旧 Safe Tier／AppContainer は現行の方針には存在しません。旧設定が残っている場合は、弱い互換動作へ移らず起動を拒否します。
 
-## セットアップ
+## Developer editable setup
 
-Python 3.11 以上を使用します。
+Python 3.11 以上を使用します。repository checkout と `.venv` は通常 user が編集できる開発環境であり、Broker／Codex Sandbox の開発・テスト用です。Approved Host の production trust anchor にはなりません。`approved_host_enabled = true` のままでも runtime preflight は mutable runtime を検出して `available = false` にするため、editable 環境では Approved Host は利用できません。開発中に不要なら `approved_host_enabled = false` を推奨します。
 
 ```powershell
 Set-Location C:\dev\windows-local-mcp-python
@@ -41,6 +41,7 @@ Copy-Item config.example.toml config.local.toml
 workspace_root = "C:\\dev\\your-project"
 data_dir = "C:\\Users\\you\\AppData\\Local\\windows-local-mcp\\your-project"
 protect_data_dir_acl = true
+approved_host_enabled = false
 ```
 
 Broker が自動実行する ADB helper は `PATH` 上の同名ファイルを使用しません。workspace、`data_dir`、Sandbox scratch の外にある絶対 path と SHA-256 を対で設定してください。未設定時は capability が有効でも実行を拒否します。
@@ -57,7 +58,7 @@ git_executable_path = "C:\\Program Files\\Git\\cmd\\git.exe"
 git_executable_sha256 = "ここを64桁のSHA-256へ置換"
 ```
 
-起動は次のとおりです。設定が不正な場合は、workspace を操作する前に起動を拒否します。
+開発 server は次のとおり起動します。設定が不正な場合は、workspace を操作する前に起動を拒否します。
 
 ```powershell
 .\run-server.ps1 -Config .\config.local.toml
@@ -69,8 +70,36 @@ Secure MCP Tunnel には、Shell 文字列ではなく次の argv を登録し�
 powershell.exe -NoProfile -File C:\dev\windows-local-mcp-python\run-server.ps1 -Config C:\path\to\config.local.toml
 ```
 
-複数 workspace は別々の `config`、`data_dir`、Sandbox scratch を使用してください。namespace marker が workspace、data_dir、実体識別子の混在を拒否します。
-Windows では handle から得た volume GUID 付きの物理 path も比較するため、junction／reparse point だけでなく SUBST 等の別名で同じ領域を指定した場合も起動を拒否します。
+複数 workspace は別々の `config`、`data_dir`、Sandbox scratch を使用してください。namespace marker が workspace、data_dir、実体識別子の混在を拒否します。Windows では handle から得た volume GUID 付きの物理 path も比較するため、junction／reparse point だけでなく SUBST 等の別名で同じ領域を指定した場合も起動を拒否します。
+
+## Approved Host production setup
+
+Approved Host を有効にする production runtime は editable checkout とは分離し、通常 user が read/execute のみ可能な非 editable install として Windows の Program Files 配下へ配置します。base Python と `sys.base_prefix` も Program Files 配下である必要があり、通常 user からの実効的な変更権限は non-elevated verification で fail closed します。
+
+管理者 PowerShell から、Approved Host を使用する通常 Windows account を `RuntimeUser` に指定して provision します。
+
+```powershell
+.\install-approved-host-runtime.ps1 `
+  -BasePython "C:\Program Files\Python312\python.exe" `
+  -RuntimeUser "$env:USERDOMAIN\$env:USERNAME"
+```
+
+installer は WLMCP を wheel から非 editable install し、production runtime の ACL を通常 runtime user = RX、SYSTEM／Administrators = Full Control に固定します。既存 runtime を更新する場合だけ `-Replace` を使用します。
+
+install 後は管理者 shell を閉じ、Approved Host を実際に使用する通常 user の非昇格 PowerShell から runtime preflight を実行します。
+
+```powershell
+& "C:\Program Files\WindowsLocalMCP\verify-approved-host-runtime.ps1"
+```
+
+成功後、production launcher から server／approval UI を起動します。
+
+```powershell
+& "C:\Program Files\WindowsLocalMCP\run-server.ps1" -Config "C:\path\to\config.local.toml"
+& "C:\Program Files\WindowsLocalMCP\run-approvals.ps1" -Config "C:\path\to\config.local.toml"
+```
+
+`session_info()` の Approved Host capability は設定上の `enabled` と production runtime preflight に基づく `available` を別々に表示します。preflight が成功していても、実際の Approved Host worker 起動直前には runtime immutability gate を必ず再実行します。詳細な provision／更新／実機検証手順は `docs/APPROVED_HOST_RUNTIME.md` を参照してください。
 
 ## 主な機能
 
