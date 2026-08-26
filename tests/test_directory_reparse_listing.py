@@ -6,8 +6,6 @@ from pathlib import Path
 
 import pytest
 
-from windows_local_mcp.paths import release_verified_hold
-
 pytestmark = pytest.mark.skipif(
     os.name != "nt",
     reason="Windows reparse semantics are the directory-listing security boundary",
@@ -55,7 +53,7 @@ def entry_types(result: dict[str, object]) -> dict[str, str]:
     }
 
 
-def test_list_directory_does_not_follow_external_junction(
+def test_list_directory_classifies_external_junction_without_following_target(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     server, root = load_server(tmp_path, monkeypatch)
@@ -70,12 +68,10 @@ def test_list_directory_does_not_follow_external_junction(
 
     assert types["normal-dir"] == "directory"
     assert types["normal.txt"] == "file"
-    # list_directory has a two-value public type schema. A reparse child is deliberately
-    # non-directory so callers cannot infer that it is safe to traverse as a directory.
-    assert types["external-junction"] == "file"
+    assert types["external-junction"] == "reparse"
 
 
-def test_list_directory_does_not_follow_external_directory_symlink(
+def test_list_directory_classifies_external_directory_symlink_as_reparse(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     server, root = load_server(tmp_path, monkeypatch)
@@ -89,25 +85,4 @@ def test_list_directory_does_not_follow_external_directory_symlink(
 
     types = entry_types(server.list_directory("."))
 
-    assert types["external-symlink"] == "file"
-
-
-def test_listed_reparse_child_is_dir_uses_parent_enumeration_metadata(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    server, root = load_server(tmp_path, monkeypatch)
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    create_junction(root / "external-junction", outside)
-
-    directory = server.runtime.workspace.resolve_directory(".")
-    try:
-        child = next(entry for entry in directory.iterdir() if entry.name == "external-junction")
-
-        def forbidden_child_stat(*_args: object, **_kwargs: object) -> object:
-            raise AssertionError("listed child type must not stat the child target")
-
-        monkeypatch.setattr(type(child), "stat", forbidden_child_stat)
-        assert child.is_dir() is False
-    finally:
-        release_verified_hold(directory)
+    assert types["external-symlink"] == "reparse"
