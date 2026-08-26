@@ -301,6 +301,18 @@ def build_runtime_trust_inventory(package_root: Path | None = None) -> RuntimeTr
                 if candidate.is_file():
                     files.add(candidate.resolve(strict=True))
 
+    # Production launchers execute before Python can inspect the control-plane marker. If
+    # present adjacent to the active venv, they are part of the persistent Approved Host TCB.
+    runtime_parent = Path(sys.prefix).resolve(strict=True).parent
+    launcher_files = [
+        runtime_parent / "run-server.ps1",
+        runtime_parent / "run-approvals.ps1",
+    ]
+    existing_launchers = [path for path in launcher_files if path.is_file()]
+    if existing_launchers:
+        security_paths.add(runtime_parent)
+        files.update(path.resolve(strict=True) for path in existing_launchers)
+
     for key in ("stdlib", "platstdlib"):
         value = sysconfig.get_path(key)
         if not value:
