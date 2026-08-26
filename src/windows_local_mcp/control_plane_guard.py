@@ -680,8 +680,8 @@ def mark_control_plane_tamper(
             temporary.unlink(missing_ok=True)
     try:
         _clear_approved_host_postflight_guard(settings, operation_id, missing_ok=True)
-    except Exception:
+    except (OSError, RuntimeError):
         # The canonical tamper marker is already durable. Keeping an unreadable or mismatched
         # pending marker is safer than allowing cleanup uncertainty to weaken the latch.
-        pass
+        return str(marker)
     return str(marker)
