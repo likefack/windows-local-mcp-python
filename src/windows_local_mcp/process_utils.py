@@ -233,7 +233,15 @@ def terminate_process_tree(identity: ProcessIdentity, timeout: float = 8.0) -> b
     if process is None:
         return False
 
-    children = process.children(recursive=True)
+    try:
+        children = process.children(recursive=True)
+        # children() performs its own PID-reuse check, but re-check the original
+        # bound Process after enumeration before sending any termination signal.
+        if not process.is_running():
+            return False
+    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+        return False
+
     for child in children:
         try:
             child.terminate()
