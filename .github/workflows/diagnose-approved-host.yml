@@ -28,14 +28,15 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Verify main base has not moved
+      - name: Merge latest main into validation branch
         shell: pwsh
         run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git fetch origin main
           $main = (git rev-parse origin/main).Trim()
-          if ($main -ne 'e56e7a3326eb384ea21fb6963efbd8fb786a1cef') {
-            throw "main moved during finalization: $main"
-          }
+          "VALIDATED_MAIN_SHA=$main" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          git merge --no-edit origin/main
 
       - name: Apply Approved Host completion patches
         run: |
@@ -86,8 +87,11 @@ jobs:
       - name: Commit verified source changes
         shell: pwsh
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          $currentMain = (git rev-parse origin/main).Trim()
+          if ($currentMain -ne $env:VALIDATED_MAIN_SHA) {
+            throw "main moved during validation: $currentMain"
+          }
           git add README.md docs/APPROVED_HOST_RUNTIME.md install-approved-host-runtime.ps1
           git add src/windows_local_mcp/control_plane_guard.py src/windows_local_mcp/process_utils.py src/windows_local_mcp/server.py src/windows_local_mcp/worker.py
           git add tests/test_approved_host_runtime_scope.py tests/test_broker_architecture.py tests/test_powershell_scripts.py tests/test_server_operations.py
