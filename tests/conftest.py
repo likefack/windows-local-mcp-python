@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 
 _MUTABLE_CHECKOUT_HOST_TESTS = {
+    "test_active_config_security_integration.py",
     "test_approval_execution_integration.py",
     "test_approved_host_audit_integrity.py",
 }

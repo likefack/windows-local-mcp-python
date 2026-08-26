@@ -8,7 +8,7 @@ import stat
 import sys
 import sysconfig
 from dataclasses import dataclass
-from importlib import metadata
+from importlib import machinery, metadata
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +24,18 @@ _ROOT_DISTRIBUTIONS = (
     "Pillow",
 )
 _REQUIREMENT_NAME = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
+_IMPORTABLE_FILE_SUFFIXES = tuple(
+    sorted(
+        {
+            *(suffix.casefold() for suffix in machinery.SOURCE_SUFFIXES),
+            *(suffix.casefold() for suffix in machinery.BYTECODE_SUFFIXES),
+            *(suffix.casefold() for suffix in machinery.EXTENSION_SUFFIXES),
+        },
+        key=len,
+        reverse=True,
+    )
+)
+_STARTUP_IMPORT_FILES = {"sitecustomize.py", "usercustomize.py"}
 
 
 @dataclass(frozen=True)
@@ -59,6 +71,50 @@ def _is_reparse(path: Path) -> bool:
     return path.is_symlink() or bool(
         attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
     )
+
+
+def _directory_has_package_init(path: Path) -> bool:
+    return any((path / f"__init__{suffix}").is_file() for suffix in _IMPORTABLE_FILE_SUFFIXES)
+
+
+def _namespace_entry_kind(path: Path) -> str | None:
+    """Classify entries that can affect trusted Python import/startup resolution.
+
+    Namespace roots are search locations, not recursive trust roots. A non-importable sibling
+    such as the Windows hosted-toolcache ``python3.exe`` alias must not make the whole runtime
+    unavailable merely because it is a reparse point. Python/native modules, startup ``.pth``
+    hooks, regular packages and namespace-package directories remain security relevant.
+    """
+
+    name = path.name
+    folded = name.casefold()
+    if folded.endswith(".pth"):
+        return "startup-hook"
+    if folded in _STARTUP_IMPORT_FILES:
+        return "startup-module"
+    for suffix in _IMPORTABLE_FILE_SUFFIXES:
+        if folded.endswith(suffix):
+            module_name = name[: -len(suffix)] if suffix else name
+            if module_name.isidentifier():
+                return "module-file"
+            return None
+
+    if _is_reparse(path):
+        try:
+            resolved = path.resolve(strict=True)
+        except OSError as error:
+            if name.isidentifier():
+                raise RuntimeError(
+                    f"trusted import namespace contains an unresolved package entry: {path}"
+                ) from error
+            return None
+        if resolved.is_dir() and name.isidentifier():
+            return "namespace-directory"
+        return None
+
+    if path.is_dir() and name.isidentifier():
+        return "package-directory" if _directory_has_package_init(path) else "namespace-directory"
+    return None
 
 
 def _resolved_existing(path: Path) -> Path:
@@ -367,6 +423,9 @@ def _namespace_records(roots: tuple[Path, ...]) -> list[dict[str, Any]]:
             continue
         entries: list[dict[str, Any]] = []
         for child in sorted(resolved.iterdir(), key=lambda item: item.name.casefold()):
+            kind = _namespace_entry_kind(child)
+            if kind is None:
+                continue
             if _is_reparse(child):
                 raise RuntimeError(
                     f"trusted import namespace contains a reparse point: {child}"
@@ -375,11 +434,7 @@ def _namespace_records(roots: tuple[Path, ...]) -> list[dict[str, Any]]:
             entries.append(
                 {
                     "name": child.name,
-                    "kind": (
-                        "directory"
-                        if child.is_dir()
-                        else "file" if child.is_file() else "other"
-                    ),
+                    "kind": kind,
                     "device": int(details.st_dev),
                     "inode": int(details.st_ino),
                 }

@@ -8,7 +8,12 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from .runtime_trust import RuntimeTree, RuntimeTrustInventory, build_runtime_trust_inventory
+from .runtime_trust import (
+    RuntimeTree,
+    RuntimeTrustInventory,
+    _namespace_entry_kind,
+    build_runtime_trust_inventory,
+)
 from .util import canonical_json, sha256_bytes, sha256_text
 
 RUNTIME_IMMUTABILITY_VERSION = 1
@@ -109,6 +114,44 @@ def _tree_paths(tree: RuntimeTree) -> tuple[set[Path], set[Path]]:
     return directories, files
 
 
+def _namespace_paths(root: Path) -> tuple[set[Path], set[Path]]:
+    """Expand only entries that can participate in trusted Python import/startup.
+
+    The namespace directory itself remains immutable so an Approved Host child cannot add
+    a new importable sibling. Regular packages are recursively immutable. Namespace-package
+    directories without an ``__init__`` are pinned at the directory boundary; declared
+    dependencies remain recursively covered by ``RuntimeTree`` inventory entries.
+    """
+
+    resolved = _resolved_existing(root)
+    if not resolved.is_dir():
+        return set(), {resolved}
+    directories: set[Path] = {resolved}
+    files: set[Path] = set()
+    for child in sorted(resolved.iterdir(), key=lambda item: item.name.casefold()):
+        kind = _namespace_entry_kind(child)
+        if kind is None:
+            continue
+        if _is_reparse(child):
+            raise RuntimeError(
+                f"Approved Host import namespace contains a reparse point: {child}"
+            )
+        if child.is_dir():
+            if kind == "package-directory":
+                child_directories, child_files = _tree_paths(RuntimeTree(child))
+                directories.update(child_directories)
+                files.update(child_files)
+            else:
+                directories.add(child.resolve(strict=True))
+        elif child.is_file():
+            files.add(child.resolve(strict=True))
+        else:
+            raise RuntimeError(
+                f"Approved Host import namespace contains an unsafe entry: {child}"
+            )
+    return directories, files
+
+
 def _validate_lexical_runtime_ancestors() -> None:
     """Reject lexical reparse ancestry without over-scoping unrelated parent creation rights."""
     values = [
@@ -147,23 +190,33 @@ def _runtime_paths(
     supplied_inventory = inventory is not None
     inventory = inventory or build_runtime_trust_inventory(package)
 
-    directories: set[Path] = set(inventory.namespace_roots)
-    directories.update(inventory.security_paths)
+    directories: set[Path] = set()
     files: set[Path] = set(inventory.files)
     if not supplied_inventory:
         _validate_lexical_runtime_ancestors()
 
-    # The postflight digest intentionally hashes only the declared dependency closure for
-    # performance. Approved Host needs a stronger invariant: every existing file under an
-    # import namespace or Python runtime root must be non-mutable, including undeclared
-    # optional packages that could be imported on a later startup.
-    complete_roots = set(inventory.namespace_roots) | set(inventory.security_paths)
-    for root in complete_roots:
-        if root.is_dir():
-            root_directories, root_files = _tree_paths(RuntimeTree(root))
-            directories.update(root_directories)
-            files.update(root_files)
+    # Security paths describe an ACL/identity boundary, not a recursive import tree. Their
+    # own mutating access is security-relevant because creation/replacement in the directory
+    # can redirect a trusted runtime path; unrelated children are not automatically TCB.
+    for security_path in inventory.security_paths:
+        resolved = _resolved_existing(security_path)
+        if resolved.is_dir():
+            directories.add(resolved)
+        elif resolved.is_file():
+            files.add(resolved)
+        else:
+            raise RuntimeError(
+                f"Approved Host runtime security path is not a regular path: {resolved}"
+            )
 
+    # Namespace roots are search locations. Keep the root immutable so new modules cannot be
+    # injected, and expand only existing import/startup-capable entries.
+    for root in inventory.namespace_roots:
+        namespace_directories, namespace_files = _namespace_paths(root)
+        directories.update(namespace_directories)
+        files.update(namespace_files)
+
+    # Declared runtime/dependency trees are complete TCB roots and remain recursively strict.
     for tree in inventory.trees:
         tree_directories, tree_files = _tree_paths(tree)
         directories.update(tree_directories)
@@ -412,6 +465,10 @@ def _verify_paths_immutable(
     return records
 
 
+def _runtime_is_isolated() -> bool:
+    return bool(sys.flags.isolated)
+
+
 def assert_approved_host_runtime_immutable(
     package_root: Path | None = None,
     *,
@@ -419,8 +476,11 @@ def assert_approved_host_runtime_immutable(
     access_resolver: Callable[[Path], int] | None = None,
 ) -> dict[str, Any]:
     """Fail closed unless every startup-active runtime file and namespace is user-immutable."""
-    if os.name != "nt" and access_resolver is None:
-        raise RuntimeError("Approved Host runtime immutability is supported only on Windows")
+    if access_resolver is None:
+        if os.name != "nt":
+            raise RuntimeError("Approved Host runtime immutability is supported only on Windows")
+        if not _runtime_is_isolated():
+            raise RuntimeError("Approved Host requires Python isolated mode (-I)")
     directories, ancestor_directories, files, distributions = _runtime_paths(
         package_root, inventory=inventory
     )
