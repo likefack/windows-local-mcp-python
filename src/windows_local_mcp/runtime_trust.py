@@ -213,7 +213,6 @@ def _distribution_closure() -> tuple[metadata.Distribution, ...]:
                     f"trusted runtime dependency is not installed: {requested}"
                 ) from error
             continue
-        name = str(distribution.metadata.get("Name") or requested)
         result.append(distribution)
         for requirement in distribution.requires or ():
             match = _REQUIREMENT_NAME.match(requirement)
