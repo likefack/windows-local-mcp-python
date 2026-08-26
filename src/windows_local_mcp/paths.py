@@ -31,7 +31,9 @@ _WINDOWS_DEVICES = {
 _REPARSE_ATTRIBUTE = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
 _DIRECTORY_ATTRIBUTE = getattr(stat, "FILE_ATTRIBUTE_DIRECTORY", 0x10)
 _GENERIC_READ = 0x80000000
+_FILE_LIST_DIRECTORY = 0x00000001
 _FILE_READ_ATTRIBUTES = 0x00000080
+_SYNCHRONIZE = 0x00100000
 _FILE_SHARE_READ = 0x00000001
 _FILE_BEGIN = 0
 _READ_CHUNK_BYTES = 1024 * 1024
@@ -292,6 +294,11 @@ def _windows_component_handles(
                 else _FILE_SHARE_READ | _FILE_SHARE_WRITE
             )
             desired_access = _FILE_READ_ATTRIBUTES
+            if not final or allow_directory:
+                # Attribute-only access is excluded from Win32 share-mode enforcement.
+                # Request real directory access so the missing FILE_SHARE_DELETE bit
+                # pins each directory component against delete/rename redirection.
+                desired_access |= _FILE_LIST_DIRECTORY | _SYNCHRONIZE
             if final and final_read_data:
                 desired_access |= _GENERIC_READ
             handle = kernel32.CreateFileW(
@@ -350,10 +357,10 @@ def hold_verified_path(
     """Return a path whose Windows namespace/file identity remains locked while referenced.
 
     On Windows, every path component is opened with reparse-point semantics and retained
-    without FILE_SHARE_DELETE. A readable final handle is consumed directly by ReadFile; a
-    path-only lease is retained for external-process bindings and write-intent identity checks.
-    This prevents namespace replacement while avoiding pathname re-open as the Broker read
-    security boundary.
+    without FILE_SHARE_DELETE. Directory components request FILE_LIST_DIRECTORY so the share
+    mode actually participates in rename/delete exclusion; readable final files are consumed
+    directly by ReadFile. This prevents namespace replacement while avoiding pathname re-open
+    as the Broker read security boundary.
     """
 
     lexical = Path(os.path.abspath(os.path.normpath(os.fspath(path))))
