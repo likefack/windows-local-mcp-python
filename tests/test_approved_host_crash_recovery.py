@@ -9,12 +9,12 @@ import pytest
 
 from windows_local_mcp.audit import AuditStore
 from windows_local_mcp.config import Settings
+from windows_local_mcp.control_plane import control_plane_generation
 from windows_local_mcp.control_plane_guard import (
     assert_control_plane_healthy,
     capture_critical_state,
     expected_critical_state,
 )
-from windows_local_mcp.control_plane import control_plane_generation
 from windows_local_mcp.executor import Executor
 
 
