@@ -48,9 +48,9 @@ write(path, text)
 # Keep the Approved Host immutable approval-row binding explicit and independently testable.
 path = "src/windows_local_mcp/worker.py"
 text = Path(path).read_text(encoding="utf-8")
-text = replace_once(
+text = regex_once(
     text,
-    'class RuntimeStoragePolicyError(RuntimeError):\n    pass\n\ndef run_operation',
+    r'class RuntimeStoragePolicyError\(RuntimeError\):\s+pass\s+def run_operation',
     'class RuntimeStoragePolicyError(RuntimeError):\n    pass\n\n\ndef _approved_host_operation_binding(operation: dict[str, Any]) -> dict[str, Any]:\n    """Return approval fields that an Approved Host child must never change."""\n\n    return {\n        "id": operation["id"],\n        "tier": operation["tier"],\n        "request_hash": operation.get("request_hash"),\n        "claimed_at": operation.get("claimed_at"),\n        "approval_status": operation.get("approval_status"),\n        "request": operation["request"],\n    }\n\n\ndef run_operation',
     "approved host binding helper",
 )
