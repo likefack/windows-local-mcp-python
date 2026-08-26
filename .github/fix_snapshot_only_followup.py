@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+# Trigger the main-branch Windows verification harness after workflow registration.
+
 
 def replace_once(text: str, old: str, new: str, label: str) -> str:
     count = text.count(old)
