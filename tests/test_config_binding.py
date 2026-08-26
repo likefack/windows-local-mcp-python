@@ -5,7 +5,11 @@ from pathlib import Path
 import pytest
 
 from windows_local_mcp.config import Settings
-from windows_local_mcp.config_binding import export_config_binding
+from windows_local_mcp.config_binding import (
+    CONFIG_BINDING_VERSION,
+    export_config_binding,
+    restore_config_binding,
+)
 from windows_local_mcp.control_plane import create_worker_context, load_worker_context
 
 
@@ -24,6 +28,18 @@ def _settings_with_config(tmp_path: Path, config: Path) -> Settings:
     settings._ambient_root_present = False
     settings.ensure_directories()
     return settings
+
+
+def test_restore_config_binding_rejects_non_boolean_ambient_root() -> None:
+    binding = {
+        "version": CONFIG_BINDING_VERSION,
+        "config_source": "environment_only",
+        "workspace_source": "LOCAL_MCP_ROOT",
+        "ambient_root_present": "false",
+    }
+
+    with pytest.raises(TypeError, match="ambient-root binding"):
+        restore_config_binding(object(), binding)
 
 
 def test_config_binding_preserves_selector_path(
