@@ -17,7 +17,7 @@ Security objectives:
 
 `filesystem_enabled`, `git_enabled`, `flutter_enabled`, `dart_enabled`, `adb_enabled`, and `powershell_enabled` are independent. A disabled capability is disabled in both the automatic and approval paths; approval does not override an explicit `false`. Disabled optional tools are not resolved at startup. `workspace_root` is mandatory; there is no current-directory fallback.
 
-`git_enabled` and `adb_enabled` do not make their broker helpers available by themselves. Automatic helper execution requires an explicit absolute executable path and operator-pinned SHA-256. PATH discovery is not a trust source. Session capability data reports configured, enabled, and available separately.
+`adb_enabled` does not make its broker helper available by itself. Automatic ADB helper execution requires an explicit absolute executable path and operator-pinned SHA-256. PATH discovery is not a trust source. `git_enabled` may enable Git-related policy and approved routes, but the current release intentionally disables automatic Git Broker helper execution even when an explicit path/hash is configured, because workspace-controlled repository metadata cannot yet be safely confined for an unapproved Git child. Session capability data reports configured, enabled, and available separately; the presence of `git_info` or `execute_readonly` does not imply that automatic Git execution is available.
 
 Dangerous configuration combinations fail startup validation:
 
@@ -37,7 +37,7 @@ All MCP file paths pass through `Workspace`.
 - Reject symlink, junction, mount/reparse components.
 - Reject regular files with `st_nlink > 1`.
 - Apply protected-name, read-denied, and write-denied policy separately.
-- Keep `.git` directly unreadable/unwritable; obtain state only through Git subprocesses.
+- Keep `.git` directly unreadable/unwritable through ordinary filesystem Broker tools. Automatic Git state tools do not bypass this boundary; approved Git operations use their separately bound metadata path.
 
 `write_file` additionally:
 
@@ -68,22 +68,26 @@ Automatic broker execution uses complete subcommand grammars, not a first-token 
 
 The MCP surface is split after the deny-by-default grammar succeeds:
 
-- `execute_readonly`: fixed Git reads only.
+- `execute_readonly`: retained as the narrow read-only command surface. The Git grammar remains deny-by-default, but current Git requests fail closed before helper execution because automatic Git Broker execution is disabled.
 - `execute_workspace_write`: retained as a compatibility tool surface, but project-controlled formatting is rejected and directed to Codex Sandbox.
 - `adb_read`: only the fixed read-only ADB grammar.
 
-The split is presentation and host-policy metadata, not a second authorization system. All three call the same `CommandPolicy.normalize_safe()` and the same queue/executor path. A command routed to the wrong surface is rejected and directed to the matching tool.
+The split is presentation and host-policy metadata, not a second authorization system. All three call the same `CommandPolicy.normalize_safe()` and the same queue/executor path when a route is available. A command routed to the wrong surface is rejected and directed to the matching tool; a Git command is rejected before any automatic Git child is created.
 
 ### Git
 
-Automatic subcommands: `status`, `diff`, `log`, `show`, restricted `rev-parse`, and `ls-files`.
+Automatic Git Broker execution is disabled in the current release. Workspace-controlled repository metadata can change Git behavior in ways that are not yet proven to be safely confined to `workspace_root`, so an explicit executable path/hash alone is not sufficient to authorize an unapproved Git child. `trusted_helper_identity(..., "git")` therefore fails closed, `capture_git_snapshot()` returns no automatic snapshot, and model-facing `git_info` / `execute_readonly` Git requests return an error rather than launching Git.
+
+If automatic Git Broker execution is re-enabled in a future revision, its candidate grammar remains limited to `status`, `diff`, `log`, `show`, restricted `rev-parse`, and `ls-files`, with all of the following controls required before availability is claimed:
 
 - Force no pager; diff/show force `--no-ext-diff --no-textconv`.
 - Disallow `-C`, `--git-dir`, `--work-tree`, `--output`, config injection, pager/external helpers, and unknown flags.
 - Pathspec is accepted only after `--` and resolved inside workspace.
 - Git repository/config override environment variables are removed before Git subprocesses run.
 - Git is resolved only from the explicitly configured path/hash identity. The worker revalidates it and holds a Windows read-only-share handle against writes/replacement through process completion.
-- `git_info` returns branch, HEAD, status, working diff, staged diff, recent log, and changed files through bounded subprocess capture.
+- Repository-controlled metadata must be proven unable to expand filesystem, helper, network, or executable behavior beyond the Broker contract.
+
+Until those conditions are implemented and verified, Git work that needs process execution uses a separately human-approved execution route. Keeping the `git_info` and `execute_readonly` MCP surfaces does not constitute automatic Git availability.
 
 ### Project-controlled tools
 
@@ -101,13 +105,13 @@ ADB is separately disabled by default. Automatic forms are exact:
 
 Targeted calls require serial validation. `adb_emulator_only=true` requires an `emulator-*` serial and a successful `adb emu avd name` preflight. Optional `adb_allowed_serials` further narrows targets. General shell and state changes require approval.
 
-Automatic device enumeration is rejected because its raw output can disclose or expand attention to non-allowlisted physical devices. ADB uses the same explicit executable path/hash/identity/hold boundary as Git.
+Automatic device enumeration is rejected because its raw output can disclose or expand attention to non-allowlisted physical devices. ADB uses an explicit executable path/hash/identity/hold boundary.
 
 ### Execution lock policy
 
 The workspace-wide mutation lock is no longer held for every command for the full child-process lifetime.
 
-- Fixed Git and ADB reads execute without the workspace-wide mutation lock.
+- Fixed ADB reads execute without the workspace-wide mutation lock. There is no automatic Git child in the current release.
 - Approved code-loading commands in immutable `staged-cwd` snapshot mode, including test/build-style execution, run without the workspace-wide mutation lock because they execute from `data_dir`, not the original workspace.
 - A Codex Sandbox or Approved Host command marked `workspace_write=true`, and approved commands that still execute against the original workspace, keep the exclusive workspace-wide mutation lock through verification and child execution.
 - Snapshot/manifest creation may still take the workspace-wide lock briefly so the captured input set is coherent.
@@ -139,7 +143,7 @@ Approval binding version 3 hashes the complete canonical security-sensitive requ
 - every regular file in the MCP-influenceable execution scope;
 - external regular-file operands where complete binding is possible;
 - Dart/Flutter package closure resolved from `package_config.json`;
-- Git HEAD/status/working diff/staged diff for Git host operations.
+- bounded Git repository metadata state for approved Git operations.
 
 ### Snapshot mode
 
@@ -163,7 +167,7 @@ Installed OS/toolchains are the trusted computing base. Their primary executable
 
 Commands intended to mutate the original workspace require `workspace_write=true`. The complete workspace (excluding direct `.git` bytes) is manifested, all source files are revalidated, and execution occurs while holding the workspace-wide form of the same mutation-lock family used by target writes. Any workspace addition, deletion, or content change after request invalidates approval.
 
-Git Host operations additionally bind Git state obtained through the fixed broker Git reader. Direct `.git` MCP access remains prohibited.
+Approved Git operations bind repository metadata without invoking the disabled automatic Git Broker helper. The metadata root must be an in-workspace `.git` directory; gitfiles, reparse points, external metadata roots, non-regular entries, hardlinks, and unstable double-scan inventories fail closed. Direct `.git` MCP filesystem access remains prohibited.
 
 ### Expiry and one-shot semantics
 
@@ -188,7 +192,7 @@ Every normalized Approved Host or Sandbox target executable is identity-bound. I
 - command count/argument/reason limits;
 - approval file-count/byte limits;
 - stdout/stderr pipes drained by bounded head/tail collectors;
-- bounded Git snapshots;
+- bounded broker snapshots and approval metadata inventories;
 - total `data_dir` quota;
 - Codex Sandbox staging/runtime byte and filesystem-entry quotas, with reparse points, non-regular entries, and NTFS alternate data streams rejected;
 - a per-Codex-Sandbox Windows Job Object active-process limit and aggregate committed-memory limit, both bound into the approved backend identity;
@@ -216,11 +220,11 @@ Selective Undo compares operation-before, operation-after, and current content. 
 
 ### Broker helper network policy
 
-Every fixed broker helper receives an explicit per-command network policy in audit and Timeline. Git receives an offline policy. ADB receives a loopback-only requested profile and the fixed `ADB_SERVER_SOCKET=tcp:127.0.0.1:5037` environment. These broker restrictions and sanitized environment are not represented as a fifth OS sandbox or policy tier.
+Automatic Git Broker execution is disabled, so the current release does not create an unapproved Git child or claim an active Broker Git network policy. ADB receives a loopback-only requested profile and the fixed `ADB_SERVER_SOCKET=tcp:127.0.0.1:5037` environment. These Broker restrictions and sanitized environment are not represented as a fifth OS sandbox or policy tier.
 
 ### Execution boundary policy
 
-1. `broker`: closed-world file, fixed Git-read, fixed ADB-read, checkpoint, transaction, rollback, and audit operations.
+1. `broker`: closed-world file, fixed ADB-read, checkpoint, transaction, rollback, and audit operations. Automatic Git process execution is currently unavailable and fails closed.
 2. `structured_processing`: declarative DOCX/XLSX/CSV/TSV/ZIP/image processing and hash-bound artifact commit.
 3. `codex_sandbox`: open-ended or project-controlled execution after one-shot local approval.
 4. `approved_host`: real Windows user authority after a separate one-shot local approval.
@@ -259,13 +263,13 @@ Authenticated multi-principal HTTP is not implemented. Setting `http_multi_princ
 
 Annotations describe the real action performed by each model-facing call:
 
-- pure local reads and `execute_readonly`: read-only, non-destructive, closed-world;
+- pure local reads and `execute_readonly`: read-only, non-destructive, closed-world; current Git requests on `execute_readonly` fail closed before process creation;
 - `adb_read`: read-only, non-destructive, closed-world;
 - `write_file` and `execute_workspace_write`: non-read-only, destructive, closed-world;
 - `request_host_command`: non-read-only, non-destructive, closed-world because it only creates an approval request and cannot launch the host command;
 - polls: read-only;
 - process-stop controls remain explicitly mutating/destructive where appropriate.
 
-The generic `execute`, `start_command`, and `execute_approved` surfaces are not exposed to MCP clients. This prevents one broad annotation from making read-only Git/analyze calls appear destructive and prevents a second model-facing dangerous execution step after local approval.
+The generic `execute`, `start_command`, and `execute_approved` surfaces are not exposed to MCP clients. This prevents one broad annotation from obscuring the narrow tool boundaries and prevents a second model-facing dangerous execution step after local approval. The presence of a read-only surface does not claim that every candidate helper route is currently available.
 
 Annotations are host hints and never replace server-side enforcement. The ChatGPT/MCP host may still apply its own confirmation policy.
