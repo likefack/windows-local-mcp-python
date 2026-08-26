@@ -17,7 +17,6 @@ from windows_local_mcp.control_plane_guard import (
 )
 from windows_local_mcp.executor import Executor
 
-
 _PENDING_GUARD_NAME = "approved-host-postflight-pending.json"
 
 
