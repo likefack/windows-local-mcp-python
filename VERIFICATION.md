@@ -259,7 +259,7 @@ C7 実装後、通常 Windows user / production route で未検証だった境�
 - directory listing の正常な directory／file 分類と非追跡 metadata 呼び出しは focused test で通過した。実 symlink 作成が許可されない環境の adversarial test は skip し、同じ sink を test double で `follow_symlinks=False` と検証した。
 - Windows HANDLE を使う directory TOCTOU／safe process／Git snapshot の focused host test は 6 passed、1 skipped。skip は symlink 作成権限による。
 - Approved Host tamper、Sandbox route、WFP identity／runtime を含む focused security suite は初回 94 passed、1 skipped、1 timing failure。失敗した tamper parameter 群を直ちに単独再実行して 7 passed、続く full suite も通過したため、今回の差分による再現性のある regression とは判定しない。
-- final full suite は `.venv\Scripts\python.exe -m pytest -q --basetemp .dev-tmp\pytest\round2-full-final` で 396 passed、5 skipped。skip は権限または platform prerequisite を明示した既存の安全な skip である。
+- 同時更新後の current HEAD を含む final full suite は `.venv\Scripts\python.exe -m pytest -q --basetemp .dev-tmp\pytest\round2-current-head-full` で 402 passed、6 skipped。これより前の確認 run では filesystem semantics probe の一時 file を `os.replace` する際の `WinError 5`、Approved Host integration の一時的な status 差、runtime preflight の外部状態が発生したが、失敗 test の独立 basetemp 再実行は 2 passed および 11 passed で、最終 full suite でも再現しなかった。probe 自体の fail-closed 動作は維持し、ACL／owner は変更していない。skip は権限または platform prerequisite を明示した既存の安全な skip である。
 - repository-wide Ruff、`python -m compileall -q src tests`、`git diff --check` は final tree で通過した。`diff --check` の出力は LF／CRLF の将来変換 warning だけだった。
 
 ### 残存 risk と次の security 作業

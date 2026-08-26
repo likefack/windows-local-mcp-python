@@ -70,9 +70,9 @@ def test_list_directory_does_not_follow_external_junction(
 
     assert types["normal-dir"] == "directory"
     assert types["normal.txt"] == "file"
-    # list_directory has a two-value public type schema. A reparse child is deliberately
-    # non-directory so callers cannot infer that it is safe to traverse as a directory.
-    assert types["external-junction"] == "file"
+    # Reparse entries remain opaque: the distinct type prevents callers from treating the
+    # target as either an ordinary file or a safe-to-traverse workspace directory.
+    assert types["external-junction"] == "reparse"
 
 
 def test_list_directory_does_not_follow_external_directory_symlink(
@@ -89,7 +89,7 @@ def test_list_directory_does_not_follow_external_directory_symlink(
 
     types = entry_types(server.list_directory("."))
 
-    assert types["external-symlink"] == "file"
+    assert types["external-symlink"] == "reparse"
 
 
 def test_listed_reparse_child_is_dir_uses_parent_enumeration_metadata(
