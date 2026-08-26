@@ -4,11 +4,16 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$RepoRoot = $PSScriptRoot
-$Python = Join-Path $RepoRoot ".venv\Scripts\python.exe"
+$LauncherRoot = $PSScriptRoot
+$ProductionPython = Join-Path $LauncherRoot "runtime\Scripts\python.exe"
+$DevelopmentPython = Join-Path $LauncherRoot ".venv\Scripts\python.exe"
 
-if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) {
-    throw "Repository virtual environment not found. Run setup first."
+if (Test-Path -LiteralPath $ProductionPython -PathType Leaf) {
+    $Python = $ProductionPython
+} elseif (Test-Path -LiteralPath $DevelopmentPython -PathType Leaf) {
+    $Python = $DevelopmentPython
+} else {
+    throw "No WLMCP runtime found. Install the Approved Host runtime or create the repository .venv."
 }
 
 if ($Config -ne "") {
