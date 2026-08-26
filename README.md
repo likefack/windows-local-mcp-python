@@ -19,6 +19,7 @@ ChatGPT から、指定した 1 つの Windows 作業領域を安全に読み書
    - 任意コード、project script／plugin、test／build、一般コマンドなど、WLMCP だけで副作用を閉じにくい処理を実行します。
    - 承認済み workspace snapshot から作った operation 固有 run copy を project filesystem として使用し、original `workspace_root` は parent／child／grandchild から read／write deny を要求します。この snapshot-only 構成は defense-in-depth として維持します。
    - current v1 では workspace 内 protected information の direct read denial を完全保証できません。`protected_information_read` と LAN access は受容済み残存 risk として実測結果を保持・表示し、それだけでは route を unavailable にしません。
+   - Job 外 process による termination／resource-bound 迂回を許容しないため、`Win32_Process.Create` の明示的 denial を live marker と approved payload 起動直前の両方で必須確認します。missing／到達可能／検証不能はいずれも fail closed です。
    - 利用にはローカル承認と、この PC での Sandbox 実機検証が必要です。その他の必須境界が失敗した場合は利用できず、Host へ自動移行しません。
 4. **Approved Host**
    - 実際の Windows ユーザー権限が必要な処理だけを、Sandbox とは別の承認で 1 回実行します。
@@ -147,11 +148,11 @@ Approved Host は同一ユーザー権限で制御領域へ到達し得るため
 
 ## Codex Sandbox
 
-Live verification は各 property を `verified`、`failed`、`unverified` の三値で保存します。`failed` は実際の probe が境界脱出を観測した場合だけ、`unverified` は起動失敗、タイムアウト、listener または probe 環境の準備失敗、出力を測定できない場合に使います。current v1 では workspace 内 `protected_information_read` と LAN access を受容済み残存 risk として分離します。これらの failure／unverified は隠さず保持しますが、それだけでは Sandbox route を unavailable にしません。一般 source-workspace read/write、workspace 外 user/protected read、control-plane、Internet、loopback、termination、resource bound 等の必須境界は引き続き fail closed です。Approved Host へ自動移行しません。
+Live verification は各 property を `verified`、`failed`、`unverified` の三値で保存します。`failed` は実際の probe が境界脱出を観測した場合だけ、`unverified` は起動失敗、タイムアウト、listener または probe 環境の準備失敗、出力を測定できない場合に使います。current v1 では workspace 内 `protected_information_read` と LAN access を受容済み残存 risk として分離します。これらの failure／unverified は隠さず保持しますが、それだけでは Sandbox route を unavailable にしません。一般 source-workspace read/write、workspace 外 user/protected read、control-plane、Internet、loopback、termination、resource bound、brokered process creation denial 等の必須境界は引き続き fail closed です。Approved Host へ自動移行しません。
 
-live marker は schema v4 です。launcher／helper の canonical path、content SHA-256、Windows stable file identity、size、実際の version、Authenticode の Valid status・leaf signer subject・leaf certificate thumbprint に加え、実際に import された WFP Guard module 群の canonical path／SHA-256／stable file identity／size、Guard version、policy generation、Sandbox account、Windows product／build／UBR／architecture、WFP read-back identity を結合します。mtime は補助的な drift signal であり、単独では security identity として扱いません。`isolation_context_digest` はさらに workspace の実体、保護名・拒否 directory、`sandbox_dependency_readable_paths`、Sandbox policy generation、process 数・process-tree memory 上限、scratch 上限、許可環境変数などを結合します。これらを変更した場合、marker は stale として拒否され、通常 operation は live verification や UAC probe を自動実行しません。明示的に `verify-codex-sandbox` を再実行してください。v1～v3 marker から v4 を推測・移行しません。
+live marker は schema v5 です。v4 の C7 identity binding を保持し、launcher／helper の canonical path、content SHA-256、Windows stable file identity、size、実際の version、Authenticode の Valid status・leaf signer subject・leaf certificate thumbprint に加え、実際に import された WFP Guard module 群の canonical path／SHA-256／stable file identity／size、Guard version、policy generation、Sandbox account、Windows product／build／UBR／architecture、WFP read-back identity を結合します。さらに `checks.brokered_process_creation_denied == true` を必須 evidence とし、Job 外の `Win32_Process.Create` が明示的に拒否されることを termination／resource-bound 境界の一部として扱います。mtime は補助的な drift signal であり、単独では security identity として扱いません。`isolation_context_digest` はさらに workspace の実体、保護名・拒否 directory、`sandbox_dependency_readable_paths`、Sandbox policy generation、process 数・process-tree memory 上限、scratch 上限、許可環境変数などを結合します。これらを変更した場合、marker は stale として拒否され、通常 operation は live verification や UAC probe を自動実行しません。明示的に `verify-codex-sandbox` を再実行してください。v1～v4 marker から v5 を推測・移行しません。
 
-marker v4 の identity がすべて現在値と一致し、static non-persistent WFP fixed object が単に missing の場合だけ、trusted Guard が exact object を再構築できます。この場合も complete read-back、`wfp_guard_verified`、child 起動の順序を維持します。既存 object の security-relevant field 不一致、conflicting object、または marker identity 不一致は silent repair せず fail closed にします。
+marker v5 の identity がすべて現在値と一致し、static non-persistent WFP fixed object が単に missing の場合だけ、trusted Guard が exact object を再構築できます。この場合も complete read-back、`wfp_guard_verified`、brokered-process denial preflight、child 起動の順序を維持します。既存 object の security-relevant field 不一致、conflicting object、marker identity 不一致、または brokered-process denial の missing／failure／unverified は silent repair せず fail closed にします。
 
 `config.local.toml` で installed Codex CLI を指定できます。
 
@@ -176,7 +177,7 @@ Sandbox 起動直前には、この PC のコンピューター名で完全修�
 .\.venv\Scripts\python.exe -m windows_local_mcp.wfp_guard_runtime --maintenance-cleanup
 ```
 
-起動時には legacy profile 名だけに依存せず、source workspace の read deny、operation 固有 scratch の write、明示した依存 root の read、保護名の deny、network restricted を含む `sandbox-state` を Codex CLI へ渡します。さらに launcher を一時停止状態で起動し、Windows Job Object へ割り当ててから再開します。Job Object は launcher を含む子孫全体の process 数、commit memory、終了時 kill を OS で強制します。上限違反は job 全体を停止し、WLMCP は子孫が 0 になったことと終了状態を回収できたことを確認します。
+起動時には legacy profile 名だけに依存せず、source workspace の read deny、operation 固有 scratch の write、明示した依存 root の read、保護名の deny、network restricted を含む `sandbox-state` を Codex CLI へ渡します。さらに launcher を一時停止状態で起動し、Windows Job Object へ割り当ててから再開します。Job Object は launcher を含む子孫全体の process 数、commit memory、終了時 kill を OS で強制します。上限違反は job 全体を停止し、WLMCP は子孫が 0 になったことと終了状態を回収できたことを確認します。Job 外 creation class については `Win32_Process.Create` の明示 denial を別途必須確認するため、Job Object だけで termination／resource bound が完全だとは扱いません。
 
 Sandbox staging は `.env` 等の保護対象と、`.venv`、`node_modules`、`build`、`__pycache__` 等の生成・依存 tree を一律 copy しません。必要な外部依存は `sandbox_dependency_readable_paths` 等の明示的で検証可能な入力として扱い、暗黙に source workspace を参照させません。source-workspace deny と protected-information direct-read probe は defense-in-depth として維持しますが、staging exclusion や deny policy の設定だけを workspace 内 secret の完全遮断保証とは扱いません。direct-read probe が `failed`／`unverified` の場合も、その結果を受容済み残存 risk として保持・表示します。
 
@@ -187,9 +188,9 @@ $env:LOCAL_MCP_CONFIG = 'C:\path\to\config.local.toml'
 .\.venv\Scripts\python.exe -m windows_local_mcp.cli verify-codex-sandbox
 ```
 
-検証結果は `filesystem_read`、`filesystem_write`、`protected_information_read`、`internet`、`lan`、`loopback`、`descendant_containment`、`termination`、`resource_bound` の property ごとに `verified`／`failed`／`unverified` として保存します。schema v4 以外、必須 identity field が欠けた marker、現在の実体に結合しない marker は受理しません。`available` は依存関係と起動前提、`windows_live_verified` は OS 境界の実測、`execution_route_available` は必須 route property を満たして実行可能かを別々に示します。`approved_sandbox_require_live_verification=false` で実行条件を回避することはできません。
+検証結果は `filesystem_read`、`filesystem_write`、`protected_information_read`、`internet`、`lan`、`loopback`、`descendant_containment`、`termination`、`resource_bound` の property ごとに `verified`／`failed`／`unverified` として保存し、`brokered_process_creation_denied` を mandatory check として保存します。schema v5 以外、必須 identity field／check が欠けた marker、現在の実体に結合しない marker は受理しません。`available` は依存関係と起動前提、`windows_live_verified` は OS 境界の実測、`execution_route_available` は必須 route property と brokered-process denial を満たして実行可能かを別々に示します。`approved_sandbox_require_live_verification=false` で実行条件を回避することはできません。
 
-検証器は親・child・grandchild の filesystem／network 境界に加え、process 数上限と process-tree memory 上限の超過、違反時の全子孫停止、終了状態回収まで実測します。独立 probe が例外になった場合、その probe を `unverified` として残し、安全に続行できる残りの probe を継続します。一般 source workspace read/write、workspace 外 read、control-plane、Internet、loopback 等の mandatory check は親・child・grandchild で fail closed します。一方、workspace 内 `protected_information_read` と対応する child／grandchild protected-information denial、LAN access は受容済み残存 risk として `failed`／`unverified` を保持・表示したまま route 判定から分離します。その他の必須境界が成立する場合に限り Sandbox 経路を利用でき、利用できない場合も Approved Host へ自動移行しません。
+検証器は親・child・grandchild の filesystem／network 境界に加え、process 数上限と process-tree memory 上限の超過、違反時の全子孫停止、終了状態回収、および Sandbox account からの `Win32_Process.Create` denial を実測します。brokered process が到達可能、または denial を確立できない場合は termination／resource-bound を failed／unverified として route を fail closed にし、approved payload の起動直前にも denial を再確認します。独立 probe が例外になった場合、その probe を `unverified` として残し、安全に続行できる残りの probe を継続します。一般 source workspace read/write、workspace 外 read、control-plane、Internet、loopback 等の mandatory check は親・child・grandchild で fail closed します。一方、workspace 内 `protected_information_read` と対応する child／grandchild protected-information denial、LAN access は受容済み残存 risk として `failed`／`unverified` を保持・表示したまま route 判定から分離します。その他の必須境界が成立する場合に限り Sandbox 経路を利用でき、利用できない場合も Approved Host へ自動移行しません。
 
 ## ファイルと制御領域の保護
 
@@ -216,6 +217,6 @@ unit／integration test、Windows 上の Sandbox 実機検証、Secure MCP Tunne
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-Sandbox が利用不能、必須境界が未検証、timeout、setup failure、command failure の場合は、その operation を unavailable／failed として表示します。受容済み残存 risk の `protected_information_read`／LAN failure はそのまま表示し、その他の mandatory route gate と分離します。Approved Host へ自動 fallback しません。
+Sandbox が利用不能、必須境界が未検証、timeout、setup failure、command failure の場合は、その operation を unavailable／failed として表示します。受容済み残存 risk の `protected_information_read`／LAN failure はそのまま表示し、その他の mandatory route gate と分離します。brokered process creation denial は受容済み残存 risk ではなく、missing／failed／unverified の場合は route unavailable のままです。Approved Host へ自動 fallback しません。
 
 `session_info.transport` は stdio と HTTP を別々に `configured`／`enabled`／`available` で表示します。現行版で利用可能なのは single-user local stdio だけで、HTTP は loopback 指定であっても startup validation が拒否します。
