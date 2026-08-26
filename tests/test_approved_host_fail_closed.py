@@ -42,15 +42,16 @@ def test_runtime_verification_only_does_not_enable_execution(
         runtime_immutability.assert_approved_host_runtime_immutable()
 
 
+@pytest.mark.parametrize("tier", ["approved_host", "host_approval"])
 def test_executor_rejects_stale_approved_host_before_worker_spawn(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tier: str
 ) -> None:
     settings = _settings(tmp_path)
     audit = AuditStore(settings)
     executor = Executor(settings, audit)
     operation_id = audit.create_operation(
         tool_name="request_host_command",
-        tier="approved_host",
+        tier=tier,
         status="queued",
         cwd=str(settings.workspace_root),
         request={},
