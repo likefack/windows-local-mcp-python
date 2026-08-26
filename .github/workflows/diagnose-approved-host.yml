@@ -15,7 +15,7 @@ concurrency:
 jobs:
   diagnose:
     runs-on: windows-2025
-    timeout-minutes: 25
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
         with:
@@ -24,63 +24,6 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install
-        shell: pwsh
-        run: |
-          python -m pip install -e ".[dev]"
-          python .github/finalize_approved_host_production.py
-      - name: Add temporary diagnostics
-        shell: pwsh
-        run: |
-          @'
-          from pathlib import Path
-
-          def replace(path, old, new):
-              p = Path(path)
-              text = p.read_text(encoding='utf-8')
-              if text.count(old) != 1:
-                  raise RuntimeError(f'{path}: diagnostic anchor count={text.count(old)}')
-              p.write_text(text.replace(old, new, 1), encoding='utf-8', newline='\n')
-
-          p = 'tests/test_approval_execution_integration.py'
-          for operation_id, expected in [
-              ('snapshot-bound-workspace', 'succeeded'),
-              ('approved-host-legitimate-descendant', 'succeeded'),
-              ('approved-host-descendant-timeout', 'timed_out'),
-          ]:
-              anchor = f'    operation = store.get_operation("{operation_id}")\n\n    assert result["status"] == "{expected}"'
-              replacement = (
-                  f'    operation = store.get_operation("{operation_id}")\n'
-                  f'    print("DIAG {operation_id} status=", result.get("status"), '
-                  f'"error=", operation.get("error"), "result=", operation.get("result"), '
-                  f'"events=", [event["event_type"] for event in operation.get("events", [])])\n\n'
-                  f'    assert result["status"] == "{expected}"'
-              )
-              replace(p, anchor, replacement)
-
-          p = 'tests/test_approved_host_audit_integrity.py'
-          anchor = '    event_types = [event["event_type"] for event in operation["events"]]\n\n    assert result["status"] == "succeeded"'
-          replacement = (
-              '    event_types = [event["event_type"] for event in operation["events"]]\n'
-              '    print("DIAG trusted-audit status=", result.get("status"), "error=", operation.get("error"), '
-              '"result=", operation.get("result"), "events=", event_types)\n\n'
-              '    assert result["status"] == "succeeded"'
-          )
-          replace(p, anchor, replacement)
-          '@ | Set-Content -LiteralPath $env:RUNNER_TEMP\diag.py -Encoding utf8
-          python $env:RUNNER_TEMP\diag.py
-      - name: Run failing Approved Host tests
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Continue'
-          python -m pytest -vv -s `
-            tests/test_approval_execution_integration.py::test_snapshot_execution_succeeds_when_bound_workspace_is_unchanged `
-            tests/test_approval_execution_integration.py::test_approved_host_allows_legitimate_descendant_to_finish `
-            tests/test_approval_execution_integration.py::test_approved_host_terminates_descendants_at_runtime_limit `
-            tests/test_approved_host_audit_integrity.py::test_approved_host_trusted_audit_updates_remain_valid
-          exit 0
-      - name: Run guard binding test
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Continue'
-          python -m pytest -vv -s tests/test_broker_architecture.py::test_host_guard_binds_current_operation_approval_state
-          exit 0
+        run: python -m pip install -e ".[dev]"
+      - name: Diagnose audit mirror
+        run: python .github/diagnose_audit_mirror.py
