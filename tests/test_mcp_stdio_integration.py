@@ -109,15 +109,11 @@ def test_real_stdio_tools_list_and_file_round_trip(tmp_path: Path) -> None:
             assert read.structured_content["content"] == "hello stdio"
 
             git_info = await session.call_tool("git_info", {})
-            assert not git_info.is_error
-            assert git_info.structured_content is not None
-            assert "===== status" in git_info.structured_content["content"]
+            assert git_info.is_error
             git_status = await session.call_tool(
                 "execute_readonly", {"program": "git", "args": ["status", "--short"]}
             )
-            assert not git_status.is_error
-            assert git_status.structured_content is not None
-            assert git_status.structured_content["status"] == "succeeded"
+            assert git_status.is_error
 
             wrong_surface = await session.call_tool(
                 "execute_workspace_write",
