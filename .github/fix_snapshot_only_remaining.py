@@ -146,6 +146,7 @@ write(path, text)
 # preflight behavior remains covered independently by Approved Host integration tests.
 path = "tests/test_approval_execution_integration.py"
 text = Path(path).read_text(encoding="utf-8")
+text = replace_once(text, "import os\n", "import json\nimport os\n", "diagnostic json import")
 text = replace_once(
     text,
     'from windows_local_mcp.tool_safety import capture_executable_identity\n',
@@ -191,14 +192,58 @@ def test_approved_host_job_terminates_descendants_at_runtime_limit(tmp_path: Pat
 text = regex_once(text, pattern, replacement, "Approved Host Job termination regression")
 text = replace_once(
     text,
-    '    assert result["status"] == "succeeded", operation\n    assert "SNAPSHOT RUNS INDEPENDENTLY" in result["stdout_preview"]',
-    '    assert result["status"] == "succeeded", {\n        "error": operation.get("error"),\n        "result": operation.get("result"),\n        "events": [event["event_type"] for event in operation["events"]],\n    }\n    assert "SNAPSHOT RUNS INDEPENDENTLY" in result["stdout_preview"]',
+    '''    _, store, executor = _prepare_operation(
+        workspace=workspace,
+        data=data,
+        operation_id="snapshot-bound-workspace",
+''',
+    '''    settings, store, executor = _prepare_operation(
+        workspace=workspace,
+        data=data,
+        operation_id="snapshot-bound-workspace",
+''',
+    "snapshot settings diagnostic",
+)
+text = replace_once(
+    text,
+    '    assert result["status"] == "succeeded"\n    assert "SNAPSHOT RUNS INDEPENDENTLY" in result["stdout_preview"]',
+    '''    marker = settings.data_dir / "control-plane" / "tamper-detected.json"
+    marker_payload = json.loads(marker.read_text(encoding="utf-8")) if marker.is_file() else None
+    assert result["status"] == "succeeded", {
+        "error": operation.get("error"),
+        "result": operation.get("result"),
+        "events": [event["event_type"] for event in operation["events"]],
+        "tamper_marker": marker_payload,
+    }
+    assert "SNAPSHOT RUNS INDEPENDENTLY" in result["stdout_preview"]''',
     "snapshot positive diagnostic",
 )
 text = replace_once(
     text,
-    '    assert result["status"] == "succeeded", operation\n    assert time.monotonic() - started >= 0.4',
-    '    assert result["status"] == "succeeded", {\n        "error": operation.get("error"),\n        "result": operation.get("result"),\n        "events": [event["event_type"] for event in operation["events"]],\n    }\n    assert time.monotonic() - started >= 0.4',
+    '''    _, store, executor = _prepare_operation(
+        workspace=workspace,
+        data=data,
+        operation_id="approved-host-legitimate-descendant",
+''',
+    '''    settings, store, executor = _prepare_operation(
+        workspace=workspace,
+        data=data,
+        operation_id="approved-host-legitimate-descendant",
+''',
+    "descendant settings diagnostic",
+)
+text = replace_once(
+    text,
+    '    assert result["status"] == "succeeded"\n    assert time.monotonic() - started >= 0.4',
+    '''    marker = settings.data_dir / "control-plane" / "tamper-detected.json"
+    marker_payload = json.loads(marker.read_text(encoding="utf-8")) if marker.is_file() else None
+    assert result["status"] == "succeeded", {
+        "error": operation.get("error"),
+        "result": operation.get("result"),
+        "events": [event["event_type"] for event in operation["events"]],
+        "tamper_marker": marker_payload,
+    }
+    assert time.monotonic() - started >= 0.4''',
     "descendant positive diagnostic",
 )
 write(path, text)
