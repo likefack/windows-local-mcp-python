@@ -32,6 +32,13 @@ code-loader または workspace 内 executable を Approved Host で実行しま
 2026-08-14 に受容した workspace 内 protected-information direct read の残存 risk を解消した保証とは扱いません。
 current v1 では `protected_information_read` と LAN access の 2 property を明示的な受容済み残存 risk とします。
 
+2026-08-27 改訂では、Codex Sandbox の Job 外 brokered process escape class に対して
+`Win32_Process.Create` が明示的に拒否されることを必須の Windows live-verification boundary とします。
+live marker schema v5 は v4 の C7 identity binding を保持したまま `brokered_process_creation_denied` を
+mandatory evidence として追加し、missing／`false`／検証不能は route unavailable として fail closed します。
+通常の approved payload 起動直前にも同じ denial を再確認します。この境界は受容済み残存 risk ではなく、
+`protected_information_read` と LAN access の 2 property だけを受容する既存方針を変更しません。
+
 ## 1. 適用範囲と信頼モデル
 
 1 台の Windows PC で、1 人の利用者が、1 つの明示設定された `workspace_root` を扱う
@@ -137,11 +144,13 @@ OS 境界の安全性を証明した意味には使いません。`Windows live-
 `verified` と表示するには、同一の launcher、helper、version、署名、hash、policy generation に
 対して、その property を実機で確認します。
 
-Live verification marker は schema v4 のみを受理します。v1～v3 または必須 field が欠けた marker から
-C7 identity を推測・移行しません。v4 は、実際に import された WFP Guard module の canonical path、
-content SHA-256、Windows handle から取得した volume serial number と file index、size、Guard version、
-policy generation に結合します。mtime は補助的な drift signal であり、単独では trust anchor にしません。
-Guard module は verification から child 起動まで置換・書込みを拒否する handle を保持します。
+Live verification marker は schema v5 のみを受理します。v1～v4 または必須 field が欠けた marker から
+現行 evidence を推測・移行しません。v5 は v4 で導入した C7 identity binding を保持し、実際に import された
+WFP Guard module の canonical path、content SHA-256、Windows handle から取得した volume serial number と
+file index、size、Guard version、policy generation に結合するとともに、
+`checks.brokered_process_creation_denied == true` を必須 evidence とします。mtime は補助的な drift signal であり、
+単独では trust anchor にしません。Guard module は verification から child 起動まで置換・書込みを拒否する
+handle を保持します。
 
 Codex launcher と adjacent helper は canonical path、content SHA-256、Windows stable file identity、size、
 実際の version、Authenticode の `Valid` status、leaf signer subject、leaf certificate thumbprint に結合します。
@@ -149,7 +158,7 @@ Codex launcher と adjacent helper は canonical path、content SHA-256、Window
 marker に結合し、現在値と異なれば marker を stale として通常 operation を停止します。通常 operation は
 stale marker を理由に live verification を自動実行せず、`verify-codex-sandbox` の明示実行を必要とします。
 
-WFP の static non-persistent fixed object は reboot や BFE restart で消失し得るため、marker v4 の Guard、
+WFP の static non-persistent fixed object は reboot や BFE restart で消失し得るため、marker v5 の Guard、
 policy、backend、account、OS identity がすべて現在値と一致し、object が単に missing の場合だけ、trusted
 Guard が exact object を再構築できます。その場合も `ensure → complete read-back → wfp_guard_verified →
 child launch` の順序を崩しません。既存 object の security-relevant field 不一致、conflicting object、または
@@ -166,6 +175,7 @@ Sandbox route の必須境界は少なくとも次です。
 - 未許可 loopback／localhost endpoint へ接続できない
 - loopback Guard の対象 SID は、この PC のコンピューター名で完全修飾して解決し、返された参照ドメインがこの PC 自身であり、`SID_NAME_USE == SidTypeUser (1)` であることを確認できない場合は Sandbox route を利用しない
 - child／grandchild に上記の必須 filesystem、network、control-plane 境界が継承される。ただし workspace 内 protected-information direct read の child／grandchild denial は受容済み残存 risk として route gate から除外する
+- Sandbox account から `Win32_Process.Create` 等の brokered process creation が到達不能であることを明示的な denial probe で確認し、marker の check が missing／`false`／検証不能なら route を利用しない。approved payload の child 起動直前にもこの denial を再確認する
 - timeout／cancel で descendant を含め停止できる
 - scratch、出力、時間、process、memory／filesystem consumption に現実的な上限がある
 
@@ -179,8 +189,9 @@ parent／child／grandchild check をそのまま `failed` として保存・表
 受容済み残存 risk を route 判定から分離しても、結果を削除したり成功へ丸めたりしません。
 
 workspace 外 protected information の read、一般 source-workspace canary の read／write、Internet access、
-未許可 loopback／localhost access、control-plane 境界はこの受容に含みません。これらの必須境界が `failed` または
-`unverified` の場合、Sandbox route は unavailable として fail closed します。
+未許可 loopback／localhost access、control-plane 境界、brokered process creation denial はこの受容に含みません。
+これらの必須境界が `failed` または `unverified`、または必須 check が missing の場合、Sandbox route は
+unavailable として fail closed します。
 
 snapshot/run projection、source-workspace deny、staging からの protected file 除外、stdout／stderr の redaction、
 network deny は defense-in-depth として維持します。これらを workspace 内 protected information の secrecy が
@@ -333,6 +344,10 @@ check の失敗も隠さず保持しますが、それだけで descendant route
 書き換えたり検証結果から削除したりしません。必須境界が `failed` または `unverified` の状態を capability 全体の
 `Windows live-verified=true` または execution-route-available へ丸めません。
 
+`brokered_process_creation_denied` は accepted residual risk ではありません。marker v5 でこの check が
+missing／`false`／検証不能の場合、termination／resource-bound の保証を満たしたとは扱わず、
+`Windows live-verified=true` または `execution_route_available=true` と表示しません。
+
 transport も capability truthfulness の対象です。stdio／HTTP 等の各 transport について、`configured`、
 `enabled`、`available` と実効 authentication／principal 前提を区別し、startup validation が拒否する状態を
 利用可能であるかのように session／UI／documentation へ表示しません。
@@ -359,6 +374,7 @@ MCP ADB E2E、Tunnel、deployment の代替にしません。
 - Broker helper の PATH shadowing、差し替え、stale executable identity
 - Git automatic execution を再有効化する場合の repository metadata confinement と capability 表示の不一致
 - Codex Sandbox の一般 source workspace read／write、workspace 外 protected information direct read、workspace 外 read／write、Internet／loopback／control-plane／必須 descendant boundary 不足。ただし Section 5 の workspace 内 protected-information direct read は除く
+- Codex Sandbox から `Win32_Process.Create` 等の brokered process creation が到達可能または検証不能で、Job containment／termination／resource bound を迂回し得る状態
 - ordinary non-admin Windows user 権限で成立する現実的な攻撃
 - common project layout で起こる機能破綻、通常操作での重大 UX 破綻
 - 容易に trigger できる resource exhaustion、過剰 copy／scan／hash／lock／approval
@@ -406,6 +422,7 @@ MCP ADB E2E、Tunnel、deployment の代替にしません。
 | ChatGPT container source→result binding | G, I |
 | Sandbox launcher の host-side cwd／DLL／search-path | C, D, F |
 | Internet／loopback と child／grandchild の必須 containment | D, O |
+| Sandbox brokered process creation denial と Job 外 escape の fail-closed 検証 | D, O |
 | LAN access が受容済み残存 risk として正確に表示されるか | D, O |
 | Sandbox property ごとの live verification と route 判定の分離 | D, O |
 | DOCX／XLSX の過剰な file-wide rejection と保存能力表示 | J, L, O |
