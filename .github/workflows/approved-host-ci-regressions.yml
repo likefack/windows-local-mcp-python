@@ -1,0 +1,88 @@
+name: Fix Approved Host CI regressions
+
+on:
+  push:
+    branches: [fix/approved-host-ci-regressions]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: approved-host-ci-regressions
+  cancel-in-progress: true
+
+jobs:
+  verify-and-finalize:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout fix branch
+        uses: actions/checkout@v7
+        with:
+          ref: fix/approved-host-ci-regressions
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Apply scoped patch
+        run: |
+          python .github/repair_approved_host_harness.py
+          python .github/apply_approved_host_ci_regressions.py
+          git diff --check
+
+      - name: Install package and dev checks
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+          python -m pip check
+
+      - name: Focused Approved Host regressions
+        run: >-
+          python -m pytest -q
+          tests/test_active_config_security_integration.py
+          tests/test_approval_execution_integration.py
+          tests/test_approved_host_audit_integrity.py
+          tests/test_broker_architecture.py
+          tests/test_runtime_trust.py
+
+      - name: Full pytest
+        run: python -m pytest -q
+
+      - name: Ruff changed code
+        run: >-
+          python -m ruff check
+          src/windows_local_mcp/runtime_trust.py
+          src/windows_local_mcp/control_plane_guard.py
+          src/windows_local_mcp/worker.py
+          tests/conftest.py
+          tests/test_active_config_security_integration.py
+          tests/test_approval_execution_integration.py
+          tests/test_broker_architecture.py
+          tests/test_runtime_trust.py
+
+      - name: Compile all
+        run: python -m compileall -q src tests
+
+      - name: Finalize target-only commit
+        shell: pwsh
+        run: |
+          git rm .github/apply_approved_host_ci_regressions.py
+          git rm .github/repair_approved_host_harness.py
+          git rm .github/workflows/approved-host-ci-regressions.yml
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/windows_local_mcp/runtime_trust.py
+          git add src/windows_local_mcp/control_plane_guard.py
+          git add src/windows_local_mcp/worker.py
+          git add tests/conftest.py
+          git add tests/test_active_config_security_integration.py
+          git add tests/test_broker_architecture.py
+          git add tests/test_runtime_trust.py
+          git diff --cached --check
+          git commit -m "Approved Host CI回帰を修正 [skip ci]"
+          git push origin HEAD:fix/approved-host-ci-regressions
