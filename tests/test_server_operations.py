@@ -284,12 +284,17 @@ def test_approved_host_capability_reports_failed_runtime_preflight(
 
     assert status["enabled"] is True
     assert status["available"] is False
+    assert status["live_verified"] is False
+    assert status["windows_live_verified"] is False
     assert status["runtime_preflight"]["status"] == "failed"
     assert "runtime is mutable" in status["runtime_preflight"]["error"]
+    assert status["properties"]["runtime_immutability"]["status"] == (
+        "failed" if os.name == "nt" else "unverified"
+    )
     assert status["execution_time_recheck"] is True
 
 
-def test_approved_host_capability_reports_passed_runtime_preflight(
+def test_approved_host_runtime_preflight_is_not_promoted_to_capability_live_verification(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     server, _ = load_server(tmp_path, monkeypatch)
@@ -312,9 +317,31 @@ def test_approved_host_capability_reports_passed_runtime_preflight(
 
     assert status["enabled"] is True
     assert status["available"] is True
-    assert status["live_verified"] is True
+    assert status["unit_tested"] is True
+    assert status["live_verified"] is False
+    assert status["windows_live_verified"] is False
+    assert status["verification_scope"] == "runtime_immutability_preflight_only"
     assert status["runtime_preflight"]["status"] == "passed"
     assert status["runtime_preflight"]["digest"] == "a" * 64
+    runtime_property = status["properties"]["runtime_immutability"]
+    assert runtime_property["status"] == (
+        "verified" if os.name == "nt" else "unverified"
+    )
+    assert runtime_property["unit_tested"] is True
+    assert runtime_property["verification_kind"] == (
+        "windows_live_preflight" if os.name == "nt" else "non_windows_preflight"
+    )
+    for property_name in (
+        "control_plane_tamper_detection",
+        "approval_integrity",
+        "job_descendant_handling",
+        "outside_job_same_user_process_detection",
+        "timeout_termination",
+    ):
+        assert status["properties"][property_name] == {
+            "status": "unverified",
+            "unit_tested": True,
+        }
     assert status["execution_time_recheck"] is True
 
 

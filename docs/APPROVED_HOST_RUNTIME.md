@@ -73,3 +73,5 @@ runtime 更新は trusted operator が elevated installer を `-Replace` 付き�
 GitHub hosted runner の editable checkout は production immutable runtime ではありません。CI では runtime gate の semantics と、gate 通過後の approval／audit／descendant／tamper controls を分離して検証します。
 
 release 判定では、CI の synthetic／integration test を production Windows live verification の代替にはしません。実際に使用する PC／account／base Python／installed runtime で `verify-approved-host-runtime.ps1` を成功させてください。
+
+`session_info()` の `runtime_preflight=passed` は、この runtime immutability scope に対する current-machine evidence だけを表します。Approved Host 全体の `live_verified`／`windows_live_verified` へ昇格させず、control-plane tamper detection、approval integrity、Job descendant handling、Job 外 same-user process detection、timeout termination は個別 property として unit／integration evidence と Windows live evidence を分離して表示します。
