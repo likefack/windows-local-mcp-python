@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import os
 import sqlite3
 import subprocess
@@ -9,9 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from windows_local_mcp import control_plane
 from windows_local_mcp.audit import AuditStore
 from windows_local_mcp.config import Settings
+from windows_local_mcp.control_plane import control_plane_generation
 from windows_local_mcp.control_plane_guard import (
     assert_control_plane_healthy,
     capture_critical_state,
@@ -189,7 +187,7 @@ def test_lost_approved_host_postflight_remains_fail_closed_after_restart(
     with pytest.raises(RuntimeError, match="postflight|recovery|tamper"):
         assert_control_plane_healthy(settings)
     with pytest.raises(RuntimeError, match="postflight|recovery|tamper"):
-        control_plane.control_plane_generation(settings)
+        control_plane_generation(settings)
 
     restarted_again = AuditStore(settings)
     Executor(settings, restarted_again)
