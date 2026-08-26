@@ -4,6 +4,7 @@ import ctypes
 import json
 import os
 import re
+import shutil
 import subprocess
 import uuid
 from collections.abc import Callable, Iterator, Sequence
@@ -15,6 +16,10 @@ from typing import Any
 
 from .child_env import build_command_environment, sanitize_executable_search_path
 from .config import Settings
+from .sandbox_brokered_process import (
+    brokered_process_probe_command,
+    classify_brokered_process_probe,
+)
 from .tool_safety import capture_executable_identity, ensure_external_tool_executable
 from .util import canonical_json, sha256_text
 from .wfp_guard import (
@@ -36,10 +41,10 @@ _SANDBOX_HELPERS = (
     "codex-command-runner.exe",
     "codex-windows-sandbox-setup.exe",
 )
-_WLMCP_ISOLATION_POLICY_VERSION = 2
+_WLMCP_ISOLATION_POLICY_VERSION = 3
 _SANDBOX_STATE_POLICY_VERSION = 2
 _SANDBOX_STATE_GLOB_SCAN_MAX_DEPTH = 64
-SANDBOX_LIVE_MARKER_VERSION = 4
+SANDBOX_LIVE_MARKER_VERSION = 5
 SANDBOX_SECURITY_PROPERTIES = (
     "filesystem_read",
     "filesystem_write",
@@ -77,6 +82,7 @@ _MANDATORY_DESCENDANT_CHECKS = (
     "grandchild_loopback_denied",
 )
 _ALLOWED_PROPERTY_STATUSES = frozenset({"verified", "failed", "unverified"})
+_BROKERED_PROCESS_CHECK = "brokered_process_creation_denied"
 
 
 class ApprovedSandboxUnavailable(RuntimeError):
@@ -451,15 +457,16 @@ def sandbox_live_verification_route_eligible(evidence: dict[str, Any]) -> bool:
     ):
         return False
 
+    checks = evidence.get("checks")
+    if not isinstance(checks, dict) or checks.get(_BROKERED_PROCESS_CHECK) is not True:
+        return False
+
     descendant = properties.get("descendant_containment")
     if not isinstance(descendant, dict):
         return False
     if descendant.get("status") == "verified":
         return True
 
-    checks = evidence.get("checks")
-    if not isinstance(checks, dict):
-        return False
     return all(checks.get(name) is True for name in _MANDATORY_DESCENDANT_CHECKS)
 
 
@@ -774,6 +781,78 @@ def launch_codex_sandbox(
     return process, job, argv
 
 
+def _require_brokered_process_creation_denied(
+    backend: CodexSandboxBackend,
+    *,
+    settings: Settings,
+) -> None:
+    """Recheck the WMI Job-escape class immediately before an approved payload launch."""
+
+    assert settings.sandbox_scratch_dir is not None
+    root = (
+        settings.sandbox_scratch_dir
+        / "brokered-process-preflight"
+        / uuid.uuid4().hex
+    )
+    root.mkdir(parents=True, exist_ok=False)
+    environment = build_command_environment(
+        os.environ,
+        extra_names=settings.child_environment_allowlist,
+        nonce=uuid.uuid4().hex,
+    )
+    sanitize_executable_search_path(
+        environment,
+        forbidden_roots=(
+            settings.workspace_root,
+            settings.data_dir,
+            settings.sandbox_scratch_dir,
+        ),
+        prepend=(Path(backend.executable).parent,),
+    )
+    process: subprocess.Popen[Any] | None = None
+    job: WindowsSandboxJob | None = None
+    try:
+        command = brokered_process_probe_command(uuid.uuid4().hex)
+        process, job, _argv = launch_codex_sandbox(
+            backend,
+            settings=settings,
+            command=command,
+            cwd=root,
+            writable_roots=(root,),
+            environment=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            stdout, _stderr = process.communicate(timeout=20)
+        except subprocess.TimeoutExpired as error:
+            raise ApprovedSandboxUnavailable(
+                "Codex Sandbox brokered-process preflight timed out"
+            ) from error
+        if not job.wait_empty(timeout=10):
+            raise ApprovedSandboxUnavailable(
+                "Codex Sandbox brokered-process preflight did not drain"
+            )
+        value, reason = classify_brokered_process_probe(process.returncode, stdout)
+        if value is not True:
+            raise ApprovedSandboxUnavailable(
+                f"Codex Sandbox brokered-process boundary is not verified: {reason}"
+            )
+    except ApprovedSandboxUnavailable:
+        raise
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        raise ApprovedSandboxUnavailable(
+            "Codex Sandbox brokered-process preflight could not be verified"
+        ) from error
+    finally:
+        if job is not None:
+            job.terminate()
+            job.wait_empty(timeout=10)
+            job.close()
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def guard_and_launch_codex_sandbox(
     backend: CodexSandboxBackend,
     *,
@@ -839,6 +918,8 @@ def guard_and_launch_codex_sandbox(
             )
     if on_guard_verified is not None:
         on_guard_verified(guard_payload)
+    if expected_live_evidence is not None:
+        _require_brokered_process_creation_denied(backend, settings=settings)
     process, job, argv = launch_codex_sandbox(
         backend,
         settings=settings,
@@ -909,8 +990,13 @@ def codex_sandbox_effective_policy(*, workspace_write: bool) -> dict[str, Any]:
             "loopback_guard_policy_generation": GUARD_POLICY_GENERATION,
         },
         "descendant_policy": "filesystem/network token plus outer Job Object inherited by descendants",
-        "resource_policy": "OS Job Object active-process and process-tree committed-memory limits",
-        "actual_execution_boundary": "live-verified Codex boundary plus WLMCP Job Object",
+        "resource_policy": (
+            "OS Job Object active-process and process-tree committed-memory limits plus "
+            "immediate Win32_Process.Create denial preflight"
+        ),
+        "actual_execution_boundary": (
+            "live-verified Codex boundary plus WLMCP Job Object and brokered-process preflight"
+        ),
         "external_state_changes": "device, service, and IPC effects are command-dependent and may not be rollbackable",
         "rollback": "workspace checkpoints only; external effects are not undone",
     }

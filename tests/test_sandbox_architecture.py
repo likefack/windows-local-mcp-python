@@ -13,6 +13,7 @@ from windows_local_mcp.audit import AuditStore
 from windows_local_mcp.config import Settings
 from windows_local_mcp.policy import approved_request_hash
 from windows_local_mcp.sandbox_backend import (
+    SANDBOX_LIVE_MARKER_VERSION,
     SANDBOX_SECURITY_PROPERTIES,
     ApprovedSandboxUnavailable,
     CodexSandboxBackend,
@@ -122,7 +123,7 @@ def _valid_live_marker(
     os_identity = context["windows_os_identity"]
     verification = _guard_verification()
     return {
-        "version": 4,
+        "version": SANDBOX_LIVE_MARKER_VERSION,
         "passed": True,
         "backend_digest": sha256_text(canonical_json(backend.as_dict())),
         "backend_version": backend.version,
@@ -134,6 +135,7 @@ def _valid_live_marker(
         "sandbox_account_identity": _account_identity().as_dict(),
         "wfp_guard_binding": guard_verification_binding(verification),
         "wfp_guard_binding_digest": guard_verification_binding_digest(verification),
+        "checks": {"brokered_process_creation_denied": True},
         "properties": {
             name: {"status": "verified"} for name in SANDBOX_SECURITY_PROPERTIES
         },
@@ -199,6 +201,9 @@ def test_valid_marker_allows_missing_exact_guard_reconstruction_before_launch(
     def record_verified(_payload: dict[str, object]) -> None:
         calls.append("wfp_guard_verified")
 
+    def verify_brokered(*_args: object, **_kwargs: object) -> None:
+        calls.append("brokered-preflight")
+
     def launch(*_args: object, **_kwargs: object) -> tuple[object, object, list[str]]:
         calls.append("launch")
         return expected
@@ -206,6 +211,10 @@ def test_valid_marker_allows_missing_exact_guard_reconstruction_before_launch(
     monkeypatch.setattr(
         "windows_local_mcp.wfp_guard_runtime.ensure_runtime_codex_loopback_guard",
         reconstruct_and_read_back,
+    )
+    monkeypatch.setattr(
+        "windows_local_mcp.sandbox_backend._require_brokered_process_creation_denied",
+        verify_brokered,
     )
     monkeypatch.setattr("windows_local_mcp.sandbox_backend.launch_codex_sandbox", launch)
 
@@ -224,7 +233,12 @@ def test_valid_marker_allows_missing_exact_guard_reconstruction_before_launch(
     )
 
     assert (process, job, argv) == expected
-    assert calls == ["ensure-and-read-back", "wfp_guard_verified", "launch"]
+    assert calls == [
+        "ensure-and-read-back",
+        "wfp_guard_verified",
+        "brokered-preflight",
+        "launch",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -540,7 +554,16 @@ def test_sandbox_live_verification_is_property_scoped_and_fails_closed(
 
     properties["resource_bound"] = {"status": "verified"}
     marker.write_text(canonical_json(_valid_live_marker(settings, backend)), encoding="utf-8")
-    assert require_codex_sandbox_live_verification(settings, backend)["version"] == 4
+    assert (
+        require_codex_sandbox_live_verification(settings, backend)["version"]
+        == SANDBOX_LIVE_MARKER_VERSION
+    )
+
+    missing_brokered = _valid_live_marker(settings, backend)
+    missing_brokered["checks"] = {}
+    marker.write_text(canonical_json(missing_brokered), encoding="utf-8")
+    with pytest.raises(ApprovedSandboxUnavailable, match="missing, failed, or stale"):
+        require_codex_sandbox_live_verification(settings, backend)
 
     settings.approved_sandbox_require_live_verification = False
     with pytest.raises(ApprovedSandboxUnavailable, match="cannot be disabled"):
@@ -571,7 +594,10 @@ def test_live_marker_is_stale_after_security_context_changes(
     marker = settings.data_dir / "control-plane" / "sandbox-live-verification.json"
     original_digest = isolation_context_digest(settings, backend)
     marker.write_text(canonical_json(_valid_live_marker(settings, backend)), encoding="utf-8")
-    assert require_codex_sandbox_live_verification(settings, backend)["version"] == 4
+    assert (
+        require_codex_sandbox_live_verification(settings, backend)["version"]
+        == SANDBOX_LIVE_MARKER_VERSION
+    )
 
     original_blocked = list(settings.blocked_file_names)
     original_dependencies = list(settings.sandbox_dependency_readable_paths)

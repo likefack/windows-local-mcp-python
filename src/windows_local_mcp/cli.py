@@ -36,7 +36,7 @@ def main() -> None:
 
     if args.command == "verify-codex-sandbox":
         from .sandbox_backend import sandbox_live_verification_route_eligible
-        from .sandbox_live_verify import verify_codex_sandbox_live
+        from .sandbox_live_verify_hardened import verify_codex_sandbox_live
 
         result = verify_codex_sandbox_live(load_settings())
         route_eligible = sandbox_live_verification_route_eligible(result)
