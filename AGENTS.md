@@ -2,6 +2,16 @@
 
 このリポジトリで Codex が Windows 上の調査・修正を行う場合は、次を守ってください。
 
+## プロダクト不変条件と機能維持
+
+- セキュリティ修正は、明示されたプロダクト目的と中核機能を維持したまま成立させる。脆弱な経路を単に削除・無効化・恒久的に fail closed にすることで finding を `fixed` / `closed` と扱ってはならない。ただし trusted operator が、その具体的な capability reduction を明示的に承認した場合を除く。
+- 特に Approved Host は optional な便宜機能ではない。Codex Sandbox または Broker では実行できないが、trusted operator が明示承認した処理を通常の Windows user authority で実行するための中核 fallback / escalation route である。この役割を失わせる変更は、セキュリティ上有利でも final remediation として採用しない。
+- Approved Host の脆弱性を修正する際は、Approved Host 自体を停止するのではなく、承認、monitor / postflight、durable tamper state、process authority separation 等の根本原因を修正して、機能と security invariant の両方を成立させる。
+- 現行 architecture では security invariant と Approved Host の機能維持を同時に満たせないと判断した場合、finding を未解決または blocked のまま報告し、必要な architecture change、選択肢、trade-off を trusted operator に提示する。ユーザー確認なしに capability reduction を final fix として commit / merge しない。
+- 緊急の exploit containment として一時的な fail-closed を導入する場合は、`temporary mitigation` / `product regression` と明記し、finding の根本解決とは区別する。機能停止だけを根拠に release blocker を解除したり `closed` と記録したりしない。
+- `SECURITY_CONTRACT.md`、`SPEC.md`、`VERIFICATION.md` その他の文書を、実装上の都合だけで capability reduction を正当化する方向へ書き換えない。中核 capability の削除・停止・意味的縮小を契約へ反映するには、その変更自体について trusted operator の明示承認が必要である。
+- 2026-08-27 に WLMCP-R2-001 対応として行われた「Approved Host execution を current v1 で全面停止して finding を close する」方針は trusted operator により拒否された。この方針を precedent として再利用しない。詳細は `docs/APPROVED_HOST_PRODUCT_INVARIANT.md` を必ず読む。
+
 ## ドキュメントと実装仕様の整合性
 
 - 実装作業を行う場合は、変更対象に関係する仕様書・設計資料・運用資料などのドキュメントを確認し、依頼された仕様および現行実装との整合性を確認する。
