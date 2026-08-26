@@ -122,7 +122,7 @@ def restore_config_binding(settings: Any, binding: object) -> None:
         raise RuntimeError("immutable worker context has no workspace selection source")
     ambient_root_present = binding.get("ambient_root_present")
     if not isinstance(ambient_root_present, bool):
-        raise RuntimeError("immutable worker context has an invalid ambient-root binding")
+        raise TypeError("immutable worker context has an invalid ambient-root binding")
 
     selector_value = binding.get("config_selector_path")
     path_value = binding.get("config_path")
