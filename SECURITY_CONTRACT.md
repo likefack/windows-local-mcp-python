@@ -32,6 +32,21 @@ code-loader または workspace 内 executable を Approved Host で実行しま
 2026-08-14 に受容した workspace 内 protected-information direct read の残存 risk を解消した保証とは扱いません。
 current v1 では `protected_information_read` と LAN access の 2 property を明示的な受容済み残存 risk とします。
 
+2026-08-27 改訂では、Codex Sandbox account から WMI／CIM 等を経由して Job 外 process を生成する経路を
+termination／resource-bound の必須境界として扱い、live verification marker を schema v5 へ更新します。
+`Win32_Process.Create` を含む brokered process creation の denial が実測されない marker は route eligibility を
+満たしません。
+
+同日、Approved Host の guarded interval について、same Windows user authority の child が worker／監視 process を
+停止して postflight を回避でき、再起動時の stale reconciliation だけでは永続 tamper latch が残らないことを
+WLMCP-R2-001 として valid と判定しました。same-desktop UAC elevation は Windows security boundary として受理せず、
+この問題を受容済み残存 risk に移しません。current v1 の Approved Host execution は capability reduction として
+fail closed に固定し、設定、surface、pending／approved state の存在から実行可能性を推測しません。既存の
+queued／approved operation も worker spawn 前の production gate で拒否します。Approved Host を再有効化する場合は、
+別 user／session、SYSTEM service その他 Microsoft が security boundary として扱う authority separation、または
+同等に実証された境界によって monitor／postflight owner と durable tamper state を untrusted same-user child から
+保護し、kill／bypass／restart 回帰を Windows 実機で通すことを先に要求します。
+
 ## 1. 適用範囲と信頼モデル
 
 1 台の Windows PC で、1 人の利用者が、1 つの明示設定された `workspace_root` を扱う
@@ -91,9 +106,14 @@ Python、Node、PowerShell、Dart、Flutter など open-ended な処理を実行
 
 ### 2.4 Approved Host
 
-real Windows user authority が本当に必要な処理だけを、Codex Sandbox とは別の明示承認で
-1 回実行します。別 OS principal による完全隔離は v1 の保証外ですが、control-plane の
-通常の改変を検出して fail closed します。
+`request_host_command` 等の surface と設定 schema は compatibility／将来拡張のため残り得ますが、current v1 の
+Approved Host execution route は WLMCP-R2-001 の capability reduction により unavailable です。新規 request を
+staging できる code path や upgrade 前の pending／approved state が残っていても、それらは execution capability を
+意味せず、production runtime gate は Approved Host worker を spawn する前に fail closed します。
+
+Approved Host を再有効化するには、one-shot human approval に加えて、same-user child が monitor／postflight owner と
+durable tamper state を停止・変更・回避できない Windows security boundary を実証しなければなりません。
+same-desktop UAC elevation だけをこの boundary の根拠にしません。
 
 旧 Safe Tier／AppContainer は第五の policy tier として復活させません。固定文法の低 risk
 処理は Broker primitive として狭く実装し、open-ended execution は Codex Sandbox へ送ります。
@@ -137,8 +157,8 @@ OS 境界の安全性を証明した意味には使いません。`Windows live-
 `verified` と表示するには、同一の launcher、helper、version、署名、hash、policy generation に
 対して、その property を実機で確認します。
 
-Live verification marker は schema v4 のみを受理します。v1～v3 または必須 field が欠けた marker から
-C7 identity を推測・移行しません。v4 は、実際に import された WFP Guard module の canonical path、
+Live verification marker は schema v5 のみを受理します。v1～v4 または必須 field が欠けた marker から
+identity を推測・移行しません。v5 は、実際に import された WFP Guard module の canonical path、
 content SHA-256、Windows handle から取得した volume serial number と file index、size、Guard version、
 policy generation に結合します。mtime は補助的な drift signal であり、単独では trust anchor にしません。
 Guard module は verification から child 起動まで置換・書込みを拒否する handle を保持します。
@@ -148,8 +168,10 @@ Codex launcher と adjacent helper は canonical path、content SHA-256、Window
 さらに Windows product、build、UBR、native architecture、Sandbox account identity、WFP read-back identity を
 marker に結合し、現在値と異なれば marker を stale として通常 operation を停止します。通常 operation は
 stale marker を理由に live verification を自動実行せず、`verify-codex-sandbox` の明示実行を必要とします。
+`Win32_Process.Create` を含む WMI／CIM brokered process creation は explicit denial probe の成功を必須とし、
+`brokered_process_creation_denied` が欠損または false の evidence は route eligible としません。
 
-WFP の static non-persistent fixed object は reboot や BFE restart で消失し得るため、marker v4 の Guard、
+WFP の static non-persistent fixed object は reboot や BFE restart で消失し得るため、marker v5 の Guard、
 policy、backend、account、OS identity がすべて現在値と一致し、object が単に missing の場合だけ、trusted
 Guard が exact object を再構築できます。その場合も `ensure → complete read-back → wfp_guard_verified →
 child launch` の順序を崩しません。既存 object の security-relevant field 不一致、conflicting object、または
@@ -166,6 +188,7 @@ Sandbox route の必須境界は少なくとも次です。
 - 未許可 loopback／localhost endpoint へ接続できない
 - loopback Guard の対象 SID は、この PC のコンピューター名で完全修飾して解決し、返された参照ドメインがこの PC 自身であり、`SID_NAME_USE == SidTypeUser (1)` であることを確認できない場合は Sandbox route を利用しない
 - child／grandchild に上記の必須 filesystem、network、control-plane 境界が継承される。ただし workspace 内 protected-information direct read の child／grandchild denial は受容済み残存 risk として route gate から除外する
+- WMI／CIM 等の brokered process creation が拒否され、Job 外 process で termination／process／memory bound を迂回できない
 - timeout／cancel で descendant を含め停止できる
 - scratch、出力、時間、process、memory／filesystem consumption に現実的な上限がある
 
@@ -179,8 +202,8 @@ parent／child／grandchild check をそのまま `failed` として保存・表
 受容済み残存 risk を route 判定から分離しても、結果を削除したり成功へ丸めたりしません。
 
 workspace 外 protected information の read、一般 source-workspace canary の read／write、Internet access、
-未許可 loopback／localhost access、control-plane 境界はこの受容に含みません。これらの必須境界が `failed` または
-`unverified` の場合、Sandbox route は unavailable として fail closed します。
+未許可 loopback／localhost access、control-plane 境界、brokered process creation denial はこの受容に含みません。
+これらの必須境界が `failed` または `unverified` の場合、Sandbox route は unavailable として fail closed します。
 
 snapshot/run projection、source-workspace deny、staging からの protected file 除外、stdout／stderr の redaction、
 network deny は defense-in-depth として維持します。これらを workspace 内 protected information の secrecy が
@@ -188,20 +211,19 @@ network deny は defense-in-depth として維持します。これらを worksp
 
 ### E. Approved Host boundary
 
-- Codex Sandbox とは別の one-shot human approval を必要とします。
-- project-controlled code-loader と workspace 内 executable は Approved Host で受理せず、Codex Sandbox の snapshot-only route を要求します。
-- 同一 Windows user principal のため防止できない瞬間的な完全復元型改変は残存 risk としますが、
-  audit DB、approval state、CAS、journal、worker context、transfer state、runtime、policy generation の
-  通常の改変は検出します。
-- 改変または検証不能を検出した場合は tamper／recovery marker を残し、後続処理を停止します。
-- Windows では親を一時停止して Job Object へ割り当ててから再開し、Job の全 descendant が終了したことを
-  確認します。通常の `CreateProcess` の子は Job に入りますが、`Win32_Process.Create` が作る process は
-  この Job の active-process 集計から外れるため、起動前に同一 user の process identity を記録し、Job が
-  empty になった後も実行中に新しく観測された同一 user process が終了するまで control-plane の事後検査へ
-  進みません。process の identity を列挙できない、または期限内に終了しない場合は tamper 検査境界を
-  検証不能として fail closed します。これは同一 principal に対する OS 権限分離ではなく、guarded interval
-  中の Job 外 process を検出する補助境界です。
-- Host の device、network、external service、process side effect を workspace rollback 可能とは表示しません。
+current v1 では Approved Host execution capability 自体を fail closed にします。したがって以下は current route の
+実行保証ではなく、将来再有効化する場合に先に満たすべき最低条件です。
+
+- Codex Sandbox とは別の one-shot human approval を必要とする。
+- project-controlled code-loader と workspace 内 executable は Approved Host で受理せず、Codex Sandbox の snapshot-only route を要求する。
+- monitor／postflight owner と durable tamper state は untrusted Approved Host child と同じ有効 authority に置かず、child から terminate／suspend／rewrite／delete／reset できない Windows security boundary で保護する。
+- same-desktop UAC elevation だけを authority separation の根拠にしない。
+- child／worker／monitor の異常終了、channel loss、timeout、postflight 未完了、control-plane mismatch、検証不能を restart 後にも残る fail-closed state へ結合し、単なる stale operation の `interrupted` 化だけで解除しない。
+- Windows Job Object の全 descendant と、Job 外 process creation の双方を閉じる。process identity を列挙できない、または期限内に終了しない場合も postflight を成功扱いしない。
+- Host の device、network、external service、process side effect を workspace rollback 可能とは表示しない。
+
+current v1 では設定が `approved_host_enabled=true` でもこの future-condition を満たした意味にはせず、worker spawn 前に
+fail closed します。upgrade 前の pending／approved operation も同じ execution-time gate を迂回できません。
 
 ### F. Approval integrity
 
@@ -276,7 +298,7 @@ network deny は defense-in-depth として維持します。これらを worksp
 - staging exclusion、argv／environment／stdout／stderr preview／error／audit field の redaction は防御を
   多層化する補助策であり、workspace 外 protected-information read denial の代替にしません。
 - argv、environment、stdout／stderr preview、error、audit field は semantic redaction と容量制限を通します。
-- Approved Host で人間が明示的に secret access を承認した場合まで絶対に読めないことは保証しません。
+- Approved Host は current v1 では execution unavailable です。将来再有効化した場合、人間が明示的に secret access を承認する operation についてまで絶対に読めないことは保証しません。
 
 ### L. Resource safety／practicality
 
@@ -342,6 +364,11 @@ Git も capability truthfulness の対象です。`git_enabled=true`、Git execu
 automatic Git Broker execution は fail closed であり、その状態を session／UI／documentation で利用可能と
 表示しません。
 
+Approved Host も capability truthfulness の対象です。`approved_host_enabled=true`、`request_host_command` surface、
+または既存 pending／approved row の存在を execution availability と同一視しません。WLMCP-R2-001 の capability
+reduction が有効な current v1 では `available=false`／`live_verified=false`／`windows_live_verified=false` を維持し、
+worker を spawn しません。
+
 過去の結果、mock、static test、direct ADB、stdio integration を、現在の commit に対する Windows live、
 MCP ADB E2E、Tunnel、deployment の代替にしません。
 
@@ -359,6 +386,7 @@ MCP ADB E2E、Tunnel、deployment の代替にしません。
 - Broker helper の PATH shadowing、差し替え、stale executable identity
 - Git automatic execution を再有効化する場合の repository metadata confinement と capability 表示の不一致
 - Codex Sandbox の一般 source workspace read／write、workspace 外 protected information direct read、workspace 外 read／write、Internet／loopback／control-plane／必須 descendant boundary 不足。ただし Section 5 の workspace 内 protected-information direct read は除く
+- Approved Host を再有効化する場合の monitor／postflight kill・bypass・restart persistence と capability 表示の不一致
 - ordinary non-admin Windows user 権限で成立する現実的な攻撃
 - common project layout で起こる機能破綻、通常操作での重大 UX 破綻
 - 容易に trigger できる resource exhaustion、過剰 copy／scan／hash／lock／approval
@@ -380,13 +408,13 @@ MCP ADB E2E、Tunnel、deployment の代替にしません。
 - provenance／live verification を通過した Sandbox 実装自体の未知の OS sandbox 0-day
 - trusted runtime／dependency environment が起動前から完全 compromise されている状態
 - security boundary 外で同等以上の Windows user authority が既に完全奪取されている状態
-- Approved Host と同一 principal で別 service／SID を導入しなければ防げない瞬間的な完全復元型改変
-- Approved Host の guarded interval が終わった後に同一 principal が新しい process を作ること、または
-  同一 user process の列挙能力そのものを失わせること
 - hardware power loss の全 timing に対する完全 ACID durability
 - 通常の validation／resource bound で防止不能な third-party parser の未知の 0-day
 - 別 kernel component、専用 service、別 user principal を必須とし、個人利用 v1 として cost が明らかに
   不釣り合いな極端な攻撃
+
+Approved Host の same-principal monitor termination／postflight bypass はこの受容済み残存 risk に含めません。
+current v1 は当該 capability を停止して解消し、将来再有効化する場合は Section E の boundary を先に要求します。
 
 ## 6. 既知問題と契約の対応
 
@@ -406,13 +434,14 @@ MCP ADB E2E、Tunnel、deployment の代替にしません。
 | ChatGPT container source→result binding | G, I |
 | Sandbox launcher の host-side cwd／DLL／search-path | C, D, F |
 | Internet／loopback と child／grandchild の必須 containment | D, O |
+| WMI／CIM brokered process creation denial と Job 外 escape | D, O |
 | LAN access が受容済み残存 risk として正確に表示されるか | D, O |
 | Sandbox property ごとの live verification と route 判定の分離 | D, O |
 | DOCX／XLSX の過剰な file-wide rejection と保存能力表示 | J, L, O |
 | 画像 format conversion の実用性と capability 表示 | J, L, O |
 | CSV／TSV preservation 表示の正確性 | J, O |
 | workspace／data／scratch の Windows physical identity | G, H, O |
-| control-plane tamper、worker／approval／process lifecycle | E, F, H |
+| Approved Host monitor termination／postflight bypass と restart 後の fail-closed persistence | E, F, H, O |
 | checkpoint／CAS／GC concurrency と rollback／Undo | G, H, L, M |
 | resource admission、protected information leakage | K, L |
 | Live Activity／Timeline／preview／conflict／recovery 表示 | M, O |

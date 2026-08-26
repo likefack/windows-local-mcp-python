@@ -16,10 +16,10 @@ if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) {
     throw "Approved Host runtime Python was not found: $Python"
 }
 
-$Probe = 'import json; from windows_local_mcp.runtime_immutability import assert_approved_host_runtime_immutable; print(json.dumps(assert_approved_host_runtime_immutable(), ensure_ascii=False, sort_keys=True))'
+$Probe = 'import json; from windows_local_mcp.approved_host_policy import verify_approved_host_runtime_immutability_only; print(json.dumps(verify_approved_host_runtime_immutability_only(), ensure_ascii=False, sort_keys=True))'
 & $Python -I -B -c $Probe
 if ($LASTEXITCODE -ne 0) {
     throw "Approved Host runtime immutability verification failed."
 }
 
-Write-Output "Approved Host runtime immutability verification passed."
+Write-Output "Approved Host runtime immutability verification passed. Approved Host execution remains unavailable in current v1."

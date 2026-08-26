@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from windows_local_mcp import runtime_immutability, runtime_trust
+from windows_local_mcp import approved_host_policy, runtime_immutability, runtime_trust
 from windows_local_mcp.runtime_trust import RuntimeTrustInventory
 
 
@@ -122,11 +122,11 @@ def test_existing_optional_namespace_package_remains_immutable(
         )
 
 
-@pytest.mark.skipif(os.name != "nt", reason="Approved Host production gate is Windows-only")
-def test_production_gate_requires_python_isolated_mode(
+@pytest.mark.skipif(os.name != "nt", reason="Approved Host runtime verification is Windows-only")
+def test_runtime_verification_requires_python_isolated_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(runtime_immutability, "_runtime_is_isolated", lambda: False)
 
     with pytest.raises(RuntimeError, match=r"isolated mode \(-I\)"):
-        runtime_immutability.assert_approved_host_runtime_immutable()
+        approved_host_policy.verify_approved_host_runtime_immutability_only()

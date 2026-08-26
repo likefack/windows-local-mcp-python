@@ -36,6 +36,7 @@ MANDATORY_DESCENDANT_CHECKS = (
     "grandchild_internet_denied",
     "grandchild_loopback_denied",
 )
+BROKERED_PROCESS_CHECK = "brokered_process_creation_denied"
 
 
 def _account_identity() -> SandboxAccountIdentity:
@@ -87,6 +88,7 @@ def _accepted_residual_risk_evidence(
     properties["lan"] = {"status": "failed"}
     properties["descendant_containment"] = {"status": "failed"}
     checks = {name: True for name in MANDATORY_DESCENDANT_CHECKS}
+    checks[BROKERED_PROCESS_CHECK] = True
     checks.update(
         {
             "child_protected_information_denied": False,
@@ -106,7 +108,7 @@ def _accepted_residual_risk_evidence(
         "test_binding": True,
     }
     return {
-        "version": 4,
+        "version": 5,
         "passed": False,
         "backend_digest": sha256_text(canonical_json(backend.as_dict())),
         "backend_version": backend.version,
@@ -166,6 +168,23 @@ def test_mandatory_descendant_failure_still_fails_closed(
     marker.write_text(canonical_json(evidence), encoding="utf-8")
     with pytest.raises(ApprovedSandboxUnavailable, match="missing, failed, or stale"):
         require_codex_sandbox_live_verification(settings, backend)
+
+
+def test_brokered_process_creation_failure_still_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    monkeypatch.setattr(
+        "windows_local_mcp.sandbox_backend.resolve_sandbox_account_identity",
+        _account_identity,
+    )
+    backend = _backend(tmp_path)
+    evidence = _accepted_residual_risk_evidence(settings, backend)
+    checks = evidence["checks"]
+    assert isinstance(checks, dict)
+    checks[BROKERED_PROCESS_CHECK] = False
+
+    assert sandbox_live_verification_route_eligible(evidence) is False
 
 
 @pytest.mark.parametrize("status", ["failed", "unverified"])

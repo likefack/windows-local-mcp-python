@@ -1,5 +1,39 @@
 # 検証記録
 
+## 2026-08-27 WLMCP-R2-001 remediation — CLOSED
+
+### 判定
+
+- WLMCP-R2-001 の finding 自体は valid のまま維持する。Approved Host child と worker／postflight monitor が同一 Windows user authority にある current architecture では、child が監視側を停止して postflight を回避でき、restart 時の stale reconciliation だけでは durable tamper latch が残らない。
+- この same-user guarded interval を安全な境界として再分類したり、受容済み残存 risk に移したりせず、current v1 の Approved Host execution capability 自体を停止する capability reduction で attack sink を除去した。
+- 下記 Security Scan Round 2 の `WLMCP-R2-001 | High | unresolved / release blocker` は scan 時点の履歴として残すが、この節が current status を supersede する。current v1 に対する WLMCP-R2-001 は `fixed by capability reduction / closed` とする。
+- `approved_host_enabled=true`、`request_host_command` surface、immutable runtime verification、pending／approved row の存在は execution availability を意味しない。`Executor.launch()` は current `approved_host` と legacy `host_approval` の双方を worker spawn 前に fail closed する。
+- same-desktop UAC elevation を monitor authority separation の security boundary として採用しない。Approved Host を将来再有効化する場合は、別 user／session、SYSTEM service その他の independently justified Windows security boundary で monitor／postflight owner と durable tamper state を untrusted child から分離し、monitor kill、worker kill、postflight bypass、restart recovery を Windows 実機で再検証することを要求する。
+
+### 実装と回帰
+
+- production `assert_approved_host_runtime_immutable()` は current-v1 capability-reduction reason で `PermissionError` を返し、`Executor` は worker context 作成／`subprocess.Popen()` より前に停止する。
+- lower-level runtime immutability algorithm は diagnostic-only `verify_approved_host_runtime_immutability_only()` へ分離した。diagnostic が成功しても production execution gate は解除されない。
+- `verify-approved-host-runtime.ps1` も diagnostic-only path を使用し、runtime immutability evidence を Approved Host availability と混同しない。
+- upgrade 前から残る queued／approved operation について、`approved_host` と legacy `host_approval` の双方が `subprocess.Popen()` 前に拒否される回帰を追加した。
+- Sandbox 側は current main の live marker schema v5 と `brokered_process_creation_denied` regression fixture に同期した。この変更を WLMCP-R2-001 の修正根拠とはせず、独立した Sandbox contract の整合性維持として扱う。
+
+### Windows CI
+
+- code-freeze head は `83a866708436ea14fc1612667015217c9b63f670`。
+- PR #20 の Windows CI #147（run `33022753266`、base main `4a6b1a7f8b5b4525f3b33e99f315eae346d1d631` との merge ref `51c6c522a07c91107536d25753a6ef2abd345768`）で全 job が成功した。
+- focused process-identity security regression: `17 passed`。
+- focused race／recovery／transaction regression: `38 passed`。
+- full pytest: `430 passed in 103.99s`。
+- repository-wide Ruff、compileall、diff whitespace check はすべて pass。
+- 途中 run では capability reduction 前の旧テスト契約が production gate に isolated-mode error を期待して 1 failure となったが、isolated-mode check 自体を diagnostic-only API へ移して保持し、最終 run で全 430 test の通過を確認した。
+
+### 検証境界と release status
+
+- Hosted Windows CI は current v1 で Approved Host execution route が worker spawn 前に fail closed する semantics と既存 regression を検証する。将来の Approved Host OS security boundary を live-verified した証拠ではない。
+- current v1 では Approved Host command の成功 E2E を要求・主張しない。route 自体を意図的に unavailable にしているためである。
+- WLMCP-R2-001 は current v1 の release blocker ではなくなった。他の Round 2 finding の status はそれぞれ独立して扱い、この remediation だけを根拠に変更しない。
+
 ## 2026-08-27 Sandbox workspace protected-read residual-risk policy correction
 
 - trusted operator の設計判断として、2026-08-14 に実機確認した workspace 内 protected information の direct-read failure は current v1 の受容済み残存 risk とする。2026-08-26 の snapshot-only source isolation は defense-in-depth として維持するが、この残存 risk を解消した保証とは扱わない。
