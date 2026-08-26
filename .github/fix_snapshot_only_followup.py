@@ -89,3 +89,26 @@ new = '''            rejected_project_host = await session.call_tool(
 '''
 text = replace_once(text, old, new, "stdio Approved Host route")
 path.write_text(text, encoding="utf-8", newline="\n")
+
+
+path = Path("tests/test_approval_execution_integration.py")
+text = path.read_text(encoding="utf-8")
+text = replace_once(
+    text,
+    '''    result = executor.launch("snapshot-bound-workspace", 30)\n\n    assert result["status"] == "succeeded"\n''',
+    '''    result = executor.launch("snapshot-bound-workspace", 30)\n    operation = store.get_operation("snapshot-bound-workspace")\n\n    assert result["status"] == "succeeded", operation\n''',
+    "snapshot success diagnostic",
+)
+text = replace_once(
+    text,
+    '''    result = executor.launch("approved-host-legitimate-descendant", 30)\n\n    assert result["status"] == "succeeded"\n''',
+    '''    result = executor.launch("approved-host-legitimate-descendant", 30)\n    operation = store.get_operation("approved-host-legitimate-descendant")\n\n    assert result["status"] == "succeeded", operation\n''',
+    "descendant success diagnostic",
+)
+text = replace_once(
+    text,
+    '''    result = executor.launch("approved-host-descendant-timeout", 10)\n    time.sleep(1.5)\n\n    assert result["status"] == "timed_out"\n''',
+    '''    result = executor.launch("approved-host-descendant-timeout", 10)\n    time.sleep(1.5)\n    operation = store.get_operation("approved-host-descendant-timeout")\n\n    assert result["status"] == "timed_out", operation\n''',
+    "descendant timeout diagnostic",
+)
+path.write_text(text, encoding="utf-8", newline="\n")
