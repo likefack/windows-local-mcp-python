@@ -118,9 +118,9 @@ def _namespace_paths(root: Path) -> tuple[set[Path], set[Path]]:
     """Expand only entries that can participate in trusted Python import/startup.
 
     The namespace directory itself remains immutable so an Approved Host child cannot add
-    a new importable sibling. Regular packages are recursively immutable. Namespace-package
-    directories without an ``__init__`` are pinned at the directory boundary; declared
-    dependencies remain recursively covered by ``RuntimeTree`` inventory entries.
+    a new importable sibling. Once a child directory is importable as either a regular or
+    namespace package, its existing tree is recursively immutable. Non-importable siblings
+    remain outside the trusted runtime closure.
     """
 
     resolved = _resolved_existing(root)
@@ -137,12 +137,9 @@ def _namespace_paths(root: Path) -> tuple[set[Path], set[Path]]:
                 f"Approved Host import namespace contains a reparse point: {child}"
             )
         if child.is_dir():
-            if kind == "package-directory":
-                child_directories, child_files = _tree_paths(RuntimeTree(child))
-                directories.update(child_directories)
-                files.update(child_files)
-            else:
-                directories.add(child.resolve(strict=True))
+            child_directories, child_files = _tree_paths(RuntimeTree(child))
+            directories.update(child_directories)
+            files.update(child_files)
         elif child.is_file():
             files.add(child.resolve(strict=True))
         else:

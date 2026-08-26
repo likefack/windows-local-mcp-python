@@ -38,6 +38,10 @@ def _inventory(tmp_path: Path) -> tuple[RuntimeTrustInventory, dict[str, Path]]:
     optional = site_root / "optional_plugin" / "__init__.py"
     optional.parent.mkdir()
     optional.write_text("VALUE = 1\n", encoding="utf-8")
+    namespace_package = site_root / "namespace_plugin"
+    namespace_package.mkdir()
+    namespace_module = namespace_package / "feature.py"
+    namespace_module.write_text("VALUE = 1\n", encoding="utf-8")
 
     inventory = RuntimeTrustInventory(
         trees=(RuntimeTree(package), RuntimeTree(dependency)),
@@ -55,6 +59,7 @@ def _inventory(tmp_path: Path) -> tuple[RuntimeTrustInventory, dict[str, Path]]:
         "dependency_file": dependency_file,
         "startup": startup,
         "optional": optional,
+        "namespace_module": namespace_module,
     }
 
 
@@ -95,6 +100,22 @@ def test_complete_runtime_rejects_undeclared_optional_package(tmp_path: Path) ->
 
     def access(path: Path) -> int:
         if path == paths["optional"].resolve(strict=True):
+            return 0x00000002  # FILE_WRITE_DATA
+        return 0
+
+    with pytest.raises(PermissionError, match="immutable Python/WLMCP runtime"):
+        assert_approved_host_runtime_immutable(
+            paths["package"],
+            inventory=inventory,
+            access_resolver=access,
+        )
+
+
+def test_complete_runtime_rejects_mutating_namespace_package_module(tmp_path: Path) -> None:
+    inventory, paths = _inventory(tmp_path)
+
+    def access(path: Path) -> int:
+        if path == paths["namespace_module"].resolve(strict=True):
             return 0x00000002  # FILE_WRITE_DATA
         return 0
 
@@ -149,6 +170,7 @@ def test_runtime_paths_include_editable_launchers_and_repository(tmp_path: Path)
     assert (paths["repository"] / "run-approvals.ps1").resolve(strict=True) in files
     assert paths["startup"].resolve(strict=True) in files
     assert paths["optional"].resolve(strict=True) in files
+    assert paths["namespace_module"].resolve(strict=True) in files
 
 
 def test_complete_runtime_accepts_read_execute_only_model(tmp_path: Path) -> None:
