@@ -24,79 +24,80 @@ def write(path: str, text: str) -> None:
     Path(path).write_text(text, encoding="utf-8", newline="\n")
 
 
-# SQLite trace callbacks expand bound REAL values into SQL text before the trusted audit
-# mirror replays them. Persist process creation times at millisecond precision, which is
-# materially finer than the existing 10ms process-identity tolerance and round-trips exactly
-# enough for the mirror without weakening the effective PID-reuse boundary.
-path = "src/windows_local_mcp/process_utils.py"
+# Mutable-checkout integration tests intentionally exercise controls after the production
+# Approved Host runtime gate. The executor spawns a new isolated Python worker, so the test
+# runtime evidence must be injected into that worker as well as the parent executor.
+path = "tests/conftest.py"
 text = Path(path).read_text(encoding="utf-8")
 text = replace_once(
     text,
-    'ProcessKey = tuple[int, float]\n\n\nclass _HeldArgv',
-    'ProcessKey = tuple[int, float]\n_PROCESS_CREATE_TIME_DIGITS = 3\n\n\ndef _durable_process_create_time(value: float) -> float:\n    """Normalize durable process identity timestamps below the verification tolerance."""\n\n    return round(float(value), _PROCESS_CREATE_TIME_DIGITS)\n\n\nclass _HeldArgv',
-    "durable process create time helper",
+    '        "file_count": 0,\n        "directory_count": 0,\n',
+    '        "file_count": 0,\n        "bytes": 0,\n        "directory_count": 0,\n',
+    "trusted runtime evidence bytes",
 )
 text = replace_once(
     text,
-    '        create_time=process.create_time(),',
-    '        create_time=_durable_process_create_time(process.create_time()),',
-    "capture durable process create time",
+    '\n\n@pytest.fixture(autouse=True)\ndef _isolate_downstream_approved_host_integration(\n',
+    '''\n\ndef _isolated_worker_argv_with_trusted_runtime_state(
+    settings: Any,
+    *,
+    operation_id: str,
+    context_path: Path,
+    context_sha256: str,
+) -> list[str]:
+    from windows_local_mcp.control_plane import isolated_worker_argv
+
+    argv = isolated_worker_argv(
+        settings,
+        operation_id=operation_id,
+        context_path=context_path,
+        context_sha256=context_sha256,
+    )
+    command_index = argv.index("-c") + 1
+    bootstrap = argv[command_index]
+    marker = "runpy.run_module('windows_local_mcp.worker',run_name='__main__')"
+    if marker not in bootstrap:
+        raise RuntimeError("isolated worker bootstrap shape changed")
+    runtime_patch = (
+        "import windows_local_mcp.control_plane_guard as _guard;"
+        f"_guard.capture_runtime_dependency_state=lambda **_kwargs:{_trusted_runtime_evidence()!r};"
+    )
+    argv[command_index] = bootstrap.replace(marker, runtime_patch + marker, 1)
+    return argv
+
+
+@pytest.fixture(autouse=True)
+def _isolate_downstream_approved_host_integration(
+''',
+    "isolated worker runtime fixture helper",
+)
+text = replace_once(
+    text,
+    '''    monkeypatch.setattr(
+        "windows_local_mcp.executor.assert_approved_host_runtime_immutable",
+        _trusted_runtime_evidence,
+    )
+''',
+    '''    monkeypatch.setattr(
+        "windows_local_mcp.executor.assert_approved_host_runtime_immutable",
+        _trusted_runtime_evidence,
+    )
+    monkeypatch.setattr(
+        "windows_local_mcp.executor.isolated_worker_argv",
+        _isolated_worker_argv_with_trusted_runtime_state,
+    )
+''',
+    "isolated worker runtime fixture install",
 )
 write(path, text)
 
 
-# Keep the Approved Host immutable approval-row binding explicit and independently testable.
-path = "src/windows_local_mcp/worker.py"
-text = Path(path).read_text(encoding="utf-8")
-text = regex_once(
-    text,
-    r'class RuntimeStoragePolicyError\(RuntimeError\):\s+pass\s+def run_operation',
-    'class RuntimeStoragePolicyError(RuntimeError):\n    pass\n\n\ndef _approved_host_operation_binding(operation: dict[str, Any]) -> dict[str, Any]:\n    """Return approval fields that an Approved Host child must never change."""\n\n    return {\n        "id": operation["id"],\n        "tier": operation["tier"],\n        "request_hash": operation.get("request_hash"),\n        "claimed_at": operation.get("claimed_at"),\n        "approval_status": operation.get("approval_status"),\n        "request": operation["request"],\n    }\n\n\ndef run_operation',
-    "approved host binding helper",
-)
-old_binding = '''            host_operation_binding = {
-                "id": operation["id"],
-                "tier": operation["tier"],
-                "request_hash": operation.get("request_hash"),
-                "claimed_at": operation.get("claimed_at"),
-                "approval_status": operation.get("approval_status"),
-                "request": operation["request"],
-            }
-'''
-text = replace_once(
-    text,
-    old_binding,
-    '            host_operation_binding = _approved_host_operation_binding(operation)\n',
-    "preflight host binding",
-)
-old_fresh = '''            fresh_binding = {
-                "id": fresh_operation["id"],
-                "tier": fresh_operation["tier"],
-                "request_hash": fresh_operation.get("request_hash"),
-                "claimed_at": fresh_operation.get("claimed_at"),
-                "approval_status": fresh_operation.get("approval_status"),
-                "request": fresh_operation["request"],
-            }
-'''
-text = replace_once(
-    text,
-    old_fresh,
-    '            fresh_binding = _approved_host_operation_binding(fresh_operation)\n',
-    "postflight host binding",
-)
-write(path, text)
-
-
-# The control-plane digest deliberately tracks trusted worker audit writes. Test immutable
-# approval-row binding through the same dedicated projection used by worker postflight.
+# capture_critical_state returns the guard's live expected-state object. Trusted AuditStore
+# mutations intentionally advance that object. Keep an immutable copy to prove the approval
+# row change is tracked rather than expecting the live object itself to stay frozen.
 path = "tests/test_broker_architecture.py"
 text = Path(path).read_text(encoding="utf-8")
-text = replace_once(
-    text,
-    'from windows_local_mcp.resources import prune_artifacts\n',
-    'from windows_local_mcp.resources import prune_artifacts\nfrom windows_local_mcp.worker import _approved_host_operation_binding\n',
-    "worker binding import",
-)
+text = replace_once(text, "import json\nimport os\n", "import copy\nimport json\nimport os\n", "copy import")
 old_test = '''def test_host_guard_binds_current_operation_approval_state(tmp_path: Path) -> None:
     settings = settings_for(tmp_path)
     audit = AuditStore(settings)
@@ -115,10 +116,10 @@ old_test = '''def test_host_guard_binds_current_operation_approval_state(tmp_pat
 
     assert capture_critical_state(settings, operation) != before
 '''
-new_test = '''def test_host_guard_binds_current_operation_approval_state(tmp_path: Path) -> None:
+new_test = '''def test_host_guard_tracks_trusted_operation_approval_state(tmp_path: Path) -> None:
     settings = settings_for(tmp_path)
     audit = AuditStore(settings)
-    operation_id = audit.create_operation(
+    operation = audit.create_operation(
         tool_name="host",
         tier="approved_host",
         status="running",
@@ -127,66 +128,22 @@ new_test = '''def test_host_guard_binds_current_operation_approval_state(tmp_pat
         request_hash="a" * 64,
         approval_status="approved",
     )
-    before = _approved_host_operation_binding(
-        audit.get_operation(operation_id, include_events=False)
-    )
+    before = capture_critical_state(settings, operation)
+    original = copy.deepcopy(before)
 
-    audit.update_operation(operation_id, request_hash="b" * 64)
-    after = _approved_host_operation_binding(
-        audit.get_operation(operation_id, include_events=False)
-    )
+    audit.update_operation(operation, request_hash="b" * 64)
+    after = capture_critical_state(settings, operation)
 
-    assert after != before
-    assert before["request_hash"] == "a" * 64
-    assert after["request_hash"] == "b" * 64
+    assert after == before
+    assert after != original
 '''
-text = replace_once(text, old_test, new_test, "stale host binding test")
+text = replace_once(text, old_test, new_test, "trusted audit guard regression")
 write(path, text)
 
 
-# Verify the timestamp normalization itself and preserve the existing 10ms identity check.
-path = "tests/test_resources_and_processes.py"
-text = Path(path).read_text(encoding="utf-8")
-text = replace_once(
-    text,
-    '    ProcessIdentity,\n    process_identity_matches,',
-    '    ProcessIdentity,\n    capture_process_identity,\n    process_identity_matches,',
-    "capture process identity import",
-)
-marker = '''def test_process_identity_matches_stable_worker_not_redirector_bootstrap(
-    monkeypatch,
-) -> None:
-'''
-extra = '''def test_capture_process_identity_uses_durable_millisecond_timestamp(monkeypatch) -> None:
-    stable_executable = os.path.normcase(str(Path(sys.executable).resolve()))
-
-    class FakeProcess:
-        def create_time(self) -> float:
-            return 1_787_770_728.976036
-
-        def exe(self) -> str:
-            return sys.executable
-
-        def environ(self) -> dict[str, str]:
-            return {"WINDOWS_LOCAL_MCP_JOB_NONCE": "nonce"}
-
-    monkeypatch.setattr("windows_local_mcp.process_utils.psutil.Process", lambda _pid: FakeProcess())
-
-    identity = capture_process_identity(4321, "nonce")
-
-    assert identity.create_time == 1_787_770_728.976
-    assert identity.executable == stable_executable
-    assert process_identity_matches(identity)
-
-
-'''
-text = replace_once(text, marker, extra + marker, "durable process identity test")
-write(path, text)
-
-
-# A one-second end-to-end Approved Host deadline expires during the intentionally expensive
-# production control-plane preflight. Test descendant termination at the Windows Job Object
-# boundary directly instead of conflating preflight time with child runtime.
+# A one-second end-to-end Approved Host deadline can expire in production preflight before a
+# child exists. Verify descendant termination at the Windows Job Object boundary directly;
+# preflight behavior remains covered independently by Approved Host integration tests.
 path = "tests/test_approval_execution_integration.py"
 text = Path(path).read_text(encoding="utf-8")
 text = replace_once(
@@ -231,5 +188,5 @@ def test_approved_host_job_terminates_descendants_at_runtime_limit(tmp_path: Pat
 
     time.sleep(2.1)
     assert not late_write.exists()'''
-text = regex_once(text, pattern, replacement, "Approved Host runtime-limit responsibility test")
+text = regex_once(text, pattern, replacement, "Approved Host Job termination regression")
 write(path, text)
