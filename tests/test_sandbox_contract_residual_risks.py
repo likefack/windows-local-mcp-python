@@ -6,6 +6,7 @@ import pytest
 
 from windows_local_mcp.config import Settings
 from windows_local_mcp.sandbox_backend import (
+    SANDBOX_LIVE_MARKER_VERSION,
     SANDBOX_SECURITY_PROPERTIES,
     ApprovedSandboxUnavailable,
     CodexSandboxBackend,
@@ -89,6 +90,7 @@ def _accepted_residual_risk_evidence(
     checks = {name: True for name in MANDATORY_DESCENDANT_CHECKS}
     checks.update(
         {
+            "brokered_process_creation_denied": True,
             "child_protected_information_denied": False,
             "child_lan_denied": False,
             "grandchild_protected_information_denied": False,
@@ -106,7 +108,7 @@ def _accepted_residual_risk_evidence(
         "test_binding": True,
     }
     return {
-        "version": 4,
+        "version": SANDBOX_LIVE_MARKER_VERSION,
         "passed": False,
         "backend_digest": sha256_text(canonical_json(backend.as_dict())),
         "backend_version": backend.version,
@@ -161,6 +163,49 @@ def test_mandatory_descendant_failure_still_fails_closed(
     checks["child_loopback_denied"] = False
 
     assert sandbox_live_verification_route_eligible(evidence) is False
+
+    marker = settings.data_dir / "control-plane" / "sandbox-live-verification.json"
+    marker.write_text(canonical_json(evidence), encoding="utf-8")
+    with pytest.raises(ApprovedSandboxUnavailable, match="missing, failed, or stale"):
+        require_codex_sandbox_live_verification(settings, backend)
+
+
+def test_accepted_residual_risks_do_not_relax_brokered_process_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    monkeypatch.setattr(
+        "windows_local_mcp.sandbox_backend.resolve_sandbox_account_identity",
+        _account_identity,
+    )
+    backend = _backend(tmp_path)
+    evidence = _accepted_residual_risk_evidence(settings, backend)
+    checks = evidence["checks"]
+    assert isinstance(checks, dict)
+    checks["brokered_process_creation_denied"] = False
+
+    assert sandbox_live_verification_route_eligible(evidence) is False
+
+    marker = settings.data_dir / "control-plane" / "sandbox-live-verification.json"
+    marker.write_text(canonical_json(evidence), encoding="utf-8")
+    with pytest.raises(ApprovedSandboxUnavailable, match="missing, failed, or stale"):
+        require_codex_sandbox_live_verification(settings, backend)
+
+
+def test_schema_v4_marker_is_rejected_without_migration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert SANDBOX_LIVE_MARKER_VERSION == 5
+    settings = _settings(tmp_path)
+    monkeypatch.setattr(
+        "windows_local_mcp.sandbox_backend.resolve_sandbox_account_identity",
+        _account_identity,
+    )
+    backend = _backend(tmp_path)
+    evidence = _accepted_residual_risk_evidence(settings, backend)
+    evidence["version"] = 4
+
+    assert sandbox_live_verification_route_eligible(evidence) is True
 
     marker = settings.data_dir / "control-plane" / "sandbox-live-verification.json"
     marker.write_text(canonical_json(evidence), encoding="utf-8")
