@@ -46,6 +46,13 @@ class SourceWorkspaceReadGuard:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class _ReadDenyState:
+    explicit_deny_read: bool
+    inheritable_to_files: bool
+    inheritable_to_directories: bool
+
+
 class _AceHeader(ctypes.Structure):
     _fields_ = [
         ("AceType", wintypes.BYTE),
@@ -101,11 +108,12 @@ class _ExplicitAccessW(ctypes.Structure):
 def ensure_source_workspace_read_deny(
     workspace_root: Path, target_sid: str
 ) -> dict[str, object]:
-    """Persist an inheritable read-deny for the fixed Codex offline account.
+    """Persist and read back a deny-read boundary for the fixed offline account.
 
-    The deny is intentionally persistent. A worker crash must not reopen the original
-    source workspace to a later Sandbox process. The trusted Windows user remains
-    unaffected because the ACE targets only the dedicated Sandbox account SID.
+    Windows may canonicalize one inheritable EXPLICIT_ACCESS entry into two explicit
+    ACEs: an effective deny for the directory itself and an inherit-only OI/CI deny
+    for descendants. The verifier therefore aggregates matching explicit ACEs rather
+    than requiring all properties to appear on one ACE.
     """
 
     workspace = workspace_root.resolve(strict=True)
@@ -133,13 +141,6 @@ def ensure_source_workspace_read_deny(
         inheritable_to_directories=state.inheritable_to_directories,
         added=added,
     ).as_dict()
-
-
-@dataclass(frozen=True)
-class _ReadDenyState:
-    explicit_deny_read: bool
-    inheritable_to_files: bool
-    inheritable_to_directories: bool
 
 
 def _state_satisfies_guard(state: _ReadDenyState) -> bool:
@@ -259,6 +260,9 @@ def _inspect_source_workspace_read_deny(
                 f"GetAclInformation failed: WinError {ctypes.get_last_error()}"
             )
 
+        effective = False
+        files = False
+        directories = False
         for index in range(int(info.AceCount)):
             ace_pointer = ctypes.c_void_p()
             if not advapi32.GetAce(dacl, index, ctypes.byref(ace_pointer)):
@@ -266,7 +270,7 @@ def _inspect_source_workspace_read_deny(
             header = ctypes.cast(ace_pointer, ctypes.POINTER(_AceHeader)).contents
             if header.AceType != _ACCESS_DENIED_ACE_TYPE:
                 continue
-            if header.AceFlags & (_INHERIT_ONLY_ACE | _INHERITED_ACE):
+            if header.AceFlags & _INHERITED_ACE:
                 continue
             ace = ctypes.cast(ace_pointer, ctypes.POINTER(_AccessDeniedAce)).contents
             sid_pointer = ctypes.c_void_p(
@@ -277,14 +281,21 @@ def _inspect_source_workspace_read_deny(
             mapped_mask = _mapped_file_read_mask(advapi32, int(ace.Mask))
             if (mapped_mask & _FILE_READ_REQUIRED) != _FILE_READ_REQUIRED:
                 continue
-            return _ReadDenyState(
-                explicit_deny_read=True,
-                inheritable_to_files=bool(header.AceFlags & _OBJECT_INHERIT_ACE),
-                inheritable_to_directories=bool(
-                    header.AceFlags & _CONTAINER_INHERIT_ACE
-                ),
-            )
-        return _ReadDenyState(False, False, False)
+
+            if not (header.AceFlags & _INHERIT_ONLY_ACE):
+                effective = True
+            if header.AceFlags & _OBJECT_INHERIT_ACE:
+                files = True
+            if header.AceFlags & _CONTAINER_INHERIT_ACE:
+                directories = True
+            if effective and files and directories:
+                break
+
+        return _ReadDenyState(
+            explicit_deny_read=effective,
+            inheritable_to_files=files,
+            inheritable_to_directories=directories,
+        )
     finally:
         kernel32.LocalFree.argtypes = [ctypes.c_void_p]
         kernel32.LocalFree.restype = ctypes.c_void_p
