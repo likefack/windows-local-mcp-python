@@ -2,7 +2,7 @@ name: Snapshot-only security finalize
 
 on:
   push:
-    branches: [main]
+    branches: [main, fix/snapshot-remaining]
 
 permissions:
   contents: write
@@ -22,24 +22,28 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Verify harness is current main
+      - name: Verify harness is current branch
         shell: pwsh
         run: |
-          foreach ($path in @('.github/fix_snapshot_only.py', '.github/fix_snapshot_only_followup.py', '.github/workflows/snapshot-only-finalize-main.yml')) {
+          foreach ($path in @('.github/fix_snapshot_only.py', '.github/fix_snapshot_only_followup.py', '.github/fix_snapshot_only_remaining.py', '.github/workflows/snapshot-only-finalize-main.yml')) {
             if (-not (Test-Path -LiteralPath $path)) { throw "missing harness file: $path" }
           }
-          $remote = ((git ls-remote origin refs/heads/main) -split '\s+')[0]
-          if ($remote -ne (git rev-parse HEAD).Trim()) { throw "main moved before verification: $remote" }
+          $branch = '${{ github.ref_name }}'
+          $remote = ((git ls-remote origin "refs/heads/$branch") -split '\s+')[0]
+          if ($remote -ne (git rev-parse HEAD).Trim()) { throw "$branch moved before verification: $remote" }
 
       - name: Apply candidate patch
         shell: pwsh
         run: |
           $patch1 = Join-Path $env:RUNNER_TEMP 'fix_snapshot_only.py'
           $patch2 = Join-Path $env:RUNNER_TEMP 'fix_snapshot_only_followup.py'
+          $patch3 = Join-Path $env:RUNNER_TEMP 'fix_snapshot_only_remaining.py'
           Copy-Item .github/fix_snapshot_only.py $patch1
           Copy-Item .github/fix_snapshot_only_followup.py $patch2
+          Copy-Item .github/fix_snapshot_only_remaining.py $patch3
           python $patch1
           python $patch2
+          python $patch3
           git diff --check
 
       - name: Verify candidate scope
@@ -52,12 +56,16 @@ jobs:
             'VERIFICATION.md',
             'src/windows_local_mcp/approval.py',
             'src/windows_local_mcp/config.py',
+            'src/windows_local_mcp/process_utils.py',
             'src/windows_local_mcp/sandbox_backend.py',
             'src/windows_local_mcp/sandbox_live_verify.py',
             'src/windows_local_mcp/server.py',
+            'src/windows_local_mcp/worker.py',
             'tests/test_approval.py',
             'tests/test_approval_execution_integration.py',
+            'tests/test_broker_architecture.py',
             'tests/test_mcp_stdio_integration.py',
+            'tests/test_resources_and_processes.py',
             'tests/test_sandbox_architecture.py',
             'tests/test_sandbox_contract_residual_risks.py',
             'tests/test_server_operations.py'
@@ -77,23 +85,28 @@ jobs:
           python -m pip install -e ".[dev]"
           python -m pip check
 
-      - name: Focused security regressions
+      - name: Focused security and residual regressions
         shell: pwsh
         run: |
           python -m pytest -q tests/test_approval.py tests/test_mcp_stdio_integration.py tests/test_sandbox_architecture.py tests/test_sandbox_contract_residual_risks.py tests/test_server_operations.py tests/test_worker_lock_policy.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m pytest -q tests/test_approval_execution_integration.py -k "local_approval_rejects_changed_transitive_live_workspace_input"
+          python -m pytest -q tests/test_approval_execution_integration.py -k "local_approval_rejects_changed_transitive_live_workspace_input or snapshot_execution_succeeds_when_bound_workspace_is_unchanged or approved_host_allows_legitimate_descendant_to_finish or approved_host_job_terminates_descendants_at_runtime_limit"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pytest -q tests/test_approved_host_audit_integrity.py -k "approved_host_trusted_audit_updates_remain_valid or control_plane_tamper"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pytest -q tests/test_broker_architecture.py -k "host_guard_binds_current_operation_approval_state"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pytest -q tests/test_resources_and_processes.py -k "capture_process_identity_uses_durable_millisecond_timestamp or process_identity_matches_stable_worker"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Full regression suite
         shell: pwsh
-        run: |
-          python -m pytest -q
+        run: python -m pytest -q
 
-      - name: Static checks for changed code
+      - name: Static checks
         shell: pwsh
         run: |
-          python -m ruff check src/windows_local_mcp/approval.py src/windows_local_mcp/config.py src/windows_local_mcp/sandbox_backend.py src/windows_local_mcp/sandbox_live_verify.py src/windows_local_mcp/server.py tests/test_approval.py tests/test_approval_execution_integration.py tests/test_mcp_stdio_integration.py tests/test_sandbox_architecture.py tests/test_sandbox_contract_residual_risks.py tests/test_server_operations.py
+          python -m ruff check .
           python -m compileall -q src tests
           git diff --check
 
@@ -106,6 +119,7 @@ jobs:
           Remove-Item -Recurse -Force .dev-tmp/review
 
       - name: Finalize verified fix on main
+        if: github.ref == 'refs/heads/main'
         shell: pwsh
         run: |
           $harness = (git rev-parse HEAD).Trim()
@@ -113,9 +127,9 @@ jobs:
           if ($remote -ne $harness) { throw "main moved during verification: $remote" }
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git rm .github/fix_snapshot_only.py .github/fix_snapshot_only_followup.py .github/workflows/snapshot-only-finalize-main.yml
-          git add README.md SECURITY_CONTRACT.md SPEC.md VERIFICATION.md src/windows_local_mcp/approval.py src/windows_local_mcp/config.py src/windows_local_mcp/sandbox_backend.py src/windows_local_mcp/sandbox_live_verify.py src/windows_local_mcp/server.py tests/test_approval.py tests/test_approval_execution_integration.py tests/test_mcp_stdio_integration.py tests/test_sandbox_architecture.py tests/test_sandbox_contract_residual_risks.py tests/test_server_operations.py
+          git rm .github/fix_snapshot_only.py .github/fix_snapshot_only_followup.py .github/fix_snapshot_only_remaining.py .github/workflows/snapshot-only-finalize-main.yml
+          git add README.md SECURITY_CONTRACT.md SPEC.md VERIFICATION.md src/windows_local_mcp/approval.py src/windows_local_mcp/config.py src/windows_local_mcp/process_utils.py src/windows_local_mcp/sandbox_backend.py src/windows_local_mcp/sandbox_live_verify.py src/windows_local_mcp/server.py src/windows_local_mcp/worker.py tests/test_approval.py tests/test_approval_execution_integration.py tests/test_broker_architecture.py tests/test_mcp_stdio_integration.py tests/test_resources_and_processes.py tests/test_sandbox_architecture.py tests/test_sandbox_contract_residual_risks.py tests/test_server_operations.py
           git diff --cached --check
           if (git status --porcelain | Select-String '^\?\?') { throw 'unexpected untracked files before final commit' }
-          git commit -m 'Sandbox実行をsnapshotに隔離'
+          git commit -m 'Sandbox承認実行を隔離'
           git push origin HEAD:main
