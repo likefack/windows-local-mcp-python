@@ -10,7 +10,8 @@ ChatGPT から、指定した 1 つの Windows 作業領域を安全に読み書
 
 1. **WLMCP Broker**
    - 対象パス、入出力、容量、副作用を WLMCP が限定できる処理です。
-   - ファイル read/write、差分、固定文法の Git 読み取り、固定 ADB 読み取り、バイナリ転送、checkpoint、transaction、Undo／rollback を直接扱います。
+   - ファイル read/write、差分、固定 ADB 読み取り、バイナリ転送、checkpoint、transaction、Undo／rollback を直接扱います。
+   - current v1 では automatic Git process execution を無効化しています。`git_info`／`execute_readonly` の Git 要求は Git child を起動せず fail closed します。
 2. **構造化処理**
    - DOCX、XLSX、CSV／TSV、ZIP、一般画像を宣言的な操作として処理します。
    - 現在は WLMCP 管理処理を使用し、処理結果を artifact として検証してから Broker の transaction で反映します。将来の ChatGPT container 処理も同じバイナリ転送境界へ接続できます。
@@ -42,7 +43,9 @@ data_dir = "C:\\Users\\you\\AppData\\Local\\windows-local-mcp\\your-project"
 protect_data_dir_acl = true
 ```
 
-Broker の Git／ADB は `PATH` 上の同名ファイルを使用しません。利用する helper ごとに、workspace、`data_dir`、Sandbox scratch の外にある絶対 path と SHA-256 を対で設定してください。未設定時は capability が有効でも `available=false` となり、実行は拒否されます。
+Broker が自動実行する ADB helper は `PATH` 上の同名ファイルを使用しません。workspace、`data_dir`、Sandbox scratch の外にある絶対 path と SHA-256 を対で設定してください。未設定時は capability が有効でも実行を拒否します。
+
+Git executable の path／SHA-256 も approved route の trust anchor として設定できますが、current v1 ではこれらを設定しても automatic Git Broker execution は有効になりません。workspace-controlled repository metadata を無承認 Git child から安全に閉じ込められることが未実証なためです。
 
 ```powershell
 $gitPath = (Get-Command git.exe).Source
@@ -74,7 +77,7 @@ Windows では handle から得た volume GUID 付きの物理 path も比較す
 | 用途 | 経路 | 主な tool |
 | --- | --- | --- |
 | テキスト／バイナリの読み書き | Broker | `read_file`, `write_file`, artifact transfer |
-| Git 状態、差分、履歴 | Broker | `git_info`, 固定文法の `execute_readonly` |
+| Git process execution | Codex Sandbox／Approved Host | `request_sandbox_command`, `request_host_command` |
 | Emulator の限定読み取り | Broker | `adb_read`, `get_adb_screenshot` |
 | DOCX／XLSX／CSV／TSV／ZIP／画像 | 構造化処理 | `structured_file_inspect`, `structured_file_apply` 等 |
 | Python、PowerShell、Node、test、build、project script | Codex Sandbox | `request_sandbox_command` |
@@ -84,7 +87,9 @@ Windows では handle から得た volume GUID 付きの物理 path も比較す
 
 `execute_workspace_write` は互換用の公開面を残していますが、Dart／Flutter 等の project-controlled 処理は拒否され、`request_sandbox_command` を案内します。
 
-Git／ADB helper は設定済み path、SHA-256、file identity を正規化時と worker 実行直前に再検証し、Windows では child の終了まで実行ファイルを差し替え不能な共有モードで保持します。ADB の自動処理は allowlist 済み emulator serial を明示する固定読み取りだけで、`adb devices` による未許可 device の列挙は行いません。
+`git_info` と `execute_readonly` も model-facing surface と annotation の互換性のため公開されていますが、Git 要求は current v1 では error で終了し、automatic Git child を起動しません。Git executable の path／SHA-256 が設定済みでもこの capability reduction は解除されません。
+
+ADB helper は設定済み path、SHA-256、file identity を正規化時と worker 実行直前に再検証し、Windows では child の終了まで実行ファイルを差し替え不能な共有モードで保持します。ADB の自動処理は allowlist 済み emulator serial を明示する固定読み取りだけで、`adb devices` による未許可 device の列挙は行いません。approved route の Git target executable も実行境界に応じた identity binding を受けます。
 
 バイナリのダウンロード転送は、開始時に元ファイルの前後同一性と SHA-256 を確認した不変スナップショットを制御領域へ固定し、各チャンクでは必要範囲だけを読み取ります。アップロード転送は開始時に申告済み全容量を予約するため、チャンクごとのデータ領域全走査を行いません。別々の転送は並行できますが、同一転送内のオフセット順序、fsync、完了時の全体 SHA-256、元ファイルと出力先の同時変更検知は維持します。監査は転送開始を親操作、各チャンクを SHA-256 付きの永続イベントとして記録し、チャンク数に比例するタイムライン行と同期書き込みを抑えます。
 
@@ -160,7 +165,7 @@ $env:LOCAL_MCP_CONFIG = 'C:\path\to\config.local.toml'
 - optimistic concurrency には表示用文字列ではなく raw file bytes の SHA-256 を使います。CRLF も raw identity に含まれます。
 - 書き込みは checkpoint、durable journal、atomic replacement、post-write 検証を通します。第三者変更を復旧処理が上書きしません。
 - `data_dir`、Sandbox scratch、workspace は分離し、起動時に lock／atomic replacement／filesystem identity と Windows の物理 path の前提を確認します。
-- `.env`、credential 等の保護対象は通常の read、diff、Git snapshot から返しません。audit、approval、Activity、argv、stdout／stderr preview は secret を伏せ字にします。
+- `.env`、credential 等の保護対象は通常の read、automatic helper／snapshot から返しません。automatic Git Broker は current v1 では無効です。audit、approval、Activity、argv、stdout／stderr preview は secret を伏せ字にします。
 - 同時 job、pending approval、出力、artifact、data_dir、Sandbox scratch、structured element／pixel／archive 展開量に上限があります。
 
 ## Activity、Undo、rollback
