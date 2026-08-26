@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import windows_local_mcp.control_plane_guard as control_plane_guard
+from windows_local_mcp import control_plane_guard
 
 
 def test_runtime_startup_state_detects_missing_path_creation(tmp_path: Path) -> None:

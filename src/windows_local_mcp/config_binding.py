@@ -51,7 +51,7 @@ def _bound_selector_path(settings: Any, config_path: Path) -> Path:
         raise RuntimeError("active config selector can no longer be resolved") from error
     if selected != config_path:
         raise RuntimeError("active config selector no longer resolves to the bound config file")
-    setattr(settings, "_config_selector_path", str(selector))
+    settings._config_selector_path = str(selector)
     return selector
 
 
@@ -95,8 +95,8 @@ def export_config_binding(settings: Any) -> dict[str, object]:
     else:
         identity = _validate_identity_shape(expected_identity)
     identity = _verify_bound_file(path, identity)
-    setattr(settings, "_config_file_identity", deepcopy(identity))
-    setattr(settings, "_config_path", str(path))
+    settings._config_file_identity = deepcopy(identity)
+    settings._config_path = str(path)
 
     return {
         "version": CONFIG_BINDING_VERSION,
@@ -134,12 +134,12 @@ def restore_config_binding(settings: Any, binding: object) -> None:
             or identity_value is not None
         ):
             raise RuntimeError("immutable worker context has an inconsistent config binding")
-        setattr(settings, "_config_selection_source", config_source)
-        setattr(settings, "_config_selector_path", None)
-        setattr(settings, "_config_path", None)
-        setattr(settings, "_config_file_identity", None)
-        setattr(settings, "_workspace_selection_source", workspace_source)
-        setattr(settings, "_ambient_root_present", ambient_root_present)
+        settings._config_selection_source = config_source
+        settings._config_selector_path = None
+        settings._config_path = None
+        settings._config_file_identity = None
+        settings._workspace_selection_source = workspace_source
+        settings._ambient_root_present = ambient_root_present
         return
 
     if config_source != _FILE_CONFIG_SOURCE or selector_value is None:
@@ -158,9 +158,9 @@ def restore_config_binding(settings: Any, binding: object) -> None:
     identity = _validate_identity_shape(identity_value)
     identity = _verify_bound_file(path, identity)
 
-    setattr(settings, "_config_selection_source", config_source)
-    setattr(settings, "_config_selector_path", str(selector))
-    setattr(settings, "_config_path", str(path))
-    setattr(settings, "_config_file_identity", deepcopy(identity))
-    setattr(settings, "_workspace_selection_source", workspace_source)
-    setattr(settings, "_ambient_root_present", ambient_root_present)
+    settings._config_selection_source = config_source
+    settings._config_selector_path = str(selector)
+    settings._config_path = str(path)
+    settings._config_file_identity = deepcopy(identity)
+    settings._workspace_selection_source = workspace_source
+    settings._ambient_root_present = ambient_root_present

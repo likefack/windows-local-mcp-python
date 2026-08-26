@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-import windows_local_mcp.runtime_immutability as runtime_immutability
+from windows_local_mcp import runtime_immutability
 from windows_local_mcp.runtime_trust import RuntimeTree, RuntimeTrustInventory
 
 

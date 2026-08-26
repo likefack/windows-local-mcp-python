@@ -15,7 +15,6 @@ from windows_local_mcp.policy import CommandPolicy
 from windows_local_mcp.process_utils import build_process_argv
 from windows_local_mcp.safe_process import SafeProcessResult, run_safe_process
 
-
 pytestmark = pytest.mark.skipif(
     os.name != "nt",
     reason="Windows file-share semantics are the directory TOCTOU security boundary",

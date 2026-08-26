@@ -38,7 +38,7 @@ class Executor:
         if tier == "approved_host":
             try:
                 runtime_trust = assert_approved_host_runtime_immutable()
-            except Exception as error:  # noqa: BLE001 - host launch must fail closed
+            except Exception as error:
                 self.audit.add_event(
                     operation_id,
                     "approved_host_runtime_immutability_failed",

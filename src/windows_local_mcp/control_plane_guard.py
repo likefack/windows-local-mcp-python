@@ -17,7 +17,6 @@ from .runtime_trust import capture_runtime_dependency_state
 from .util import canonical_json, sha256_bytes, sha256_text, utc_now_iso
 from .windows_system import windows_system_executable
 
-
 _ORIGINAL_SQLITE_CONNECT = sqlite3.connect
 _AUDIT_GUARDS_LOCK = threading.RLock()
 _ACTIVE_AUDIT_GUARDS: dict[str, _AuditMutationGuard] = {}
