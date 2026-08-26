@@ -130,6 +130,7 @@ def test_broker_workspace_read_sinks_do_not_reopen_verified_paths(
         settings=server.runtime.settings,
         workspace=server.runtime.workspace,
         records=dart_records,
+        entry_budget=approval._EntryBudget(server.runtime.settings),
     ) == []
 
 
