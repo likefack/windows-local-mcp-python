@@ -1,0 +1,119 @@
+name: Snapshot-only security finalize
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  verify-and-finalize:
+    runs-on: windows-2025
+    steps:
+      - name: Checkout harness revision
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Verify harness is current main
+        shell: pwsh
+        run: |
+          foreach ($path in @('.github/fix_snapshot_only.py', '.github/fix_snapshot_only_followup.py', '.github/workflows/snapshot-only-finalize-main.yml')) {
+            if (-not (Test-Path -LiteralPath $path)) { throw "missing harness file: $path" }
+          }
+          $remote = ((git ls-remote origin refs/heads/main) -split '\s+')[0]
+          if ($remote -ne (git rev-parse HEAD).Trim()) { throw "main moved before verification: $remote" }
+
+      - name: Apply candidate patch
+        shell: pwsh
+        run: |
+          $patch1 = Join-Path $env:RUNNER_TEMP 'fix_snapshot_only.py'
+          $patch2 = Join-Path $env:RUNNER_TEMP 'fix_snapshot_only_followup.py'
+          Copy-Item .github/fix_snapshot_only.py $patch1
+          Copy-Item .github/fix_snapshot_only_followup.py $patch2
+          python $patch1
+          python $patch2
+          git diff --check
+
+      - name: Verify candidate scope
+        shell: pwsh
+        run: |
+          $expected = @(
+            'README.md',
+            'SECURITY_CONTRACT.md',
+            'SPEC.md',
+            'VERIFICATION.md',
+            'src/windows_local_mcp/approval.py',
+            'src/windows_local_mcp/config.py',
+            'src/windows_local_mcp/sandbox_backend.py',
+            'src/windows_local_mcp/sandbox_live_verify.py',
+            'src/windows_local_mcp/server.py',
+            'tests/test_approval.py',
+            'tests/test_sandbox_architecture.py',
+            'tests/test_sandbox_contract_residual_risks.py',
+            'tests/test_server_operations.py'
+          ) | Sort-Object
+          $actual = @(git diff --name-only) | Sort-Object
+          if (($expected -join "`n") -ne ($actual -join "`n")) {
+            Write-Host 'Expected:'; $expected | ForEach-Object { Write-Host $_ }
+            Write-Host 'Actual:'; $actual | ForEach-Object { Write-Host $_ }
+            throw 'unexpected candidate patch scope'
+          }
+          git diff --stat
+
+      - name: Install test dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+          python -m pip check
+
+      - name: Focused security regressions
+        shell: pwsh
+        run: |
+          python -m pytest -q tests/test_approval.py tests/test_sandbox_architecture.py tests/test_sandbox_contract_residual_risks.py tests/test_server_operations.py tests/test_worker_lock_policy.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pytest -q tests/test_approval_execution_integration.py -k "local_approval_rejects_changed_transitive_live_workspace_input"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Stable regression suite
+        shell: pwsh
+        run: |
+          python -m pytest -q --ignore=tests/test_active_config_security_integration.py --ignore=tests/test_approval_execution_integration.py --ignore=tests/test_approved_host_audit_integrity.py --ignore=tests/test_broker_architecture.py
+
+      - name: Static checks for changed code
+        shell: pwsh
+        run: |
+          python -m ruff check src/windows_local_mcp/approval.py src/windows_local_mcp/config.py src/windows_local_mcp/sandbox_backend.py src/windows_local_mcp/sandbox_live_verify.py src/windows_local_mcp/server.py tests/test_approval.py tests/test_sandbox_architecture.py tests/test_sandbox_contract_residual_risks.py tests/test_server_operations.py
+          python -m compileall -q src tests
+          git diff --check
+
+      - name: Bypass and contract assertions
+        shell: pwsh
+        run: |
+          python -c "from windows_local_mcp.approval import PROJECT_CONTROLLED_CODE_LOADERS; assert {'python','node','powershell','flutter'} <= PROJECT_CONTROLLED_CODE_LOADERS"
+          python -c "from pathlib import Path; from windows_local_mcp.config import Settings; from windows_local_mcp.sandbox_backend import codex_sandbox_state; r=Path('.dev-tmp/review').resolve(); w=r/'workspace'; w.mkdir(parents=True); s=Settings(workspace_root=w,data_dir=r/'data',protect_data_dir_acl=False); s.ensure_directories(); t=r/'tool'/'python.exe'; t.parent.mkdir(parents=True); t.write_bytes(b'tool'); q=s.sandbox_scratch_dir/'runs'/'review'; q.mkdir(parents=True); e=codex_sandbox_state(s,command=[str(t)],cwd=q,writable_roots=(q,))['permissionProfile']['file_system']['entries']; p=str(s.workspace_root.resolve()); assert {'path':{'type':'path','path':p},'access':'deny'} in e; assert {'path':{'type':'path','path':p},'access':'read'} not in e"
+          python -c "from pathlib import Path; t=Path('SECURITY_CONTRACT.md').read_text(encoding='utf-8'); assert 'source workspace' in t and 'snapshot' in t.lower()"
+          Remove-Item -Recurse -Force .dev-tmp/review
+
+      - name: Finalize verified fix on main
+        shell: pwsh
+        run: |
+          $harness = (git rev-parse HEAD).Trim()
+          $remote = ((git ls-remote origin refs/heads/main) -split '\s+')[0]
+          if ($remote -ne $harness) { throw "main moved during verification: $remote" }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git rm .github/fix_snapshot_only.py .github/fix_snapshot_only_followup.py .github/workflows/snapshot-only-finalize-main.yml
+          git add README.md SECURITY_CONTRACT.md SPEC.md VERIFICATION.md src/windows_local_mcp/approval.py src/windows_local_mcp/config.py src/windows_local_mcp/sandbox_backend.py src/windows_local_mcp/sandbox_live_verify.py src/windows_local_mcp/server.py tests/test_approval.py tests/test_sandbox_architecture.py tests/test_sandbox_contract_residual_risks.py tests/test_server_operations.py
+          git diff --cached --check
+          if (git status --porcelain | Select-String '^\?\?') { throw 'unexpected untracked files before final commit' }
+          git commit -m 'Sandbox実行をsnapshotに隔離'
+          git push origin HEAD:main
