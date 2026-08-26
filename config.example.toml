@@ -36,7 +36,8 @@ approved_sandbox_permission_profile = ":workspace"
 # false への変更は、Sandbox を有効にしたまま検証を回避する設定として起動時に拒否されます。
 approved_sandbox_require_live_verification = true
 
-# ADB is a separate target boundary. The safe default accepts emulator-* serials only.
+# Automatic ADB is fail-closed: an empty allowlist authorizes no target.
+# Add only the fixed trusted emulator serials that automatic reads may reach.
 adb_emulator_only = true
 adb_allowed_serials = []
 

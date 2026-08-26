@@ -1,5 +1,12 @@
 # 検証記録
 
+## 2026-08-27 Approved Host capability verification truthfulness
+
+- 修正前の `session_info()` は `assert_approved_host_runtime_immutable()` の成功だけで Approved Host capability 全体の `live_verified=true`、Windows では `windows_live_verified=true` を返していた。これは current runtime の immutability preflight という限定された evidence を、control-plane tamper detection、approval integrity、Job descendant handling、Job 外 same-user process detection、timeout termination を含む capability 全体の live verification へ拡張して表示していた。
+- 修正後は既存の `configured`／`enabled`／`available`／`live_verified`／`windows_live_verified` と `runtime_preflight` を維持しつつ、`verification_scope=runtime_immutability_preflight_only` と `properties` を追加する。runtime preflight が成功しても capability 全体の `live_verified`／`windows_live_verified` は `false` のままとし、Windows 上で実測した `runtime_immutability` だけを `verified` とする。
+- control-plane tamper detection、approval integrity、Job descendant handling、Job 外 same-user process detection、timeout termination は既存 regression coverage を `unit_tested=true` として区別し、current-machine live evidence をこの code path が生成しない限り `unverified` と表示する。
+- `available=true` は Approved Host の runtime preflight と local execution prerequisite が解決したことを示すだけで、capability 全体の Windows live verification を意味しない。実行直前の runtime immutability recheck と既存の tamper／approval／process／timeout mechanism は変更しない。
+
 ## 2026-08-26 Sandbox snapshot-only source isolation
 
 - Codex Sandbox の filesystem policy から original `workspace_root` の read capability を除去し、source workspace／`data_dir` を明示 deny、operation 固有 run projection だけを write root とする設計へ変更した。

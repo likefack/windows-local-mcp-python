@@ -367,7 +367,11 @@ class CommandPolicy:
 
     def _validate_adb_serial(self, serial: str) -> None:
         allowed = self.settings.adb_allowed_serials
-        if allowed and serial not in allowed:
+        if not allowed:
+            raise PermissionError(
+                "automatic ADB requires at least one explicitly allowlisted target"
+            )
+        if serial not in allowed:
             raise PermissionError(f"ADB serial is not allowlisted: {serial}")
         if self.settings.adb_emulator_only and not serial.casefold().startswith("emulator-"):
             raise PermissionError("physical or nonstandard ADB targets are disabled")

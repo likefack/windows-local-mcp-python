@@ -138,13 +138,20 @@ _PathBase = type(Path())
 
 
 class _HeldPath(_PathBase):
-    __slots__ = ("__weakref__", "_lease", "_lease_finalizer", "_write_intent")
+    __slots__ = (
+        "__weakref__",
+        "_lease",
+        "_lease_finalizer",
+        "_listed_is_directory",
+        "_write_intent",
+    )
 
     def __new__(cls, *parts: Any) -> Self:
         instance = super().__new__(cls, *parts)
         instance._lease = None
         instance._lease_finalizer = None
         instance._write_intent = False
+        instance._listed_is_directory = None
         return instance
 
     @classmethod
@@ -160,6 +167,27 @@ class _HeldPath(_PathBase):
         instance._write_intent = write_intent
         instance._lease_finalizer = weakref.finalize(instance, lease.close)
         return instance
+
+    def iterdir(self) -> Iterator[Self]:
+        if self._listed_is_directory is False:
+            raise NotADirectoryError(f"not a directory: {self}")
+        with os.scandir(self) as entries:
+            for entry in entries:
+                # Windows DirEntry no-follow metadata is backed by the parent directory
+                # enumeration and does not traverse a child reparse target.
+                information = entry.stat(follow_symlinks=False)
+                attributes = int(getattr(information, "st_file_attributes", 0))
+                child = type(self)(entry.path)
+                child._listed_is_directory = (
+                    not bool(attributes & _REPARSE_ATTRIBUTE)
+                    and stat.S_ISDIR(information.st_mode)
+                )
+                yield child
+
+    def is_dir(self) -> bool:
+        if self._listed_is_directory is not None:
+            return self._listed_is_directory
+        return super().is_dir()
 
 
 class _MissingWritePath(_PathBase):

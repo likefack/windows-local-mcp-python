@@ -391,12 +391,26 @@ def _codex_sandbox_capability() -> dict[str, Any]:
 
 
 def _approved_host_capability() -> dict[str, Any]:
+    properties = {
+        name: {"status": "unverified", "unit_tested": True}
+        for name in (
+            "runtime_immutability",
+            "control_plane_tamper_detection",
+            "approval_integrity",
+            "job_descendant_handling",
+            "outside_job_same_user_process_detection",
+            "timeout_termination",
+        )
+    }
     status: dict[str, Any] = {
         "configured": runtime.settings.approved_host_enabled,
         "enabled": runtime.settings.approved_host_enabled,
         "available": False,
+        "unit_tested": True,
         "live_verified": False,
         "windows_live_verified": False,
+        "verification_scope": "runtime_immutability_preflight_only",
+        "properties": properties,
         "execution_time_recheck": True,
         "runtime_preflight": {"status": "not_run"},
     }
@@ -409,11 +423,21 @@ def _approved_host_capability() -> dict[str, Any]:
         message = redact_text(f"{type(error).__name__}: {error}")
         status["unavailable_reason"] = message
         status["runtime_preflight"] = {"status": "failed", "error": message}
+        properties["runtime_immutability"].update(
+            status="failed" if os.name == "nt" else "unverified",
+            verification_kind=(
+                "windows_live_preflight" if os.name == "nt" else "non_windows_preflight"
+            ),
+        )
         return status
 
     status["available"] = True
-    status["live_verified"] = True
-    status["windows_live_verified"] = os.name == "nt"
+    properties["runtime_immutability"].update(
+        status="verified" if os.name == "nt" else "unverified",
+        verification_kind=(
+            "windows_live_preflight" if os.name == "nt" else "non_windows_preflight"
+        ),
+    )
     status["runtime_preflight"] = {
         "status": "passed",
         "version": evidence.get("version"),

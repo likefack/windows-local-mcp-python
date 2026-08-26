@@ -105,13 +105,13 @@ ADB is separately disabled by default. Automatic forms are exact:
 - fixed read-only `getprop`, `wm`, and `dumpsys` forms
 - `adb -s SERIAL exec-out screencap -p`
 
-Targeted calls require serial validation. `adb_emulator_only=true` requires an `emulator-*` serial and a successful `adb emu avd name` preflight. Optional `adb_allowed_serials` further narrows targets. General shell and state changes require approval.
+Targeted calls require an explicitly configured non-empty `adb_allowed_serials`; an empty list authorizes no targets and fails closed. `adb_emulator_only=true` additionally requires an `emulator-*` serial and a successful `adb emu avd name` preflight. A target must satisfy both the explicit allowlist and the emulator validation. General shell and state changes require approval.
 
 Automatic device enumeration is rejected because its raw output can disclose or expand attention to non-allowlisted physical devices. ADB uses an explicit executable path/hash/identity/hold boundary.
 
 ### Execution lock policy
 
-Approved execution は承認時 snapshot の整合性確保と Broker mutation の defense-in-depth のため workspace-wide mutation lock を使用します。Codex Sandbox の実行中に original workspace を読めないことの主境界は、この cooperative lock ではなく Sandbox の実効 OS filesystem capability です。lock を知らない同一-user process が original workspace を変更しても、Sandbox child は変更後 bytes を参照できません。
+Approved execution は承認時 snapshot の整合性確保と Broker mutation の defense-in-depth のため workspace-wide mutation lock を使用します。Codex Sandbox の実行中に original `workspace_root` を読めないことの主境界は、この cooperative lock ではなく Sandbox の実効 OS filesystem capability です。lock を知らない同一-user process が original workspace を変更しても、Sandbox child は変更後 bytes を参照できません。
 
 - snapshot／manifest 作成は workspace-wide lock 下で coherent input set を取得します。
 - Approved Sandbox／Approved Host は実行前 binding 検証から child／descendant 終了まで workspace-wide Broker mutation lock を保持します。
@@ -145,7 +145,7 @@ Approval binding version 3 hashes the complete canonical security-sensitive requ
 
 ### Snapshot mode
 
-Codex Sandbox の open-ended execution は program 名の allowlist に依存せず、原則として bounded な workspace-wide snapshot projection から実行します。projection は original workspace の相対 layout と requested cwd を保持し、worker は immutable projection を検証後、operation 固有の writable `runs/<operation>/workspace` へ materialize します。
+Codex Sandbox の open-ended execution は program 名の allowlist に依存せず、原則として bounded な workspace-wide snapshot projection から実行します。projection は original workspace の相対 layout と requested cwd を保持し、worker は immutable projection の検証後、operation 固有の writable `runs/<operation>/workspace` へ materialize します。
 
 - original `workspace_root` は Sandbox filesystem policy で parent／child／grandchildから read／write deny にする。
 - workspace-relative argv は snapshot/run projection へ書き換える。source absolute path が code 本文に残っていても original workspace は OS capability で読めない。
