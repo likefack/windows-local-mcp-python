@@ -24,7 +24,7 @@ jobs:
       - name: Prepare exact main and apply patch
         shell: pwsh
         run: |
-          $expected = '5d4f8eaed016a7c139e240fcb33bd9c749658d20'
+          $expected = '2b5df559cd69c14d1a46cb3407e09fbda61aa771'
           $patcher = Join-Path $env:RUNNER_TEMP 'fix_snapshot_only.py'
           Copy-Item .github/fix_snapshot_only.py $patcher
           $remote = ((git ls-remote origin refs/heads/main) -split '\s+')[0]
@@ -95,7 +95,7 @@ jobs:
       - name: Commit verified fix to main
         shell: pwsh
         run: |
-          $expected = '5d4f8eaed016a7c139e240fcb33bd9c749658d20'
+          $expected = '2b5df559cd69c14d1a46cb3407e09fbda61aa771'
           $remote = ((git ls-remote origin refs/heads/main) -split '\s+')[0]
           if ($remote -ne $expected) { throw "main moved during verification: $remote" }
           git config user.name 'github-actions[bot]'
