@@ -26,7 +26,7 @@ jobs:
       - name: Verify harness base
         shell: pwsh
         run: |
-          $base = 'ec389b2c84186db39b36e045658762d70b1bca7b'
+          $base = '15aa23764fdada557e14b101090181e00e10d907'
           if ((git rev-parse HEAD^).Trim() -ne $base) { throw 'harness parent is not the reviewed main base' }
           $paths = @(git diff --name-only HEAD^ HEAD) | Sort-Object
           $expected = @(
