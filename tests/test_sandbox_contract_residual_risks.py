@@ -6,6 +6,7 @@ import pytest
 
 from windows_local_mcp.config import Settings
 from windows_local_mcp.sandbox_backend import (
+    SANDBOX_LIVE_MARKER_VERSION,
     SANDBOX_SECURITY_PROPERTIES,
     ApprovedSandboxUnavailable,
     CodexSandboxBackend,
@@ -93,6 +94,7 @@ def _accepted_residual_risk_evidence(
             "child_lan_denied": False,
             "grandchild_protected_information_denied": False,
             "grandchild_lan_denied": False,
+            "brokered_process_creation_denied": True,
         }
     )
     context = sandbox_isolation_context(settings, backend)
@@ -106,7 +108,7 @@ def _accepted_residual_risk_evidence(
         "test_binding": True,
     }
     return {
-        "version": 4,
+        "version": SANDBOX_LIVE_MARKER_VERSION,
         "passed": False,
         "backend_digest": sha256_text(canonical_json(backend.as_dict())),
         "backend_version": backend.version,
