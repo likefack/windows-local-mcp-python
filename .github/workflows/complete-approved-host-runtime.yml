@@ -102,13 +102,9 @@ jobs:
           .dev-tmp/candidate-full.xml
 
       - name: Ruff changed code
-        run: >-
-          python -m ruff check
-          src/windows_local_mcp/runtime_immutability.py
-          src/windows_local_mcp/server.py
-          tests/test_approved_host_runtime_scope.py
-          tests/test_server_operations.py
-          tests/test_runtime_closure_isolation.py
+        run: |
+          python -m ruff check --fix tests/test_runtime_closure_isolation.py
+          python -m ruff check src/windows_local_mcp/runtime_immutability.py src/windows_local_mcp/server.py tests/test_approved_host_runtime_scope.py tests/test_server_operations.py tests/test_runtime_closure_isolation.py
 
       - name: Compile all
         run: python -m compileall -q src tests
@@ -126,7 +122,7 @@ jobs:
           git add src/windows_local_mcp/runtime_immutability.py src/windows_local_mcp/server.py
           git add tests/test_approved_host_runtime_scope.py tests/test_server_operations.py
           git add tests/test_runtime_closure_isolation.py
-          if (-not (git diff --cached --quiet)) {
-            git commit -m "Approved Host runtime境界を完了 [skip ci]"
-            git push origin HEAD:fix/approved-host-runtime-completion
-          }
+          git rm .github/complete_approved_host_runtime.py .github/compare_pytest_failures.py .github/workflows/complete-approved-host-runtime.yml
+          git diff --cached --check
+          git commit -m "Approved Host runtime境界を完了 [skip ci]"
+          git push origin HEAD:fix/approved-host-runtime-completion
