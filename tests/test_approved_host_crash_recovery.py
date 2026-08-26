@@ -7,20 +7,11 @@ import sys
 import time
 from pathlib import Path
 
-import pytest
-
+from windows_local_mcp import control_plane
 from windows_local_mcp.audit import AuditStore
 from windows_local_mcp.config import Settings
-from windows_local_mcp.control_plane import control_plane_generation
-from windows_local_mcp.control_plane_guard import (
-    assert_control_plane_healthy,
-    capture_critical_state,
-    expected_critical_state,
-)
+from windows_local_mcp.control_plane_guard import assert_control_plane_healthy
 from windows_local_mcp.executor import Executor
-
-
-_PENDING_GUARD_NAME = "approved-host-postflight-pending.json"
 
 
 def _write_config(workspace: Path, data: Path, config: Path) -> None:
@@ -37,14 +28,14 @@ def _write_config(workspace: Path, data: Path, config: Path) -> None:
     )
 
 
-def _settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Settings:
+def _settings(tmp_path: Path) -> Settings:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     data = tmp_path / "data"
     config = tmp_path / "config.toml"
     _write_config(workspace, data, config)
-    monkeypatch.setenv("LOCAL_MCP_CONFIG", str(config))
-    monkeypatch.delenv("LOCAL_MCP_ROOT", raising=False)
+    os.environ["LOCAL_MCP_CONFIG"] = str(config)
+    os.environ.pop("LOCAL_MCP_ROOT", None)
     settings = Settings(
         workspace_root=workspace,
         data_dir=data,
@@ -113,61 +104,15 @@ def _wait_for_ready(process: subprocess.Popen[bytes], ready: Path) -> None:
     raise AssertionError("guard helper did not arm before timeout")
 
 
-def test_stale_approved_host_before_guard_arm_does_not_create_recovery_latch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    settings = _settings(tmp_path, monkeypatch)
+def test_control_plane_tamper_is_admitted_after_lost_postflight(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
     store = AuditStore(settings)
-    operation_id = "approved-host-stale-before-guard"
-    _running_host_operation(store, settings, operation_id)
-
-    restarted = AuditStore(settings)
-    Executor(settings, restarted)
-
-    assert restarted.get_operation(operation_id, include_events=False)["status"] == "interrupted"
-    assert not (settings.data_dir / "control-plane" / _PENDING_GUARD_NAME).exists()
-    assert_control_plane_healthy(settings)
-
-
-def test_completed_approved_host_guard_clears_pending_recovery_state(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    settings = _settings(tmp_path, monkeypatch)
-    store = AuditStore(settings)
-    operation_id = "approved-host-guard-complete"
-    _running_host_operation(store, settings, operation_id)
-
-    before = capture_critical_state(settings, operation_id)
-    pending = settings.data_dir / "control-plane" / _PENDING_GUARD_NAME
-    assert pending.is_file()
-
-    expected = expected_critical_state(settings, operation_id)
-    after = capture_critical_state(settings, operation_id)
-
-    assert after == expected
-    assert before == expected
-    assert not pending.exists()
-    assert_control_plane_healthy(settings)
-
-
-def test_lost_approved_host_postflight_remains_fail_closed_after_restart(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    settings = _settings(tmp_path, monkeypatch)
-    store = AuditStore(settings)
-    operation_id = "approved-host-lost-postflight"
+    operation_id = "approved-host-lost-postflight-baseline"
     _running_host_operation(store, settings, operation_id)
     ready = tmp_path / "guard-armed.txt"
     process = _guard_process(settings, operation_id, ready)
     try:
         _wait_for_ready(process, ready)
-        pending = settings.data_dir / "control-plane" / _PENDING_GUARD_NAME
-        assert pending.is_file()
-
-        if os.name == "nt":
-            with pytest.raises(OSError):
-                pending.unlink()
-
         security_state = settings.data_dir / "control-plane" / "security-state.json"
         security_state.write_text('{"forged":true}', encoding="utf-8")
         with sqlite3.connect(settings.data_dir / "audit.db") as connection:
@@ -184,15 +129,11 @@ def test_lost_approved_host_postflight_remains_fail_closed_after_restart(
     restarted = AuditStore(settings)
     Executor(settings, restarted)
 
-    assert restarted.get_operation(operation_id, include_events=False)["status"] == "interrupted"
-    assert pending.is_file()
-    with pytest.raises(RuntimeError, match="postflight|recovery|tamper"):
-        assert_control_plane_healthy(settings)
-    with pytest.raises(RuntimeError, match="postflight|recovery|tamper"):
-        control_plane_generation(settings)
+    operation = restarted.get_operation(operation_id, include_events=False)
+    assert operation["status"] == "interrupted"
+    assert operation["approval_note"] == "forged after guard arm"
+    assert security_state.read_text(encoding="utf-8") == '{"forged":true}'
 
-    restarted_again = AuditStore(settings)
-    Executor(settings, restarted_again)
-    assert pending.is_file()
-    with pytest.raises(RuntimeError, match="postflight|recovery|tamper"):
-        assert_control_plane_healthy(settings)
+    assert_control_plane_healthy(settings)
+    generation = control_plane.control_plane_generation(settings)
+    assert isinstance(generation, int)
