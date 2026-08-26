@@ -4,6 +4,8 @@ import json
 import shutil
 from pathlib import Path
 
+import psutil
+
 from windows_local_mcp.audit import AuditStore
 from windows_local_mcp.config import Settings
 from windows_local_mcp import control_plane_guard as guard
@@ -47,10 +49,12 @@ before = guard.capture_critical_state(settings, operation)
 audit.add_event(operation, 'approved_host_control_plane_guard_armed', before)
 audit.update_operation(operation, network_policy_json=canonical_json({'name': 'approved-host-network'}))
 audit.add_event(operation, 'network_policy_applied', {'name': 'approved-host-network'})
+precise_create_time = psutil.Process().create_time()
+print('PRECISE_CREATE_TIME', repr(precise_create_time))
 audit.update_operation(
     operation,
     child_pid=1234,
-    child_create_time=123.5,
+    child_create_time=precise_create_time,
     child_executable='C:\\Python\\python.exe',
 )
 audit.add_event(operation, 'child_started', {'child_pid': 1234, 'identity_verified': True})
