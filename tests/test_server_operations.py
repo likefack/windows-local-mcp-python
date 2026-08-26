@@ -1,8 +1,10 @@
 import importlib
 import os
+import stat
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -112,6 +114,56 @@ def test_oversized_write_is_rejected_and_audited(
         record["tool_name"] == "write_file" and record["status"] == "rejected"
         for record in records
     )
+
+
+def test_list_directory_does_not_follow_child_reparse_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, root = load_server(tmp_path, monkeypatch)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = root / "linked-outside"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("creating symlinks requires Windows developer mode or elevation")
+
+    real_is_dir = Path.is_dir
+
+    def reject_target_resolution(path: Path) -> bool:
+        if path == link:
+            raise AssertionError("list_directory followed a child reparse target")
+        return real_is_dir(path)
+
+    monkeypatch.setattr(Path, "is_dir", reject_target_resolution)
+    result = server.list_directory(".")
+
+    assert {item["name"]: item["type"] for item in result["entries"]}[
+        "linked-outside"
+    ] == "reparse"
+
+
+def test_directory_entry_type_uses_non_following_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, root = load_server(tmp_path, monkeypatch)
+    follow_arguments: list[bool] = []
+
+    class ReparseEntry:
+        def stat(self, *, follow_symlinks: bool):
+            follow_arguments.append(follow_symlinks)
+            return SimpleNamespace(
+                st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT,
+                st_mode=stat.S_IFDIR,
+            )
+
+    assert server._directory_entry_type(ReparseEntry()) == "reparse"
+    assert follow_arguments == [False]
+
+    (root / "folder").mkdir()
+    (root / "note.txt").write_text("safe", encoding="utf-8")
+    entries = {item["name"]: item["type"] for item in server.list_directory(".")["entries"]}
+    assert entries == {"folder": "directory", "note.txt": "file"}
 
 
 def test_denied_command_is_audited(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

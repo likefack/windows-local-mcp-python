@@ -228,3 +228,35 @@ C7 実装後、通常 Windows user / production route で未検証だった境�
 - 本作業中に、既知問題と独立した新規脆弱性は確認していない。
 - 次タスクでは未知問題の探索と、本記録の未検証項目を区別する。特に Codex Sandbox の 9 property を実測できる backend／setup が得られた場合は、property ごとの probe を再実行する。
 - repository-wide Ruff の `timeline.py` import order は独立した非 security 品質事項であり、新規脆弱性としては扱わない。
+
+## 8. Security Scan Round 2（2026-08-27）
+
+### 対象と方法
+
+- start revision は `d6dae8cfec769270f68152da2a913b9f3515ddac`。C7 完了後の `main` 全体に Standard Security Scan を 1 回実行した。scan ID は `df9f57d8-08c4-45eb-b8d8-f97d414e9b6e`。
+- `SECURITY_CONTRACT.md` の invariant、WFP Guard schema v4 identity binding、Approved Host、Codex Sandbox、Broker filesystem、workspace transaction、artifact processing、process lifecycle、runtime provenance、resource bound を source から sink まで確認した。
+- Windows 全体の ACL／Firewall／WFP は変更していない。Codex Desktop 自身の Sandbox からの入れ子実行を通常 host の live WFP／UAC 証拠として扱っていない。
+
+### Finding と処置
+
+| ID | Severity | 結果 | 概要 |
+| --- | --- | --- | --- |
+| WLMCP-R2-001 | High | unresolved / release blocker | Approved Host child と同じ user principal で動く監視 worker は child から停止可能である。child が control-plane を改変して worker を停止すると postflight が実行されず、startup reconciliation も stale operation を `interrupted` にするだけなので、永続 tamper latch が残らない。guard lifecycle と latch を child の kill／write authority から分離する必要がある。 |
+| WLMCP-R2-002 | Medium | unresolved | Approved Host では `Win32_Process.Create` による Job 外 process を補助 census で扱う一方、Codex Sandbox live verification は通常の child／grandchild と Job termination だけを測定する。Sandbox account が WMI／CIM process creation を利用できる環境では descendant termination／resource bound を迂回し得る。現在の host での到達性は未検証なので、identity-bound live denial probe を追加し、不明も route unavailable とする必要がある。 |
+| WLMCP-R2-003 | Medium | fixed | `list_directory` が workspace-controlled child に `Path.is_dir()` を使用し、symlink／junction／UNC target を Broker authority で追跡していた。`os.scandir` と `DirEntry.stat(follow_symlinks=False)` へ変更し、reparse entry を target 非追跡の `reparse` type として返す。 |
+
+既知 Critical は 0、既知 High は 1。したがって Round 2 の release 判定は `BLOCKED` とする。`SECURITY_CONTRACT.md` の保証は弱めていない。
+
+### 修正後の再確認
+
+- directory listing の正常な directory／file 分類と非追跡 metadata 呼び出しは focused test で通過した。実 symlink 作成が許可されない環境の adversarial test は skip し、同じ sink を test double で `follow_symlinks=False` と検証した。
+- Windows HANDLE を使う directory TOCTOU／safe process／Git snapshot の focused host test は 6 passed、1 skipped。skip は symlink 作成権限による。
+- Approved Host tamper、Sandbox route、WFP identity／runtime を含む focused security suite は初回 94 passed、1 skipped、1 timing failure。失敗した tamper parameter 群を直ちに単独再実行して 7 passed、続く full suite も通過したため、今回の差分による再現性のある regression とは判定しない。
+- final full suite は `.venv\Scripts\python.exe -m pytest -q --basetemp .dev-tmp\pytest\round2-full-final` で 396 passed、5 skipped。skip は権限または platform prerequisite を明示した既存の安全な skip である。
+- repository-wide Ruff、`python -m compileall -q src tests`、`git diff --check` は final tree で通過した。`diff --check` の出力は LF／CRLF の将来変換 warning だけだった。
+
+### 残存 risk と次の security 作業
+
+- WLMCP-R2-001 は既知 High なので C8 production-route E2E より前に解消する。最低条件は abnormal worker／server termination を Approved Host child から独立して検出し、Sandbox live marker を失効させ、明示的な再検証まで後続 operation を拒否することである。
+- WLMCP-R2-002 は現在の Sandbox account と backend identity に binding した WMI／CIM provider process-creation denial probe を追加する。process 作成成功、結果不明、cleanup 不成立はすべて fail closed とする。
+- WLMCP-R2-003 の元 attack path、child replacement race、junction／symlink／UNC variant、hidden-name 判定を再確認し、target を追跡する別経路は変更差分内に確認していない。

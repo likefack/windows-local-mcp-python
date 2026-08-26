@@ -598,15 +598,18 @@ def list_directory(path: str = ".") -> dict[str, Any]:
         _require_filesystem()
         directory = runtime.workspace.resolve_directory(path)
         limit = runtime.settings.max_directory_entries
-        entries = list(islice(directory.iterdir(), limit + 1))
+        # DirEntry.stat(follow_symlinks=False) classifies workspace-controlled children
+        # without resolving a symlink, junction, or other reparse target with Broker authority.
+        with os.scandir(directory) as scanner:
+            entries = list(islice(scanner, limit + 1))
         if len(entries) > limit:
             raise ValueError("directory entry limit exceeded")
         result = {
             "path": runtime.workspace.relative(directory),
             "entries": [
-                {"name": entry.name, "type": "directory" if entry.is_dir() else "file"}
+                {"name": entry.name, "type": _directory_entry_type(entry)}
                 for entry in sorted(entries, key=lambda item: item.name.casefold())
-                if not runtime.workspace.is_hidden(entry)
+                if not runtime.workspace.is_hidden(Path(entry.path))
             ],
         }
         result["operation_id"] = _log_simple(
@@ -616,6 +619,19 @@ def list_directory(path: str = ".") -> dict[str, Any]:
     except Exception as error:
         _audit_rejection("list_directory", request, error)
         raise
+
+
+def _directory_entry_type(entry: os.DirEntry[str]) -> str:
+    """Classify one directory entry without following an attacker-controlled target."""
+    details = entry.stat(follow_symlinks=False)
+    attributes = int(getattr(details, "st_file_attributes", 0))
+    if attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400) or entry.is_symlink():
+        return "reparse"
+    if stat.S_ISDIR(details.st_mode):
+        return "directory"
+    if stat.S_ISREG(details.st_mode):
+        return "file"
+    return "other"
 
 
 @mcp.tool(annotations=READ_ONLY)

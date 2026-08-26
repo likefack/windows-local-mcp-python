@@ -38,6 +38,7 @@ All MCP file paths pass through `Workspace`.
 - Reject regular files with `st_nlink > 1`.
 - Apply protected-name, read-denied, and write-denied policy separately.
 - Keep `.git` directly unreadable/unwritable through ordinary filesystem Broker tools. Automatic Git state tools do not bypass this boundary; approved Git operations use their separately bound metadata path.
+- `list_directory` は検証済み parent directory の child 名だけを列挙し、entry type は target を追跡しない metadata で判定します。symlink／junction／その他の reparse entry は `reparse` として返し、Broker 権限で target の種類や到達可能性を確認しません。
 
 `write_file` additionally:
 
