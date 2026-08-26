@@ -21,6 +21,7 @@ from .config import Settings
 from .control_plane import load_worker_context, verify_control_plane_generation
 from .control_plane_guard import (
     capture_critical_state,
+    expected_critical_state,
     mark_control_plane_tamper,
 )
 from .git_snapshot import capture_git_snapshot
@@ -207,7 +208,7 @@ def run_operation(operation_id: str, settings: Settings) -> int:
     args = list(normalized["args"])
     cwd = normalized["cwd"]
     max_runtime = int(request["max_runtime_seconds"])
-    deadline = operation_started + max_runtime
+    deadline: float | None = None
     nonce = str(operation.get("process_nonce") or os.environ.get("WINDOWS_LOCAL_MCP_JOB_NONCE", ""))
     if not nonce:
         raise RuntimeError("worker process nonce is missing")
@@ -506,10 +507,9 @@ def run_operation(operation_id: str, settings: Settings) -> int:
                 byte_limit=runtime_limit,
                 entry_limit=runtime_entry_limit,
             )
-        if time.monotonic() >= deadline:
-            raise OperationDeadlineExceeded(
-                f"operation deadline exceeded before child start: {max_runtime} seconds"
-            )
+        # max_runtime_seconds is the admitted child/finalization budget. Trusted
+        # preflight work happens before this point and must not consume that command budget.
+        deadline = time.monotonic() + max_runtime
         if operation["tier"] == "codex_sandbox":
             if sandbox_backend is None:
                 raise ApprovedSandboxUnavailable("Approved Sandbox backend is unavailable")
@@ -807,6 +807,8 @@ def run_operation(operation_id: str, settings: Settings) -> int:
             if os.name == "nt" and host_process_census_required:
                 if host_user_process_baseline is None:
                     raise RuntimeError("Approved Host same-user process baseline is missing")
+                if deadline is None:
+                    raise RuntimeError("Approved Host execution deadline was not initialized")
                 untracked_processes = wait_for_untracked_current_user_processes(
                     host_user_process_baseline,
                     deadline=deadline,
@@ -838,7 +840,13 @@ def run_operation(operation_id: str, settings: Settings) -> int:
                 raise RuntimeError("Approved Host changed the operation terminal state")
             if fresh_operation.get("result") is not None or fresh_operation.get("exit_code") is not None:
                 raise RuntimeError("Approved Host forged operation result fields")
-            if int(fresh_operation.get("worker_pid") or 0) != os.getpid():
+            if (
+                int(fresh_operation.get("worker_pid") or 0) != worker_identity.pid
+                or float(fresh_operation.get("worker_create_time") or 0)
+                != worker_identity.create_time
+                or str(fresh_operation.get("worker_executable") or "")
+                != worker_identity.executable
+            ):
                 raise RuntimeError("Approved Host changed the worker process binding")
             if str(fresh_operation.get("process_nonce") or "") != nonce:
                 raise RuntimeError("Approved Host changed the process nonce binding")
@@ -850,10 +858,11 @@ def run_operation(operation_id: str, settings: Settings) -> int:
                 != child_identity.executable
             ):
                 raise RuntimeError("Approved Host changed the child process identity")
+            host_control_expected = expected_critical_state(settings, operation_id)
             host_control_after = capture_critical_state(settings, operation_id)
-            if host_control_after != host_control_state:
+            if host_control_after != host_control_expected:
                 marker = mark_control_plane_tamper(
-                    settings, operation_id, host_control_state, host_control_after
+                    settings, operation_id, host_control_expected, host_control_after
                 )
                 status = "failed"
                 failure_class = "control_plane_tamper"
@@ -864,7 +873,7 @@ def run_operation(operation_id: str, settings: Settings) -> int:
                 audit.add_event(
                     operation_id,
                     "approved_host_control_plane_tamper_detected",
-                    {"before": host_control_state, "after": host_control_after},
+                    {"before": host_control_expected, "after": host_control_after},
                 )
         except Exception as guard_error:  # noqa: BLE001 - uncertainty fails closed
             marker = mark_control_plane_tamper(
@@ -997,7 +1006,7 @@ def run_operation(operation_id: str, settings: Settings) -> int:
             }
     if workspace_lock is not None:
         workspace_lock.__exit__(None, None, None)
-    if time.monotonic() > deadline and status == "succeeded":
+    if deadline is not None and time.monotonic() > deadline and status == "succeeded":
         status = "timed_out"
         failure_class = "operation_deadline"
         error = (

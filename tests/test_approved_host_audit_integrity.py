@@ -1,5 +1,6 @@
 import sqlite3
 import sys
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -262,8 +263,13 @@ def test_approved_host_trusted_audit_updates_remain_valid(tmp_path: Path, monkey
     store.approve_and_claim(operation_id, approver="integration-test")
 
     result = executor.launch(operation_id, 30)
-    operation = store.get_operation(operation_id)
-    event_types = [event["event_type"] for event in operation["events"]]
+    deadline = time.monotonic() + 5.0
+    while True:
+        operation = store.get_operation(operation_id)
+        event_types = [event["event_type"] for event in operation["events"]]
+        if "worker_finished" in event_types or time.monotonic() >= deadline:
+            break
+        time.sleep(0.05)
 
     assert result["status"] == "succeeded"
     assert "approved_host_control_plane_guard_armed" in event_types

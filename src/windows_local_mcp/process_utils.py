@@ -137,7 +137,10 @@ def capture_process_identity(pid: int, nonce: str) -> ProcessIdentity:
     process = psutil.Process(pid)
     identity = ProcessIdentity(
         pid=pid,
-        create_time=process.create_time(),
+        # sqlite3 trace callbacks stringify bound REAL values to about 15 significant
+        # digits. Persist 10-microsecond precision so trusted audit replay is bit-stable;
+        # process verification already uses a 10-millisecond tolerance plus PID/exe/nonce.
+        create_time=round(float(process.create_time()), 5),
         executable=os.path.normcase(str(Path(process.exe()).resolve())),
         nonce=nonce,
     )

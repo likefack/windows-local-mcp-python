@@ -130,6 +130,82 @@ def test_code_loader_rejects_new_mutable_workspace_directory_after_approval(
         )
 
 
+def test_sandbox_snapshot_preserves_workspace_relative_siblings(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    app = settings.workspace_root / "app"
+    shared = settings.workspace_root / "shared"
+    app.mkdir()
+    shared.mkdir()
+    (app / "main.py").write_text("print('main')", encoding="utf-8")
+    (shared / "payload.py").write_text("print('shared')", encoding="utf-8")
+    command = make_command(make_executable(tmp_path), app, ["main.py"])
+
+    _, manifest, digest = prepare_approval_bundle(
+        settings=settings,
+        workspace=Workspace(settings),
+        operation_id="sandbox-workspace",
+        normalized=command,
+        snapshot_workspace=True,
+    )
+    assert manifest["mode"] == "staged-sandbox-workspace"
+    staged_workspace = Path(str(manifest["staged_workspace"]))
+    assert (staged_workspace / "app" / "main.py").is_file()
+    assert (staged_workspace / "shared" / "payload.py").is_file()
+
+    verified = verify_approval_bundle(
+        settings=settings,
+        operation_id="sandbox-workspace",
+        expected_digest=digest,
+    )
+    runtime = materialize_execution_copy(
+        settings=settings,
+        operation_id="sandbox-workspace",
+        normalized=verified,
+    )
+    run_cwd = Path(runtime.cwd)
+    run_workspace = run_cwd.parent
+    assert run_cwd.name == "app"
+    assert (run_workspace / "shared" / "payload.py").read_text(encoding="utf-8") == "print('shared')"
+
+
+def test_sandbox_workspace_write_collects_sibling_delta(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    app = settings.workspace_root / "app"
+    shared = settings.workspace_root / "shared"
+    app.mkdir()
+    shared.mkdir()
+    (app / "main.py").write_text("print('main')", encoding="utf-8")
+    (shared / "payload.txt").write_text("before", encoding="utf-8")
+    command = make_command(make_executable(tmp_path), app, ["main.py"])
+    _, _manifest, digest = prepare_approval_bundle(
+        settings=settings,
+        workspace=Workspace(settings),
+        operation_id="sandbox-workspace-write",
+        normalized=command,
+        workspace_write=True,
+        snapshot_workspace=True,
+    )
+    verified = verify_approval_bundle(
+        settings=settings,
+        operation_id="sandbox-workspace-write",
+        expected_digest=digest,
+    )
+    runtime = materialize_execution_copy(
+        settings=settings,
+        operation_id="sandbox-workspace-write",
+        normalized=verified,
+    )
+    run_workspace = Path(runtime.cwd).parent
+    (run_workspace / "shared" / "payload.txt").write_text("after", encoding="utf-8")
+    changes, deletions = collect_staged_workspace_changes(
+        settings=settings,
+        operation_id="sandbox-workspace-write",
+        normalized=runtime,
+    )
+    assert changes == {"shared/payload.txt": b"after"}
+    assert deletions == set()
+
+
 def test_staging_excludes_protected_files_and_generated_dependency_trees(
     tmp_path: Path,
 ) -> None:

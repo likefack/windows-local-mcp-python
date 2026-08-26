@@ -378,25 +378,27 @@ def test_codex_state_limits_reads_and_denies_protected_workspace_paths(
     entries = profile["file_system"]["entries"]
     assert {
         "path": {"type": "path", "path": str(settings.workspace_root.resolve())},
-        "access": "read",
+        "access": "deny",
     } in entries
+    assert not any(
+        entry.get("access") == "read"
+        and entry.get("path") == {
+            "type": "path",
+            "path": str(settings.workspace_root.resolve()),
+        }
+        for entry in entries
+    )
     assert {
         "path": {"type": "path", "path": str(runtime.resolve())},
         "access": "write",
     } in entries
-    patterns = {
-        entry["path"]["pattern"] for entry in entries if entry["path"]["type"] == "glob_pattern"
-    }
-    workspace = settings.workspace_root.resolve().as_posix()
-    assert f"{workspace}/**/.env" in patterns
-    assert f"{workspace}/**/credentials.json" in patterns
     assert all(str(Path.home()) not in str(entry) for entry in entries)
 
 
 def test_live_verification_properties_distinguish_failed_from_unverified() -> None:
     properties = _property_results(
         {
-            "source_read": True,
+            "source_workspace_read_denied": True,
             "outside_user_read_denied": False,
             "control_plane_read_denied": True,
             "scratch_write": True,
@@ -1202,3 +1204,18 @@ def test_legacy_complete_journal_repairs_audit_before_marking_reconciled(
     assert journal["state"] == "complete"
     assert journal["audit_reconciled"] is True
     assert incomplete_workspace_transactions(settings) == []
+
+
+def test_sandbox_dependency_read_root_cannot_overlap_scratch(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    data = tmp_path / "data"
+    scratch = tmp_path / "scratch"
+    with pytest.raises(ValidationError, match="sandbox_scratch_dir"):
+        Settings(
+            workspace_root=workspace,
+            data_dir=data,
+            sandbox_scratch_dir=scratch,
+            sandbox_dependency_readable_paths=[scratch / "dependency"],
+            protect_data_dir_acl=False,
+        )

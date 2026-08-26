@@ -36,8 +36,8 @@ _SANDBOX_HELPERS = (
     "codex-command-runner.exe",
     "codex-windows-sandbox-setup.exe",
 )
-_WLMCP_ISOLATION_POLICY_VERSION = 1
-_SANDBOX_STATE_POLICY_VERSION = 1
+_WLMCP_ISOLATION_POLICY_VERSION = 2
+_SANDBOX_STATE_POLICY_VERSION = 2
 _SANDBOX_STATE_GLOB_SCAN_MAX_DEPTH = 64
 SANDBOX_LIVE_MARKER_VERSION = 4
 SANDBOX_SECURITY_PROPERTIES = (
@@ -51,26 +51,29 @@ SANDBOX_SECURITY_PROPERTIES = (
     "termination",
     "resource_bound",
 )
-_ACCEPTED_RESIDUAL_RISK_PROPERTIES = frozenset(
-    {"protected_information_read", "lan"}
-)
+_ACCEPTED_RESIDUAL_RISK_PROPERTIES = frozenset({"lan"})
 _MANDATORY_ROUTE_PROPERTIES = (
     "filesystem_read",
     "filesystem_write",
+    "protected_information_read",
     "internet",
     "loopback",
     "termination",
     "resource_bound",
 )
 _MANDATORY_DESCENDANT_CHECKS = (
+    "child_source_workspace_read_denied",
     "child_source_workspace_write_denied",
     "child_outside_user_read_denied",
+    "child_protected_information_denied",
     "child_control_plane_read_denied",
     "child_control_plane_write_denied",
     "child_internet_denied",
     "child_loopback_denied",
+    "grandchild_source_workspace_read_denied",
     "grandchild_source_workspace_write_denied",
     "grandchild_outside_user_read_denied",
+    "grandchild_protected_information_denied",
     "grandchild_control_plane_read_denied",
     "grandchild_control_plane_write_denied",
     "grandchild_internet_denied",
@@ -332,7 +335,7 @@ def sandbox_isolation_context(
         )
 
     return {
-        "version": 2,
+        "version": 3,
         "backend": backend.as_dict(),
         "wfp_guard_implementation": capture_wfp_guard_implementation_identity(),
         "windows_os_identity": windows_os_identity(),
@@ -357,7 +360,7 @@ def sandbox_isolation_context(
         "configured_process_tree_memory_limit_bytes": settings.max_sandbox_memory_bytes,
         "sandbox_state_policy": {
             "version": _SANDBOX_STATE_POLICY_VERSION,
-            "filesystem_policy_generation": 1,
+            "filesystem_policy_generation": 2,
             "network_policy_generation": 1,
             "filesystem": "restricted",
             "network": "restricted",
@@ -665,14 +668,39 @@ def codex_sandbox_state(
         raise ValueError("Approved Sandbox command cannot be empty")
     cwd = cwd.resolve(strict=True)
     workspace = settings.workspace_root.resolve(strict=True)
+    data_dir = settings.data_dir.resolve(strict=True)
+    assert settings.sandbox_scratch_dir is not None
+    scratch = settings.sandbox_scratch_dir.resolve(strict=True)
+    protected_roots = (workspace, data_dir, scratch)
     entries: list[dict[str, Any]] = [
         _special_filesystem_entry("minimal", "read"),
-        _path_filesystem_entry(workspace, "read"),
+        _path_filesystem_entry(workspace, "deny"),
+        _path_filesystem_entry(data_dir, "deny"),
     ]
     readable_roots = [
         Path(command[0]).resolve(strict=True).parent,
         *(path.resolve(strict=True) for path in settings.sandbox_dependency_readable_paths),
     ]
+
+    def overlaps_protected(path: Path) -> bool:
+        for protected in protected_roots:
+            try:
+                path.relative_to(protected)
+                return True
+            except ValueError:
+                pass
+            try:
+                protected.relative_to(path)
+                return True
+            except ValueError:
+                pass
+        return False
+
+    for path in readable_roots:
+        if overlaps_protected(path):
+            raise ApprovedSandboxUnavailable(
+                f"Sandbox readable dependency overlaps a protected root: {path}"
+            )
     seen: set[str] = set()
     for path in [*readable_roots, *(root.resolve(strict=True) for root in writable_roots)]:
         folded = os.path.normcase(str(path))
@@ -687,7 +715,6 @@ def codex_sandbox_state(
                 else "read",
             )
         )
-    entries.extend(_protected_read_entries(settings, workspace))
     return {
         "permissionProfile": {
             "type": "managed",
@@ -867,7 +894,7 @@ def codex_sandbox_effective_policy(*, workspace_write: bool) -> dict[str, Any]:
     return {
         "sandbox_backend": "openai-codex-windows-sandbox",
         "filesystem_policy": {
-            "source_workspace": "requested read-only with protected-path deny-read rules",
+            "source_workspace": "denied; execution uses only the approved snapshot/run projection",
             "execution_copy": "read-write" if workspace_write else "read-write disposable scratch",
             "outside_workspace_read": "requested deny except minimal Windows/toolchain and explicit dependencies",
             "outside_workspace_write": "denied except the per-operation scratch root",

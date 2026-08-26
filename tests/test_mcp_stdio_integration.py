@@ -121,11 +121,21 @@ def test_real_stdio_tools_list_and_file_round_trip(tmp_path: Path) -> None:
             )
             assert wrong_surface.is_error
 
+            rejected_project_host = await session.call_tool(
+                "request_host_command",
+                {
+                    "command": [sys.executable, "-c", "print('must stay sandboxed')"],
+                    "reason": "verify project-controlled code is rejected from Approved Host",
+                    "risk_summary": "test request must fail before approval creation",
+                },
+            )
+            assert rejected_project_host.is_error
+
             approval = await session.call_tool(
                 "request_host_command",
                 {
-                    "command": [sys.executable, "-c", "print('approval request only')"],
-                    "reason": "verify request-only MCP behavior",
+                    "command": [git, "status", "--short"],
+                    "reason": "verify explicit approved Git request-only MCP behavior",
                     "risk_summary": "test request must not launch a child process",
                 },
             )

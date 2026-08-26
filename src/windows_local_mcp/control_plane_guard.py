@@ -13,7 +13,6 @@ from urllib.parse import unquote
 
 from .config import Settings
 from .config_binding import export_config_binding
-from .runtime_trust import capture_runtime_dependency_state
 from .util import canonical_json, sha256_bytes, sha256_text, utc_now_iso
 from .windows_system import windows_system_executable
 
@@ -206,27 +205,21 @@ def capture_critical_state(settings: Settings, operation_id: str) -> dict[str, A
                     "sha256": sha256_bytes(data),
                 }
             )
-    runtime_state = (
-        capture_runtime_dependency_state(
-            max_files=settings.approval_manifest_max_files,
-            max_bytes=settings.approval_manifest_max_bytes,
-        )
-        if os.name == "nt"
-        else None
-    )
+    # Approved Host runtime content is admitted by the execution-time immutable-runtime
+    # gate before this worker is launched. Re-hashing that complete dependency closure here
+    # would duplicate the gate and can consume the command runtime budget before child start.
+    # This guard therefore protects mutable control-plane state and Python startup state.
     runtime_startup_state = _capture_runtime_startup_state() if os.name == "nt" else None
     audit_snapshot, audit_bytes = _audit_state_snapshot(settings)
     acl_digest, acl_bytes = _acl_state_digest(settings, roots)
-    runtime_bytes = int(runtime_state["bytes"]) if runtime_state is not None else 0
-    runtime_digest = str(runtime_state["digest"]) if runtime_state is not None else None
+    runtime_bytes = 0
+    runtime_digest = None
     runtime_startup_digest = (
         str(runtime_startup_state["digest"])
         if runtime_startup_state is not None
         else None
     )
-    runtime_file_count = (
-        int(runtime_state["file_count"]) if runtime_state is not None else 0
-    )
+    runtime_file_count = 0
     runtime_startup_path_count = (
         int(runtime_startup_state["count"])
         if runtime_startup_state is not None
@@ -269,7 +262,7 @@ def capture_critical_state(settings: Settings, operation_id: str) -> dict[str, A
             database_identity=database_identity,
             operation_id=operation_id,
             mirror=mirror,
-            expected_state=state,
+            expected_state=dict(state),
             file_count=len(records),
             static_bytes=static_bytes,
             base_digest_payload=base_digest_payload,
@@ -348,6 +341,23 @@ def _activate_audit_guard(guard: _AuditMutationGuard) -> None:
         if not _SQLITE_CONNECT_PATCHED:
             sqlite3.connect = _guarded_sqlite_connect
             _SQLITE_CONNECT_PATCHED = True
+
+
+def expected_critical_state(settings: Settings, operation_id: str) -> dict[str, Any]:
+    """Return the trusted-worker mirror state without mutating the original preflight snapshot."""
+    database_identity = _database_identity(settings.data_dir / "audit.db")
+    with _AUDIT_GUARDS_LOCK:
+        guard = _ACTIVE_AUDIT_GUARDS.get(database_identity)
+        if guard is None:
+            raise RuntimeError("Approved Host audit guard is not active")
+        if guard.operation_id != operation_id:
+            raise RuntimeError("Approved Host audit guard is bound to another operation")
+        if guard.tracking_error is not None:
+            raise RuntimeError(
+                "trusted audit mutation tracking failed during Approved Host execution: "
+                f"{guard.tracking_error}"
+            )
+        return dict(guard.expected_state)
 
 
 def _deactivate_audit_guard(database_identity: str) -> None:

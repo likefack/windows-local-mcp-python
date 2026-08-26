@@ -157,7 +157,7 @@ def test_git_info_failure_terminalizes_its_operation_without_duplicate_rejection
     assert timeline_record["status"] == "failed"
 
 
-def test_approved_sandbox_and_host_are_distinct_requests(
+def test_sandbox_is_snapshot_only_and_host_rejects_project_code_loaders(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     server, _ = load_server(tmp_path, monkeypatch)
@@ -194,14 +194,23 @@ def test_approved_sandbox_and_host_are_distinct_requests(
     assert sandbox_record["request"]["effective_sandbox_policy"]["network_policy"][
         "internet"
     ] == "deny"
-
-    host = server.request_host_command(
-        [sys.executable, "-c", "print('host')"],
-        reason="explicit host-only operation",
+    assert sandbox_record["request"]["approval_manifest_summary"]["mode"] == (
+        "staged-sandbox-workspace"
     )
-    host_record = server.runtime.audit.get_operation(host["approval_id"])
-    assert host_record["tier"] == "approved_host"
-    assert host_record["request"]["sandbox_backend"] is None
+
+    with pytest.raises(PermissionError, match="request_sandbox_command"):
+        server.request_host_command(
+            [sys.executable, "-c", "print('host')"],
+            reason="project-controlled Python must stay in Sandbox",
+        )
+
+    workspace_executable = server.runtime.settings.workspace_root / "project-tool.exe"
+    workspace_executable.write_bytes(b"project executable")
+    with pytest.raises(PermissionError, match="trusted toolchain"):
+        server.request_sandbox_command(
+            [str(workspace_executable)],
+            reason="workspace executable must not become a Sandbox read capability",
+        )
 
 
 def test_sandbox_dependency_availability_is_separate_from_live_verified_route(
@@ -240,6 +249,73 @@ def test_sandbox_dependency_availability_is_separate_from_live_verified_route(
     assert status["execution_route_available"] is False
     assert status["windows_live_verified"] is False
     assert "property evidence is incomplete" in status["execution_unavailable_reason"]
+
+
+def test_approved_host_capability_does_not_preflight_when_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, _ = load_server(tmp_path, monkeypatch)
+    server.runtime.settings.approved_host_enabled = False
+
+    def unexpected_preflight():
+        raise AssertionError("disabled Approved Host must not run runtime preflight")
+
+    monkeypatch.setattr(server, "assert_approved_host_runtime_immutable", unexpected_preflight)
+
+    status = server._approved_host_capability()
+
+    assert status["enabled"] is False
+    assert status["available"] is False
+    assert status["runtime_preflight"]["status"] == "not_run"
+
+
+def test_approved_host_capability_reports_failed_runtime_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, _ = load_server(tmp_path, monkeypatch)
+    server.runtime.settings.approved_host_enabled = True
+    monkeypatch.setattr(
+        server,
+        "assert_approved_host_runtime_immutable",
+        lambda: (_ for _ in ()).throw(RuntimeError("runtime is mutable")),
+    )
+
+    status = server._approved_host_capability()
+
+    assert status["enabled"] is True
+    assert status["available"] is False
+    assert status["runtime_preflight"]["status"] == "failed"
+    assert "runtime is mutable" in status["runtime_preflight"]["error"]
+    assert status["execution_time_recheck"] is True
+
+
+def test_approved_host_capability_reports_passed_runtime_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, _ = load_server(tmp_path, monkeypatch)
+    server.runtime.settings.approved_host_enabled = True
+    monkeypatch.setattr(
+        server,
+        "assert_approved_host_runtime_immutable",
+        lambda: {
+            "version": 1,
+            "scope": "complete-runtime",
+            "path_count": 12,
+            "file_count": 5,
+            "directory_count": 4,
+            "ancestor_directory_count": 3,
+            "digest": "a" * 64,
+        },
+    )
+
+    status = server._approved_host_capability()
+
+    assert status["enabled"] is True
+    assert status["available"] is True
+    assert status["live_verified"] is True
+    assert status["runtime_preflight"]["status"] == "passed"
+    assert status["runtime_preflight"]["digest"] == "a" * 64
+    assert status["execution_time_recheck"] is True
 
 
 def test_backup_and_diff_limits_fail_before_replacement(

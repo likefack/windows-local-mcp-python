@@ -276,11 +276,11 @@ class Settings(BaseModel):
                 raise ValueError("sandbox_dependency_readable_paths cannot include a drive root")
             if any(
                 _is_relative_to(path, protected) or _is_relative_to(protected, path)
-                for protected in (root, data)
+                for protected in (root, data, scratch)
             ):
                 raise ValueError(
                     "sandbox_dependency_readable_paths cannot overlap workspace_root, data_dir, "
-                    "or an ancestor of either"
+                    "sandbox_scratch_dir, or an ancestor of those roots"
                 )
         codex_path = self.approved_sandbox_codex_path
         if codex_path is not None:

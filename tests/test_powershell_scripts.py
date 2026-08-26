@@ -41,3 +41,17 @@ def test_powershell_script_parses(script_name: str) -> None:
         shell=False,
     )
     assert completed.returncode == 0, completed.stderr or completed.stdout
+
+
+def test_approved_host_installer_requires_program_files_base_and_install_root() -> None:
+    script = (_REPOSITORY_ROOT / "install-approved-host-runtime.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'Assert-UnderProgramFiles -Path $InstallRoot -Label "InstallRoot"' in script
+    assert 'Assert-UnderProgramFiles -Path $BasePython -Label "BasePython"' in script
+    assert 'Assert-UnderProgramFiles -Path $BasePrefix -Label "sys.base_prefix"' in script
+    assert '-c "import sys; print(sys.base_prefix)"' in script
+    assert '"*${runtimeSid}:(OI)(CI)RX"' in script
+    assert '"*S-1-5-18:(OI)(CI)F"' in script
+    assert '"*S-1-5-32-544:(OI)(CI)F"' in script

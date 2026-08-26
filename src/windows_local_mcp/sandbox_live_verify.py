@@ -124,7 +124,7 @@ def _property_results(
     """Translate concrete probes into contract-level properties without overclaiming."""
     requirements = {
         "filesystem_read": (
-            "source_read",
+            "source_workspace_read_denied",
             "outside_user_read_denied",
             "control_plane_read_denied",
         ),
@@ -139,6 +139,7 @@ def _property_results(
         "lan": ("lan_denied",),
         "loopback": ("loopback_denied",),
         "descendant_containment": (
+            "child_source_workspace_read_denied",
             "child_source_workspace_write_denied",
             "child_outside_user_read_denied",
             "child_protected_information_denied",
@@ -147,6 +148,7 @@ def _property_results(
             "child_internet_denied",
             "child_lan_denied",
             "child_loopback_denied",
+            "grandchild_source_workspace_read_denied",
             "grandchild_source_workspace_write_denied",
             "grandchild_outside_user_read_denied",
             "grandchild_protected_information_denied",
@@ -1034,7 +1036,9 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
                 argv=["host-canary-cleanup", str(path)],
             )
 
-    prepare_canary("source_read", source_canary, "source-readable-canary")
+    prepare_canary(
+        "source_workspace_read_denied", source_canary, "source-readable-canary"
+    )
     prepare_canary(
         "protected_information_denied",
         protected_canary,
@@ -1102,29 +1106,6 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
             )
             _set_check(checks, check_reasons, "python_child", value, reason)
 
-            if canary_ready.get("source_read"):
-                source_result = _run(
-                    settings,
-                    backend,
-                    root,
-                    [
-                        python,
-                        "-I",
-                        "-c",
-                        f"from pathlib import Path;print(Path({str(source_canary)!r}).read_text())",
-                    ],
-                    probe_name="source_read",
-                    probe_diagnostics=probe_diagnostics,
-                )
-                value, reason = _classify_probe_result(
-                    source_result,
-                    success=b"source-readable-canary" in source_result.stdout,
-                    boundary_escape_code=None,
-                )
-            else:
-                value, reason = None, "unverified: source canary setup failed"
-            _set_check(checks, check_reasons, "source_read", value, reason)
-
             write_result = _run(
                 settings,
                 backend,
@@ -1180,6 +1161,12 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
                     result, success=result.returncode == 0
                 )
 
+            value, reason = denied_access_probe(
+                "source_workspace_read_denied", source_canary, "read"
+            )
+            _set_check(
+                checks, check_reasons, "source_workspace_read_denied", value, reason
+            )
             value, reason = denied_access_probe(
                 "source_workspace_write_denied", source_write_target, "write"
             )
@@ -1340,6 +1327,7 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
                 _set_check(checks, check_reasons, "lan_denied", value, reason)
 
             descendant_check_names = (
+                "source_workspace_read_denied",
                 "source_workspace_write_denied",
                 "outside_user_read_denied",
                 "protected_information_denied",
@@ -1369,6 +1357,7 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
 
                 def descendant_boundary_code(write_target: Path) -> str:
                     filesystem = {
+                        "source_workspace_read_denied": ("read", str(source_canary)),
                         "source_workspace_write_denied": ("write", str(write_target)),
                         "outside_user_read_denied": ("read", str(outside_canary)),
                         "protected_information_denied": (

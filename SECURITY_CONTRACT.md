@@ -23,6 +23,13 @@ Git executable の path／SHA-256 が設定済みであることを、automatic 
 Git process execution が必要な場合は separately human-approved route を使用し、automatic Git を再有効化する
 場合は本契約の Broker boundary を満たす metadata confinement と回帰／実機検証を先に要求します。
 
+同日追加改訂では、承認済み Codex Sandbox の open-ended／project-controlled execution を
+immutable snapshot/run projection だけから実行する境界へ強化します。original `workspace_root` は
+Sandbox parent／child／grandchild から read／write とも OS capability で到達不能であることを必須とし、
+trusted toolchain と明示設定した external dependency だけを追加 read capability として許可します。
+Approved Host は同一 Windows user authority のためこの filesystem isolation を提供できず、project-controlled
+code-loader または workspace 内 executable を Approved Host で実行しません。
+
 ## 1. 適用範囲と信頼モデル
 
 1 台の Windows PC で、1 人の利用者が、1 つの明示設定された `workspace_root` を扱う
@@ -151,7 +158,8 @@ Sandbox route の必須境界は少なくとも次です。
 - workspace 外の不要な user file を読めない。workspace 外の `.env`、credential、secret もこの必須境界に含む
 - control-plane と `data_dir` を読み書きできない
 - write 可能範囲が、明示された scratch／実行 copy と Broker が検証して反映する出力範囲に限定される
-- source workspace を read-only と表示する場合、実効 OS capability でも write できない
+- original source workspace を Sandbox parent／child／grandchild が read／write できない
+- project-controlled execution は承認済み immutable snapshot から作成した operation 固有 run projection だけを使用し、trusted toolchain と明示的 external dependency 以外の ambient filesystem read capability を持たない
 - Internet へ接続できない
 - 未許可 loopback／localhost endpoint へ接続できない
 - loopback Guard の対象 SID は、この PC のコンピューター名で完全修飾して解決し、返された参照ドメインがこの PC 自身であり、`SID_NAME_USE == SidTypeUser (1)` であることを確認できない場合は Sandbox route を利用しない
@@ -159,12 +167,10 @@ Sandbox route の必須境界は少なくとも次です。
 - timeout／cancel で descendant を含め停止できる
 - scratch、出力、時間、process、memory／filesystem consumption に現実的な上限がある
 
-個人利用 v1 では、次の 2 点を明示的に受容する残存 risk とし、それ単独を理由に Sandbox route を
-unavailable にしません。
-
-- workspace 内に存在する `.env`、credential、secret 等の protected information を Sandbox process または
-  child／grandchild が直接読み取れる場合があること
-- Sandbox process または child／grandchild が LAN／private network 上の endpoint へ接続できる場合があること
+個人利用 v1 では、Sandbox process または child／grandchild が LAN／private network 上の endpoint へ
+接続できる場合があることだけを明示的に受容する残存 risk とし、それ単独を理由に Sandbox route を
+unavailable にしません。source workspace／workspace 内 protected information の direct read は受容済み risk
+ではなく必須遮断境界です。
 
 これらは安全、遮断済み、`verified` とは表示しません。実機で境界突破を確認した場合は property を
 `failed` のまま保存・表示し、受容済み残存 risk として route 判定から分離します。
@@ -180,6 +186,7 @@ staging からの除外、stdout／stderr の redaction、network deny は補助
 ### E. Approved Host boundary
 
 - Codex Sandbox とは別の one-shot human approval を必要とします。
+- project-controlled code-loader と workspace 内 executable は Approved Host で受理せず、Codex Sandbox の snapshot-only route を要求します。
 - 同一 Windows user principal のため防止できない瞬間的な完全復元型改変は残存 risk としますが、
   audit DB、approval state、CAS、journal、worker context、transfer state、runtime、policy generation の
   通常の改変は検出します。
@@ -259,9 +266,9 @@ staging からの除外、stdout／stderr の redaction、network deny は補助
   では無効であり、将来再有効化する場合もこの protected-information boundary を満たす必要があります。
 - workspace 外の protected path は、Codex Sandbox process とその descendant からも実効 OS capability で
   直接読めないことを必要とします。
-- workspace 内 protected information は Sandbox staging へ自動追加しませんが、open-ended execution が
-  source workspace の実体を直接読める場合に `.env`、credential、secret の read denial が成立しないことを、
-  個人利用 v1 の受容済み残存 risk とします。この状態を「secret が Sandbox から読めない」と表示しません。
+- workspace 内 protected information は Sandbox staging へ自動追加せず、original source workspace 自体を
+  parent／child／grandchild の実効 OS capability から read deny にします。snapshot に含めない protected file を
+  live workspace から補う経路は認めません。
 - staging exclusion、argv／environment／stdout／stderr preview／error／audit field の redaction は防御を
   多層化する補助策であり、workspace 外 protected-information read denial の代替にしません。
 - argv、environment、stdout／stderr preview、error、audit field は semantic redaction と容量制限を通します。

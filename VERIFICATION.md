@@ -1,5 +1,14 @@
 # 検証記録
 
+## 2026-08-26 Sandbox snapshot-only source isolation
+
+- Codex Sandbox の filesystem policy から original `workspace_root` の read capability を除去し、source workspace／`data_dir` を明示 deny、operation 固有 run projection だけを write root とする設計へ変更した。
+- open-ended Sandbox request は code-loader 名に依存せず bounded な full workspace projection を承認時に snapshot 化し、worker は immutable projection の検証後に writable run copy へ materialize する。workspace-relative cwd／sibling layout を維持する。
+- Approved Host は project-controlled code-loader と workspace 内 primary executable を request 時点で拒否する。
+- Sandbox isolation/state policy generation と isolation-context version を更新したため、旧 live-verification marker は意図的に stale になる。新 route は通常 Windows user 文脈で `verify-codex-sandbox` を再実行し、parent／child／grandchild の `source_workspace_read_denied`、source write denial、protected-information denialを含む必須 property が実測されるまで fail closed のままとする。
+- GitHub Hosted Windows で unit／integration／policy regression、Ruff、compileall を実行する。Hosted runner は installed production Codex Windows Sandbox の通常 user 実機境界ではないため、新しい source-read denial の OS-level 成立をそこで証明したとは扱わない。
+
+
 ## 2026-08-20 C7 verified state identity binding
 
 ### baseline と実装前 checkpoint

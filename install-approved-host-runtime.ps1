@@ -12,6 +12,31 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Assert-UnderProgramFiles {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [Parameter(Mandatory = $true)]
+        [string]$Label
+    )
+
+    $candidate = [IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
+    $roots = @(
+        $env:ProgramFiles,
+        ${env:ProgramFiles(x86)},
+        $env:ProgramW6432
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\', '/') } |
+        Select-Object -Unique
+
+    foreach ($root in $roots) {
+        if ($candidate.StartsWith($root + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) {
+            return $candidate
+        }
+    }
+    throw "$Label must be below a Windows Program Files directory: $candidate"
+}
+
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = [Security.Principal.WindowsPrincipal]::new($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -19,10 +44,20 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 }
 
 $SourceRoot = $PSScriptRoot
+$InstallRoot = Assert-UnderProgramFiles -Path $InstallRoot -Label "InstallRoot"
 $BasePython = (Resolve-Path -LiteralPath $BasePython).Path
 if (-not (Test-Path -LiteralPath $BasePython -PathType Leaf)) {
     throw "Base Python executable does not exist: $BasePython"
 }
+$BasePython = Assert-UnderProgramFiles -Path $BasePython -Label "BasePython"
+$BasePrefix = ((& $BasePython -I -B -c "import sys; print(sys.base_prefix)") | Out-String).Trim()
+if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($BasePrefix)) {
+    throw "Could not resolve sys.base_prefix from BasePython."
+}
+if (-not (Test-Path -LiteralPath $BasePrefix -PathType Container)) {
+    throw "Base Python prefix does not exist: $BasePrefix"
+}
+$BasePrefix = Assert-UnderProgramFiles -Path $BasePrefix -Label "sys.base_prefix"
 
 $runtimeAccount = [Security.Principal.NTAccount]::new($RuntimeUser)
 try {
@@ -107,6 +142,7 @@ try {
     Write-Output "Approved Host runtime installed at: $InstallRoot"
     Write-Output "Runtime user: $RuntimeUser ($runtimeSid)"
     Write-Output "Base Python: $BasePython"
+    Write-Output "Base Python prefix: $BasePrefix"
     Write-Output "Run verify-approved-host-runtime.ps1 from a normal non-elevated $RuntimeUser session before enabling Approved Host use."
 } finally {
     if (Test-Path -LiteralPath $StagingRoot) {

@@ -91,9 +91,10 @@ Until those conditions are implemented and verified, Git work that needs process
 
 ### Project-controlled tools
 
-- Python, Node, PowerShell, Dart, Flutter, project scripts, plugins, tests, builds, and formatting can load project-controlled code or configuration.
-- These operations are never broker commands. They require a separately approved Codex Sandbox request.
-- An operation that needs real Windows user authority beyond Codex Sandbox requires a new, separately approved Host request; Sandbox failure does not create or approve it.
+- Python、Node、PowerShell、Dart、Flutter、project scripts、plugins、tests、builds、formatting 等の project-controlled code-loader は Codex Sandbox 専用です。
+- Codex Sandbox は original `workspace_root` を filesystem capability として受け取りません。承認時に bounded な workspace projection を snapshot 化し、実行時は operation 固有の writable run copy だけを使用します。
+- trusted toolchain executable と `sandbox_dependency_readable_paths` で明示した workspace／data／scratch 外 dependency だけを追加 read root として許可します。
+- Approved Host は同一 Windows user authority のため source-workspace read isolation を保証できません。したがって project-controlled code-loader と workspace 内 executable は Host request で拒否します。Sandbox failure から Host への fallback はありません。
 
 ### ADB
 
@@ -109,16 +110,12 @@ Automatic device enumeration is rejected because its raw output can disclose or 
 
 ### Execution lock policy
 
-The workspace-wide mutation lock is no longer held for every command for the full child-process lifetime.
+Approved execution は承認時 snapshot の整合性確保と Broker mutation の defense-in-depth のため workspace-wide mutation lock を使用します。Codex Sandbox の実行中に original workspace を読めないことの主境界は、この cooperative lock ではなく Sandbox の実効 OS filesystem capability です。lock を知らない同一-user process が original workspace を変更しても、Sandbox child は変更後 bytes を参照できません。
 
-- Fixed ADB reads execute without the workspace-wide mutation lock. There is no automatic Git child in the current release.
-- Approved code-loading commands in immutable `staged-cwd` snapshot mode, including test/build-style execution, run without the workspace-wide mutation lock because they execute from `data_dir`, not the original workspace.
-- A Codex Sandbox or Approved Host command marked `workspace_write=true`, and approved commands that still execute against the original workspace, keep the exclusive workspace-wide mutation lock through verification and child execution.
-- Snapshot/manifest creation may still take the workspace-wide lock briefly so the captured input set is coherent.
-- `write_file` uses one target slot rather than all slots, so unrelated file writes can proceed concurrently while still conflicting with workspace-wide writers.
-- Old approval rows that do not contain explicit snapshot metadata fail conservatively and keep the workspace-wide lock.
-
-This permits long-running isolated tests/builds, read-only analysis, and unrelated target writes to overlap without weakening the source-write boundary.
+- snapshot／manifest 作成は workspace-wide lock 下で coherent input set を取得します。
+- Approved Sandbox／Approved Host は実行前 binding 検証から child／descendant 終了まで workspace-wide Broker mutation lock を保持します。
+- `write_file` は target slot を使用するため、workspace-wide approved execution と必ず競合します。
+- non-cooperating process に対する source isolation は Codex Sandbox の source-workspace deny で担保し、Approved Host には同じ保証を表示しません。
 
 ## 5. Approval and immutable execution
 
@@ -147,27 +144,22 @@ Approval binding version 3 hashes the complete canonical security-sensitive requ
 
 ### Snapshot mode
 
-Code-loading commands that do not need to mutate the source run from an immutable copy of their `cwd`. Paths outside `cwd` are not reachable through the original workspace because:
+Codex Sandbox の open-ended execution は program 名の allowlist に依存せず、原則として bounded な workspace-wide snapshot projection から実行します。projection は original workspace の相対 layout と requested cwd を保持し、worker は immutable projection を検証後、operation 固有の writable `runs/<operation>/workspace` へ materialize します。
 
-- standalone workspace paths are rewritten to the copy;
-- embedded workspace paths and external code-loader paths are rejected;
-- symlink/junction/reparse/hardlink entries are rejected;
-- MCP configuration variables and language/module injection variables are removed from the child environment;
-- HOME/USERPROFILE/APPDATA/LOCALAPPDATA/TEMP/PUB_CACHE point to an operation-local runtime directory;
-- file-based Dart/Flutter package dependencies outside `cwd` are copied and `package_config.json` is rewritten;
-- non-file or non-enumerable dependencies fail closed.
+- original `workspace_root` は Sandbox filesystem policy で parent／child／grandchildから read／write deny にする。
+- workspace-relative argv は snapshot/run projection へ書き換える。source absolute path が code 本文に残っていても original workspace は OS capability で読めない。
+- `.git`、`.env` 等の protected file、`.venv`、`node_modules`、`build`、`__pycache__` は ordinary snapshot へ自動追加しない。
+- Dart／Flutter の file package dependency は既存の bounded dependency staging と package-config rewrite を維持する。
+- trusted toolchain primary executable は workspace／data／scratch 外に置き、明示的 external dependency もこれら protected root と重ならないことを設定時と policy construction 時に検査する。
+- file count、byte count、scratch quota、reparse／hardlink／ADS 等の既存 bound を越える projection は fail closed にする。
 
-Protected file names and generated/dependency trees such as `.venv`, `node_modules`, `build`, and `__pycache__` are excluded from ordinary staging. An exclusion is not treated as an OS read-denial property: execution remains unavailable unless current-backend live evidence independently verifies direct protected-information denial and source/outside-user filesystem boundaries for descendants as well as the initial process.
-
-The immutable copy is verified after local approval. The worker then creates a separate writable disposable run copy, so build artifacts cannot mutate the approved input copy. Unrelated workspace changes outside the approved `cwd` do not invalidate snapshot execution. Snapshot-backed child execution does not hold the workspace-wide mutation lock.
-
-Installed OS/toolchains are the trusted computing base. Their primary executable is content-bound. Complete OS DLL/toolchain virtualization is not provided.
+Sandbox filesystem policy generation の変更は live-verification context digest を変更し、旧 marker を stale にします。新 policy では `source_workspace_read_denied` と protected-information denial を親・child・grandchildで実測し、必須境界が成立しない installed backend では route を unavailable にします。
 
 ### Source-write mode
 
-Commands intended to mutate the original workspace require `workspace_write=true`. The complete workspace (excluding direct `.git` bytes) is manifested, all source files are revalidated, and execution occurs while holding the workspace-wide form of the same mutation-lock family used by target writes. Any workspace addition, deletion, or content change after request invalidates approval.
+Codex Sandbox の `workspace_write=true` も original workspace 上では実行しません。同じ full snapshot projection の writable run copy を処理し、終了後に bounded output tree を検査して workspace-relative delta を抽出します。Broker は承認時 source binding と workspace-wide lock を保持したまま transaction／commit-time validation を通して delta を original workspace へ反映します。source workspace の追加・削除・content change が approval 後に発生した場合は commit 前に fail closed します。
 
-Approved Git operations bind repository metadata without invoking the disabled automatic Git Broker helper. The metadata root must be an in-workspace `.git` directory; gitfiles, reparse points, external metadata roots, non-regular entries, hardlinks, and unstable double-scan inventories fail closed. Direct `.git` MCP filesystem access remains prohibited.
+Approved Host の non-project-code-loader operation は real Windows user authority が必要な場合に限り別承認で利用できますが、Codex Sandbox と同じ source-read isolation を保証しません。
 
 ### Expiry and one-shot semantics
 

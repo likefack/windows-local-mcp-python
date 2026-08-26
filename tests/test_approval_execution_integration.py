@@ -197,8 +197,9 @@ def test_snapshot_execution_succeeds_when_bound_workspace_is_unchanged(
     )
     store.approve_and_claim("snapshot-bound-workspace", approver="integration-test")
     result = executor.launch("snapshot-bound-workspace", 30)
+    operation = store.get_operation("snapshot-bound-workspace")
 
-    assert result["status"] == "succeeded"
+    assert result["status"] == "succeeded", operation
     assert "SNAPSHOT RUNS INDEPENDENTLY" in result["stdout_preview"]
 
 
@@ -393,8 +394,9 @@ def test_approved_host_allows_legitimate_descendant_to_finish(tmp_path: Path, mo
     store.approve_and_claim("approved-host-legitimate-descendant", approver="integration-test")
     started = time.monotonic()
     result = executor.launch("approved-host-legitimate-descendant", 30)
+    operation = store.get_operation("approved-host-legitimate-descendant")
 
-    assert result["status"] == "succeeded"
+    assert result["status"] == "succeeded", operation
     assert time.monotonic() - started >= 0.4
     assert output.read_text(encoding="utf-8") == "finished"
 
@@ -433,7 +435,8 @@ def test_approved_host_terminates_descendants_at_runtime_limit(tmp_path: Path, m
     store.approve_and_claim("approved-host-descendant-timeout", approver="integration-test")
     result = executor.launch("approved-host-descendant-timeout", 10)
     time.sleep(1.5)
+    operation = store.get_operation("approved-host-descendant-timeout")
 
-    assert result["status"] == "timed_out"
+    assert result["status"] == "timed_out", operation
     assert result["failure_class"] == "runtime_limit"
     assert not late_write.exists()

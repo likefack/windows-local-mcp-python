@@ -18,7 +18,11 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver import Image
 from mcp.types import ToolAnnotations
 
-from .approval import prepare_approval_bundle, settings_digest
+from .approval import (
+    is_project_controlled_code_loader,
+    prepare_approval_bundle,
+    settings_digest,
+)
 from .audit import AuditStore
 from .command_traits import (
     SafeExecutionKind,
@@ -44,6 +48,7 @@ from .policy import CommandPolicy, NormalizedCommand, approved_request_hash
 from .redaction import redact_command_args, redact_text
 from .resources import NamedControlPlaneLock, WorkspaceExecutionLock, enforce_data_quota
 from .risk import command_risk_facts
+from .runtime_immutability import assert_approved_host_runtime_immutable
 from .sandbox_backend import (
     SANDBOX_LIVE_MARKER_VERSION,
     SANDBOX_SECURITY_PROPERTIES,
@@ -385,6 +390,43 @@ def _codex_sandbox_capability() -> dict[str, Any]:
     return status
 
 
+def _approved_host_capability() -> dict[str, Any]:
+    status: dict[str, Any] = {
+        "configured": runtime.settings.approved_host_enabled,
+        "enabled": runtime.settings.approved_host_enabled,
+        "available": False,
+        "live_verified": False,
+        "windows_live_verified": False,
+        "execution_time_recheck": True,
+        "runtime_preflight": {"status": "not_run"},
+    }
+    if not runtime.settings.approved_host_enabled:
+        status["unavailable_reason"] = "disabled by configuration"
+        return status
+    try:
+        evidence = assert_approved_host_runtime_immutable()
+    except Exception as error:  # noqa: BLE001 - capability display must remain available
+        message = redact_text(f"{type(error).__name__}: {error}")
+        status["unavailable_reason"] = message
+        status["runtime_preflight"] = {"status": "failed", "error": message}
+        return status
+
+    status["available"] = True
+    status["live_verified"] = True
+    status["windows_live_verified"] = os.name == "nt"
+    status["runtime_preflight"] = {
+        "status": "passed",
+        "version": evidence.get("version"),
+        "scope": evidence.get("scope"),
+        "path_count": evidence.get("path_count"),
+        "file_count": evidence.get("file_count"),
+        "directory_count": evidence.get("directory_count"),
+        "ancestor_directory_count": evidence.get("ancestor_directory_count"),
+        "digest": evidence.get("digest"),
+    }
+    return status
+
+
 def _broker_helper_capability(program_key: str, enabled: bool) -> dict[str, Any]:
     configured = bool(
         getattr(runtime.settings, f"{program_key}_executable_path")
@@ -417,6 +459,7 @@ def session_info() -> dict[str, Any]:
     codex_sandbox = _codex_sandbox_capability()
     git_helper = _broker_helper_capability("git", runtime.settings.git_enabled)
     adb_helper = _broker_helper_capability("adb", runtime.settings.adb_enabled)
+    approved_host = _approved_host_capability()
     result = {
         "workspace_root": str(runtime.settings.workspace_root),
         "data_dir": str(runtime.settings.data_dir),
@@ -474,12 +517,7 @@ def session_info() -> dict[str, Any]:
                 "codex_sandbox": codex_sandbox,
                 "git_broker_helper": git_helper,
                 "adb_broker_helper": adb_helper,
-                "approved_host": {
-                    "configured": runtime.settings.approved_host_enabled,
-                    "enabled": runtime.settings.approved_host_enabled,
-                    "available": runtime.settings.approved_host_enabled and os.name == "nt",
-                    "live_verified": False,
-                },
+                "approved_host": approved_host,
             },
         },
         "architecture": {
@@ -2346,6 +2384,36 @@ def _request_approved_command(
         normalized = runtime.policy.normalize_host(
             command=command, cwd=cwd, network_expected=network_required
         )
+        executable_path = Path(normalized.executable).resolve(strict=True)
+        assert runtime.settings.sandbox_scratch_dir is not None
+
+        def executable_inside(root: Path) -> bool:
+            try:
+                executable_path.relative_to(root.resolve(strict=True))
+                return True
+            except ValueError:
+                return False
+
+        if execution_tier == "approved_host" and (
+            is_project_controlled_code_loader(normalized.program_key)
+            or executable_inside(runtime.settings.workspace_root)
+        ):
+            raise PermissionError(
+                "project-controlled code is not eligible for Approved Host; "
+                "use request_sandbox_command"
+            )
+        if execution_tier == "codex_sandbox" and any(
+            executable_inside(root)
+            for root in (
+                runtime.settings.workspace_root,
+                runtime.settings.data_dir,
+                runtime.settings.sandbox_scratch_dir,
+            )
+        ):
+            raise PermissionError(
+                "Codex Sandbox primary executable must be a trusted toolchain outside "
+                "workspace_root, data_dir, and sandbox_scratch_dir"
+            )
         backend: dict[str, Any] | None = None
         sandbox_policy: dict[str, Any] | None = None
         backend_digest: str | None = None
@@ -2367,6 +2435,7 @@ def _request_approved_command(
                 operation_id=operation_id,
                 normalized=normalized,
                 workspace_write=workspace_write,
+                snapshot_workspace=execution_tier == "codex_sandbox",
             )
         now = datetime.now(UTC)
         request_expires_at = (

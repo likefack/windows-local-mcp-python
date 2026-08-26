@@ -25,7 +25,8 @@ from .resources import (
 )
 from .util import canonical_json, sha256_bytes, sha256_text
 
-_CODE_LOADERS = {
+PROJECT_CONTROLLED_CODE_LOADERS = frozenset(
+    {
     "python",
     "python3",
     "py",
@@ -40,7 +41,13 @@ _CODE_LOADERS = {
     "cmd",
     "bash",
     "sh",
-}
+    }
+)
+_CODE_LOADERS = PROJECT_CONTROLLED_CODE_LOADERS
+
+
+def is_project_controlled_code_loader(program_key: str) -> bool:
+    return program_key in PROJECT_CONTROLLED_CODE_LOADERS
 
 
 class _EntryBudget:
@@ -110,6 +117,7 @@ def prepare_approval_bundle(
     operation_id: str,
     normalized: NormalizedCommand,
     workspace_write: bool = False,
+    snapshot_workspace: bool = False,
 ) -> tuple[NormalizedCommand, dict[str, Any], str]:
     """Bind approval to executable bytes and immutable copies of behavior inputs."""
     manifest_root = settings.data_dir / "approval-staging" / operation_id
@@ -128,7 +136,7 @@ def prepare_approval_bundle(
         allow_hardlinks=True,
     )
     manifest: dict[str, Any] = {
-        "version": 2,
+        "version": 3,
         "operation_id": operation_id,
         "executable": executable_record,
         "settings_digest": settings_digest(settings),
@@ -149,7 +157,60 @@ def prepare_approval_bundle(
         )
         manifest["workspace_write"] = workspace_write
 
-        if normalized.program_key in _CODE_LOADERS:
+        if snapshot_workspace:
+            source_workspace = workspace.root
+            source_cwd = Path(normalized.cwd).resolve(strict=True)
+            relative_cwd = source_cwd.relative_to(source_workspace)
+            staged_workspace = stage_root / "workspace"
+            records = _copy_tree_bounded(
+                source=source_workspace,
+                destination=staged_workspace,
+                settings=settings,
+                workspace=workspace,
+                entry_budget=entry_budget,
+            )
+            staged_cwd = staged_workspace / relative_cwd
+            if not staged_cwd.is_dir():
+                raise RuntimeError("Sandbox snapshot does not contain the requested cwd")
+            manifest["mode"] = (
+                "staged-sandbox-workspace-write"
+                if workspace_write
+                else "staged-sandbox-workspace"
+            )
+            manifest["source_workspace"] = str(source_workspace)
+            manifest["staged_workspace"] = str(staged_workspace)
+            manifest["source_cwd"] = str(source_cwd)
+            manifest["staged_cwd"] = str(staged_cwd)
+            manifest["inputs"] = records
+            execution.cwd = str(staged_cwd)
+            execution.args = [
+                _rewrite_workspace_argument(value, source_workspace, staged_workspace)
+                for value in execution.args
+            ]
+            if normalized.program_key in {"dart", "flutter"}:
+                dependency_records = _stage_dart_package_dependencies(
+                    source_cwd=source_cwd,
+                    staged_cwd=staged_cwd,
+                    stage_root=stage_root,
+                    settings=settings,
+                    workspace=workspace,
+                    records=records,
+                    entry_budget=entry_budget,
+                )
+                records.extend(dependency_records)
+                manifest["inputs"] = records
+            _enforce_manifest_totals(records, settings)
+            manifest["source_workspace_binding"] = _broker_mutable_workspace_binding(
+                source=source_workspace,
+                settings=settings,
+                workspace=workspace,
+            )
+            root_text = str(source_workspace).casefold()
+            if any(root_text in value.casefold() for value in execution.args):
+                raise PermissionError(
+                    "embedded workspace paths cannot be safely rewritten for immutable execution"
+                )
+        elif normalized.program_key in _CODE_LOADERS:
             source_cwd = Path(normalized.cwd)
             staged_cwd = stage_root / "cwd"
             records = _copy_tree_bounded(
@@ -245,7 +306,7 @@ def verify_approval_bundle(
     actual_digest = sha256_text(canonical_json(manifest))
     if stored_digest != expected_digest or actual_digest != expected_digest:
         raise RuntimeError("approval manifest digest mismatch")
-    if manifest.get("version") != 2:
+    if manifest.get("version") != 3:
         raise RuntimeError("approval manifest uses an unsupported version")
     if manifest.get("settings_digest") != settings_digest(settings):
         raise RuntimeError("effective MCP settings changed after approval was requested")
@@ -271,7 +332,10 @@ def verify_approval_bundle(
         current = _file_record(staged)
         if current["sha256"] != record["sha256"] or current["size"] != record["size"]:
             raise RuntimeError("approved input changed after approval was requested")
-    if manifest.get("mode") == "staged-workspace-write":
+    if manifest.get("mode") in {
+        "staged-workspace-write",
+        "staged-sandbox-workspace-write",
+    }:
         for record in manifest.get("inputs", []):
             source_value = record.get("source_path")
             if not source_value:
@@ -286,7 +350,12 @@ def verify_approval_bundle(
             )
             if current["sha256"] != record["sha256"] or current["size"] != record["size"]:
                 raise RuntimeError("workspace files changed after formatting was staged")
-    if manifest.get("mode") in {"staged-cwd", "staged-workspace-write"}:
+    if manifest.get("mode") in {
+        "staged-cwd",
+        "staged-workspace-write",
+        "staged-sandbox-workspace",
+        "staged-sandbox-workspace-write",
+    }:
         expected_binding = manifest.get("source_workspace_binding")
         if not isinstance(expected_binding, dict):
             raise RuntimeError("staged approval has no live workspace binding")
@@ -329,32 +398,60 @@ def verify_approval_bundle(
 def materialize_execution_copy(
     *, settings: Settings, operation_id: str, normalized: NormalizedCommand
 ) -> NormalizedCommand:
-    """Create a disposable writable run tree from a verified immutable cwd snapshot."""
+    """Create a disposable writable run tree from a verified immutable snapshot."""
     manifest_root = (settings.data_dir / "approval-staging" / operation_id).resolve(strict=True)
     manifest = json.loads((manifest_root / "manifest.json").read_text(encoding="utf-8"))
     stage_root = Path(str(manifest["execution_staging_root"])).resolve(strict=True)
     assert settings.sandbox_scratch_dir is not None
     stage_root.relative_to((settings.sandbox_scratch_dir / "approval-inputs").resolve(strict=True))
     immutable_cwd = Path(normalized.cwd).resolve(strict=True)
-    expected_cwd = Path(str(manifest.get("staged_cwd", stage_root / "cwd")))
-    if immutable_cwd != expected_cwd.resolve(strict=True):
+    expected_cwd = Path(str(manifest.get("staged_cwd", stage_root / "cwd"))).resolve(
+        strict=True
+    )
+    if immutable_cwd != expected_cwd:
         return normalized
+
     _enforce_sandbox_scratch_quota(settings, admission=True)
     run_root = settings.sandbox_scratch_dir / "runs" / operation_id
     if run_root.exists():
         shutil.rmtree(run_root)
     run_root.mkdir(parents=True)
-    run_cwd = run_root / "cwd"
     entry_budget = _EntryBudget(settings)
+    mode = str(manifest.get("mode", ""))
     try:
-        _copy_external_tree_bounded(
-            source=immutable_cwd,
-            destination=run_cwd,
-            settings=settings,
-            entry_budget=entry_budget,
-            charge_data_dir=False,
-        )
-        _make_writable(run_cwd)
+        if mode in {"staged-sandbox-workspace", "staged-sandbox-workspace-write"}:
+            immutable_workspace = Path(str(manifest["staged_workspace"])).resolve(strict=True)
+            immutable_workspace.relative_to(stage_root)
+            source_workspace = Path(str(manifest["source_workspace"])).resolve(strict=True)
+            source_cwd = Path(str(manifest["source_cwd"])).resolve(strict=True)
+            relative_cwd = source_cwd.relative_to(source_workspace)
+            run_workspace = run_root / "workspace"
+            _copy_external_tree_bounded(
+                source=immutable_workspace,
+                destination=run_workspace,
+                settings=settings,
+                entry_budget=entry_budget,
+                charge_data_dir=False,
+            )
+            _make_writable(run_workspace)
+            run_cwd = run_workspace / relative_cwd
+            if not run_cwd.is_dir():
+                raise RuntimeError("runtime workspace does not contain the approved cwd")
+            rewrite_source = immutable_workspace
+            rewrite_destination = run_workspace
+        else:
+            run_cwd = run_root / "cwd"
+            _copy_external_tree_bounded(
+                source=immutable_cwd,
+                destination=run_cwd,
+                settings=settings,
+                entry_budget=entry_budget,
+                charge_data_dir=False,
+            )
+            _make_writable(run_cwd)
+            rewrite_source = immutable_cwd
+            rewrite_destination = run_cwd
+
         immutable_dependencies = stage_root / "dependencies"
         if immutable_dependencies.exists():
             run_dependencies = run_root / "dependencies"
@@ -393,7 +490,7 @@ def materialize_execution_copy(
         raise
     result = normalized.model_copy(deep=True)
     result.args = [
-        _rewrite_workspace_argument(value, immutable_cwd, run_cwd)
+        _rewrite_workspace_argument(value, rewrite_source, rewrite_destination)
         for value in result.args
     ]
     result.cwd = str(run_cwd)
@@ -406,25 +503,34 @@ def collect_staged_workspace_changes(
     """Validate a disposable run tree and return its closed-world workspace delta."""
     stage_root = (settings.data_dir / "approval-staging" / operation_id).resolve(strict=True)
     manifest = json.loads((stage_root / "manifest.json").read_text(encoding="utf-8"))
-    if manifest.get("mode") != "staged-workspace-write":
+    mode = str(manifest.get("mode", ""))
+    if mode not in {"staged-workspace-write", "staged-sandbox-workspace-write"}:
         return {}, set()
-    run_cwd = Path(normalized.cwd).resolve(strict=True)
     assert settings.sandbox_scratch_dir is not None
     runtime_root = (settings.sandbox_scratch_dir / "runs" / operation_id).resolve(strict=True)
-    run_cwd.relative_to(runtime_root)
-    staged_cwd = Path(str(manifest["staged_cwd"])).resolve(strict=True)
-    source_cwd = Path(str(manifest["source_cwd"])).resolve(strict=True)
+    normalized_cwd = Path(normalized.cwd).resolve(strict=True)
+    normalized_cwd.relative_to(runtime_root)
+
+    if mode == "staged-sandbox-workspace-write":
+        staged_base = Path(str(manifest["staged_workspace"])).resolve(strict=True)
+        source_base = Path(str(manifest["source_workspace"])).resolve(strict=True)
+        run_base = (runtime_root / "workspace").resolve(strict=True)
+    else:
+        staged_base = Path(str(manifest["staged_cwd"])).resolve(strict=True)
+        source_base = Path(str(manifest["source_cwd"])).resolve(strict=True)
+        run_base = normalized_cwd
+
     records: dict[str, dict[str, Any]] = {}
     for record in manifest.get("inputs", []):
         staged_path = Path(str(record["staged_path"])).resolve(strict=True)
         try:
-            relative = staged_path.relative_to(staged_cwd).as_posix()
+            relative = staged_path.relative_to(staged_base).as_posix()
         except ValueError:
             continue
         records[relative] = record
     runtime_entry_limit = max(128, settings.approval_manifest_max_files * 4)
     runtime_scan = scan_directory_bounded(
-        run_cwd,
+        run_base,
         stop_after_bytes=settings.approval_manifest_max_bytes,
         stop_after_entries=runtime_entry_limit,
         collect_files=True,
@@ -435,14 +541,14 @@ def collect_staged_workspace_changes(
         raise RuntimeError("sandbox processing created too many runtime filesystem entries")
     if runtime_scan.total_bytes > settings.approval_manifest_max_bytes:
         raise RuntimeError("sandbox outputs exceed approval_manifest_max_bytes")
-    actual_files = {path.relative_to(run_cwd).as_posix() for path in runtime_scan.files}
+    actual_files = {path.relative_to(run_base).as_posix() for path in runtime_scan.files}
     changes: dict[str, bytes] = {}
     deletions: set[str] = set()
     changed_bytes = 0
     workspace = Workspace(settings)
     for relative in sorted(actual_files):
-        candidate = (run_cwd / Path(relative)).resolve(strict=True)
-        candidate.relative_to(run_cwd)
+        candidate = (run_base / Path(relative)).resolve(strict=True)
+        candidate.relative_to(run_base)
         if candidate.is_symlink() or candidate.stat().st_nlink > 1:
             raise PermissionError("sandbox output contains an unsafe file")
         size = candidate.stat().st_size
@@ -453,14 +559,18 @@ def collect_staged_workspace_changes(
             raise ValueError("sandbox outputs exceed approval_manifest_max_bytes")
         data = candidate.read_bytes()
         record = records.get(relative)
-        if record is not None and sha256_bytes(data) == record["sha256"] and len(data) == int(record["size"]):
+        if (
+            record is not None
+            and sha256_bytes(data) == record["sha256"]
+            and len(data) == int(record["size"])
+        ):
             continue
-        source = source_cwd / Path(relative)
+        source = source_base / Path(relative)
         workspace_relative = source.relative_to(workspace.root).as_posix()
         workspace.resolve_planned_write(workspace_relative)
         changes[workspace_relative] = data
     for relative in sorted(set(records) - actual_files):
-        source = source_cwd / Path(relative)
+        source = source_base / Path(relative)
         workspace_relative = source.relative_to(workspace.root).as_posix()
         workspace.resolve_existing(workspace_relative, allow_directory=False, access="write")
         deletions.add(workspace_relative)

@@ -21,12 +21,14 @@ from windows_local_mcp.wfp_guard import (
 )
 
 MANDATORY_DESCENDANT_CHECKS = (
+    "child_source_workspace_read_denied",
     "child_source_workspace_write_denied",
     "child_outside_user_read_denied",
     "child_control_plane_read_denied",
     "child_control_plane_write_denied",
     "child_internet_denied",
     "child_loopback_denied",
+    "grandchild_source_workspace_read_denied",
     "grandchild_source_workspace_write_denied",
     "grandchild_outside_user_read_denied",
     "grandchild_control_plane_read_denied",
@@ -81,15 +83,14 @@ def _accepted_residual_risk_evidence(
     properties = {
         name: {"status": "verified"} for name in SANDBOX_SECURITY_PROPERTIES
     }
-    properties["protected_information_read"] = {"status": "failed"}
     properties["lan"] = {"status": "failed"}
     properties["descendant_containment"] = {"status": "failed"}
     checks = {name: True for name in MANDATORY_DESCENDANT_CHECKS}
     checks.update(
         {
-            "child_protected_information_denied": False,
+            "child_protected_information_denied": True,
             "child_lan_denied": False,
-            "grandchild_protected_information_denied": False,
+            "grandchild_protected_information_denied": True,
             "grandchild_lan_denied": False,
         }
     )
@@ -121,7 +122,7 @@ def _accepted_residual_risk_evidence(
     }
 
 
-def test_accepted_workspace_secret_and_lan_failures_do_not_block_route(
+def test_only_accepted_lan_failures_do_not_block_route(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     settings = _settings(tmp_path)
@@ -138,7 +139,7 @@ def test_accepted_workspace_secret_and_lan_failures_do_not_block_route(
     marker = settings.data_dir / "control-plane" / "sandbox-live-verification.json"
     marker.write_text(canonical_json(evidence), encoding="utf-8")
     accepted = require_codex_sandbox_live_verification(settings, backend)
-    assert accepted["properties"]["protected_information_read"]["status"] == "failed"
+    assert accepted["properties"]["protected_information_read"]["status"] == "verified"
     assert accepted["properties"]["lan"]["status"] == "failed"
 
 
@@ -155,6 +156,28 @@ def test_mandatory_descendant_failure_still_fails_closed(
     checks = evidence["checks"]
     assert isinstance(checks, dict)
     checks["child_loopback_denied"] = False
+
+    assert sandbox_live_verification_route_eligible(evidence) is False
+
+    marker = settings.data_dir / "control-plane" / "sandbox-live-verification.json"
+    marker.write_text(canonical_json(evidence), encoding="utf-8")
+    with pytest.raises(ApprovedSandboxUnavailable, match="missing, failed, or stale"):
+        require_codex_sandbox_live_verification(settings, backend)
+
+
+def test_workspace_protected_information_failure_blocks_route(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    monkeypatch.setattr(
+        "windows_local_mcp.sandbox_backend.resolve_sandbox_account_identity",
+        _account_identity,
+    )
+    backend = _backend(tmp_path)
+    evidence = _accepted_residual_risk_evidence(settings, backend)
+    properties = evidence["properties"]
+    assert isinstance(properties, dict)
+    properties["protected_information_read"] = {"status": "failed"}
 
     assert sandbox_live_verification_route_eligible(evidence) is False
 
