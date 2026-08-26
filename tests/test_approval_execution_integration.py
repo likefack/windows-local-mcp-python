@@ -434,7 +434,10 @@ def test_approved_host_terminates_descendants_at_runtime_limit(tmp_path: Path, m
     )
     store.approve_and_claim("approved-host-descendant-timeout", approver="integration-test")
     result = executor.launch("approved-host-descendant-timeout", 10)
-    time.sleep(1.5)
+    deadline = time.monotonic() + 20.0
+    while result["status"] in {"queued", "running"} and time.monotonic() < deadline:
+        time.sleep(0.05)
+        result = executor.poll("approved-host-descendant-timeout")
     operation = store.get_operation("approved-host-descendant-timeout")
 
     assert result["status"] == "timed_out", operation
