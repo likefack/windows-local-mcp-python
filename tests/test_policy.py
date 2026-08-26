@@ -234,6 +234,41 @@ def test_rejects_generic_or_destructive_adb(
         policy.normalize_safe(program="adb", args=args, cwd=".")
 
 
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["-s", "emulator-5554", "get-state"],
+        ["-s", "emulator-5554", "shell", "dumpsys", "battery"],
+        ["-s", "emulator-5554", "exec-out", "screencap", "-p"],
+    ],
+)
+def test_adb_empty_allowlist_rejects_fixed_reads(
+    tmp_path: Path, fake_tools: Path, args: list[str]
+) -> None:
+    settings = make_settings(tmp_path, adb_enabled=True, adb_allowed_serials=[])
+    policy = CommandPolicy(settings, Workspace(settings))
+
+    with pytest.raises(PermissionError, match="explicitly allowlisted target"):
+        policy.normalize_safe(program="adb", args=args, cwd=".")
+
+
+def test_adb_explicit_allowlist_accepts_fixed_target_get_state(
+    tmp_path: Path, fake_tools: Path
+) -> None:
+    settings = make_settings(
+        tmp_path,
+        adb_enabled=True,
+        adb_allowed_serials=["emulator-5554"],
+    )
+    policy = CommandPolicy(settings, Workspace(settings))
+
+    command = policy.normalize_safe(
+        program="adb", args=["-s", "emulator-5554", "get-state"], cwd="."
+    )
+
+    assert command.args == ["-s", "emulator-5554", "get-state"]
+
+
 def test_adb_emulator_read_and_screenshot_remain_automatic(
     tmp_path: Path, fake_tools: Path
 ) -> None:
