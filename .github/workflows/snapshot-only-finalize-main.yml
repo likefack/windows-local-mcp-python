@@ -56,16 +56,14 @@ jobs:
             'VERIFICATION.md',
             'src/windows_local_mcp/approval.py',
             'src/windows_local_mcp/config.py',
-            'src/windows_local_mcp/process_utils.py',
             'src/windows_local_mcp/sandbox_backend.py',
             'src/windows_local_mcp/sandbox_live_verify.py',
             'src/windows_local_mcp/server.py',
-            'src/windows_local_mcp/worker.py',
+            'tests/conftest.py',
             'tests/test_approval.py',
             'tests/test_approval_execution_integration.py',
             'tests/test_broker_architecture.py',
             'tests/test_mcp_stdio_integration.py',
-            'tests/test_resources_and_processes.py',
             'tests/test_sandbox_architecture.py',
             'tests/test_sandbox_contract_residual_risks.py',
             'tests/test_server_operations.py'
@@ -94,9 +92,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m pytest -q tests/test_approved_host_audit_integrity.py -k "approved_host_trusted_audit_updates_remain_valid or control_plane_tamper"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m pytest -q tests/test_broker_architecture.py -k "host_guard_binds_current_operation_approval_state"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python -m pytest -q tests/test_resources_and_processes.py -k "capture_process_identity_uses_durable_millisecond_timestamp or process_identity_matches_stable_worker"
+          python -m pytest -q tests/test_broker_architecture.py -k "host_guard_tracks_trusted_operation_approval_state"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Full regression suite
@@ -128,7 +124,7 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git rm .github/fix_snapshot_only.py .github/fix_snapshot_only_followup.py .github/fix_snapshot_only_remaining.py .github/workflows/snapshot-only-finalize-main.yml
-          git add README.md SECURITY_CONTRACT.md SPEC.md VERIFICATION.md src/windows_local_mcp/approval.py src/windows_local_mcp/config.py src/windows_local_mcp/process_utils.py src/windows_local_mcp/sandbox_backend.py src/windows_local_mcp/sandbox_live_verify.py src/windows_local_mcp/server.py src/windows_local_mcp/worker.py tests/test_approval.py tests/test_approval_execution_integration.py tests/test_broker_architecture.py tests/test_mcp_stdio_integration.py tests/test_resources_and_processes.py tests/test_sandbox_architecture.py tests/test_sandbox_contract_residual_risks.py tests/test_server_operations.py
+          git add README.md SECURITY_CONTRACT.md SPEC.md VERIFICATION.md src/windows_local_mcp/approval.py src/windows_local_mcp/config.py src/windows_local_mcp/sandbox_backend.py src/windows_local_mcp/sandbox_live_verify.py src/windows_local_mcp/server.py tests/conftest.py tests/test_approval.py tests/test_approval_execution_integration.py tests/test_broker_architecture.py tests/test_mcp_stdio_integration.py tests/test_sandbox_architecture.py tests/test_sandbox_contract_residual_risks.py tests/test_server_operations.py
           git diff --cached --check
           if (git status --porcelain | Select-String '^\?\?') { throw 'unexpected untracked files before final commit' }
           git commit -m 'Sandbox承認実行を隔離'
