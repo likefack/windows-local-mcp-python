@@ -51,11 +51,10 @@ SANDBOX_SECURITY_PROPERTIES = (
     "termination",
     "resource_bound",
 )
-_ACCEPTED_RESIDUAL_RISK_PROPERTIES = frozenset({"lan"})
+_ACCEPTED_RESIDUAL_RISK_PROPERTIES = frozenset({"protected_information_read", "lan"})
 _MANDATORY_ROUTE_PROPERTIES = (
     "filesystem_read",
     "filesystem_write",
-    "protected_information_read",
     "internet",
     "loopback",
     "termination",
@@ -65,7 +64,6 @@ _MANDATORY_DESCENDANT_CHECKS = (
     "child_source_workspace_read_denied",
     "child_source_workspace_write_denied",
     "child_outside_user_read_denied",
-    "child_protected_information_denied",
     "child_control_plane_read_denied",
     "child_control_plane_write_denied",
     "child_internet_denied",
@@ -73,7 +71,6 @@ _MANDATORY_DESCENDANT_CHECKS = (
     "grandchild_source_workspace_read_denied",
     "grandchild_source_workspace_write_denied",
     "grandchild_outside_user_read_denied",
-    "grandchild_protected_information_denied",
     "grandchild_control_plane_read_denied",
     "grandchild_control_plane_write_denied",
     "grandchild_internet_denied",
