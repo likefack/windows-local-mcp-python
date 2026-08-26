@@ -16,6 +16,13 @@ workspace 内 protected information の read denial と LAN denial が現在の 
 未許可 loopback／localhost access は Sandbox 外の同一 host service を経由する権限迂回になり得るため、
 引き続き必須遮断境界とします。
 
+2026-08-26 改訂では、workspace-controlled な Git repository metadata が unapproved Git child の作用を
+`workspace_root` 内へ安全に閉じ込められることを実証できていないため、automatic Git Broker execution を
+capability reduction として fail closed に固定します。`git_info`／`execute_readonly` の surface が存在することや
+Git executable の path／SHA-256 が設定済みであることを、automatic Git 利用可能性の根拠にしません。
+Git process execution が必要な場合は separately human-approved route を使用し、automatic Git を再有効化する
+場合は本契約の Broker boundary を満たす metadata confinement と回帰／実機検証を先に要求します。
+
 ## 1. 適用範囲と信頼モデル
 
 1 台の Windows PC で、1 人の利用者が、1 つの明示設定された `workspace_root` を扱う
@@ -33,9 +40,11 @@ workspace 内 protected information の read denial と LAN denial が現在の 
 
 - Windows kernel と Windows security model
 - 事前に侵害されていない WLMCP runtime、Python runtime、検証済み依存 package
-- Broker が自動実行する Git／ADB 等の installed external helper と通常の trusted OS／toolchain dependency。
+- Broker が自動実行する ADB 等の installed external helper と通常の trusted OS／toolchain dependency。
   少なくとも primary executable は、署名等の provenance または trusted operator が固定した絶対 path と
   content hash／file identity を trust anchor とし、ambient PATH で名前が一致しただけでは信頼しません。
+  Git は current v1 では automatic Broker helper として利用せず、承認済み route で target executable として
+  使用する場合も同等以上の executable identity binding を必要とします。
 - provenance と必要な Windows live verification を通過した Codex Sandbox 実装
 - 明示承認を行う local user と trusted operator
 - Windows user authority が既に完全奪取されていないこと
@@ -49,9 +58,12 @@ security state を変更する攻撃は対象外ですが、通常の非管理�
 ### 2.1 WLMCP Broker
 
 WLMCP が入力、出力、対象 path、resource 上限、filesystem／network／device／外部作用を
-閉じて検証できる処理だけを直接扱います。主な対象は bounded file read/write、固定文法の
-Git 読み取り、固定対象の ADB 読み取り、binary transfer、checkpoint、transaction、
-rollback／Undo、監査です。
+閉じて検証できる処理だけを直接扱います。主な対象は bounded file read/write、固定対象の ADB 読み取り、
+binary transfer、checkpoint、transaction、rollback／Undo、監査です。
+
+Git の automatic Broker process execution は current v1 では無効です。固定文法 parser や model-facing
+surface が残っていても Git child を無承認で起動せず、`git_info` と `execute_readonly` の Git 要求は
+fail closed します。Git process execution が必要な処理は separately human-approved route へ送ります。
 
 ### 2.2 Structured Processing
 
@@ -97,6 +109,9 @@ real Windows user authority が本当に必要な処理だけを、Codex Sandbox
   security-relevant identity を固定し、実行直前の差し替え、PATH shadowing、stale identity を検出したら
   fail closed します。署名等の provenance が利用できない場合は、trusted operator が固定した executable
   identity を明示的な trust anchor とします。
+- Git は executable identity だけでは automatic Broker helper として十分とみなしません。repository metadata、
+  config、attributes、helper resolution 等の workspace-controlled behavior input を閉じ込める保証が実証される
+  まで automatic Git process execution を fail closed とし、surface／設定の存在から availability を推測しません。
 - Broker が作用を閉じられない場合は、承認済み Codex Sandbox へ送るか fail closed します。
 
 ### C. Open-ended execution
@@ -239,8 +254,9 @@ staging からの除外、stdout／stderr の redaction、network deny は補助
 
 ### K. Protected information
 
-- policy で保護した `.env`、credential、secret を Broker read、automatic Git／diff／snapshot、audit／UI、
-  Sandbox staging、artifact processing から意図せず model へ露出させません。
+- policy で保護した `.env`、credential、secret を Broker read、automatic helper／snapshot、audit／UI、
+  Sandbox staging、artifact processing から意図せず model へ露出させません。automatic Git Broker は current v1
+  では無効であり、将来再有効化する場合もこの protected-information boundary を満たす必要があります。
 - workspace 外の protected path は、Codex Sandbox process とその descendant からも実効 OS capability で
   直接読めないことを必要とします。
 - workspace 内 protected information は Sandbox staging へ自動追加しませんが、open-ended execution が
@@ -309,6 +325,11 @@ transport も capability truthfulness の対象です。stdio／HTTP 等の各 t
 `enabled`、`available` と実効 authentication／principal 前提を区別し、startup validation が拒否する状態を
 利用可能であるかのように session／UI／documentation へ表示しません。
 
+Git も capability truthfulness の対象です。`git_enabled=true`、Git executable path/hash の設定、または
+`git_info`／`execute_readonly` surface の公開を automatic Git availability と同一視しません。current v1 の
+automatic Git Broker execution は fail closed であり、その状態を session／UI／documentation で利用可能と
+表示しません。
+
 過去の結果、mock、static test、direct ADB、stdio integration を、現在の commit に対する Windows live、
 MCP ADB E2E、Tunnel、deployment の代替にしません。
 
@@ -324,6 +345,7 @@ MCP ADB E2E、Tunnel、deployment の代替にしません。
 - stale approval、replay、double execution、cancel race、ordinary TOCTOU
 - crash／timeout／cancellation、stale source／destination、path／filesystem race
 - Broker helper の PATH shadowing、差し替え、stale executable identity
+- Git automatic execution を再有効化する場合の repository metadata confinement と capability 表示の不一致
 - Codex Sandbox の workspace 外 read／write／Internet／loopback／control-plane／必須 descendant boundary 不足
 - ordinary non-admin Windows user 権限で成立する現実的な攻撃
 - common project layout で起こる機能破綻、通常操作での重大 UX 破綻
@@ -361,6 +383,7 @@ MCP ADB E2E、Tunnel、deployment の代替にしません。
 | 重点確認項目 | 主な契約項目 |
 | --- | --- |
 | Broker helper executable の provenance／path／hash／file identity と差し替え耐性 | A, B, O |
+| automatic Git Broker の repository metadata confinement と fail-closed capability 表示 | B, K, O |
 | legacy `:workspace` と `workspace_write=false` の実効 filesystem boundary | C, D, O |
 | workspace 外 protected information の read denial | D, K, O |
 | workspace 内 `.env`／credential／secret の直接 read は受容済み残存 risk として正確に表示されるか | D, K, O |
