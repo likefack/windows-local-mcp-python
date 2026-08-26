@@ -1,5 +1,13 @@
 # 検証記録
 
+## 2026-08-27 Structured Processing resource admission
+
+- CSV／TSV は全行 `list` 化より前に `csv.reader` を逐次走査し、row／cell budget を超えた時点で fail closed する preflight を追加した。preflight 通過後だけ既存 parser／preservation path へ進む。
+- DOCX／XLSX は ZIP entry count／expanded-size admission の後、高水準 parser より前に対象 Office XML を Expat で chunk streaming し、XML element 数、nesting depth、DOCX paragraph／table-cell 数、XLSX cell 数を admission する。DTD は Office input として不要なため preflight で拒否する。
+- unsupported-feature discovery は DOCX／XLSX の XML part を同時に全 materialize せず、必要 marker を ZIP member stream 上で検索するよう変更した。既存の package-preserving rewrite と transaction／rollback 境界は変更していない。
+- 新規 regression は、oversized CSV row／blank-row count、quoted delimiter 正常系、DOCX paragraph、XLSX cell、Office XML element、malformed XML、DTD を対象とし、高水準 parser／full-document materialization より前に admission が成立することを確認する。
+- この記録を含む commit は GitHub Hosted Windows 上で新規 resource-admission regression、既存 structured-file regression、full pytest、Ruff、compileall、`git diff --check` がすべて成功した場合だけ生成する。
+
 ## 2026-08-26 Sandbox snapshot-only source isolation
 
 - Codex Sandbox の filesystem policy から original `workspace_root` の read capability を除去し、source workspace／`data_dir` を明示 deny、operation 固有 run projection だけを write root とする設計へ変更した。
