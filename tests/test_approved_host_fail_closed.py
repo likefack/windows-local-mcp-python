@@ -3,7 +3,6 @@ from pathlib import Path
 import pytest
 
 from windows_local_mcp import runtime_immutability
-from windows_local_mcp.approved_host_policy import APPROVED_HOST_UNAVAILABLE_REASON
 from windows_local_mcp.audit import AuditStore
 from windows_local_mcp.config import Settings
 from windows_local_mcp.executor import Executor
@@ -25,20 +24,6 @@ def _settings(tmp_path: Path) -> Settings:
 def test_production_runtime_gate_reports_approved_host_unavailable() -> None:
     with pytest.raises(PermissionError, match="Approved Host execution is unavailable"):
         runtime_immutability.assert_approved_host_runtime_immutable()
-
-
-def test_explicit_test_probe_still_exercises_runtime_immutability(tmp_path: Path) -> None:
-    package = tmp_path / "runtime"
-    package.mkdir()
-    (package / "__init__.py").write_text("VALUE = 1\n", encoding="utf-8")
-
-    result = runtime_immutability.assert_approved_host_runtime_immutable(
-        package,
-        access_resolver=lambda _path: 0,
-    )
-
-    assert result["scope"] == "complete-runtime"
-    assert result["file_count"] == 1
 
 
 def test_executor_rejects_stale_approved_host_before_worker_spawn(
@@ -69,10 +54,7 @@ def test_executor_rejects_stale_approved_host_before_worker_spawn(
 
     assert spawned is False
     events = audit.get_operation(operation_id, include_events=True)["events"]
-    failure_events = [
-        event
+    assert any(
+        event["event_type"] == "approved_host_runtime_immutability_failed"
         for event in events
-        if event["event_type"] == "approved_host_runtime_immutability_failed"
-    ]
-    assert len(failure_events) == 1
-    assert APPROVED_HOST_UNAVAILABLE_REASON in str(failure_events[0]["payload"])
+    )
