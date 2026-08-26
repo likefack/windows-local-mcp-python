@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from windows_local_mcp import runtime_immutability
+import windows_local_mcp.approved_host_policy as approved_host_policy
 from windows_local_mcp.approved_host_policy import APPROVED_HOST_UNAVAILABLE_REASON
 from windows_local_mcp.audit import AuditStore
 from windows_local_mcp.config import Settings
@@ -23,6 +24,21 @@ def _settings(tmp_path: Path) -> Settings:
 
 
 def test_production_runtime_gate_reports_approved_host_unavailable() -> None:
+    with pytest.raises(PermissionError, match="Approved Host execution is unavailable"):
+        runtime_immutability.assert_approved_host_runtime_immutable()
+
+
+def test_runtime_verification_only_does_not_enable_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evidence = {"scope": "complete-runtime", "digest": "test"}
+    monkeypatch.setattr(
+        approved_host_policy,
+        "_LOWER_LEVEL_RUNTIME_CHECK",
+        lambda: evidence,
+    )
+
+    assert approved_host_policy.verify_approved_host_runtime_immutability_only() == evidence
     with pytest.raises(PermissionError, match="Approved Host execution is unavailable"):
         runtime_immutability.assert_approved_host_runtime_immutable()
 
