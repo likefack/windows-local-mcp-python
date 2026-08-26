@@ -1,0 +1,57 @@
+name: Diagnose Approved Host residual failures
+
+on:
+  push:
+    branches: [tmp/approved-host-diagnosis]
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Apply snapshot candidate
+        shell: pwsh
+        run: |
+          python .github/fix_snapshot_only.py
+          python .github/fix_snapshot_only_followup.py
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[dev]"
+      - name: Run residual Approved Host tests and dump audit state
+        shell: pwsh
+        run: |
+          python -m pytest -q `
+            tests/test_approval_execution_integration.py::test_snapshot_execution_succeeds_when_bound_workspace_is_unchanged `
+            tests/test_approval_execution_integration.py::test_approved_host_allows_legitimate_descendant_to_finish `
+            tests/test_approval_execution_integration.py::test_approved_host_terminates_descendants_at_runtime_limit `
+            tests/test_approved_host_audit_integrity.py::test_approved_host_trusted_audit_updates_remain_valid
+          $pytestExit = $LASTEXITCODE
+          @'
+import json
+import sqlite3
+from pathlib import Path
+
+for database in sorted(Path('.dev-tmp').rglob('audit.db')):
+    print(f'=== {database} ===')
+    db = sqlite3.connect(database)
+    db.row_factory = sqlite3.Row
+    try:
+        rows = db.execute('SELECT id,status,error,result_json,worker_pid,child_pid FROM operations ORDER BY created_at').fetchall()
+        for row in rows:
+            print(dict(row))
+            events = db.execute('SELECT event_type,payload_json FROM events WHERE operation_id=? ORDER BY id', (row['id'],)).fetchall()
+            for event in events:
+                print('  EVENT', event['event_type'], event['payload_json'])
+    finally:
+        db.close()
+'@ | python -
+          exit $pytestExit
