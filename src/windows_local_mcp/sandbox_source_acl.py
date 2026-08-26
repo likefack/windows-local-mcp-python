@@ -16,8 +16,12 @@ _TRUSTEE_IS_UNKNOWN = 0
 _OBJECT_INHERIT_ACE = 0x01
 _CONTAINER_INHERIT_ACE = 0x02
 _INHERIT_ONLY_ACE = 0x08
+_INHERITED_ACE = 0x10
 _ACCESS_DENIED_ACE_TYPE = 0x01
 _FILE_GENERIC_READ = 0x00120089
+_FILE_GENERIC_WRITE = 0x00120116
+_FILE_GENERIC_EXECUTE = 0x001200A0
+_FILE_ALL_ACCESS = 0x001F01FF
 _GENERIC_READ = 0x80000000
 _ERROR_SUCCESS = 0
 _ACL_SIZE_INFORMATION = 2
@@ -62,6 +66,15 @@ class _AclSizeInformation(ctypes.Structure):
         ("AceCount", wintypes.DWORD),
         ("AclBytesInUse", wintypes.DWORD),
         ("AclBytesFree", wintypes.DWORD),
+    ]
+
+
+class _GenericMapping(ctypes.Structure):
+    _fields_ = [
+        ("GenericRead", wintypes.DWORD),
+        ("GenericWrite", wintypes.DWORD),
+        ("GenericExecute", wintypes.DWORD),
+        ("GenericAll", wintypes.DWORD),
     ]
 
 
@@ -146,7 +159,10 @@ def _windows_apis() -> tuple[ctypes.WinDLL, ctypes.WinDLL]:
 
 
 def _convert_sid(advapi32: ctypes.WinDLL, sid: str) -> ctypes.c_void_p:
-    advapi32.ConvertStringSidToSidW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
+    advapi32.ConvertStringSidToSidW.argtypes = [
+        wintypes.LPCWSTR,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
     advapi32.ConvertStringSidToSidW.restype = wintypes.BOOL
     pointer = ctypes.c_void_p()
     if not advapi32.ConvertStringSidToSidW(sid, ctypes.byref(pointer)) or not pointer:
@@ -187,6 +203,23 @@ def _read_dacl(
             f"GetNamedSecurityInfoW failed for source workspace: {int(code)}"
         )
     return dacl, security_descriptor
+
+
+def _mapped_file_read_mask(advapi32: ctypes.WinDLL, raw_mask: int) -> int:
+    advapi32.MapGenericMask.argtypes = [
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(_GenericMapping),
+    ]
+    advapi32.MapGenericMask.restype = None
+    mask = wintypes.DWORD(raw_mask)
+    mapping = _GenericMapping(
+        GenericRead=_FILE_GENERIC_READ,
+        GenericWrite=_FILE_GENERIC_WRITE,
+        GenericExecute=_FILE_GENERIC_EXECUTE,
+        GenericAll=_FILE_ALL_ACCESS,
+    )
+    advapi32.MapGenericMask(ctypes.byref(mask), ctypes.byref(mapping))
+    return int(mask.value)
 
 
 def _inspect_source_workspace_read_deny(
@@ -232,21 +265,16 @@ def _inspect_source_workspace_read_deny(
             header = ctypes.cast(ace_pointer, ctypes.POINTER(_AceHeader)).contents
             if header.AceType != _ACCESS_DENIED_ACE_TYPE:
                 continue
-            if header.AceFlags & _INHERIT_ONLY_ACE:
+            if header.AceFlags & (_INHERIT_ONLY_ACE | _INHERITED_ACE):
                 continue
             ace = ctypes.cast(ace_pointer, ctypes.POINTER(_AccessDeniedAce)).contents
             sid_pointer = ctypes.c_void_p(
-                int(ace_pointer.value)
-                + ctypes.sizeof(_AceHeader)
-                + ctypes.sizeof(wintypes.DWORD)
+                int(ace_pointer.value) + _AccessDeniedAce.SidStart.offset
             )
             if not advapi32.EqualSid(sid_pointer, target):
                 continue
-            mask = int(ace.Mask)
-            denies_read = bool(mask & _GENERIC_READ) or (
-                mask & _FILE_GENERIC_READ
-            ) == _FILE_GENERIC_READ
-            if not denies_read:
+            mapped_mask = _mapped_file_read_mask(advapi32, int(ace.Mask))
+            if (mapped_mask & _FILE_GENERIC_READ) != _FILE_GENERIC_READ:
                 continue
             return _ReadDenyState(
                 explicit_deny_read=True,
