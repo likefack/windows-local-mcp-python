@@ -25,14 +25,17 @@ def test_legacy_safe_rows_do_not_restore_a_fifth_policy_tier() -> None:
     assert not _requires_workspace_execution_lock(operation, request, normalized)
 
 
-def test_snapshot_backed_approved_host_does_not_lock_unrelated_workspace_writes() -> None:
-    operation: dict[str, object] = {"tier": "host_approval"}
+def test_snapshot_backed_approved_execution_holds_workspace_lock() -> None:
     request: dict[str, object] = {
         "workspace_write": False,
         "approval_manifest_summary": {"mode": "staged-cwd"},
     }
     normalized: dict[str, object] = {"program_key": "python", "args": ["main.py"]}
-    assert not _requires_workspace_execution_lock(operation, request, normalized)
+
+    for tier in ("host_approval", "approved_host", "approved_sandbox", "codex_sandbox"):
+        assert _requires_workspace_execution_lock(
+            {"tier": tier}, request, normalized
+        )
 
 
 def test_host_execution_against_real_workspace_remains_exclusive() -> None:

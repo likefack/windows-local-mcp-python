@@ -14,7 +14,6 @@ from windows_local_mcp.control_plane import control_plane_generation
 from windows_local_mcp.executor import Executor
 from windows_local_mcp.paths import Workspace
 from windows_local_mcp.policy import NormalizedCommand, approved_request_hash
-from windows_local_mcp.resources import WorkspaceExecutionLock
 from windows_local_mcp.tool_safety import capture_executable_identity
 
 
@@ -144,7 +143,7 @@ def _require_local_wmi() -> None:
         )
 
 
-def test_local_approval_launches_immutable_snapshot_once(
+def test_local_approval_rejects_changed_transitive_live_workspace_input(
     tmp_path: Path, monkeypatch
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -154,26 +153,32 @@ def test_local_approval_launches_immutable_snapshot_once(
     _write_config(workspace, data, config)
     monkeypatch.setenv("LOCAL_MCP_CONFIG", str(config))
     monkeypatch.delenv("LOCAL_MCP_ROOT", raising=False)
+    payload = workspace / "payload.py"
+    payload.write_text("print('APPROVED PAYLOAD')", encoding="utf-8")
 
     settings, store, executor = _prepare_operation(
         workspace=workspace,
         data=data,
         operation_id="approval-execution-integration",
-        script_text="print('APPROVED SNAPSHOT')",
+        script_text=(
+            "from pathlib import Path\n"
+            f"exec(Path({str(payload)!r}).read_text(encoding='utf-8'))\n"
+        ),
     )
-    script = workspace / "main.py"
-    script.write_text("print('REPLACED SOURCE')", encoding="utf-8")
+    payload.write_text("print('REPLACED PAYLOAD')", encoding="utf-8")
     store.approve_and_claim("approval-execution-integration", approver="integration-test")
     result = executor.launch("approval-execution-integration", 30)
-    assert result["status"] == "succeeded"
-    assert "APPROVED SNAPSHOT" in result["stdout_preview"]
-    assert "REPLACED SOURCE" not in result["stdout_preview"]
-    assert store.get_operation("approval-execution-integration")["claimed_at"] is not None
-    assert os.path.exists(result["stdout_path"])
+    operation = store.get_operation("approval-execution-integration")
+
+    assert result["status"] == "failed"
+    assert operation["child_pid"] is None
+    assert "workspace behavior inputs changed" in str(operation["error"])
+    assert "REPLACED PAYLOAD" not in result.get("stdout_preview", "")
+    assert operation["claimed_at"] is not None
     assert settings.data_dir == data.resolve()
 
 
-def test_snapshot_execution_does_not_wait_for_workspace_write_lock(
+def test_snapshot_execution_succeeds_when_bound_workspace_is_unchanged(
     tmp_path: Path, monkeypatch
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -184,18 +189,14 @@ def test_snapshot_execution_does_not_wait_for_workspace_write_lock(
     monkeypatch.setenv("LOCAL_MCP_CONFIG", str(config))
     monkeypatch.delenv("LOCAL_MCP_ROOT", raising=False)
 
-    settings, store, executor = _prepare_operation(
+    _, store, executor = _prepare_operation(
         workspace=workspace,
         data=data,
-        operation_id="snapshot-with-workspace-lock-held",
+        operation_id="snapshot-bound-workspace",
         script_text="print('SNAPSHOT RUNS INDEPENDENTLY')",
     )
-    store.approve_and_claim("snapshot-with-workspace-lock-held", approver="integration-test")
-
-    # Simulate an unrelated workspace write that holds the exclusive mutation lock.
-    # Snapshot-backed execution works only from data_dir, so it must not wait for this lock.
-    with WorkspaceExecutionLock(settings):
-        result = executor.launch("snapshot-with-workspace-lock-held", 5)
+    store.approve_and_claim("snapshot-bound-workspace", approver="integration-test")
+    result = executor.launch("snapshot-bound-workspace", 30)
 
     assert result["status"] == "succeeded"
     assert "SNAPSHOT RUNS INDEPENDENTLY" in result["stdout_preview"]

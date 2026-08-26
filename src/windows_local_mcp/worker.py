@@ -297,9 +297,6 @@ def run_operation(operation_id: str, settings: Settings) -> int:
             if workspace_lock is not None:
                 workspace_lock.__exit__(None, None, None)
             return 1
-    if staged_sandbox_commit and workspace_lock is not None:
-        workspace_lock.__exit__(None, None, None)
-        workspace_lock = None
 
     host_control_state: dict[str, Any] | None = None
     host_operation_binding: dict[str, Any] | None = None
@@ -932,8 +929,9 @@ def run_operation(operation_id: str, settings: Settings) -> int:
                     operation_id=operation_id,
                     normalized=NormalizedCommand.model_validate(normalized),
                 )
-                workspace_lock = WorkspaceExecutionLock(settings)
-                workspace_lock.__enter__()
+                if workspace_lock is None:
+                    workspace_lock = WorkspaceExecutionLock(settings)
+                    workspace_lock.__enter__()
                 target_manifest = build_workspace_target_from_bytes(
                     settings,
                     operation_id,
@@ -1080,21 +1078,17 @@ def _requires_workspace_execution_lock(
     if tier in {"broker", "safe_sandbox", "safe_command"}:
         return False
 
-    if tier in {"approved_host", "host_approval"}:
-        if bool(request.get("workspace_write")):
-            return True
-        summary = request.get("approval_manifest_summary")
-        # Staged read-only Host execution never uses the original workspace. The separate
-        # control-plane guard remains armed, so unrelated broker writes need not wait.
-        return not (isinstance(summary, dict) and summary.get("mode") == "staged-cwd")
-
-    if tier in {"codex_sandbox", "approved_sandbox"}:
-        if bool(request.get("workspace_write")):
-            return True
-        summary = request.get("approval_manifest_summary")
-        # Old audit rows or non-snapshot host commands remain conservative. They may execute
-        # against the real workspace, so keep the exclusive lock unless isolation is explicit.
-        return not (isinstance(summary, dict) and summary.get("mode") == "staged-cwd")
+    if tier in {
+        "approved_host",
+        "host_approval",
+        "codex_sandbox",
+        "approved_sandbox",
+    }:
+        # Staged project code can derive absolute paths back into the live workspace.
+        # Revalidation therefore needs an exclusive Broker-mutation interval that remains
+        # held until the child and all descendants have terminated (and any staged commit
+        # has completed). This is required even when workspace_write is false.
+        return True
 
     return True
 

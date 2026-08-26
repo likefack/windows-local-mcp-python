@@ -128,7 +128,7 @@ def prepare_approval_bundle(
         allow_hardlinks=True,
     )
     manifest: dict[str, Any] = {
-        "version": 1,
+        "version": 2,
         "operation_id": operation_id,
         "executable": executable_record,
         "settings_digest": settings_digest(settings),
@@ -183,6 +183,11 @@ def prepare_approval_bundle(
                 records.extend(dependency_records)
                 manifest["inputs"] = records
             _enforce_manifest_totals(records, settings)
+            manifest["source_workspace_binding"] = _broker_mutable_workspace_binding(
+                source=workspace.root,
+                settings=settings,
+                workspace=workspace,
+            )
             root_text = str(workspace.root).casefold()
             if any(root_text in value.casefold() for value in execution.args):
                 raise PermissionError(
@@ -240,6 +245,8 @@ def verify_approval_bundle(
     actual_digest = sha256_text(canonical_json(manifest))
     if stored_digest != expected_digest or actual_digest != expected_digest:
         raise RuntimeError("approval manifest digest mismatch")
+    if manifest.get("version") != 2:
+        raise RuntimeError("approval manifest uses an unsupported version")
     if manifest.get("settings_digest") != settings_digest(settings):
         raise RuntimeError("effective MCP settings changed after approval was requested")
     if manifest.get("environment_digest") != _environment_digest():
@@ -279,6 +286,19 @@ def verify_approval_bundle(
             )
             if current["sha256"] != record["sha256"] or current["size"] != record["size"]:
                 raise RuntimeError("workspace files changed after formatting was staged")
+    if manifest.get("mode") in {"staged-cwd", "staged-workspace-write"}:
+        expected_binding = manifest.get("source_workspace_binding")
+        if not isinstance(expected_binding, dict):
+            raise RuntimeError("staged approval has no live workspace binding")
+        current_binding = _broker_mutable_workspace_binding(
+            source=settings.workspace_root,
+            settings=settings,
+            workspace=Workspace(settings),
+        )
+        if current_binding != expected_binding:
+            raise RuntimeError(
+                "workspace behavior inputs changed after approval was requested"
+            )
     for record in manifest.get("external_inputs", []):
         current = _file_record(Path(record["path"]), max_bytes=settings.approval_manifest_max_bytes)
         if current != record:
@@ -798,6 +818,90 @@ def _validate_external_arguments(
             )
         records.append(_file_record(resolved))
     return records
+
+
+
+def _broker_mutable_workspace_binding(
+    *, source: Path, settings: Settings, workspace: Workspace
+) -> dict[str, Any]:
+    """Hash the complete workspace state that Broker/model operations can mutate."""
+    root = source.resolve(strict=True)
+    if root != workspace.root:
+        raise RuntimeError("approval workspace binding root does not match workspace_root")
+
+    write_denied = {name.casefold() for name in settings.write_denied_directories}
+    blocked_files = {name.casefold() for name in settings.blocked_file_names}
+    entry_budget = _EntryBudget(settings)
+    directories: list[str] = []
+    files: list[dict[str, Any]] = []
+    total_bytes = 0
+
+    for current, directory_names, file_names in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        filtered_directories: list[str] = []
+        for name in sorted(directory_names, key=lambda value: (value.casefold(), value)):
+            entry_budget.consume()
+            if name.casefold() in write_denied:
+                continue
+            candidate = current_path / name
+            if _is_reparse(candidate):
+                raise PermissionError(
+                    f"mutable workspace binding contains a reparse point: {candidate}"
+                )
+            filtered_directories.append(name)
+            directories.append(candidate.relative_to(root).as_posix())
+        directory_names[:] = filtered_directories
+
+        for name in sorted(file_names, key=lambda value: (value.casefold(), value)):
+            entry_budget.consume()
+            folded = name.casefold()
+            if folded in blocked_files or (
+                folded.startswith(".env.") and folded != ".env.example"
+            ):
+                continue
+            candidate = current_path / name
+            relative = candidate.relative_to(root).as_posix()
+            checked = workspace.resolve_existing(
+                relative,
+                allow_directory=False,
+                access="write",
+                readable=True,
+            )
+            try:
+                info = checked.stat()
+                total_bytes += info.st_size
+                if len(files) + 1 > settings.approval_manifest_max_files:
+                    raise ValueError(
+                        "mutable workspace binding exceeds approval_manifest_max_files"
+                    )
+                if total_bytes > settings.approval_manifest_max_bytes:
+                    raise ValueError(
+                        "mutable workspace binding exceeds approval_manifest_max_bytes"
+                    )
+                data = read_verified_bytes(
+                    checked, settings.approval_manifest_max_bytes
+                )
+                files.append(
+                    {
+                        "path": relative,
+                        "size": len(data),
+                        "sha256": sha256_bytes(data),
+                        "device": int(info.st_dev),
+                        "inode": int(info.st_ino),
+                        "modified_ns": int(info.st_mtime_ns),
+                    }
+                )
+            finally:
+                release_verified_hold(checked)
+
+    state = {"directories": directories, "files": files}
+    return {
+        "root": str(root),
+        "digest": sha256_text(canonical_json(state)),
+        "directories": len(directories),
+        "files": len(files),
+        "bytes": total_bytes,
+    }
 
 
 def _source_inventory(

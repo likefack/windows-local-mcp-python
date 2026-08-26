@@ -47,7 +47,7 @@ def make_command(executable: Path, cwd: Path, args: list[str]) -> NormalizedComm
     )
 
 
-def test_code_loader_runs_immutable_cwd_copy_and_ignores_unrelated_changes(
+def test_code_loader_snapshot_verifies_when_bound_workspace_is_unchanged(
     tmp_path: Path,
 ) -> None:
     settings = make_settings(tmp_path)
@@ -55,8 +55,6 @@ def test_code_loader_runs_immutable_cwd_copy_and_ignores_unrelated_changes(
     project.mkdir()
     script = project / "main.py"
     script.write_text("print('approved')", encoding="utf-8")
-    unrelated = settings.workspace_root / "notes.txt"
-    unrelated.write_text("one", encoding="utf-8")
     command = make_command(make_executable(tmp_path), project, ["main.py"])
 
     _, manifest, digest = prepare_approval_bundle(
@@ -65,8 +63,6 @@ def test_code_loader_runs_immutable_cwd_copy_and_ignores_unrelated_changes(
         operation_id="immutable",
         normalized=command,
     )
-    script.write_text("print('replaced')", encoding="utf-8")
-    unrelated.write_text("two", encoding="utf-8")
 
     verified = verify_approval_bundle(
         settings=settings, operation_id="immutable", expected_digest=digest
@@ -74,7 +70,64 @@ def test_code_loader_runs_immutable_cwd_copy_and_ignores_unrelated_changes(
     staged_script = Path(verified.cwd) / "main.py"
     assert staged_script.read_text(encoding="utf-8") == "print('approved')"
     assert manifest["mode"] == "staged-cwd"
+    assert manifest["source_workspace_binding"]["files"] == 1
     assert len(manifest["inputs"]) == 1
+
+
+def test_code_loader_rejects_transitive_live_workspace_change_after_approval(
+    tmp_path: Path,
+) -> None:
+    settings = make_settings(tmp_path)
+    project = settings.workspace_root / "project"
+    project.mkdir()
+    shared = settings.workspace_root / "shared"
+    shared.mkdir()
+    payload = shared / "payload.py"
+    payload.write_text("print('approved payload')", encoding="utf-8")
+    script = project / "main.py"
+    script.write_text(
+        "from pathlib import Path\n"
+        f"exec(Path({str(payload)!r}).read_text(encoding='utf-8'))\n",
+        encoding="utf-8",
+    )
+    command = make_command(make_executable(tmp_path), project, ["main.py"])
+
+    _, _, digest = prepare_approval_bundle(
+        settings=settings,
+        workspace=Workspace(settings),
+        operation_id="transitive-live-path",
+        normalized=command,
+    )
+    payload.write_text("print('replaced payload')", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="workspace behavior inputs changed"):
+        verify_approval_bundle(
+            settings=settings,
+            operation_id="transitive-live-path",
+            expected_digest=digest,
+        )
+
+
+def test_code_loader_rejects_new_mutable_workspace_directory_after_approval(
+    tmp_path: Path,
+) -> None:
+    settings = make_settings(tmp_path)
+    script = settings.workspace_root / "main.py"
+    script.write_text("print('approved')", encoding="utf-8")
+    command = make_command(make_executable(tmp_path), settings.workspace_root, ["main.py"])
+    _, _, digest = prepare_approval_bundle(
+        settings=settings,
+        workspace=Workspace(settings),
+        operation_id="new-directory",
+        normalized=command,
+    )
+
+    (settings.workspace_root / "runtime-trigger").mkdir()
+
+    with pytest.raises(RuntimeError, match="workspace behavior inputs changed"):
+        verify_approval_bundle(
+            settings=settings, operation_id="new-directory", expected_digest=digest
+        )
 
 
 def test_staging_excludes_protected_files_and_generated_dependency_trees(
@@ -342,7 +395,6 @@ def test_dart_path_dependency_outside_cwd_is_copied_and_rewritten(tmp_path: Path
         operation_id="dart-path-dependency",
         normalized=command,
     )
-    shared_source.write_text("const value = 'replaced';", encoding="utf-8")
     verified = verify_approval_bundle(
         settings=settings,
         operation_id="dart-path-dependency",
