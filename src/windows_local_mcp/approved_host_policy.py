@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from functools import wraps
-from typing import Any, Callable
+from typing import Any
 
 APPROVED_HOST_UNAVAILABLE_REASON = (
     "Approved Host execution is unavailable in current v1 because its same-user child can "
