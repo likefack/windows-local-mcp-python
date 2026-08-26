@@ -12,7 +12,9 @@ def replace_once(text: str, old: str, new: str, label: str) -> str:
 
 
 def regex_once(text: str, pattern: str, replacement: str, label: str) -> str:
-    updated, count = re.subn(pattern, replacement, text, count=1, flags=re.DOTALL)
+    updated, count = re.subn(
+        pattern, lambda _match: replacement, text, count=1, flags=re.DOTALL
+    )
     if count != 1:
         raise RuntimeError(f"{label}: expected 1 regex match, found {count}")
     return updated
@@ -198,17 +200,17 @@ replacement = '''@pytest.mark.skipif(os.name != "nt", reason="Approved Host desc
 def test_approved_host_job_terminates_descendants_at_runtime_limit(tmp_path: Path) -> None:
     late_write = tmp_path / "after-timeout.txt"
     descendant = (
-        "import time\n"
-        "from pathlib import Path\n"
-        "time.sleep(2.0)\n"
-        f"Path({str(late_write)!r}).write_text('escaped', encoding='utf-8')\n"
+        "import time\\n"
+        "from pathlib import Path\\n"
+        "time.sleep(2.0)\\n"
+        f"Path({str(late_write)!r}).write_text('escaped', encoding='utf-8')\\n"
     )
     parent = (
-        "import subprocess, sys\n"
-        f"descendant={descendant!r}\n"
+        "import subprocess, sys\\n"
+        f"descendant={descendant!r}\\n"
         "subprocess.Popen([sys.executable, '-I', '-c', descendant], "
         "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
-        "stderr=subprocess.DEVNULL, close_fds=True)\n"
+        "stderr=subprocess.DEVNULL, close_fds=True)\\n"
     )
 
     job = WindowsSandboxJob()
