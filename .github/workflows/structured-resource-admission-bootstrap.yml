@@ -1,0 +1,658 @@
+name: Structured resource admission bootstrap
+
+on:
+  push:
+    branches: ["fix/structured-resource-admission"]
+    paths: [".github/workflows/structured-resource-admission-bootstrap.yml"]
+
+permissions:
+  contents: write
+
+jobs:
+  patch-test-commit:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v7
+        with:
+          ref: fix/structured-resource-admission
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install package and dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+          python -m pip check
+
+      - name: Apply structured resource admission patch
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+
+          path = Path("src/windows_local_mcp/structured_files.py")
+          text = path.read_text(encoding="utf-8")
+
+          def replace_exact(source: str, old: str, new: str) -> str:
+              count = source.count(old)
+              if count != 1:
+                  raise RuntimeError(f"expected exactly one replacement target, found {count}: {old[:80]!r}")
+              return source.replace(old, new, 1)
+
+          text = replace_exact(
+              text,
+              "from xml.etree import ElementTree\n",
+              "from xml.etree import ElementTree\nfrom xml.parsers import expat\n",
+          )
+
+          helpers = r'''
+
+          _XML_STREAM_CHUNK_BYTES = 64 * 1024
+          _XML_MAX_DEPTH = 256
+
+
+          def _office_xml_element_budget(settings: Settings) -> int:
+              # Keep normal Office package scaffolding usable even when a test/operator chooses a
+              # very small semantic element limit, while still placing a finite admission boundary
+              # in front of parsers that would otherwise materialize the complete XML tree.
+              return max(
+                  50_000,
+                  min(
+                      settings.max_structured_elements * 4,
+                      settings.max_zip_expanded_bytes // 16,
+                  ),
+              )
+
+
+          def _office_xml_part(name: str, label: str) -> bool:
+              folded = name.casefold()
+              if not folded.endswith((".xml", ".rels")):
+                  return False
+              if folded == "[content_types].xml":
+                  return True
+              prefixes = (
+                  ("word/", "docprops/", "_rels/")
+                  if label == "DOCX"
+                  else ("xl/", "docprops/", "_rels/")
+              )
+              return folded.startswith(prefixes)
+
+
+          def _preflight_office_xml_part(
+              stream: Any,
+              *,
+              part_name: str,
+              label: str,
+              settings: Settings,
+              counters: dict[str, int],
+              xml_budget: int,
+          ) -> None:
+              parser = expat.ParserCreate(namespace_separator="}")
+              depth = 0
+
+              def start_element(name: str, _attributes: dict[str, str]) -> None:
+                  nonlocal depth
+                  depth += 1
+                  if depth > _XML_MAX_DEPTH:
+                      raise StructuredFileError(
+                          f"{label} XML nesting exceeds the bounded processing limit"
+                      )
+                  counters["xml"] += 1
+                  if counters["xml"] > xml_budget:
+                      raise StructuredFileError(
+                          f"{label} XML elements exceed the bounded processing limit"
+                      )
+                  if "}" in name:
+                      namespace, local_name = name.rsplit("}", 1)
+                  else:
+                      namespace, local_name = "", name
+                  if label == "DOCX" and namespace == _WORD_NS:
+                      if local_name == "p":
+                          counters["paragraphs"] += 1
+                          if counters["paragraphs"] > settings.max_structured_elements:
+                              raise StructuredFileError(
+                                  "DOCX paragraphs exceed max_structured_elements"
+                              )
+                      elif local_name == "tc":
+                          counters["cells"] += 1
+                          if counters["cells"] > settings.max_structured_elements:
+                              raise StructuredFileError(
+                                  "DOCX table cells exceed max_structured_elements"
+                              )
+                  elif label == "XLSX" and namespace == _SHEET_NS and local_name == "c":
+                      counters["cells"] += 1
+                      if counters["cells"] > settings.max_structured_elements:
+                          raise StructuredFileError("XLSX cells exceed max_structured_elements")
+
+              def end_element(_name: str) -> None:
+                  nonlocal depth
+                  depth -= 1
+
+              def reject_doctype(*_args: Any) -> None:
+                  raise StructuredFileError(f"{label} XML DTD is unsupported")
+
+              parser.StartElementHandler = start_element
+              parser.EndElementHandler = end_element
+              parser.StartDoctypeDeclHandler = reject_doctype
+              parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_NEVER)
+              try:
+                  while True:
+                      chunk = stream.read(_XML_STREAM_CHUNK_BYTES)
+                      if not chunk:
+                          break
+                      parser.Parse(chunk, False)
+                  parser.Parse(b"", True)
+              except StructuredFileError:
+                  raise
+              except expat.ExpatError as error:
+                  raise StructuredFileError(
+                      f"invalid {label} XML part: {part_name}"
+                  ) from error
+
+
+          def _preflight_office_package(data: bytes, settings: Settings, label: str) -> None:
+              counters = {"xml": 0, "paragraphs": 0, "cells": 0}
+              xml_budget = _office_xml_element_budget(settings)
+              try:
+                  with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                      infos = _require_package_bounds(archive, settings, label)
+                      for info in infos:
+                          if info.is_dir() or not _office_xml_part(info.filename, label):
+                              continue
+                          with archive.open(info) as stream:
+                              _preflight_office_xml_part(
+                                  stream,
+                                  part_name=info.filename,
+                                  label=label,
+                                  settings=settings,
+                                  counters=counters,
+                                  xml_budget=xml_budget,
+                              )
+              except zipfile.BadZipFile as error:
+                  raise StructuredFileError(f"invalid {label} package") from error
+
+
+          def _archive_member_contains_any(
+              archive: zipfile.ZipFile, name: str, markers: tuple[bytes, ...]
+          ) -> bool:
+              overlap = max(len(marker) for marker in markers) - 1
+              tail = b""
+              with archive.open(name) as stream:
+                  while True:
+                      chunk = stream.read(_XML_STREAM_CHUNK_BYTES)
+                      if not chunk:
+                          return False
+                      window = tail + chunk
+                      if any(marker in window for marker in markers):
+                          return True
+                      tail = window[-overlap:] if overlap > 0 else b""
+
+
+          def _archive_member_matches(
+              archive: zipfile.ZipFile,
+              name: str,
+              pattern: re.Pattern[bytes],
+              *,
+              overlap: int = 256,
+          ) -> bool:
+              tail = b""
+              with archive.open(name) as stream:
+                  while True:
+                      chunk = stream.read(_XML_STREAM_CHUNK_BYTES)
+                      if not chunk:
+                          return False
+                      window = tail + chunk
+                      if pattern.search(window):
+                          return True
+                      tail = window[-overlap:]
+          '''
+
+          text = replace_exact(
+              text,
+              "    return infos\n\n\ndef _parse_package_xml(data: bytes, label: str) -> ElementTree.Element:\n",
+              "    return infos\n" + helpers + "\n\ndef _parse_package_xml(data: bytes, label: str) -> ElementTree.Element:\n",
+          )
+
+          text = replace_exact(
+              text,
+              '''            document = archive.read("word/document.xml")
+              word_xml = [
+                  archive.read(name)
+                  for name in archive_names
+                  if name.casefold().startswith("word/")
+                  and name.casefold().endswith(".xml")
+              ]
+          ''',
+              '''            tracked_changes = _archive_member_contains_any(
+                  archive,
+                  "word/document.xml",
+                  (b"<w:ins", b"<w:del", b"<w:move"),
+              )
+              has_data_binding = any(
+                  _archive_member_contains_any(archive, name, (b":dataBinding",))
+                  for name in archive_names
+                  if name.casefold().startswith("word/")
+                  and name.casefold().endswith(".xml")
+              )
+          ''',
+          )
+          text = replace_exact(
+              text,
+              '''    if b"<w:ins" in document or b"<w:del" in document or b"<w:move" in document:
+                  found.append("tracked changes")
+              if any(b":dataBinding" in xml for xml in word_xml):
+                  found.append("custom XML data binding")
+          ''',
+              '''    if tracked_changes:
+                  found.append("tracked changes")
+              if has_data_binding:
+                  found.append("custom XML data binding")
+          ''',
+          )
+
+          text = replace_exact(
+              text,
+              '''            xml_parts = [
+                  archive.read(name)
+                  for name in archive_names
+                  if name.casefold().endswith(".xml")
+              ]
+          ''',
+              '''            extension_pattern = re.compile(rb"<(?:[A-Za-z0-9_]+:)?extLst\\b")
+              has_extension_list = any(
+                  _archive_member_matches(archive, name, extension_pattern)
+                  for name in archive_names
+                  if name.casefold().endswith(".xml")
+              )
+          ''',
+          )
+          text = replace_exact(
+              text,
+              '''    if any(re.search(rb"<(?:[A-Za-z0-9_]+:)?extLst\\b", part) for part in xml_parts):
+                  blocked.append("unsupported extension lists")
+          ''',
+              '''    if has_extension_list:
+                  blocked.append("unsupported extension lists")
+          ''',
+          )
+
+          csv_preflight = r'''
+
+          def _preflight_csv(data: bytes, kind: str, settings: Settings) -> None:
+              _require_size(data, settings)
+              if data.startswith(b"\xef\xbb\xbf"):
+                  codec, bom = "utf-8", b"\xef\xbb\xbf"
+              elif data.startswith(b"\xff\xfe"):
+                  codec, bom = "utf-16-le", b"\xff\xfe"
+              elif data.startswith(b"\xfe\xff"):
+                  codec, bom = "utf-16-be", b"\xfe\xff"
+              else:
+                  codec, bom = "utf-8", b""
+
+              try:
+                  sample_raw = io.BytesIO(data)
+                  sample_raw.seek(len(bom))
+                  with io.TextIOWrapper(sample_raw, encoding=codec, newline="") as sample_stream:
+                      sample = sample_stream.read(8192)
+              except UnicodeDecodeError as error:
+                  raise StructuredFileError(
+                      "CSV/TSV encoding is unsupported or invalid"
+                  ) from error
+
+              if kind == "tsv":
+                  if "\t" not in sample and any(marker in sample for marker in (",", ";", "|")):
+                      raise StructuredFileError("TSV delimiter identity is ambiguous")
+                  dialect = csv.excel_tab
+              else:
+                  try:
+                      dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+                  except csv.Error as error:
+                      if any(marker in sample for marker in (",", ";", "\t", "|")):
+                          raise StructuredFileError("CSV delimiter identity is ambiguous") from error
+                      dialect = csv.excel
+
+              rows = 0
+              cells = 0
+              try:
+                  raw = io.BytesIO(data)
+                  raw.seek(len(bom))
+                  with io.TextIOWrapper(raw, encoding=codec, newline="") as stream:
+                      for row in csv.reader(stream, dialect):
+                          rows += 1
+                          if rows > settings.max_structured_elements:
+                              raise StructuredFileError(
+                                  "CSV rows exceed max_structured_elements"
+                              )
+                          cells += len(row)
+                          if cells > settings.max_structured_elements:
+                              raise StructuredFileError(
+                                  "CSV cells exceed max_structured_elements"
+                              )
+              except StructuredFileError:
+                  raise
+              except UnicodeDecodeError as error:
+                  raise StructuredFileError(
+                      "CSV/TSV encoding is unsupported or invalid"
+                  ) from error
+              except csv.Error as error:
+                  raise StructuredFileError("invalid CSV/TSV structure") from error
+          '''
+
+          text = replace_exact(
+              text,
+              '''class CsvDocument:
+              rows: list[list[str]]
+              encoding: str
+              codec: str
+              bom: bytes
+              dialect: csv.Dialect
+              newline: str
+              final_newline: bool
+
+
+          def _parse_csv(data: bytes, kind: str, settings: Settings) -> CsvDocument:
+          ''',
+              '''class CsvDocument:
+              rows: list[list[str]]
+              encoding: str
+              codec: str
+              bom: bytes
+              dialect: csv.Dialect
+              newline: str
+              final_newline: bool
+          ''' + csv_preflight + '''
+
+          def _parse_csv(data: bytes, kind: str, settings: Settings) -> CsvDocument:
+              _preflight_csv(data, kind, settings)
+          ''',
+          )
+
+          text = replace_exact(
+              text,
+              '''def _inspect_docx(data: bytes, settings: Settings) -> dict[str, Any]:
+              Document, _, _, _ = _docx_modules()
+          ''',
+              '''def _inspect_docx(data: bytes, settings: Settings) -> dict[str, Any]:
+              _preflight_office_package(data, settings, "DOCX")
+              Document, _, _, _ = _docx_modules()
+          ''',
+          )
+          text = replace_exact(
+              text,
+              '''def _transform_docx(
+              data: bytes, operations: list[Any], settings: Settings
+          ) -> tuple[bytes, dict[str, Any]]:
+              unsupported = _docx_has_unsupported_features(data, settings)
+          ''',
+              '''def _transform_docx(
+              data: bytes, operations: list[Any], settings: Settings
+          ) -> tuple[bytes, dict[str, Any]]:
+              _preflight_office_package(data, settings, "DOCX")
+              unsupported = _docx_has_unsupported_features(data, settings)
+          ''',
+          )
+          text = replace_exact(
+              text,
+              '''def _inspect_xlsx(data: bytes, settings: Settings, range_ref: str | None = None) -> dict[str, Any]:
+              _, load_workbook, *_ = _xlsx_modules()
+          ''',
+              '''def _inspect_xlsx(data: bytes, settings: Settings, range_ref: str | None = None) -> dict[str, Any]:
+              _preflight_office_package(data, settings, "XLSX")
+              _, load_workbook, *_ = _xlsx_modules()
+          ''',
+          )
+          text = replace_exact(
+              text,
+              '''def _transform_xlsx(
+              data: bytes, operations: list[Any], settings: Settings
+          ) -> tuple[bytes, dict[str, Any]]:
+              unsupported = _xlsx_unsupported(data, settings)
+          ''',
+              '''def _transform_xlsx(
+              data: bytes, operations: list[Any], settings: Settings
+          ) -> tuple[bytes, dict[str, Any]]:
+              _preflight_office_package(data, settings, "XLSX")
+              unsupported = _xlsx_unsupported(data, settings)
+          ''',
+          )
+
+          path.write_text(text, encoding="utf-8", newline="\n")
+
+          tests = r'''from __future__ import annotations
+
+import io
+import zipfile
+from pathlib import Path
+
+import pytest
+
+from windows_local_mcp import structured_files
+from windows_local_mcp.config import Settings
+
+
+def _settings(tmp_path: Path, *, elements: int = 100) -> Settings:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    return Settings(
+        workspace_root=root,
+        data_dir=tmp_path / "data",
+        protect_data_dir_acl=False,
+        git_enabled=False,
+        max_structured_elements=elements,
+        max_structured_file_bytes=2 * 1024 * 1024,
+        max_zip_entries=1000,
+        max_zip_expanded_bytes=8 * 1024 * 1024,
+    )
+
+
+def _package(parts: dict[str, bytes]) -> bytes:
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, payload in parts.items():
+            archive.writestr(name, payload)
+    return output.getvalue()
+
+
+def test_csv_cells_are_admitted_before_full_document_materialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    payload = ((",".join("x" for _ in range(101))) + "\n").encode()
+
+    def fail_string_io(*_args, **_kwargs):
+        raise AssertionError("full-document StringIO must not be reached")
+
+    monkeypatch.setattr(structured_files.io, "StringIO", fail_string_io)
+    with pytest.raises(structured_files.StructuredFileError, match="CSV cells exceed"):
+        structured_files._parse_csv(payload, "csv", settings)
+
+
+def test_csv_rows_are_admitted_incrementally_even_when_cells_are_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    payload = b"\n" * 101
+
+    def fail_string_io(*_args, **_kwargs):
+        raise AssertionError("full-document StringIO must not be reached")
+
+    monkeypatch.setattr(structured_files.io, "StringIO", fail_string_io)
+    with pytest.raises(structured_files.StructuredFileError, match="CSV rows exceed"):
+        structured_files._parse_csv(payload, "csv", settings)
+
+
+def test_csv_preflight_does_not_count_delimiters_inside_quoted_fields(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    quoted = ",".join("x" for _ in range(101))
+    document = structured_files._parse_csv(f'"{quoted}"\n'.encode(), "csv", settings)
+    assert document.rows == [[quoted]]
+
+
+def test_docx_paragraph_budget_rejects_before_python_docx(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    body = "".join("<w:p/>" for _ in range(101))
+    payload = _package(
+        {
+            "word/document.xml": (
+                f'<w:document xmlns:w="{structured_files._WORD_NS}"><w:body>{body}</w:body></w:document>'
+            ).encode()
+        }
+    )
+
+    monkeypatch.setattr(
+        structured_files,
+        "_docx_modules",
+        lambda: (_ for _ in ()).throw(AssertionError("python-docx must not be reached")),
+    )
+    with pytest.raises(structured_files.StructuredFileError, match="DOCX paragraphs exceed"):
+        structured_files._inspect_docx(payload, settings)
+
+
+def test_xlsx_cell_budget_rejects_before_openpyxl(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    cells = "".join(f'<c r="A{index}"/>' for index in range(1, 102))
+    payload = _package(
+        {
+            "xl/worksheets/sheet1.xml": (
+                f'<worksheet xmlns="{structured_files._SHEET_NS}"><sheetData><row r="1">{cells}</row></sheetData></worksheet>'
+            ).encode()
+        }
+    )
+
+    monkeypatch.setattr(
+        structured_files,
+        "_xlsx_modules",
+        lambda: (_ for _ in ()).throw(AssertionError("openpyxl must not be reached")),
+    )
+    with pytest.raises(structured_files.StructuredFileError, match="XLSX cells exceed"):
+        structured_files._inspect_xlsx(payload, settings)
+
+
+def test_office_xml_element_budget_rejects_before_tree_materialization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    runs = "".join("<w:r/>" for _ in range(50_001))
+    payload = _package(
+        {
+            "word/styles.xml": (
+                f'<w:styles xmlns:w="{structured_files._WORD_NS}">{runs}</w:styles>'
+            ).encode()
+        }
+    )
+
+    monkeypatch.setattr(
+        structured_files,
+        "_docx_modules",
+        lambda: (_ for _ in ()).throw(AssertionError("python-docx must not be reached")),
+    )
+    with pytest.raises(structured_files.StructuredFileError, match="XML elements exceed"):
+        structured_files._inspect_docx(payload, settings)
+
+
+def test_malformed_office_xml_is_rejected_by_streaming_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    payload = _package(
+        {
+            "word/document.xml": (
+                f'<w:document xmlns:w="{structured_files._WORD_NS}"><w:body><w:p>'
+            ).encode()
+        }
+    )
+
+    monkeypatch.setattr(
+        structured_files,
+        "_docx_modules",
+        lambda: (_ for _ in ()).throw(AssertionError("python-docx must not be reached")),
+    )
+    with pytest.raises(structured_files.StructuredFileError, match="invalid DOCX XML part"):
+        structured_files._inspect_docx(payload, settings)
+
+
+def test_office_dtd_is_rejected_before_high_level_parser(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    payload = _package(
+        {
+            "word/document.xml": (
+                f'<!DOCTYPE w:document [<!ENTITY x "value">]>'
+                f'<w:document xmlns:w="{structured_files._WORD_NS}"><w:body><w:p>&x;</w:p></w:body></w:document>'
+            ).encode()
+        }
+    )
+
+    monkeypatch.setattr(
+        structured_files,
+        "_docx_modules",
+        lambda: (_ for _ in ()).throw(AssertionError("python-docx must not be reached")),
+    )
+    with pytest.raises(structured_files.StructuredFileError, match="DTD is unsupported"):
+        structured_files._inspect_docx(payload, settings)
+'''
+          Path("tests/test_structured_resource_admission.py").write_text(
+              tests, encoding="utf-8", newline="\n"
+          )
+
+          verification = Path("VERIFICATION.md")
+          verification_text = verification.read_text(encoding="utf-8")
+          note = '''# 検証記録
+
+## 2026-08-27 Structured Processing resource admission
+
+- CSV／TSV は全行 `list` 化より前に `csv.reader` を逐次走査し、row／cell budget を超えた時点で fail closed する preflight を追加した。preflight 通過後だけ既存 parser／preservation path へ進む。
+- DOCX／XLSX は ZIP entry count／expanded-size admission の後、高水準 parser より前に対象 Office XML を Expat で chunk streaming し、XML element 数、nesting depth、DOCX paragraph／table-cell 数、XLSX cell 数を admission する。DTD は Office input として不要なため preflight で拒否する。
+- unsupported-feature discovery は DOCX／XLSX の XML part を同時に全 materialize せず、必要 marker を ZIP member stream 上で検索するよう変更した。既存の package-preserving rewrite と transaction／rollback 境界は変更していない。
+- 新規 regression は、oversized CSV row／blank-row count、quoted delimiter 正常系、DOCX paragraph、XLSX cell、Office XML element、malformed XML、DTD を対象とし、高水準 parser／full-document materialization より前に admission が成立することを確認する。
+- この記録を含む commit は GitHub Hosted Windows 上で新規 resource-admission regression、既存 structured-file regression、full pytest、Ruff、compileall、`git diff --check` がすべて成功した場合だけ生成する。
+
+'''
+          if not verification_text.startswith("# 検証記録\n\n"):
+              raise RuntimeError("unexpected VERIFICATION.md heading")
+          verification.write_text(
+              note + verification_text[len("# 検証記録\n\n"):],
+              encoding="utf-8",
+              newline="\n",
+          )
+          '@ | python -
+
+      - name: Focused structured resource regression
+        run: >-
+          python -m pytest -q
+          tests/test_structured_resource_admission.py
+          tests/test_structured_files.py
+
+      - name: Full pytest
+        run: python -m pytest
+
+      - name: Ruff
+        run: python -m ruff check .
+
+      - name: Compile all
+        run: python -m compileall -q src tests
+
+      - name: Diff whitespace check
+        shell: bash
+        run: git diff --check
+
+      - name: Commit verified implementation
+        shell: pwsh
+        run: |
+          Remove-Item .github/workflows/structured-resource-admission-bootstrap.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/windows_local_mcp/structured_files.py tests/test_structured_resource_admission.py VERIFICATION.md .github/workflows/structured-resource-admission-bootstrap.yml
+          git commit -m "構造化処理の事前リソース境界を追加"
+          git push origin HEAD:fix/structured-resource-admission
