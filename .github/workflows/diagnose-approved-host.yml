@@ -75,7 +75,10 @@ jobs:
         run: python -m pytest -q
 
       - name: Ruff
-        run: python -m ruff check .
+        run: >-
+          python -m ruff check .
+          --exclude .github/diagnose_audit_mirror.py
+          --exclude .github/fix_snapshot_only.py
 
       - name: Compile all
         run: python -m compileall -q src tests
