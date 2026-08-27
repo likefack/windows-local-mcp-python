@@ -181,14 +181,14 @@ try {
     }
 
     if ($Replace -and (Test-Path -LiteralPath $InstallRoot)) {
-        # An existing immutable runtime can come from an older installer whose descendant ACLs
-        # accidentally removed the Administrators ACE. icacls /setowner cannot necessarily walk
-        # such a tree because it still needs traversal/access to every descendant. Replacement is
-        # an explicit elevated maintenance action, so use takeown with SeTakeOwnershipPrivilege to
-        # make Administrators the owner of the retired tree first, then restore Administrators full
-        # control and delete it. /SKIPSL prevents recursive ownership recovery from following links.
-        # This runs only after active/recovery state has been excluded and any authority service has
-        # been stopped; the newly staged immutable runtime is not weakened by this recovery step.
+        # A previous runtime can contain malformed/protected descendant DACLs left by an older
+        # installer. takeown recovers ownership, but an Administrators allow ACE alone is not
+        # sufficient because an existing deny ACE still wins access evaluation. This is an
+        # explicit elevated maintenance action, so first take ownership without following links,
+        # then replace the retired tree's DACLs with their normal inherited defaults, restore an
+        # explicit Administrators full-control ACE, and only then delete the old tree. The reset
+        # applies only to the retired runtime after active/recovery state has been excluded and any
+        # authority service has stopped; the newly staged immutable runtime is never weakened.
         $TakeownExe = Join-Path $env:SystemRoot "System32\takeown.exe"
         if (-not (Test-Path -LiteralPath $TakeownExe -PathType Leaf)) {
             throw "Windows takeown.exe is required to replace a previous Approved Host runtime: $TakeownExe"
@@ -196,6 +196,10 @@ try {
         & $TakeownExe /F $InstallRoot /A /R /D Y /SKIPSL | Out-Null
         if ($LASTEXITCODE -ne 0) {
             throw "Reclaiming ownership of the previous Approved Host runtime failed."
+        }
+        & icacls.exe $InstallRoot /reset /T | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "Resetting the previous Approved Host runtime DACL failed."
         }
         & icacls.exe $InstallRoot /grant:r "*S-1-5-32-544:(OI)(CI)F" /T | Out-Null
         if ($LASTEXITCODE -ne 0) {
