@@ -7,10 +7,9 @@ import tempfile
 from pathlib import Path
 
 import anyio
+import pytest
 from mcp import Client, StdioServerParameters
 from mcp.client.stdio import stdio_client
-import pytest
-
 
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="WLMCP stdio production route is Windows-only")
 
