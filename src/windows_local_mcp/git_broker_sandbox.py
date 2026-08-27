@@ -366,8 +366,7 @@ def _command_requires_full_refs(command: Sequence[str]) -> bool:
     head = tail[: tail.index("--")] if "--" in tail else tail
     if any(
         value in {"--all", "--branches", "--tags"}
-        or value.startswith("--branches=")
-        or value.startswith("--tags=")
+        or value.startswith(("--branches=", "--tags="))
         for value in head
     ):
         return True
@@ -376,6 +375,8 @@ def _command_requires_full_refs(command: Sequence[str]) -> bool:
 
 
 def _commands_require_full_refs(commands: Sequence[Sequence[str]]) -> bool:
+    if not commands:
+        return True
     return any(_command_requires_full_refs(command) for command in commands)
 
 
