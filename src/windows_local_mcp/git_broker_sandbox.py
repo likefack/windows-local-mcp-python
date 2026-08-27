@@ -1,0 +1,667 @@
+from __future__ import annotations
+
+import configparser
+import hashlib
+import os
+import shutil
+import subprocess
+import tempfile
+import time
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Sequence
+
+from .child_env import build_command_environment, sanitize_executable_search_path
+from .config import Settings
+from .paths import hold_verified_path, read_verified_bytes, release_verified_hold
+from .resources import BoundedStreamCapture, scan_directory_bounded
+from .sandbox_backend import (
+    ApprovedSandboxUnavailable,
+    CodexSandboxBackend,
+    guard_and_launch_codex_sandbox,
+    hold_codex_sandbox_backend,
+    isolation_context_digest,
+    require_codex_sandbox_live_verification,
+    resolve_codex_sandbox_backend,
+)
+from .tool_safety import hold_executable_identity
+from .util import canonical_json, sha256_bytes, sha256_text
+from .wfp_guard_identity import hold_wfp_guard_implementation
+from .windows_job import WindowsJobLimits
+
+GIT_BROKER_POLICY_VERSION = 1
+_GIT_PROCESS_LIMIT = 16
+_GIT_MEMORY_LIMIT = 1024 * 1024 * 1024
+
+
+class GitBrokerUnavailable(RuntimeError):
+    """Automatic Git cannot run without its verified containment boundary."""
+
+
+@dataclass(frozen=True)
+class GitBrokerContainment:
+    backend: CodexSandboxBackend
+    live_evidence: dict[str, Any]
+    policy_digest: str
+
+
+@dataclass(frozen=True)
+class GitBrokerStage:
+    root: Path
+    repository: Path
+    runtime: Path
+    source_root: Path
+    snapshot_digest: str
+    file_count: int
+    total_bytes: int
+
+
+@dataclass(frozen=True)
+class GitBrokerResult:
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+    stdout_truncated: bool
+    stderr_truncated: bool
+    backend_version: str
+    containment_policy_digest: str
+    snapshot_digest: str
+    wfp_guard_verification: dict[str, object]
+
+
+def require_git_broker_containment(
+    settings: Settings, git_identity: dict[str, Any]
+) -> GitBrokerContainment:
+    """Require the already live-verified Windows sandbox before Git is called available."""
+
+    if os.name != "nt":
+        raise GitBrokerUnavailable("Automatic Git Broker requires native Windows")
+    try:
+        backend = resolve_codex_sandbox_backend(settings)
+        evidence = require_codex_sandbox_live_verification(settings, backend)
+        context = {
+            "version": GIT_BROKER_POLICY_VERSION,
+            "git_executable": git_identity,
+            "sandbox_backend": backend.as_dict(),
+            "sandbox_isolation_context_digest": isolation_context_digest(settings, backend),
+            "workspace_root": str(settings.workspace_root.resolve(strict=True)),
+            "source_workspace_access": "deny",
+            "execution_input": "sanitized-disposable-repository-snapshot",
+            "network": "deny",
+            "host_fallback": False,
+        }
+        return GitBrokerContainment(
+            backend=backend,
+            live_evidence=evidence,
+            policy_digest=sha256_text(canonical_json(context)),
+        )
+    except GitBrokerUnavailable:
+        raise
+    except ApprovedSandboxUnavailable as error:
+        raise GitBrokerUnavailable(
+            f"Automatic Git Broker containment is unavailable: {error}"
+        ) from error
+    except (OSError, PermissionError, RuntimeError, ValueError) as error:
+        raise GitBrokerUnavailable(
+            "Automatic Git Broker containment could not be verified"
+        ) from error
+
+
+def _repo_limits(settings: Settings) -> tuple[int, int]:
+    byte_limit = max(
+        16 * 1024 * 1024,
+        min(settings.max_sandbox_scratch_bytes * 3 // 4, 1024 * 1024 * 1024),
+    )
+    entry_limit = max(4096, min(settings.approval_manifest_max_files * 8, 200_000))
+    return byte_limit, entry_limit
+
+
+def _is_reparse(path: Path) -> bool:
+    details = path.lstat()
+    return path.is_symlink() or bool(int(getattr(details, "st_file_attributes", 0)) & 0x400)
+
+
+def _validate_source_repository(settings: Settings) -> tuple[Path, int, int]:
+    source = settings.workspace_root.resolve(strict=True)
+    metadata = source / ".git"
+    if not metadata.exists() or not metadata.is_dir() or _is_reparse(metadata):
+        raise GitBrokerUnavailable(
+            "automatic Git requires an in-workspace regular .git directory; gitfiles and "
+            "reparse metadata roots require an approved route"
+        )
+    byte_limit, entry_limit = _repo_limits(settings)
+    try:
+        scan = scan_directory_bounded(
+            source,
+            stop_after_bytes=byte_limit,
+            stop_after_entries=entry_limit,
+            collect_files=True,
+            reject_alternate_streams=True,
+            reject_reparse_points=True,
+        )
+    except (OSError, RuntimeError) as error:
+        raise GitBrokerUnavailable(
+            f"automatic Git repository layout is unsafe: {error}"
+        ) from error
+    if scan.total_bytes > byte_limit or scan.entry_count > entry_limit:
+        raise GitBrokerUnavailable(
+            "automatic Git repository exceeds the bounded snapshot resource policy"
+        )
+    for path in scan.files:
+        try:
+            if path.stat(follow_symlinks=False).st_nlink > 1:
+                raise GitBrokerUnavailable(
+                    f"automatic Git repository contains a hard-linked file: {path}"
+                )
+        except FileNotFoundError as error:
+            raise GitBrokerUnavailable(
+                "automatic Git repository changed during preflight"
+            ) from error
+    for unsafe_relative in (
+        Path(".git") / "commondir",
+        Path(".git") / "config.worktree",
+        Path(".git") / "objects" / "info" / "alternates",
+        Path(".git") / "objects" / "info" / "http-alternates",
+    ):
+        candidate = source / unsafe_relative
+        if candidate.exists():
+            try:
+                if candidate.is_file() and candidate.stat().st_size == 0:
+                    continue
+            except OSError:
+                pass
+            raise GitBrokerUnavailable(
+                f"automatic Git does not accept external/extended repository metadata: {unsafe_relative}"
+            )
+    return source, scan.total_bytes, scan.entry_count
+
+
+def _protected_worktree_path(relative: Path, settings: Settings) -> bool:
+    parts = [part.casefold() for part in relative.parts]
+    if any(part in {name.casefold() for name in settings.read_denied_directories} for part in parts[:-1]):
+        return True
+    name = relative.name.casefold()
+    if name in {value.casefold() for value in settings.blocked_file_names}:
+        return True
+    return name.startswith(".env.") and name != ".env.example"
+
+
+def _copy_verified_file(
+    source: Path,
+    destination: Path,
+    *,
+    byte_limit: int,
+) -> tuple[int, str]:
+    held = hold_verified_path(
+        source,
+        allow_directory=False,
+        allow_hardlinks=False,
+        readable=True,
+    )
+    try:
+        details = held.stat()
+        if details.st_nlink > 1:
+            raise GitBrokerUnavailable(f"hard-linked Git input is denied: {source}")
+        data = read_verified_bytes(held, byte_limit)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(data)
+        try:
+            shutil.copystat(held, destination, follow_symlinks=False)
+        except OSError:
+            # Timestamp/mode fidelity improves Git status performance but is not the security boundary.
+            pass
+        return len(data), sha256_bytes(data)
+    finally:
+        release_verified_hold(held)
+
+
+def _copy_repository_tree(
+    source: Path,
+    destination: Path,
+    settings: Settings,
+    *,
+    byte_limit: int,
+    entry_limit: int,
+) -> tuple[int, int, str]:
+    file_count = 0
+    total_bytes = 0
+    digest = hashlib.sha256()
+    pending: list[tuple[Path, Path]] = [(source, Path())]
+    while pending:
+        current, relative_root = pending.pop()
+        held_directory = hold_verified_path(
+            current,
+            allow_directory=True,
+            allow_hardlinks=True,
+        )
+        try:
+            with os.scandir(held_directory) as scanner:
+                entries = sorted(scanner, key=lambda entry: entry.name.casefold())
+        finally:
+            release_verified_hold(held_directory)
+        for entry in entries:
+            relative = relative_root / entry.name
+            if relative.parts and relative.parts[0].casefold() == ".git":
+                if len(relative.parts) == 1:
+                    pending.append((Path(entry.path), relative))
+                    continue
+                metadata_parts = [part.casefold() for part in relative.parts[1:]]
+                if metadata_parts and metadata_parts[0] in {"hooks", "modules"}:
+                    continue
+                if relative.as_posix().casefold() in {
+                    ".git/info/attributes",
+                    ".git/config.worktree",
+                    ".git/objects/info/alternates",
+                    ".git/objects/info/http-alternates",
+                }:
+                    continue
+            elif _protected_worktree_path(relative, settings):
+                continue
+            elif relative.name.casefold() == ".gitattributes":
+                # Attributes can select project-controlled filters/textconv drivers. The automatic
+                # projection intentionally removes them; advanced attribute semantics use approval.
+                continue
+
+            candidate = Path(entry.path)
+            details = entry.stat(follow_symlinks=False)
+            if entry.is_symlink() or bool(int(getattr(details, "st_file_attributes", 0)) & 0x400):
+                raise GitBrokerUnavailable(f"reparse input is denied: {relative}")
+            if entry.is_dir(follow_symlinks=False):
+                (destination / relative).mkdir(parents=True, exist_ok=True)
+                pending.append((candidate, relative))
+                continue
+            if not entry.is_file(follow_symlinks=False):
+                raise GitBrokerUnavailable(f"non-regular Git input is denied: {relative}")
+            file_count += 1
+            if file_count > entry_limit:
+                raise GitBrokerUnavailable("automatic Git snapshot exceeds its file-count limit")
+            remaining = byte_limit - total_bytes
+            if remaining < 0:
+                raise GitBrokerUnavailable("automatic Git snapshot exceeds its byte limit")
+            size, file_digest = _copy_verified_file(
+                candidate,
+                destination / relative,
+                byte_limit=remaining,
+            )
+            total_bytes += size
+            if total_bytes > byte_limit:
+                raise GitBrokerUnavailable("automatic Git snapshot exceeds its byte limit")
+            digest.update(relative.as_posix().encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(str(size).encode("ascii"))
+            digest.update(b"\0")
+            digest.update(file_digest.encode("ascii"))
+            digest.update(b"\n")
+    return file_count, total_bytes, digest.hexdigest()
+
+
+def _parse_bool(value: str | None, *, default: bool) -> bool:
+    if value is None:
+        return default
+    folded = value.strip().casefold()
+    if folded in {"true", "yes", "on", "1"}:
+        return True
+    if folded in {"false", "no", "off", "0"}:
+        return False
+    raise GitBrokerUnavailable("automatic Git repository has an invalid boolean core setting")
+
+
+def _sanitize_repository_config(repository: Path) -> None:
+    config_path = repository / ".git" / "config"
+    if not config_path.is_file():
+        raise GitBrokerUnavailable("automatic Git repository has no .git/config")
+    try:
+        raw = config_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise GitBrokerUnavailable("automatic Git repository config is unreadable") from error
+    parser = configparser.RawConfigParser(
+        interpolation=None,
+        strict=False,
+        allow_no_value=True,
+    )
+    try:
+        parser.read_string(raw)
+    except configparser.Error as error:
+        raise GitBrokerUnavailable("automatic Git repository config is not safely parseable") from error
+    repository_format = parser.get("core", "repositoryformatversion", fallback="0").strip()
+    if repository_format != "0":
+        raise GitBrokerUnavailable(
+            "automatic Git supports repositoryformatversion=0 only; extended repositories require approval"
+        )
+    if parser.has_section("extensions") and list(parser.items("extensions")):
+        raise GitBrokerUnavailable(
+            "automatic Git does not accept repository extensions without explicit approval"
+        )
+    filemode = _parse_bool(parser.get("core", "filemode", fallback=None), default=False)
+    ignorecase = _parse_bool(parser.get("core", "ignorecase", fallback=None), default=os.name == "nt")
+    safe = (
+        "[core]\n"
+        "\trepositoryformatversion = 0\n"
+        f"\tfilemode = {'true' if filemode else 'false'}\n"
+        "\tbare = false\n"
+        "\tlogallrefupdates = true\n"
+        f"\tignorecase = {'true' if ignorecase else 'false'}\n"
+    )
+    config_path.write_text(safe, encoding="utf-8", newline="\n")
+
+
+def stage_git_repository(settings: Settings, token: str) -> GitBrokerStage:
+    """Create a bounded, sanitized repository projection outside the live workspace."""
+
+    if settings.sandbox_scratch_dir is None:
+        raise GitBrokerUnavailable("sandbox_scratch_dir is required for Automatic Git Broker")
+    source, _source_bytes, _source_entries = _validate_source_repository(settings)
+    byte_limit, entry_limit = _repo_limits(settings)
+    safe_token = "".join(ch for ch in token if ch.isalnum() or ch in "-_")[:120]
+    if not safe_token:
+        raise ValueError("invalid Automatic Git snapshot token")
+    root = settings.sandbox_scratch_dir / "git-broker" / safe_token
+    if root.exists():
+        raise GitBrokerUnavailable("Automatic Git snapshot directory already exists")
+    repository = root / "repository"
+    runtime = root / "runtime"
+    repository.mkdir(parents=True, exist_ok=False)
+    runtime.mkdir(parents=True, exist_ok=False)
+    try:
+        file_count, total_bytes, snapshot_digest = _copy_repository_tree(
+            source,
+            repository,
+            settings,
+            byte_limit=byte_limit,
+            entry_limit=entry_limit,
+        )
+        _sanitize_repository_config(repository)
+        verification = scan_directory_bounded(
+            repository,
+            stop_after_bytes=byte_limit,
+            stop_after_entries=entry_limit,
+            reject_alternate_streams=True,
+            reject_reparse_points=True,
+        )
+        if verification.total_bytes > byte_limit or verification.entry_count > entry_limit:
+            raise GitBrokerUnavailable("staged Automatic Git repository exceeds resource limits")
+        return GitBrokerStage(
+            root=root,
+            repository=repository,
+            runtime=runtime,
+            source_root=source,
+            snapshot_digest=snapshot_digest,
+            file_count=file_count,
+            total_bytes=total_bytes,
+        )
+    except Exception:
+        shutil.rmtree(root, ignore_errors=True)
+        raise
+
+
+def _rewrite_path(value: str, source: Path, destination: Path) -> str:
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        return value
+    try:
+        relative = candidate.resolve(strict=False).relative_to(source)
+    except (OSError, ValueError):
+        return value
+    return str(destination / relative)
+
+
+def _rewrite_command(command: Sequence[str], stage: GitBrokerStage) -> list[str]:
+    if not command:
+        raise ValueError("Git Broker command cannot be empty")
+    return [command[0], *(_rewrite_path(value, stage.source_root, stage.repository) for value in command[1:])]
+
+
+def _rewrite_cwd(cwd: str, stage: GitBrokerStage) -> Path:
+    source_cwd = Path(cwd).resolve(strict=True)
+    try:
+        relative = source_cwd.relative_to(stage.source_root)
+    except ValueError as error:
+        raise GitBrokerUnavailable("automatic Git cwd escaped workspace_root") from error
+    staged = stage.repository / relative
+    if not staged.is_dir():
+        raise GitBrokerUnavailable("automatic Git cwd is absent from the sanitized snapshot")
+    return staged
+
+
+def _map_output_paths(data: bytes, stage: GitBrokerStage) -> bytes:
+    replacements = (
+        (str(stage.repository).encode(), str(stage.source_root).encode()),
+        (stage.repository.as_posix().encode(), stage.source_root.as_posix().encode()),
+    )
+    result = data
+    for staged, source in replacements:
+        result = result.replace(staged, source)
+    return result
+
+
+def _git_environment(
+    settings: Settings,
+    containment: GitBrokerContainment,
+    stage: GitBrokerStage,
+    git_identity: dict[str, Any],
+) -> dict[str, str]:
+    nonce = uuid.uuid4().hex
+    environment = build_command_environment(
+        os.environ,
+        extra_names=settings.child_environment_allowlist,
+        nonce=nonce,
+        git_command=True,
+    )
+    home = stage.runtime / "home"
+    temp = stage.runtime / "temp"
+    home.mkdir(parents=True, exist_ok=True)
+    temp.mkdir(parents=True, exist_ok=True)
+    environment.update(
+        {
+            "HOME": str(home),
+            "USERPROFILE": str(home),
+            "APPDATA": str(home / "AppData" / "Roaming"),
+            "LOCALAPPDATA": str(home / "AppData" / "Local"),
+            "TEMP": str(temp),
+            "TMP": str(temp),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "NUL",
+            "GIT_CONFIG_SYSTEM": "NUL",
+            "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_ALLOW_PROTOCOL": "",
+            "GCM_INTERACTIVE": "Never",
+        }
+    )
+    sanitize_executable_search_path(
+        environment,
+        forbidden_roots=(
+            settings.workspace_root,
+            settings.data_dir,
+            settings.sandbox_scratch_dir,
+        ),
+        prepend=(
+            Path(str(git_identity["path"])).resolve(strict=True).parent,
+            Path(containment.backend.executable).resolve(strict=True).parent,
+        ),
+    )
+    return environment
+
+
+def _run_one(
+    *,
+    settings: Settings,
+    containment: GitBrokerContainment,
+    stage: GitBrokerStage,
+    git_identity: dict[str, Any],
+    command: Sequence[str],
+    cwd: str,
+    deadline: float,
+    output_limit: int,
+    output_paths: tuple[Path, Path] | None,
+    on_launch: Callable[[subprocess.Popen[Any], dict[str, object], CodexSandboxBackend], None] | None,
+) -> GitBrokerResult:
+    rewritten = _rewrite_command(command, stage)
+    staged_cwd = _rewrite_cwd(cwd, stage)
+    if Path(rewritten[0]).resolve(strict=True) != Path(str(git_identity["path"])).resolve(strict=True):
+        raise GitBrokerUnavailable("Automatic Git command does not match the bound executable")
+    environment = _git_environment(settings, containment, stage, git_identity)
+    if output_paths is None:
+        token = uuid.uuid4().hex
+        stdout_path = stage.runtime / f"{token}.stdout"
+        stderr_path = stage.runtime / f"{token}.stderr"
+        persistent = False
+    else:
+        stdout_path, stderr_path = output_paths
+        persistent = True
+    process: subprocess.Popen[Any] | None = None
+    job: Any | None = None
+    stdout_capture: BoundedStreamCapture | None = None
+    stderr_capture: BoundedStreamCapture | None = None
+    guard_payload: dict[str, object] = {}
+    try:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Automatic Git operation deadline exceeded before launch")
+        process, job, _argv, guard_payload = guard_and_launch_codex_sandbox(
+            containment.backend,
+            settings=settings,
+            command=rewritten,
+            cwd=staged_cwd,
+            writable_roots=(stage.root,),
+            environment=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            limits=WindowsJobLimits(
+                max_processes=min(_GIT_PROCESS_LIMIT, containment.backend.max_processes),
+                max_memory_bytes=min(_GIT_MEMORY_LIMIT, containment.backend.max_memory_bytes),
+            ),
+            expected_live_evidence=containment.live_evidence,
+        )
+        if on_launch is not None:
+            on_launch(process, guard_payload, containment.backend)
+        if process.stdout is None or process.stderr is None:
+            raise RuntimeError("Automatic Git sandbox did not create output pipes")
+        stdout_capture = BoundedStreamCapture(process.stdout, stdout_path, output_limit)
+        stderr_capture = BoundedStreamCapture(process.stderr, stderr_path, output_limit)
+        stdout_capture.start()
+        stderr_capture.start()
+        while True:
+            if job.violation is not None:
+                raise GitBrokerUnavailable(
+                    f"Automatic Git sandbox resource limit exceeded: {job.violation}"
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Automatic Git operation exceeded its runtime limit")
+            try:
+                returncode = process.wait(timeout=min(0.5, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        if not job.wait_empty(timeout=min(10.0, max(0.0, deadline - time.monotonic()))):
+            raise GitBrokerUnavailable("Automatic Git sandbox descendants did not drain")
+        if job.violation is not None:
+            raise GitBrokerUnavailable(
+                f"Automatic Git sandbox resource limit exceeded: {job.violation}"
+            )
+        stdout_capture.join()
+        stderr_capture.join()
+        stdout = _map_output_paths(stdout_path.read_bytes(), stage)
+        stderr = _map_output_paths(stderr_path.read_bytes(), stage)
+        stdout_path.write_bytes(stdout)
+        stderr_path.write_bytes(stderr)
+        return GitBrokerResult(
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
+            stdout_truncated=stdout_capture.truncated,
+            stderr_truncated=stderr_capture.truncated,
+            backend_version=containment.backend.version,
+            containment_policy_digest=containment.policy_digest,
+            snapshot_digest=stage.snapshot_digest,
+            wfp_guard_verification=guard_payload,
+        )
+    finally:
+        if job is not None:
+            try:
+                job.terminate()
+                job.wait_empty(timeout=10)
+            finally:
+                job.close()
+        if stdout_capture is not None:
+            stdout_capture.join()
+        if stderr_capture is not None:
+            stderr_capture.join()
+        if not persistent:
+            stdout_path.unlink(missing_ok=True)
+            stderr_path.unlink(missing_ok=True)
+
+
+def run_git_broker_batch(
+    *,
+    settings: Settings,
+    git_identity: dict[str, Any],
+    commands: Sequence[Sequence[str]],
+    cwd: str,
+    timeout: float,
+    output_limit: int,
+    token: str | None = None,
+    output_paths: tuple[Path, Path] | None = None,
+    on_launch: Callable[[subprocess.Popen[Any], dict[str, object], CodexSandboxBackend], None] | None = None,
+) -> list[GitBrokerResult]:
+    if not commands:
+        return []
+    containment = require_git_broker_containment(settings, git_identity)
+    stage = stage_git_repository(settings, token or uuid.uuid4().hex)
+    deadline = time.monotonic() + max(0.0, timeout)
+    try:
+        with (
+            hold_executable_identity(git_identity),
+            hold_codex_sandbox_backend(containment.backend),
+            hold_wfp_guard_implementation(),
+        ):
+            results: list[GitBrokerResult] = []
+            for index, command in enumerate(commands):
+                persistent_paths = output_paths if len(commands) == 1 and index == 0 else None
+                results.append(
+                    _run_one(
+                        settings=settings,
+                        containment=containment,
+                        stage=stage,
+                        git_identity=git_identity,
+                        command=command,
+                        cwd=cwd,
+                        deadline=deadline,
+                        output_limit=output_limit,
+                        output_paths=persistent_paths,
+                        on_launch=on_launch if index == 0 else None,
+                    )
+                )
+            return results
+    finally:
+        shutil.rmtree(stage.root, ignore_errors=True)
+
+
+def run_git_broker_command(
+    *,
+    settings: Settings,
+    git_identity: dict[str, Any],
+    command: Sequence[str],
+    cwd: str,
+    timeout: float,
+    output_limit: int,
+    token: str | None = None,
+    output_paths: tuple[Path, Path] | None = None,
+    on_launch: Callable[[subprocess.Popen[Any], dict[str, object], CodexSandboxBackend], None] | None = None,
+) -> GitBrokerResult:
+    results = run_git_broker_batch(
+        settings=settings,
+        git_identity=git_identity,
+        commands=(command,),
+        cwd=cwd,
+        timeout=timeout,
+        output_limit=output_limit,
+        token=token,
+        output_paths=output_paths,
+        on_launch=on_launch,
+    )
+    return results[0]
