@@ -1,7 +1,7 @@
-from hashlib import sha256
-from pathlib import Path
 import shutil
 import subprocess
+from hashlib import sha256
+from pathlib import Path
 
 import pytest
 
@@ -40,14 +40,13 @@ def _policy(
     return settings, CommandPolicy(settings, Workspace(settings))
 
 
-def test_git_show_raw_blob_is_forced_through_commit_peel(
+def _real_git_policy(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+) -> tuple[str, Settings, CommandPolicy]:
     git = shutil.which("git.exe") or shutil.which("git")
     if git is None:
         pytest.skip("Git is not installed")
-    executable = Path(git)
-    settings, policy = _policy(tmp_path, monkeypatch, executable=executable)
+    settings, policy = _policy(tmp_path, monkeypatch, executable=Path(git))
     shutil.rmtree(settings.workspace_root / ".git")
     subprocess.run(
         [git, "init", str(settings.workspace_root)],
@@ -55,14 +54,25 @@ def test_git_show_raw_blob_is_forced_through_commit_peel(
         check=True,
         shell=False,
     )
-    blob = subprocess.run(
+    return git, settings, policy
+
+
+def _write_blob(git: str, workspace: Path, payload: bytes) -> str:
+    return subprocess.run(
         [git, "hash-object", "-w", "--stdin"],
-        cwd=settings.workspace_root,
-        input=b"TOP_SECRET\n",
+        cwd=workspace,
+        input=payload,
         capture_output=True,
         check=True,
         shell=False,
     ).stdout.decode("ascii").strip()
+
+
+def test_git_show_raw_blob_is_forced_through_commit_peel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    git, settings, policy = _real_git_policy(tmp_path, monkeypatch)
+    blob = _write_blob(git, settings.workspace_root, b"TOP_SECRET\n")
 
     normalized = policy.normalize_safe(program="git", args=["show", blob], cwd=".")
 
@@ -79,6 +89,49 @@ def test_git_show_raw_blob_is_forced_through_commit_peel(
     assert b"TOP_SECRET" not in result.stderr
 
 
+def test_git_diff_raw_blobs_are_forced_through_commit_peel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    git, settings, policy = _real_git_policy(tmp_path, monkeypatch)
+    secret = _write_blob(git, settings.workspace_root, b"TOP_SECRET  \n")
+    public = _write_blob(git, settings.workspace_root, b"PUBLIC\n")
+
+    normalized = policy.normalize_safe(
+        program="git", args=["diff", "--stat", secret, public], cwd="."
+    )
+
+    assert f"{secret}^{{commit}}" in normalized.args
+    assert f"{public}^{{commit}}" in normalized.args
+    result = subprocess.run(
+        [git, *normalized.args],
+        cwd=settings.workspace_root,
+        capture_output=True,
+        check=False,
+        shell=False,
+    )
+    assert result.returncode != 0
+    assert b"TOP_SECRET" not in result.stdout
+    assert b"TOP_SECRET" not in result.stderr
+
+
+def test_git_diff_check_requires_regular_file_pathspec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = tmp_path / "git.exe"
+    executable.write_bytes(b"MZ fake")
+    settings, policy = _policy(tmp_path, monkeypatch, executable=executable)
+    source = settings.workspace_root / "public.txt"
+    source.write_text("public\n", encoding="utf-8")
+
+    with pytest.raises(PermissionError, match="safe grammar"):
+        policy.normalize_safe(program="git", args=["diff", "--check"], cwd=".")
+    normalized = policy.normalize_safe(
+        program="git", args=["diff", "--check", "--", "public.txt"], cwd="."
+    )
+    assert "--check" in normalized.args
+    assert str(source.resolve()) in normalized.args
+
+
 def test_git_show_default_revision_is_commit_bound(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -91,12 +144,15 @@ def test_git_show_default_revision_is_commit_bound(
     assert "HEAD^{commit}" in normalized.args
 
 
-def test_git_show_revision_range_is_not_automatic(
+def test_git_revision_ranges_bind_both_commit_endpoints(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     executable = tmp_path / "git.exe"
     executable.write_bytes(b"MZ fake")
     _settings, policy = _policy(tmp_path, monkeypatch, executable=executable)
 
-    with pytest.raises(PermissionError, match="individual commit-ish revisions"):
-        policy.normalize_safe(program="git", args=["show", "HEAD~2..HEAD"], cwd=".")
+    show = policy.normalize_safe(program="git", args=["show", "HEAD~2..HEAD"], cwd=".")
+    diff = policy.normalize_safe(program="git", args=["diff", "HEAD~2...HEAD"], cwd=".")
+
+    assert "HEAD~2^{commit}..HEAD^{commit}" in show.args
+    assert "HEAD~2^{commit}...HEAD^{commit}" in diff.args
