@@ -11,7 +11,7 @@ ChatGPT から、指定した 1 つの Windows 作業領域を安全に読み書
 1. **WLMCP Broker**
    - 対象パス、入出力、容量、副作用を WLMCP が限定できる処理です。
    - ファイル read/write、差分、固定 ADB 読み取り、固定 Git metadata 読み取り、バイナリ転送、checkpoint、transaction、Undo／rollback を直接扱います。
-   - Automatic Git Broker は pinned `git.exe`、bounded／sanitized disposable repository projection、live-verified Codex Windows Sandbox containment、Git-specific live marker がすべて current の場合だけ `git_info`／`execute_readonly` の固定 Git grammar を実行します。Automatic `diff`／`show` は metadata-only で、patch／binary patch／`--check`／暗黙 patch output は対象外です。marker が missing／stale／failed の PC では Git child を起動せず fail closed します。
+   - Automatic Git Broker は pinned Git runtime、bounded／sanitized disposable repository projection、live-verified Codex Windows Sandbox containment、Git-specific live marker がすべて current の場合だけ `git_info`／`execute_readonly` の固定 Git grammar を実行します。Automatic `diff`／`show` は metadata-only で、patch／binary patch／`--check`／暗黙 patch output は対象外です。marker が missing／stale／failed の PC では Git child を起動せず fail closed します。
 2. **構造化処理**
    - DOCX、XLSX、CSV／TSV、ZIP、一般画像を宣言的な操作として処理します。
    - 現在は WLMCP 管理処理を使用し、処理結果を artifact として検証してから Broker の transaction で反映します。将来の ChatGPT container 処理も同じバイナリ転送境界へ接続できます。
@@ -50,15 +50,15 @@ approved_host_enabled = false
 
 Broker が自動実行する ADB helper は `PATH` 上の同名ファイルを使用しません。workspace、`data_dir`、Sandbox scratch の外にある絶対 path と SHA-256 を対で設定してください。未設定時は capability が有効でも実行を拒否します。
 
-Automatic Git Broker も `PATH` discovery を trust source にせず、workspace／`data_dir`／Sandbox scratch の外にある Git executable の絶対 path と SHA-256 を必要とします。path／hash を設定しただけでは execution availability にはなりません。まず generic Codex Sandbox live verification を成立させ、そのうえで同じ containment 内の pinned Git を使う `verify-git-broker` を明示実行して Git-specific marker schema v1 を作成する必要があります。
+Automatic Git Broker も `PATH` discovery を trust source にせず、workspace／`data_dir`／Sandbox scratch の外にある実 Git runtime executable の絶対 path と SHA-256 を必要とします。Git for Windows の `cmd\git.exe` や install-root の `bin\git.exe` は wrapper／redirector になり得るため、Automatic Git の trust anchor には使用しません。典型的な 64-bit Git for Windows では `mingw64\bin\git.exe` を直接 pin します。path／hash を設定しただけでは execution availability にはなりません。まず generic Codex Sandbox live verification を成立させ、そのうえで同じ containment 内の pinned runtime を使う `verify-git-broker` を明示実行して Git-specific marker schema v1 を作成する必要があります。
 
 ```powershell
-$gitPath = (Get-Command git.exe).Source
+$gitPath = 'C:\Program Files\Git\mingw64\bin\git.exe'
 $gitHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $gitPath).Hash.ToLowerInvariant()
 ```
 
 ```toml
-git_executable_path = "C:\\Program Files\\Git\\cmd\\git.exe"
+git_executable_path = "C:\\Program Files\\Git\\mingw64\\bin\\git.exe"
 git_executable_sha256 = "ここを64桁のSHA-256へ置換"
 ```
 
@@ -68,7 +68,7 @@ $env:LOCAL_MCP_CONFIG = 'C:\path\to\config.local.toml'
 .\.venv\Scripts\python.exe -m windows_local_mcp.cli verify-git-broker
 ```
 
-`verify-git-broker` は通常 operation から自動実行されません。Git executable identity、Sandbox backend、generic live evidence、workspace、scratch quota、containment policy、Automatic Git command-policy generation のいずれかが変わった場合は marker が stale になり、再検証するまで Automatic Git は `available=false` です。Git-specific route は general Sandbox で residual risk として許容する `protected_information_read`／LAN を継承せず、全 Sandbox security property が `verified` の場合だけ route eligible です。
+`verify-git-broker` は通常 operation から自動実行されません。Git runtime identity、Sandbox backend、generic live evidence、workspace、scratch quota、containment policy、Automatic Git command-policy generation v3、trusted process-cwd policy、required-builtin policy のいずれかが変わった場合は marker が stale になり、再検証するまで Automatic Git は `available=false` です。verifier は `status`／`diff`／`log`／`show`／`rev-parse`／`ls-files` が exact pinned runtime の builtin command であることも確認します。Git-specific route は general Sandbox で residual risk として許容する `protected_information_read`／LAN を継承せず、全 Sandbox security property が `verified` の場合だけ route eligible です。
 
 開発 server は次のとおり起動します。設定が不正な場合は、workspace を操作する前に起動を拒否します。
 
@@ -108,11 +108,11 @@ Approved Host の immutable runtime installer／verifier は、将来この rout
 
 `execute_workspace_write` は互換用の公開面を残していますが、Dart／Flutter 等の project-controlled 処理は拒否され、`request_sandbox_command` を案内します。
 
-`git_info` と `execute_readonly` の固定 Git grammar は、current Git-specific marker が成立した Windows PC では Automatic Git Broker として実行できます。Git child は live workspace を直接読まず、operation ごとの bounded／sanitized projection を処理します。`.gitattributes`、hooks、object alternates、external／extended repository metadata、nested `.git`、reparse／hardlink／ADS 等は除外または拒否し、source `.git/config` は raw bytes を scratch へ保存せず Broker memory 上で解析して inert `core` settings だけを書き出します。config parsing は 1 MiB で fail closed します。
+`git_info` と `execute_readonly` の固定 Git grammar は、current Git-specific marker が成立した Windows PC では Automatic Git Broker として実行できます。Git child は live workspace を直接読まず、operation ごとの bounded／sanitized projection を処理します。Git process 自体の Windows process cwd は pinned runtime directory に固定し、repository selection は Broker が argv へ挿入する `git -C <sanitized projection cwd>` で行うため、project-controlled projection を current-directory DLL search surface にしません。`.gitattributes`、hooks、object alternates、external／extended repository metadata、nested `.git`、reparse／hardlink／ADS 等は除外または拒否し、source `.git/config` は raw bytes を scratch へ保存せず Broker memory 上で解析して inert `core` settings だけを書き出します。config parsing は 1 MiB で fail closed します。
 
 Git object database には、現在の working-tree policy では protected な内容を含む historical blob が残り得ます。また攻撃者はその blob を一見安全な tree／commit／index path に再結合できます。そのため current workspace path の検証や `^{commit}` binding だけを content provenance とみなしません。Automatic `diff`／`show` は `--stat`、`--name-only`、`--name-status`、`--quiet`、`--no-patch` 等の metadata-only output に限定し、`--patch`／`-p`／`--binary`／`--check`／pathspec 付き暗黙 patch は `request_sandbox_command` の対象です。`git_info` snapshot も status、diff stat/name-status、log metadata 等に限定します。marker がない／stale な PC では process creation 前に拒否し、Approved Host へ fallback しません。
 
-Automatic Git repository projection の byte limit は configured `max_sandbox_scratch_bytes` の 1/2 以下です。残りを operation 固有 runtime／transient output 用に残し、operator quota を超える hard-coded repository-size floor は使用しません。
+Automatic Git repository projection の byte limit は configured `max_sandbox_scratch_bytes` の 1/2 以下です。残りを operation 固有 runtime／transient output 用に残し、operator quota を超える hard-coded repository-size floor は使用しません。runner は `maintenance.auto=false` と `gc.auto=0` も固定し、automatic maintenance／GC を通常の Automatic Git command semantics から除外します。
 
 ADB helper は設定済み path、SHA-256、file identity を正規化時と worker 実行直前に再検証し、Windows では child の終了まで実行ファイルを差し替え不能な共有モードで保持します。ADB の自動処理は allowlist 済み emulator serial を明示する固定読み取りだけで、`adb devices` による未許可 device の列挙は行いません。
 
@@ -211,7 +211,7 @@ unit／integration test、Windows 上の Sandbox／Automatic Git 実機検証、
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-Automatic Git の unit／CI regression が green でも、この PC で `verify-git-broker` が成功して current Git-specific marker が存在するまでは `available=false` が正しい状態です。通常 operation は marker を作成・repair しません。Git executable、Sandbox backend／live evidence、workspace、scratch quota、containment policy または command-policy generation が変われば marker は stale になり、Git child spawn 前に fail closed します。
+Automatic Git の unit／CI regression が green でも、この PC で `verify-git-broker` が成功して current Git-specific marker が存在するまでは `available=false` が正しい状態です。通常 operation は marker を作成・repair しません。Git runtime identity、Sandbox backend／live evidence、workspace、scratch quota、containment policy、command-policy generation v3、trusted process-cwd policy、required-builtin policy が変われば marker は stale になり、Git child spawn 前に fail closed します。
 
 Sandbox が利用不能、必須境界が未検証、timeout、setup failure、command failure の場合は、その operation を unavailable／failed として表示します。一般 Sandbox で受容済み残存 risk の `protected_information_read`／LAN failure はそのまま表示し、その他の mandatory route gate と分離します。Automatic Git はこの residual-risk allowance を使用せず、全 property が verified でなければ unavailable です。Approved Host へ自動 fallback しません。
 
