@@ -12,13 +12,15 @@ Automatic Git Broker は、`git_info` および `execute_readonly` の固定 Git
 2. `git_info`、`execute_readonly` の Git route、固定 Git snapshot が実際に Git child を起動できることを product capability として維持します。
 3. Git child は通常 Broker process の unrestricted Windows user authority で直接実行しません。固定 Git grammar を Broker primitive として維持しつつ、内部実装では OS-enforced containment を使用します。
 4. repository-controlled `.git/config`、attributes、filters、hooks、object alternates、gitfile、reparse point、external helper 等を trusted input とみなしません。危険な metadata が存在しても workspace 外 read/write、control-plane access、network access、project-controlled executable executionへ作用を拡大できないことを主境界とします。
-5. Git executable は trusted operator が固定した絶対 path、SHA-256、stable file identity を実行直前まで binding し、replacement を拒否します。
+5. Git executable は trusted operator が固定した絶対 path、SHA-256、stable file identity を実行直前まで binding し、replacement を拒否します。Git for Windows の既知 wrapper／redirector を primary trust anchor とせず、実際に Git command を実装する runtime executable を直接 pin します。
 6. Automatic route は repository metadata root が workspace 内の実 `.git` directory である場合だけ許可します。外部 gitdir、reparse/junction、unsafe hardlink、ADS、nested `.git`、未検証 filesystem feature は fail closed とし、必要なら承認済み route へ送ります。
-7. network capability は付与しません。Internet、LAN、未許可 loopback を OS-level boundary と live verification で deny します。
-8. process tree は Job Object の process/memory/kill-on-close boundary に収容し、Job 外 process creation を live verification で否定できない環境では automatic Git を available と表示しません。
-9. protected information への read access は Broker policy と OS boundary の両方で deny し、Git config/filter 等を経由した stdout/stderr への持ち出しを許可しません。projection 内の Git object database に protected file の historical blob が存在し得ることを前提にし、raw object ID、commit/tree path、index entry のいずれも protected-content provenance の根拠にはしません。
-10. Automatic `diff`／`show` は metadata-only output に限定します。patch、binary patch、`--check`、または pathspec を伴う暗黙 patch output 等、Git object database の blob bytes を stdout/stderr へ出し得る content-bearing mode は `request_sandbox_command` へ送ります。fixed Git capability 全体を停止するのではなく、status／metadata diff／log／show metadata／rev-parse／ls-files／snapshot は維持します。
-11. security fix、hardening、test correction、documentation correction の名目で、この capability を再び恒久停止する場合は trusted operator の明示承認を必要とします。
+7. Git process の Windows process cwd を project-controlled projection にしません。process は trusted runtime executable directory から起動し、repository selection は Broker が固定挿入する `git -C <sanitized projection cwd>` によって行います。
+8. network capability は付与しません。Internet、LAN、未許可 loopback を OS-level boundary と live verification で deny します。
+9. process tree は Job Object の process/memory/kill-on-close boundary に収容し、Job 外 process creation を live verification で否定できない環境では automatic Git を available と表示しません。
+10. protected information への read access は Broker policy と OS boundary の両方で deny し、Git config/filter 等を経由した stdout/stderr への持ち出しを許可しません。projection 内の Git object database に protected file の historical blob が存在し得ることを前提にし、raw object ID、commit/tree path、index entry のいずれも protected-content provenance の根拠にはしません。
+11. Automatic `diff`／`show` は metadata-only output に限定します。patch、binary patch、`--check`、または pathspec を伴う暗黙 patch output 等、Git object database の blob bytes を stdout/stderr へ出し得る content-bearing mode は `request_sandbox_command` へ送ります。fixed Git capability 全体を停止するのではなく、status／metadata diff／log／show metadata／rev-parse／ls-files／snapshot は維持します。
+12. Automatic grammar で使用する Git subcommand は、Git-specific live verification で exact pinned runtime の builtin command であることを確認します。外部 `git-*` helper へ委譲される runtime を verified とみなしません。
+13. security fix、hardening、test correction、documentation correction の名目で、この capability を再び恒久停止する場合は trusted operator の明示承認を必要とします。
 
 ## Current implementation contract
 
@@ -30,11 +32,13 @@ Git object database は repository semantics のため projection に含まれ�
 
 `git_info` snapshot の Git commands も branch、HEAD、status、diff/staged の stat/name-status、recent log metadata、changed-file name-status に限定し、blob content を返しません。`ls-files --stage` が object hash を返し得ても、Automatic grammar 内にその blob bytes を dereference する content-bearing route を残しません。
 
-Git child の environment は system/global Git config、system attributes、credential prompt、optional lock、Git protocol access を無効化し、PATH は workspace、`data_dir`、scratch を除外した trusted dependency path に限定します。Git child と descendant は disposable projection 以外へ write capability を持たず、source workspace と control-plane は Sandbox policy で deny します。Approved Host への automatic fallback はありません。
+Git for Windows では `cmd\git.exe` や install-root の `bin\git.exe` が別 runtime へ委譲する構成を取り得ます。Automatic Git はその wrapper／redirector の hash だけを execution identity として受理せず、通常は `mingw64\bin\git.exe`、architecture に応じて `clangarm64\bin\git.exe`／`mingw32\bin\git.exe` のような実 runtime を直接 operator pin します。Git process の process cwd はこの trusted executable directory とし、Broker が argv へ固定 `-C <sanitized projection cwd>` を挿入します。これにより projection を current-directory DLL search surface として利用しません。
+
+Git child の environment は system/global Git config、system attributes、credential prompt、optional lock、Git protocol access を無効化し、PATH は workspace、`data_dir`、scratch を除外した trusted dependency path に限定します。さらに Broker runner は `maintenance.auto=false` と `gc.auto=0` を固定し、automatic maintenance／GC を command semantics から除外します。Git child と descendant は disposable projection 以外へ write capability を持たず、source workspace と control-plane は Sandbox policy で deny します。Approved Host への automatic fallback はありません。
 
 Current `broker` operation だけでなく upgrade 前に残り得る legacy `safe_command`／`safe_sandbox` Git operation も `Executor` で dedicated Git worker へ収束させます。legacy row が standard worker の unrestricted child path を復活させることを許可しません。worker は original safe request、normalized command、settings digest、control-plane generation、process nonce を再検証します。
 
-Repository projection の byte limit は configured `max_sandbox_scratch_bytes` の 1/2 以下とし、旧 16 MiB floor のように operator quota を上回る下限を持ちません。残りの scratch budget は operation 固有 runtime／transient output のために確保します。scratch quota 自体も Git-specific live context に binding し、変更時は marker を stale にします。
+Repository projection の byte limit は configured `max_sandbox_scratch_bytes` の 1/2 以下とし、旧 16 MiB floor のように operator quota を上回る下限を持ちません。残りの scratch budget は operation 固有 runtime／transient output のために確保します。copy loop 自体にも entry-count bound を適用し、preflight 後の concurrent directory growth で final scan 前に scratch を無制限に増幅させません。scratch quota 自体も Git-specific live context に binding し、変更時は marker を stale にします。
 
 ## Git-specific live verification
 
@@ -42,9 +46,11 @@ Generic Codex Sandbox の route eligibility だけでは Automatic Git の avail
 
 Git-specific marker は次へ exact binding します。
 
-- pinned `git.exe` の path、SHA-256、stable file identity、size、mtime/provenance
+- pinned Git runtime executable の path、SHA-256、stable file identity、size、mtime/provenance
+- trusted executable-directory process cwd と Broker-fixed `-C` repository selection policy
+- Automatic grammar の required subcommand が pinned runtime の builtin であるという policy
 - Codex Sandbox backend identity と Automatic Git containment policy digest
-- Automatic Git command-policy generation
+- Automatic Git command-policy generation v3
 - current generic Sandbox live evidence 全体の digest
 - current `workspace_root`
 - `max_sandbox_scratch_bytes`
@@ -52,7 +58,7 @@ Git-specific marker は次へ exact binding します。
 
 Automatic Git は generic Sandbox で受容済み residual risk とされる property を継承して自動実行を許可しません。Git-specific route では `filesystem_read`、`filesystem_write`、`protected_information_read`、`internet`、`lan`、`loopback`、`descendant_containment`、`termination`、`resource_bound` の全 property が `verified` であることを要求します。
 
-明示的な `verify-git-broker` は pinned Git を同じ containment 内で実際に起動し、worktree 認識、strict source-workspace deny 下での read-only `status` 成功、および同一 sanitized projection snapshot digest への probe batch binding を確認してから marker を atomic に更新します。user-facing path remap 後の `--show-toplevel` 文字列を projection 実行の独立証拠として扱いません。通常 operation は marker を自動生成・repair せず、missing/stale/failed marker なら fail closed します。dedicated worker と `git_info` が共有する runner は child launch 直前にも Git-specific marker を再検証します。
+明示的な `verify-git-broker` は pinned runtime Git を同じ containment 内で実際に起動し、worktree 認識、strict source-workspace deny 下での read-only `status` 成功、Automatic grammar の `status`／`diff`／`log`／`show`／`rev-parse`／`ls-files` がその exact runtime の builtin であること、および同一 sanitized projection snapshot digest への probe batch binding を確認してから marker を atomic に更新します。user-facing path remap 後の `--show-toplevel` 文字列を projection 実行の独立証拠として扱いません。通常 operation は marker を自動生成・repair せず、missing/stale/failed marker なら fail closed します。dedicated worker と `git_info` が共有する runner は child launch 直前にも Git-specific marker を再検証します。
 
 Source／CI evidence と Windows machine-local evidence の記録は `docs/AUTOMATIC_GIT_BROKER_VERIFICATION.md` に分離します。
 
