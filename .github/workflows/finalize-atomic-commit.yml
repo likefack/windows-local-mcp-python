@@ -150,6 +150,7 @@ jobs:
           tests/test_tool_safety.py
           tests/test_directory_toctou.py
           tests/test_mcp_stdio_transport.py
+          tests/test_mcp_policy_error_visibility.py
           tests/test_sandbox_scratch_retention.py
 
       - name: Full pytest
