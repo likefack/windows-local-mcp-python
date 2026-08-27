@@ -6,7 +6,6 @@ import pytest
 from windows_local_mcp.config import Settings
 from windows_local_mcp.sandbox_backend import SANDBOX_SECURITY_PROPERTIES
 
-
 _BUILTINS = b"status diff log show rev-parse ls-files\n"
 
 
