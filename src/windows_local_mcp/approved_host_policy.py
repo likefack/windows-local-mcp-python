@@ -80,7 +80,7 @@ def assert_approved_host_authority_available() -> dict[str, Any]:
         raise PermissionError("Approved Host authority requires native Windows")
     try:
         return ApprovedHostAuthorityClient().assert_available()
-    except Exception as error:  # noqa: BLE001 - normalize authority failures at API boundary
+    except Exception as error:
         raise PermissionError(
             f"{APPROVED_HOST_UNAVAILABLE_REASON} {type(error).__name__}: {error}"
         ) from error

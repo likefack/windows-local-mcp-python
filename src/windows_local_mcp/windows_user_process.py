@@ -396,14 +396,15 @@ def popen_as_requester_in_job(
         if not attribute_size.value:
             raise _winerror("InitializeProcThreadAttributeList(size)")
         attribute_buffer = ctypes.create_string_buffer(attribute_size.value)
-        attribute_list = ctypes.cast(attribute_buffer, ctypes.c_void_p)
+        attribute_candidate = ctypes.cast(attribute_buffer, ctypes.c_void_p)
         if not _kernel32.InitializeProcThreadAttributeList(
-            attribute_list,
+            attribute_candidate,
             1,
             0,
             ctypes.byref(attribute_size),
         ):
             raise _winerror("InitializeProcThreadAttributeList")
+        attribute_list = attribute_candidate
         inherited_handles = (wintypes.HANDLE * 3)(
             stdin_handle,
             stdout_write,

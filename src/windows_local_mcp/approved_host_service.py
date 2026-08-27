@@ -47,7 +47,6 @@ if os.name == "nt":
     _GENERIC_WRITE = 0x40000000
     _OPEN_EXISTING = 3
     _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-    _PROCESS_TERMINATE = 0x0001
     _TOKEN_QUERY = 0x0008
     _TOKEN_USER = 1
     _TOKEN_ELEVATION = 20
@@ -482,8 +481,6 @@ class ApprovedHostAuthorityServer:
             }
         if action == "launch":
             return self._launch(client_pid, request)
-        if action == "cancel":
-            return self._cancel(request)
         raise ValueError("unknown Approved Host authority action")
 
     def _launch(
@@ -623,42 +620,6 @@ class ApprovedHostAuthorityServer:
         finally:
             with self._workers_lock:
                 self._workers.pop(operation_id, None)
-
-    def _cancel(self, request: Mapping[str, Any]) -> dict[str, Any]:
-        operation_id = str(request.get("operation_id") or "")
-        active = self.store.read_active()
-        if active is None or active.get("operation_id") != operation_id:
-            raise RuntimeError(
-                "Approved Host authority has no matching active operation"
-            )
-        with self._workers_lock:
-            process = self._workers.get(operation_id)
-        if process is None:
-            self.store.mark_recovery_required(
-                "cancellation requested after worker identity was lost"
-            )
-            raise ApprovedHostRecoveryRequired(
-                "Approved Host worker identity was lost; explicit recovery is required"
-            )
-        handle = _kernel32.OpenProcess(_PROCESS_TERMINATE, False, process.pid)
-        if not handle:
-            self.store.mark_recovery_required(
-                "cancellation could not open the SYSTEM worker"
-            )
-            raise _winerror("OpenProcess(PROCESS_TERMINATE SYSTEM worker)")
-        try:
-            process.terminate()
-        finally:
-            _kernel32.CloseHandle(handle)
-        self.store.mark_recovery_required(
-            "operator cancellation terminated the SYSTEM worker; "
-            "postflight completion was not proven"
-        )
-        return {
-            "protocol_version": APPROVED_HOST_AUTHORITY_PROTOCOL_VERSION,
-            "ok": True,
-            "status": "recovery_required",
-        }
 
 
 class _WindowsServiceHost:

@@ -60,7 +60,7 @@ if (-not (Test-Path -LiteralPath $RuntimePython -PathType Leaf)) {
     throw "Immutable Approved Host runtime Python was not found: $RuntimePython"
 }
 
-& $RuntimePython -I -B -c "import windows_local_mcp.approved_host_service_entry" 
+& $RuntimePython -I -B -c "import windows_local_mcp.approved_host_service_entry"
 if ($LASTEXITCODE -ne 0) {
     throw "Approved Host authority service module is not importable from the immutable runtime."
 }
