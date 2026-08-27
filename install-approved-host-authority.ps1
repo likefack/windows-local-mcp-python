@@ -66,8 +66,12 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $ActiveState = Join-Path $AuthorityStateRoot "active.json"
-if (Test-Path -LiteralPath $ActiveState -PathType Leaf) {
-    throw "Approved Host authority has active/recovery state. Perform explicit recovery before replacing or reinstalling the service: $ActiveState"
+$RecoveryState = Join-Path $AuthorityStateRoot "recovery_required"
+if (
+    (Test-Path -LiteralPath $ActiveState -PathType Leaf) -or
+    (Test-Path -LiteralPath $RecoveryState)
+) {
+    throw "Approved Host authority has active/recovery state. Perform explicit recovery before replacing or reinstalling the service."
 }
 
 $ExistingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
@@ -82,17 +86,25 @@ if (-not $PSCmdlet.ShouldProcess($ServiceName, "install LocalSystem Approved Hos
 New-Item -ItemType Directory -Path $AuthorityStateRoot -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $AuthorityStateRoot "completed") -Force | Out-Null
 
-# Protect the complete WLMCP ProgramData authority namespace. The runtime user intentionally
-# receives no file-system access: all health/launch interaction goes through the authenticated
-# named pipe, and only LocalSystem writes durable state or completion proofs.
-& "$env:SystemRoot\System32\icacls.exe" $AuthorityBase /setowner "*S-1-5-18" /T /C | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "Setting authority state owner failed." }
-& "$env:SystemRoot\System32\icacls.exe" $AuthorityBase /inheritance:r /T /C | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "Removing authority state ACL inheritance failed." }
+# Build one protected ACL boundary for the complete WLMCP ProgramData authority namespace, then
+# make every descendant inherit from that root. The runtime user intentionally receives no
+# file-system access: all health/launch interaction goes through the authenticated named pipe,
+# and only LocalSystem writes durable state or completion proofs. Explicit SYSTEM/Admin grants
+# must exist before inheritance is removed so the elevated installer cannot lock itself out
+# mid-recursion. Do not use /C for security-critical ACL operations: one error aborts install.
 & "$env:SystemRoot\System32\icacls.exe" $AuthorityBase /grant:r `
     "*S-1-5-18:(OI)(CI)F" `
-    "*S-1-5-32-544:(OI)(CI)F" /T /C | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "Applying authority state ACL failed." }
+    "*S-1-5-32-544:(OI)(CI)F" | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "Applying authority state root ACL failed." }
+& "$env:SystemRoot\System32\icacls.exe" $AuthorityBase /inheritance:r | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "Protecting authority state root ACL failed." }
+$AuthorityChildren = Join-Path $AuthorityBase "*"
+& "$env:SystemRoot\System32\icacls.exe" $AuthorityChildren /reset /T | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "Resetting authority state descendants to the protected root ACL failed." }
+& "$env:SystemRoot\System32\icacls.exe" $AuthorityBase /setowner "*S-1-5-18" /T | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "Setting authority state owner failed." }
+& "$env:SystemRoot\System32\icacls.exe" $AuthorityBase /verify /T | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "Verifying authority state ACL tree failed." }
 
 if ($null -ne $ExistingService) {
     if ($ExistingService.Status -ne [ServiceProcess.ServiceControllerStatus]::Stopped) {
