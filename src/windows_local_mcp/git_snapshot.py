@@ -16,13 +16,18 @@ def capture_git_snapshot(
     settings: Settings,
     operation_id: str,
     stage: str,
+    required: bool = False,
 ) -> str | None:
     if not settings.git_enabled:
+        if required:
+            raise PermissionError("git capability is disabled")
         return None
     try:
         identity = trusted_helper_identity(settings, "git")
         git = str(identity["path"])
     except (FileNotFoundError, PermissionError, RuntimeError):
+        if required:
+            raise
         return None
 
     root = settings.workspace_root.resolve(strict=True)
@@ -33,6 +38,8 @@ def capture_git_snapshot(
     )
     try:
         if not root_hold.is_dir():
+            if required:
+                raise RuntimeError("workspace root is not a directory")
             return None
         root = Path(str(root_hold))
         git_base = [
@@ -125,6 +132,8 @@ def capture_git_snapshot(
                 token=f"snapshot-{operation_id}-{stage}",
             )
         except (OSError, PermissionError, RuntimeError, TimeoutError):
+            if required:
+                raise
             return None
         parts: list[str] = []
         for (name, _command), result in zip(commands, results, strict=True):
