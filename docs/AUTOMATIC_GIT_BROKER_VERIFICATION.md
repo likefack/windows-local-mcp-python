@@ -4,17 +4,17 @@
 
 Automatic Git Broker の source／unit／Windows CI remediation と、実機 route verification を分離して記録します。
 
-- implementation source/test freeze: `86dde9409990aea42681e3d96b4c42b50127f451`
-- product-invariant synchronization head validated by CI: `a901ac711639cf508d137e472ff5174c46365877`
+- implementation source/test freeze: `3e14f04a2323a34e52f70fe4622b83078b1ad108`
+- focused-CI integration head: `f8d84f71c55c23f34d248a0f223822e1f6ac2ac2`
 - Git-specific live marker schema: v1 implemented
 - Automatic Git command-policy generation: v4
-- Automatic Git containment-policy generation: v4
+- Automatic Git containment-policy generation: v5
 - ordinary-operation auto verification/repair: prohibited
-- Windows CI: run #312 succeeded for the PR state containing the frozen source/tests
+- Windows CI: run #329 succeeded for the PR state containing the frozen source/tests and the dedicated ref-projection focused regression
 - focused process-identity security regression: 17 passed
 - focused race/recovery/transaction regression: 38 passed
-- focused Automatic Git Broker regression: 81 passed
-- full pytest: 486 passed
+- focused Automatic Git Broker regression: 90 passed
+- full pytest: 495 passed
 - Ruff: passed
 - compileall: passed
 - diff whitespace: passed
@@ -46,25 +46,28 @@ Current implementation requires all of the following before a model-facing Autom
 17. Git executable, Codex backend, and WFP Guard implementation identities are held against replacement during the batch. Scratch projection cleanup runs in `finally`, and stale `git-broker` scratch roots are included in retention cleanup.
 18. Repository projection bytes are limited to at most half of configured `max_sandbox_scratch_bytes`, leaving the remaining budget for operation runtime/transient output. No hard-coded repository-size floor may exceed the operator quota. Entry count is enforced during the copy itself as well as bounded scans.
 19. Projection pruning is input-driven rather than filename-whitelisted. A root ignored/generated subtree is omitted only when the batch does not observe ignored untracked entries, a conservatively parsed root `.gitignore` single-component directory-only pattern matches it, and the pinned ordinary Git index proves that no tracked descendant exists. Both root-anchored forms such as `/.dev-tmp/` and unanchored forms such as `.venv/` may prove the corresponding root entry ignored. Unsupported/split index, negation/complex ignore semantics, a tracked descendant, or an observable ignored-tree command disables pruning and required unreadable input remains fail closed.
-20. Source paths that are valid in the live workspace but would cross the currently supported Windows legacy path boundary only after the scratch/projection prefix is added are classified explicitly as `GitBrokerUnavailable` before materialization instead of leaking a raw `FileNotFoundError`. Extended-length path execution is not silently enabled without a verified security/TOCTOU integration.
-21. No Automatic Git failure falls back to the normal Broker worker or Approved Host.
-22. The explicit Git-specific verifier does not use remapped `git rev-parse --show-toplevel` output as independent projection proof. It requires pinned Git worktree recognition and read-only status success under the stricter source-workspace-deny containment, requires the allowed command set to be builtin, and requires all probe results from the batch to carry the same valid sanitized-projection snapshot digest before a marker can be issued.
+20. Loose-ref projection is command-observability driven rather than a blanket copy of `.git/refs`. For batches whose allowed semantics are HEAD-derived, the Broker pins `.git/HEAD`, the current symbolic loose-ref chain, and `packed-refs` when present, then omits unrelated loose-ref namespaces and reflogs before opening or materializing them. Commands that can observe unrelated refs, such as `log --all`, `--branches`, `--tags`, or non-HEAD revisions, retain the full required ref namespace and remain fail closed if those inputs are unsafe or unreadable. `refs/replace` remains conservatively retained because replace refs can affect object lookup without being named explicitly.
+21. Source paths that are valid in the live workspace but would cross the currently supported Windows legacy path boundary only after the scratch/projection prefix is added are classified explicitly as `GitBrokerUnavailable` before materialization instead of leaking a raw `FileNotFoundError`. Extended-length path execution is not silently enabled without a verified security/TOCTOU integration.
+22. No Automatic Git failure falls back to the normal Broker worker or Approved Host.
+23. The explicit Git-specific verifier does not use remapped `git rev-parse --show-toplevel` output as independent projection proof. It requires pinned Git worktree recognition and read-only status success under the stricter source-workspace-deny containment, requires the allowed command set to be builtin, and requires all probe results from the batch to carry the same valid sanitized-projection snapshot digest before a marker can be issued.
 
 ## Regression coverage
 
-Focused Windows CI includes the Automatic Git environment/staging tests, launch-time marker-gate tests, Git-specific marker tests, scratch-resource tests, object-access tests, current/legacy worker-routing tests, helper/runtime-identity tests, trusted-cwd/fixed-`-C` tests, builtin-command tests, projection-boundary tests, and directory TOCTOU tests.
+Focused Windows CI includes the Automatic Git environment/staging tests, launch-time marker-gate tests, Git-specific marker tests, scratch-resource tests, object-access tests, current/legacy worker-routing tests, helper/runtime-identity tests, trusted-cwd/fixed-`-C` tests, builtin-command tests, projection-boundary tests, ref-projection tests, and directory TOCTOU tests.
 
-At implementation source/test freeze `86dde9409990aea42681e3d96b4c42b50127f451`, the PR state was subsequently validated by Windows CI run #312 with product-invariant documentation synchronized at `a901ac711639cf508d137e472ff5174c46365877`:
+At implementation source/test freeze `3e14f04a2323a34e52f70fe4622b83078b1ad108`, the focused-CI integration head `f8d84f71c55c23f34d248a0f223822e1f6ac2ac2` was validated by Windows CI run #329:
 
 - focused process-identity security regression: 17 passed
 - focused race/recovery/transaction regression: 38 passed
-- focused Automatic Git Broker regression: 81 passed
-- full pytest: 486 passed
+- focused Automatic Git Broker regression: 90 passed
+- full pytest: 495 passed
 - Ruff: success
 - compileall: success
 - diff whitespace: success
 
 The projection-boundary regressions cover the original whole-workspace availability failure and its follow-up cases. They verify that a proven ignored/untracked root tree is not opened, including the repository's real-world unanchored `.venv/` form; that a tracked descendant prevents pruning; that `ls-files --others` without `--exclude-standard` prevents pruning because ignored/untracked entries become observable; that source named ADS such as `Zone.Identifier` do not cross the projection boundary; and that reparse points, relevant hardlinks, nested `.git`, external alternates, and unreadable security-relevant Git metadata remain fail closed. A dedicated path regression verifies the case where the source path is below the Windows legacy limit but the longer scratch projection path crosses it and must produce an explicit broker-unavailable classification.
+
+The ref-projection regressions cover the machine-observed `.git/refs/codex/turn-diffs/checkpoints/...` path-length availability failure. They create an unrelated deeply nested loose-ref namespace, make opening that namespace a test failure, and verify that the verifier/status-style HEAD-only projection neither opens nor materializes it while retaining the current loose HEAD ref and executing staged `git status` successfully. Separate regressions verify packed current-branch resolution and require full-ref commands such as `log --all` to retain/fail closed on an unreadable required ref namespace instead of silently pruning it.
 
 The object-access regressions cover two distinct unsafe Git behaviors:
 
@@ -94,8 +97,8 @@ $env:LOCAL_MCP_CONFIG = 'C:\path\to\config.local.toml'
 .\.venv\Scripts\python.exe -m windows_local_mcp.cli verify-git-broker
 ```
 
-A successful `verify-git-broker` must create a schema-v1 marker whose exact context, including current command-policy generation v4, containment-policy generation v4, trusted process-cwd policy, builtin-command requirement, and scratch quota, is still current. Missing, failed, stale, or mismatched evidence leaves Automatic Git fail closed. This document must not be changed to claim Windows live verification merely because CI passes.
+A successful `verify-git-broker` must create a schema-v1 marker whose exact context, including current command-policy generation v4, containment-policy generation v5, trusted process-cwd policy, builtin-command requirement, and scratch quota, is still current. Missing, failed, stale, or mismatched evidence leaves Automatic Git fail closed. This document must not be changed to claim Windows live verification merely because CI passes.
 
 ## Finalization record
 
-Implementation source/tests are frozen at `86dde9409990aea42681e3d96b4c42b50127f451`; Windows CI run #312 is the corresponding source/CI evidence for the PR state with synchronized product invariant at `a901ac711639cf508d137e472ff5174c46365877`. This verification-record commit is documentation-only and does not change the code/test freeze identity. Real-machine `verify-git-broker` evidence remains explicitly `NOT RUN` on the final remediation source until it is actually performed.
+Implementation source/tests are frozen at `3e14f04a2323a34e52f70fe4622b83078b1ad108`; Windows CI run #329 validates that source/test state through focused-CI integration head `f8d84f71c55c23f34d248a0f223822e1f6ac2ac2`. This verification-record update is documentation-only and does not change the source/test freeze identity. Real-machine `verify-git-broker` evidence remains explicitly `NOT RUN` on the final remediation source until it is actually performed.
