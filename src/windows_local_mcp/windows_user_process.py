@@ -30,8 +30,10 @@ if os.name == "nt":
     _TOKEN_ELEVATION = 20
     _CREATE_SUSPENDED = 0x00000004
     _CREATE_UNICODE_ENVIRONMENT = 0x00000400
+    _EXTENDED_STARTUPINFO_PRESENT = 0x00080000
     _STARTF_USESTDHANDLES = 0x00000100
     _HANDLE_FLAG_INHERIT = 0x00000001
+    _PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002
     _WAIT_OBJECT_0 = 0
     _WAIT_TIMEOUT = 258
     _INFINITE = 0xFFFFFFFF
@@ -70,6 +72,12 @@ if os.name == "nt":
             ("hStdInput", wintypes.HANDLE),
             ("hStdOutput", wintypes.HANDLE),
             ("hStdError", wintypes.HANDLE),
+        ]
+
+    class _STARTUPINFOEXW(ctypes.Structure):
+        _fields_ = [
+            ("StartupInfo", _STARTUPINFOW),
+            ("lpAttributeList", ctypes.c_void_p),
         ]
 
     class _PROCESS_INFORMATION(ctypes.Structure):
@@ -116,6 +124,25 @@ if os.name == "nt":
     _kernel32.ResumeThread.restype = wintypes.DWORD
     _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     _kernel32.CloseHandle.restype = wintypes.BOOL
+    _kernel32.InitializeProcThreadAttributeList.argtypes = [
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    _kernel32.InitializeProcThreadAttributeList.restype = wintypes.BOOL
+    _kernel32.UpdateProcThreadAttribute.argtypes = [
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    _kernel32.UpdateProcThreadAttribute.restype = wintypes.BOOL
+    _kernel32.DeleteProcThreadAttributeList.argtypes = [ctypes.c_void_p]
+    _kernel32.DeleteProcThreadAttributeList.restype = None
 
     _advapi32.OpenProcessToken.argtypes = [
         wintypes.HANDLE,
@@ -150,7 +177,7 @@ if os.name == "nt":
         wintypes.DWORD,
         ctypes.c_void_p,
         wintypes.LPCWSTR,
-        ctypes.POINTER(_STARTUPINFOW),
+        ctypes.c_void_p,
         ctypes.POINTER(_PROCESS_INFORMATION),
     ]
     _advapi32.CreateProcessAsUserW.restype = wintypes.BOOL
@@ -349,22 +376,66 @@ def popen_as_requester_in_job(
     stderr_read = wintypes.HANDLE()
     stderr_write = wintypes.HANDLE()
     stdin_handle = wintypes.HANDLE()
+    attribute_list = ctypes.c_void_p()
+    attribute_buffer: ctypes.Array[ctypes.c_char] | None = None
+    inherited_handles: ctypes.Array[wintypes.HANDLE] | None = None
     process_info = _PROCESS_INFORMATION()
     process_created = False
     try:
         stdout_read, stdout_write = _create_output_pipe()
         stderr_read, stderr_write = _create_output_pipe()
         stdin_handle = _open_inheritable_nul()
-        startup = _STARTUPINFOW()
-        startup.cb = ctypes.sizeof(startup)
-        startup.lpDesktop = "winsta0\\default"
-        startup.dwFlags = _STARTF_USESTDHANDLES
-        startup.hStdInput = stdin_handle
-        startup.hStdOutput = stdout_write
-        startup.hStdError = stderr_write
+
+        attribute_size = ctypes.c_size_t()
+        _kernel32.InitializeProcThreadAttributeList(
+            None,
+            1,
+            0,
+            ctypes.byref(attribute_size),
+        )
+        if not attribute_size.value:
+            raise _winerror("InitializeProcThreadAttributeList(size)")
+        attribute_buffer = ctypes.create_string_buffer(attribute_size.value)
+        attribute_list = ctypes.cast(attribute_buffer, ctypes.c_void_p)
+        if not _kernel32.InitializeProcThreadAttributeList(
+            attribute_list,
+            1,
+            0,
+            ctypes.byref(attribute_size),
+        ):
+            raise _winerror("InitializeProcThreadAttributeList")
+        inherited_handles = (wintypes.HANDLE * 3)(
+            stdin_handle,
+            stdout_write,
+            stderr_write,
+        )
+        if not _kernel32.UpdateProcThreadAttribute(
+            attribute_list,
+            0,
+            _PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            ctypes.cast(inherited_handles, ctypes.c_void_p),
+            ctypes.sizeof(inherited_handles),
+            None,
+            None,
+        ):
+            raise _winerror("UpdateProcThreadAttribute(HANDLE_LIST)")
+
+        startup = _STARTUPINFOEXW()
+        startup.StartupInfo.cb = ctypes.sizeof(startup)
+        startup.StartupInfo.lpDesktop = "winsta0\\default"
+        startup.StartupInfo.dwFlags = _STARTF_USESTDHANDLES
+        startup.StartupInfo.hStdInput = stdin_handle
+        startup.StartupInfo.hStdOutput = stdout_write
+        startup.StartupInfo.hStdError = stderr_write
+        startup.lpAttributeList = attribute_list
         command_line = ctypes.create_unicode_buffer(subprocess.list2cmdline(argv))
         env_block = _environment_block(environment)
-        flags = int(creationflags) | _CREATE_SUSPENDED | _CREATE_UNICODE_ENVIRONMENT
+        flags = (
+            int(creationflags)
+            | _CREATE_SUSPENDED
+            | _CREATE_UNICODE_ENVIRONMENT
+            | _EXTENDED_STARTUPINFO_PRESENT
+        )
         if not _advapi32.CreateProcessAsUserW(
             primary_token,
             str(Path(argv[0]).resolve(strict=True)),
@@ -421,6 +492,10 @@ def popen_as_requester_in_job(
             process_info.hProcess = wintypes.HANDLE()
         raise
     finally:
+        if attribute_list:
+            _kernel32.DeleteProcThreadAttributeList(attribute_list)
+        # Keep the Python objects that back lpAttributeList/lpValue alive through process creation.
+        _ = attribute_buffer, inherited_handles
         for handle in (
             stdout_read,
             stdout_write,
