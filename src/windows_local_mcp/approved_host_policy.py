@@ -14,6 +14,18 @@ APPROVED_HOST_UNAVAILABLE_REASON = (
     "Approved Host requires the independently privileged WindowsLocalMCPApprovedHost "
     "LocalSystem authority service and a healthy durable authority state."
 )
+_SERVICE_DOES_NOT_EXIST_EXIT_CODE = 1060
+
+
+def _service_query_indicates_installed(returncode: int) -> bool:
+    if returncode == 0:
+        return True
+    if returncode == _SERVICE_DOES_NOT_EXIST_EXIT_CODE:
+        return False
+    raise RuntimeError(
+        "Approved Host authority SCM query failed closed: "
+        f"sc.exe exited with {returncode}"
+    )
 
 
 def _authority_service_installed() -> bool:
@@ -32,7 +44,7 @@ def _authority_service_installed() -> bool:
         check=False,
         shell=False,
     )
-    return completed.returncode == 0
+    return _service_query_indicates_installed(completed.returncode)
 
 
 def install_approved_host_authority_health_gate() -> None:
@@ -68,7 +80,7 @@ def assert_approved_host_authority_available() -> dict[str, Any]:
         raise PermissionError("Approved Host authority requires native Windows")
     try:
         return ApprovedHostAuthorityClient().assert_available()
-    except Exception as error:
+    except Exception as error:  # noqa: BLE001 - normalize authority failures at API boundary
         raise PermissionError(
             f"{APPROVED_HOST_UNAVAILABLE_REASON} {type(error).__name__}: {error}"
         ) from error
