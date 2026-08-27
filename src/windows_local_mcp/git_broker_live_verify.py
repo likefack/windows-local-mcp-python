@@ -20,9 +20,9 @@ from .tool_safety import pinned_helper_identity
 from .util import canonical_json, sha256_text, utc_now_iso
 
 GIT_BROKER_LIVE_MARKER_VERSION = 1
-GIT_BROKER_COMMAND_POLICY_VERSION = 4
+GIT_BROKER_COMMAND_POLICY_VERSION = 5
 _GIT_BROKER_ALLOWED_BUILTINS = frozenset(
-    {"status", "diff", "log", "show", "rev-parse", "ls-files"}
+    {"status", "diff", "log", "show", "rev-parse", "ls-files", "symbolic-ref"}
 )
 _GIT_BROKER_REQUIRED_CHECKS = (
     "git_inside_worktree",
