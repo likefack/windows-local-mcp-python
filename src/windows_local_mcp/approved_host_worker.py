@@ -6,18 +6,18 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from .approved_host_authority import AuthorityWorkerLease
 from .approved_host_process_census import (
     capture_user_processes,
     requester_username,
     wait_for_untracked_user_processes,
 )
+from .approved_host_worker_lease import HardenedAuthorityWorkerLease
 from .control_plane import load_worker_context
 from .windows_user_process import popen_as_requester_in_job
 
 
 def _install_authority_hooks(
-    lease: AuthorityWorkerLease,
+    lease: HardenedAuthorityWorkerLease,
     *,
     requester_pid: int,
     requester_create_time: float,
@@ -116,7 +116,7 @@ def main() -> None:
     args = parser.parse_args()
 
     os.environ["WINDOWS_LOCAL_MCP_AUTHORITY_WORKER"] = "1"
-    lease = AuthorityWorkerLease(
+    lease = HardenedAuthorityWorkerLease(
         operation_id=args.operation_id,
         service_epoch=args.authority_service_epoch,
         authority_nonce=args.authority_nonce,
@@ -133,11 +133,10 @@ def main() -> None:
     # direct imports bind to the independently privileged implementations.
     from .worker import run_operation
 
-    exit_code = 1
-    try:
-        exit_code = int(run_operation(args.operation_id, settings))
-    finally:
-        lease.finalize(exit_code)
+    exit_code = int(run_operation(args.operation_id, settings))
+    # Reaching this line proves run_operation returned normally. Any unhandled exception or
+    # external process termination skips proof creation and leaves the ProgramData latch armed.
+    lease.finalize_normal_return(exit_code)
     raise SystemExit(exit_code)
 
 
