@@ -81,18 +81,19 @@ def test_git_live_context_rejects_generic_sandbox_residual_property(
         git_broker_live_context(settings, identity)
 
 
-def test_git_live_context_rejects_scratch_quota_below_projection_floor(
+def test_git_live_context_binds_small_scratch_quota_without_artificial_floor(
     tmp_path: Path,
 ) -> None:
     settings = _settings(tmp_path, max_sandbox_scratch_bytes=1024 * 1024)
     identity = _identity(tmp_path)
 
-    with pytest.raises(GitBrokerUnavailable, match="at least 16 MiB"):
-        git_broker_live_context(
-            settings,
-            identity,
-            containment=_containment(_evidence()),
-        )
+    context = git_broker_live_context(
+        settings,
+        identity,
+        containment=_containment(_evidence()),
+    )
+
+    assert context["max_sandbox_scratch_bytes"] == 1024 * 1024
 
 
 def test_git_live_context_binds_scratch_quota(
