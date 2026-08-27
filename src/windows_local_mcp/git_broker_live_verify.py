@@ -22,7 +22,7 @@ GIT_BROKER_LIVE_MARKER_VERSION = 1
 GIT_BROKER_COMMAND_POLICY_VERSION = 2
 _GIT_BROKER_REQUIRED_CHECKS = (
     "git_inside_worktree",
-    "git_top_level_projection",
+    "git_projection_snapshot_bound",
     "git_status_readonly",
 )
 
@@ -148,6 +148,14 @@ def _git_probe_base(git: str) -> list[str]:
     ]
 
 
+def _valid_snapshot_digest(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value.casefold())
+    )
+
+
 def _atomic_write_marker(settings: Settings, payload: dict[str, Any]) -> None:
     path = _marker_path(settings)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -182,7 +190,6 @@ def verify_git_broker_live(settings: Settings) -> dict[str, Any]:
         git_identity=git_identity,
         commands=(
             [*base, "rev-parse", "--is-inside-work-tree"],
-            [*base, "rev-parse", "--show-toplevel"],
             [*base, "status", "--porcelain=v1", "--untracked-files=no"],
         ),
         cwd=str(settings.workspace_root),
@@ -190,27 +197,25 @@ def verify_git_broker_live(settings: Settings) -> dict[str, Any]:
         output_limit=64 * 1024,
         live_verification_probe=True,
     )
-    if len(results) != 3:
+    if len(results) != 2:
         raise GitBrokerUnavailable(
             "Automatic Git Broker live verification returned an incomplete probe set"
         )
-    inside, top_level, status = results
+    inside, status = results
     inside_ok = inside.returncode == 0 and inside.stdout.strip().lower() == b"true"
-    try:
-        top_level_path = Path(
-            top_level.stdout.decode("utf-8", errors="strict").strip()
-        ).resolve(strict=True)
-    except (OSError, UnicodeDecodeError, ValueError):
-        top_level_path = Path()
-    top_level_ok = (
-        top_level.returncode == 0
-        and os.path.normcase(str(top_level_path))
-        == os.path.normcase(str(settings.workspace_root.resolve(strict=True)))
+    snapshot_digests = {
+        getattr(result, "snapshot_digest", None)
+        for result in results
+        if _valid_snapshot_digest(getattr(result, "snapshot_digest", None))
+    }
+    snapshot_bound = len(snapshot_digests) == 1 and all(
+        _valid_snapshot_digest(getattr(result, "snapshot_digest", None))
+        for result in results
     )
     status_ok = status.returncode == 0
     checks = {
         "git_inside_worktree": inside_ok,
-        "git_top_level_projection": top_level_ok,
+        "git_projection_snapshot_bound": snapshot_bound,
         "git_status_readonly": status_ok,
     }
     payload = {
