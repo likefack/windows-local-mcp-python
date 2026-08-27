@@ -82,6 +82,7 @@ def test_verify_git_broker_live_uses_bootstrap_probe_mode(
         policy_digest="containment-policy",
     )
     seen: dict[str, object] = {}
+    snapshot_digest = "c" * 64
 
     monkeypatch.setattr(
         git_broker_live_verify,
@@ -97,13 +98,18 @@ def test_verify_git_broker_live_uses_bootstrap_probe_mode(
     def fake_batch(**kwargs: object) -> list[SimpleNamespace]:
         seen.update(kwargs)
         return [
-            SimpleNamespace(returncode=0, stdout=b"true\n", stderr=b""),
             SimpleNamespace(
                 returncode=0,
-                stdout=(str(workspace.resolve()) + "\n").encode(),
+                stdout=b"true\n",
                 stderr=b"",
+                snapshot_digest=snapshot_digest,
             ),
-            SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
+            SimpleNamespace(
+                returncode=0,
+                stdout=b"",
+                stderr=b"",
+                snapshot_digest=snapshot_digest,
+            ),
         ]
 
     monkeypatch.setattr(git_broker_live_verify, "run_git_broker_batch", fake_batch)
@@ -111,4 +117,5 @@ def test_verify_git_broker_live_uses_bootstrap_probe_mode(
     marker = git_broker_live_verify.verify_git_broker_live(settings)
 
     assert marker["route_eligible"] is True
+    assert marker["checks"]["git_projection_snapshot_bound"] is True
     assert seen["live_verification_probe"] is True
