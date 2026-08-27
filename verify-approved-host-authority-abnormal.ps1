@@ -69,12 +69,12 @@ function Assert-WmiHelperIdentities {
         $actualCreate = Get-UnixCreateTimeSeconds -Process $process
         $expectedCreate = [double]$helper.create_time
         if ([Math]::Abs($actualCreate - $expectedCreate) -gt 1.0) {
-            throw "WMI helper PID was reused $Stage: PID=$pidValue"
+            throw "WMI helper PID was reused ${Stage}: PID=$pidValue"
         }
         $actualPath = [IO.Path]::GetFullPath($process.Path)
         $expectedPath = [IO.Path]::GetFullPath([string]$helper.executable)
         if (-not $actualPath.Equals($expectedPath, [StringComparison]::OrdinalIgnoreCase)) {
-            throw "WMI helper executable identity changed $Stage: expected=$expectedPath actual=$actualPath"
+            throw "WMI helper executable identity changed ${Stage}: expected=$expectedPath actual=$actualPath"
         }
     }
 }
