@@ -18,6 +18,9 @@ def _duplicate_utf8_stream(fd: int, mode: str, *, errors: str) -> TextIOWrapper:
 
     duplicate = os.dup(fd)
     try:
+        os.set_inheritable(duplicate, False)
+        if os.get_inheritable(duplicate):
+            raise OSError("protocol duplicate remained inheritable")
         binary = os.fdopen(duplicate, mode, closefd=True)
         return TextIOWrapper(
             binary,
