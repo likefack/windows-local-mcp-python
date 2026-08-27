@@ -219,3 +219,22 @@ def test_automatic_git_rejects_object_alternates(tmp_path: Path) -> None:
 
     with pytest.raises(GitBrokerUnavailable, match="external/extended repository metadata"):
         stage_git_repository(settings, "alternates")
+
+
+def test_automatic_git_rejects_nested_git_metadata(tmp_path: Path) -> None:
+    settings, _git = _git_settings(tmp_path)
+    nested = settings.workspace_root / "vendor" / ".git"
+    nested.mkdir(parents=True)
+    (nested / "config").write_text("[core]\nrepositoryformatversion = 0\n", encoding="utf-8")
+
+    with pytest.raises(GitBrokerUnavailable, match="nested .git metadata"):
+        stage_git_repository(settings, "nested-git")
+
+
+def test_automatic_git_rejects_oversized_repository_config(tmp_path: Path) -> None:
+    settings, _git = _git_settings(tmp_path)
+    config = settings.workspace_root / ".git" / "config"
+    config.write_bytes(b"[core]\nrepositoryformatversion = 0\n#" + b"x" * (1024 * 1024))
+
+    with pytest.raises(GitBrokerUnavailable, match="1 MiB parsing limit"):
+        stage_git_repository(settings, "oversized-config")
