@@ -60,9 +60,10 @@ def main() -> None:
         return
 
     if args.command == "server":
-        from .server import main as server_main
+        from .mcp_stdio import run_stdio_server
+        from .server import mcp
 
-        server_main()
+        run_stdio_server(mcp)
         return
 
     if args.command == "approvals":
