@@ -10,8 +10,8 @@ ChatGPT から、指定した 1 つの Windows 作業領域を安全に読み書
 
 1. **WLMCP Broker**
    - 対象パス、入出力、容量、副作用を WLMCP が限定できる処理です。
-   - ファイル read/write、差分、固定 ADB 読み取り、バイナリ転送、checkpoint、transaction、Undo／rollback を直接扱います。
-   - current v1 では automatic Git process execution を無効化しています。`git_info`／`execute_readonly` の Git 要求は Git child を起動せず fail closed します。
+   - ファイル read/write、差分、固定 ADB 読み取り、固定 Git 読み取り、バイナリ転送、checkpoint、transaction、Undo／rollback を直接扱います。
+   - Automatic Git Broker は pinned `git.exe`、bounded／sanitized disposable repository projection、live-verified Codex Windows Sandbox containment、Git-specific live marker がすべて current の場合だけ `git_info`／`execute_readonly` の固定 Git grammar を実行します。marker が missing／stale／failed の PC では Git child を起動せず fail closed します。
 2. **構造化処理**
    - DOCX、XLSX、CSV／TSV、ZIP、一般画像を宣言的な操作として処理します。
    - 現在は WLMCP 管理処理を使用し、処理結果を artifact として検証してから Broker の transaction で反映します。将来の ChatGPT container 処理も同じバイナリ転送境界へ接続できます。
@@ -50,7 +50,7 @@ approved_host_enabled = false
 
 Broker が自動実行する ADB helper は `PATH` 上の同名ファイルを使用しません。workspace、`data_dir`、Sandbox scratch の外にある絶対 path と SHA-256 を対で設定してください。未設定時は capability が有効でも実行を拒否します。
 
-Git executable の path／SHA-256 も approved route の trust anchor として設定できますが、current v1 ではこれらを設定しても automatic Git Broker execution は有効になりません。workspace-controlled repository metadata を無承認 Git child から安全に閉じ込められることが未実証なためです。Approved Host も current v1 では unavailable なので、その代替経路にはなりません。
+Automatic Git Broker も `PATH` discovery を trust source にせず、workspace／`data_dir`／Sandbox scratch の外にある Git executable の絶対 path と SHA-256 を必要とします。path／hash を設定しただけでは execution availability にはなりません。まず generic Codex Sandbox live verification を成立させ、そのうえで同じ containment 内の pinned Git を使う `verify-git-broker` を明示実行して Git-specific marker schema v1 を作成する必要があります。
 
 ```powershell
 $gitPath = (Get-Command git.exe).Source
@@ -61,6 +61,14 @@ $gitHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $gitPath).Hash.ToLowerIn
 git_executable_path = "C:\\Program Files\\Git\\cmd\\git.exe"
 git_executable_sha256 = "ここを64桁のSHA-256へ置換"
 ```
+
+```powershell
+$env:LOCAL_MCP_CONFIG = 'C:\path\to\config.local.toml'
+.\.venv\Scripts\python.exe -m windows_local_mcp.cli verify-codex-sandbox
+.\.venv\Scripts\python.exe -m windows_local_mcp.cli verify-git-broker
+```
+
+`verify-git-broker` は通常 operation から自動実行されません。Git executable identity、Sandbox backend、generic live evidence、workspace、containment policy のいずれかが変わった場合は marker が stale になり、再検証するまで Automatic Git は `available=false` です。Git-specific route は generic Sandbox で residual risk として許容する `protected_information_read`／LAN を継承せず、全 Sandbox security property が `verified` の場合だけ route eligible です。
 
 開発 server は次のとおり起動します。設定が不正な場合は、workspace を操作する前に起動を拒否します。
 
@@ -89,7 +97,8 @@ Approved Host の immutable runtime installer／verifier は、将来この rout
 | 用途 | 経路 | 主な tool |
 | --- | --- | --- |
 | テキスト／バイナリの読み書き | Broker | `read_file`, `write_file`, artifact transfer |
-| Git process execution | Codex Sandbox（適用可能な場合） | `request_sandbox_command` |
+| 固定 Git 読み取り | Automatic Git Broker | `git_info`, `execute_readonly` |
+| 一般／変更系 Git、project-controlled 処理 | Codex Sandbox（適用可能な場合） | `request_sandbox_command` |
 | Emulator の限定読み取り | Broker | `adb_read`, `get_adb_screenshot` |
 | DOCX／XLSX／CSV／TSV／ZIP／画像 | 構造化処理 | `structured_file_inspect`, `structured_file_apply` 等 |
 | Python、PowerShell、Node、test、build、project script | Codex Sandbox | `request_sandbox_command` |
@@ -99,7 +108,7 @@ Approved Host の immutable runtime installer／verifier は、将来この rout
 
 `execute_workspace_write` は互換用の公開面を残していますが、Dart／Flutter 等の project-controlled 処理は拒否され、`request_sandbox_command` を案内します。
 
-`git_info` と `execute_readonly` も model-facing surface と annotation の互換性のため公開されていますが、Git 要求は current v1 では error で終了し、automatic Git child を起動しません。Git executable の path／SHA-256 が設定済みでもこの capability reduction は解除されません。
+`git_info` と `execute_readonly` の固定 Git grammar は、current Git-specific marker が成立した Windows PC では Automatic Git Broker として実行できます。Git child は live workspace を直接読まず、operation ごとの bounded／sanitized projection を処理します。`.gitattributes`、hooks、object alternates、external／extended repository metadata、nested `.git`、reparse／hardlink／ADS 等は除外または拒否し、source `.git/config` は raw bytes を scratch へ保存せず Broker memory 上で解析して inert `core` settings だけを書き出します。config parsing は 1 MiB で fail closed します。marker がない／stale な PC では従来どおり process creation 前に拒否し、Approved Host へ fallback しません。
 
 ADB helper は設定済み path、SHA-256、file identity を正規化時と worker 実行直前に再検証し、Windows では child の終了まで実行ファイルを差し替え不能な共有モードで保持します。ADB の自動処理は allowlist 済み emulator serial を明示する固定読み取りだけで、`adb devices` による未許可 device の列挙は行いません。
 
@@ -179,7 +188,7 @@ $env:LOCAL_MCP_CONFIG = 'C:\path\to\config.local.toml'
 - optimistic concurrency には表示用文字列ではなく raw file bytes の SHA-256 を使います。CRLF も raw identity に含まれます。
 - 書き込みは checkpoint、durable journal、atomic replacement、post-write 検証を通します。第三者変更を復旧処理が上書きしません。
 - `data_dir`、Sandbox scratch、workspace は分離し、起動時に lock／atomic replacement／filesystem identity と Windows の物理 path の前提を確認します。
-- `.env`、credential 等の保護対象は通常の Broker read、automatic helper／snapshot から返しません。automatic Git Broker は current v1 では無効です。audit、approval、Activity、argv、stdout／stderr preview は secret を伏せ字にします。Codex Sandbox から workspace 内 protected information を direct read できる可能性は別途受容済み残存 risk として明示します。
+- `.env`、credential 等の保護対象は通常の Broker read、automatic helper／snapshot から返しません。Automatic Git Broker は live workspace を Git child に渡さず、sanitized projection から protected worktree file／behavior metadata を除外します。audit、approval、Activity、argv、stdout／stderr preview は secret を伏せ字にします。Codex Sandbox から workspace 内 protected information を direct read できる可能性は別途受容済み残存 risk として明示します。
 - 同時 job、pending approval、出力、artifact、data_dir、Sandbox scratch、structured element／pixel／archive 展開量に上限があります。
 
 ## Activity、Undo、rollback
@@ -192,11 +201,13 @@ checkpoint が戻せるのは、manifest に含まれる通常の workspace file
 
 ## 検証範囲
 
-unit／integration test、Windows 上の Sandbox 実機検証、Secure MCP Tunnel／ChatGPT E2E は別の証拠です。テスト成功だけで OS 隔離や Tunnel E2E を検証済みとは表示しません。
+unit／integration test、Windows 上の Sandbox／Automatic Git 実機検証、Secure MCP Tunnel／ChatGPT E2E は別の証拠です。テスト成功だけで OS 隔離や Tunnel E2E を検証済みとは表示しません。
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -q
 ```
+
+Automatic Git の unit／CI regression が green でも、この PC で `verify-git-broker` が成功して current Git-specific marker が存在するまでは `available=false` が正しい状態です。通常 operation は marker を作成・repair しません。Git executable、Sandbox backend／live evidence、workspace または containment policy が変われば marker は stale になり、Git child spawn 前に fail closed します。
 
 Sandbox が利用不能、必須境界が未検証、timeout、setup failure、command failure の場合は、その operation を unavailable／failed として表示します。受容済み残存 risk の `protected_information_read`／LAN failure はそのまま表示し、その他の mandatory route gate と分離します。Approved Host へ自動 fallback しません。
 
