@@ -111,8 +111,10 @@ jobs:
           python -m pytest -q
           tests/test_git_environment.py
           tests/test_git_broker_live_verify.py
+          tests/test_git_broker_resource_limits.py
           tests/test_git_object_access.py
           tests/test_git_worker_routing.py
+          tests/test_security_regressions_git_staging.py
           tests/test_tool_safety.py
           tests/test_directory_toctou.py
 
