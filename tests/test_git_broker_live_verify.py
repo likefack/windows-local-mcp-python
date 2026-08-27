@@ -5,6 +5,7 @@ import pytest
 
 from windows_local_mcp.config import Settings
 from windows_local_mcp.git_broker_live_verify import (
+    GIT_BROKER_COMMAND_POLICY_VERSION,
     GIT_BROKER_LIVE_MARKER_VERSION,
     git_broker_live_context,
     require_git_broker_live_verification,
@@ -94,6 +95,7 @@ def test_git_live_context_binds_small_scratch_quota_without_artificial_floor(
     )
 
     assert context["max_sandbox_scratch_bytes"] == 1024 * 1024
+    assert context["command_policy_version"] == GIT_BROKER_COMMAND_POLICY_VERSION
 
 
 def test_git_live_context_binds_scratch_quota(
@@ -144,6 +146,7 @@ def test_git_live_verifier_writes_exact_context_marker(
     marker = verify_git_broker_live(settings)
 
     assert marker["version"] == GIT_BROKER_LIVE_MARKER_VERSION
+    assert marker["context"]["command_policy_version"] == GIT_BROKER_COMMAND_POLICY_VERSION
     assert marker["route_eligible"] is True
     assert all(marker["checks"].values())
     assert require_git_broker_live_verification(settings, identity) == marker
@@ -184,6 +187,46 @@ def test_git_live_marker_is_stale_when_pinned_git_identity_changes(
     changed["sha256"] = "b" * 64
     with pytest.raises(GitBrokerUnavailable, match="stale"):
         require_git_broker_live_verification(settings, changed)
+
+
+def test_git_live_marker_is_stale_when_command_policy_generation_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    identity = _identity(tmp_path)
+    containment = _containment(_evidence())
+    from windows_local_mcp import git_broker_live_verify
+
+    monkeypatch.setattr(
+        git_broker_live_verify, "configured_git_identity", lambda _settings: identity
+    )
+    monkeypatch.setattr(
+        git_broker_live_verify,
+        "require_git_broker_containment",
+        lambda _settings, _identity: containment,
+    )
+    monkeypatch.setattr(
+        git_broker_live_verify,
+        "run_git_broker_batch",
+        lambda **_kwargs: [
+            SimpleNamespace(returncode=0, stdout=b"true\n", stderr=b""),
+            SimpleNamespace(
+                returncode=0,
+                stdout=(str(settings.workspace_root.resolve()) + "\n").encode(),
+                stderr=b"",
+            ),
+            SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
+        ],
+    )
+    verify_git_broker_live(settings)
+
+    monkeypatch.setattr(
+        git_broker_live_verify,
+        "GIT_BROKER_COMMAND_POLICY_VERSION",
+        GIT_BROKER_COMMAND_POLICY_VERSION + 1,
+    )
+    with pytest.raises(GitBrokerUnavailable, match="stale"):
+        require_git_broker_live_verification(settings, identity)
 
 
 def test_missing_git_live_marker_fails_closed(
