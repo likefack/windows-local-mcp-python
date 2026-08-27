@@ -52,8 +52,7 @@ def test_provisioned_authority_latch_is_checked_even_when_host_config_is_disable
 def test_authority_worker_environment_flag_alone_cannot_bypass_latch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from windows_local_mcp import approved_host_policy
-    from windows_local_mcp import approved_host_service
+    from windows_local_mcp import approved_host_policy, approved_host_service
 
     monkeypatch.setattr(approved_host_policy.os, "name", "nt")
     monkeypatch.setenv("WINDOWS_LOCAL_MCP_AUTHORITY_WORKER", "1")
@@ -69,8 +68,7 @@ def test_authority_worker_environment_flag_alone_cannot_bypass_latch(
 def test_authority_worker_bypass_requires_localsystem_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from windows_local_mcp import approved_host_policy
-    from windows_local_mcp import approved_host_service
+    from windows_local_mcp import approved_host_policy, approved_host_service
 
     monkeypatch.setattr(approved_host_policy.os, "name", "nt")
     monkeypatch.setenv("WINDOWS_LOCAL_MCP_AUTHORITY_WORKER", "1")
