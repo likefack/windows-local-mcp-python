@@ -1,55 +1,81 @@
 from __future__ import annotations
 
-from collections.abc import Callable
-from functools import wraps
+import os
+import subprocess
 from typing import Any
 
+from .approved_host_authority import (
+    APPROVED_HOST_AUTHORITY_SERVICE_NAME,
+    ApprovedHostAuthorityClient,
+)
+from .windows_system import windows_system_executable
+
 APPROVED_HOST_UNAVAILABLE_REASON = (
-    "Approved Host execution is unavailable in current v1 because its same-user child can "
-    "terminate or bypass an in-process postflight monitor without a separately provisioned "
-    "Windows security boundary. Same-desktop UAC elevation is not accepted as that boundary."
+    "Approved Host requires the independently privileged WindowsLocalMCPApprovedHost "
+    "LocalSystem authority service and a healthy durable authority state."
 )
 
-_LOWER_LEVEL_RUNTIME_CHECK: Callable[..., dict[str, Any]] | None = None
+
+def _authority_service_installed() -> bool:
+    if os.name != "nt":
+        return False
+    completed = subprocess.run(
+        [
+            windows_system_executable("sc.exe"),
+            "query",
+            APPROVED_HOST_AUTHORITY_SERVICE_NAME,
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=10,
+        check=False,
+        shell=False,
+    )
+    return completed.returncode == 0
 
 
-def install_approved_host_fail_closed_gate() -> None:
-    """Make every production Approved Host runtime check reject before worker creation."""
+def install_approved_host_authority_health_gate() -> None:
+    """Bind global control-plane health to a provisioned SYSTEM authority latch."""
+    from . import control_plane_guard
 
-    global _LOWER_LEVEL_RUNTIME_CHECK
-
-    from . import runtime_immutability
-
-    original = runtime_immutability.assert_approved_host_runtime_immutable
-    if bool(getattr(original, "__wlmcp_approved_host_fail_closed__", False)):
+    original = control_plane_guard.assert_control_plane_healthy
+    if bool(getattr(original, "__wlmcp_approved_host_authority_gate__", False)):
         return
-    _LOWER_LEVEL_RUNTIME_CHECK = original
 
-    @wraps(original)
-    def fail_closed(
-        package_root: Any = None,
-        *,
-        inventory: Any = None,
-        access_resolver: Callable[[Any], int] | None = None,
-    ) -> dict[str, Any]:
-        # access_resolver is an explicit test-only seam used to verify the lower-level
-        # immutability algorithm without claiming that Approved Host itself is available.
-        if access_resolver is not None:
-            return original(
-                package_root,
-                inventory=inventory,
-                access_resolver=access_resolver,
-            )
-        raise PermissionError(APPROVED_HOST_UNAVAILABLE_REASON)
+    def guarded(settings: Any) -> None:
+        original(settings)
+        if os.name != "nt":
+            return
+        if os.environ.get("WINDOWS_LOCAL_MCP_AUTHORITY_WORKER") == "1":
+            # The active durable latch is expected while the SYSTEM worker owns postflight.
+            return
+        if not bool(getattr(settings, "approved_host_enabled", False)):
+            return
+        if not _authority_service_installed():
+            # Broker and Sandbox remain usable on installations that never provisioned Host.
+            # Approved Host launch itself separately requires the authority service.
+            return
+        ApprovedHostAuthorityClient().assert_available()
 
-    fail_closed.__wlmcp_approved_host_fail_closed__ = True  # type: ignore[attr-defined]
-    runtime_immutability.assert_approved_host_runtime_immutable = fail_closed
+    guarded.__wlmcp_approved_host_authority_gate__ = True  # type: ignore[attr-defined]
+    control_plane_guard.assert_control_plane_healthy = guarded
+
+
+def assert_approved_host_authority_available() -> dict[str, Any]:
+    """Require the authenticated SCM-backed authority before an Approved Host launch."""
+    if os.name != "nt":
+        raise PermissionError("Approved Host authority requires native Windows")
+    try:
+        return ApprovedHostAuthorityClient().assert_available()
+    except Exception as error:
+        raise PermissionError(
+            f"{APPROVED_HOST_UNAVAILABLE_REASON} {type(error).__name__}: {error}"
+        ) from error
 
 
 def verify_approved_host_runtime_immutability_only() -> dict[str, Any]:
-    """Measure only immutable-runtime preconditions; never authorize Host execution."""
+    """Verify the immutable runtime without making an Approved Host availability claim."""
+    from .runtime_immutability import assert_approved_host_runtime_immutable
 
-    check = _LOWER_LEVEL_RUNTIME_CHECK
-    if check is None:
-        raise RuntimeError("Approved Host fail-closed policy was not initialized")
-    return check()
+    return assert_approved_host_runtime_immutable()
