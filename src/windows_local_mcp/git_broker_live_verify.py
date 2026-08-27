@@ -19,6 +19,7 @@ from .tool_safety import capture_executable_identity, ensure_external_tool_execu
 from .util import canonical_json, sha256_text, utc_now_iso
 
 GIT_BROKER_LIVE_MARKER_VERSION = 1
+_GIT_BROKER_MIN_SCRATCH_BYTES = 16 * 1024 * 1024
 _GIT_BROKER_REQUIRED_CHECKS = (
     "git_inside_worktree",
     "git_top_level_projection",
@@ -30,11 +31,20 @@ def _marker_path(settings: Settings) -> Path:
     return settings.data_dir / "control-plane" / "git-broker-live-verification.json"
 
 
+def _require_git_broker_scratch_budget(settings: Settings) -> None:
+    if settings.max_sandbox_scratch_bytes < _GIT_BROKER_MIN_SCRATCH_BYTES:
+        raise GitBrokerUnavailable(
+            "Automatic Git Broker requires max_sandbox_scratch_bytes of at least 16 MiB; "
+            "the disposable repository projection must never exceed the configured scratch quota"
+        )
+
+
 def configured_git_identity(settings: Settings) -> dict[str, Any]:
     """Resolve the pinned Git identity without recursively consulting route availability."""
 
     if not settings.git_enabled:
         raise GitBrokerUnavailable("Automatic Git Broker is disabled by configuration")
+    _require_git_broker_scratch_budget(settings)
     if settings.git_executable_path is None or settings.git_executable_sha256 is None:
         raise GitBrokerUnavailable(
             "Automatic Git Broker requires git_executable_path and git_executable_sha256"
@@ -79,6 +89,7 @@ def git_broker_live_context(
 ) -> dict[str, Any]:
     """Build the exact machine/workspace/backend identity bound to Git availability."""
 
+    _require_git_broker_scratch_budget(settings)
     containment = containment or require_git_broker_containment(settings, git_identity)
     _require_strict_sandbox_properties(containment.live_evidence)
     return {
@@ -90,6 +101,7 @@ def git_broker_live_context(
             canonical_json(containment.live_evidence)
         ),
         "workspace_root": str(settings.workspace_root.resolve(strict=True)),
+        "max_sandbox_scratch_bytes": settings.max_sandbox_scratch_bytes,
         "source_workspace_access": "deny",
         "execution_input": "sanitized-disposable-repository-snapshot",
         "network": "deny",
