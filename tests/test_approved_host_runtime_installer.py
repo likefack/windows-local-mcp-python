@@ -16,6 +16,13 @@ def _security_block() -> str:
     )[1].split("if ($Replace -and (Test-Path -LiteralPath $InstallRoot))", maxsplit=1)[0]
 
 
+def _replace_block() -> str:
+    return _installer_text().split(
+        "if ($Replace -and (Test-Path -LiteralPath $InstallRoot))",
+        maxsplit=1,
+    )[1].split("Move-Item -LiteralPath $StagingRoot -Destination $InstallRoot", maxsplit=1)[0]
+
+
 def test_runtime_installer_builds_protected_root_before_resetting_descendants() -> None:
     security_block = _security_block()
 
@@ -54,3 +61,34 @@ def test_runtime_installer_does_not_continue_after_acl_errors() -> None:
 
     assert len(icacls_lines) == 5
     assert all(" /C" not in line and " /c" not in line for line in icacls_lines)
+
+
+def test_runtime_installer_reclaims_legacy_runtime_before_recursive_delete() -> None:
+    replace_block = _replace_block()
+
+    setowner = replace_block.index('icacls.exe $InstallRoot /setowner "*S-1-5-32-544" /T')
+    admin_grant = replace_block.index(
+        'icacls.exe $InstallRoot /grant:r "*S-1-5-32-544:(OI)(CI)F" /T'
+    )
+    remove_tree = replace_block.index("Remove-Item -LiteralPath $InstallRoot -Recurse -Force")
+
+    assert setowner < admin_grant < remove_tree
+    assert " /C" not in replace_block and " /c" not in replace_block
+    assert "Reclaiming ownership of the previous Approved Host runtime failed." in replace_block
+    assert "Reclaiming Administrators access to the previous Approved Host runtime failed." in (
+        replace_block
+    )
+
+
+def test_runtime_installer_replace_gate_checks_recovery_state_without_service_dependency() -> None:
+    script = _installer_text()
+    replace_gate = script.split("if ($Replace) {", maxsplit=1)[1].split(
+        "if (Test-Path -LiteralPath $StagingRoot)", maxsplit=1
+    )[0]
+
+    assert '$AuthorityRecoveryState = Join-Path $AuthorityStateRoot "recovery_required"' in script
+    assert "Test-Path -LiteralPath $AuthorityActiveState -PathType Leaf" in replace_gate
+    assert "Test-Path -LiteralPath $AuthorityRecoveryState" in replace_gate
+    recovery_check = replace_gate.index("Test-Path -LiteralPath $AuthorityRecoveryState")
+    service_check = replace_gate.index("if ($null -ne $existingAuthorityService)")
+    assert recovery_check < service_check
