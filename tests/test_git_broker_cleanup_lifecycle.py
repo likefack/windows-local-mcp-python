@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import os
-import stat
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -89,7 +87,7 @@ def test_live_verifier_cleans_its_exact_readonly_projection(
         object_file = root / "repository" / ".git" / "objects" / "00" / "object"
         object_file.parent.mkdir(parents=True)
         object_file.write_bytes(b"object")
-        object_file.chmod(stat.S_IREAD)
+        object_file.chmod(0o444)
         observed["root"] = root
         return _probe_results()
 
@@ -135,7 +133,7 @@ def test_live_verifier_cleanup_is_scoped_to_its_operation_token(
         token = str(kwargs["token"])
         root = settings.sandbox_scratch_dir / "git-broker" / token
         root.mkdir(parents=True)
-        (root / "artifact.bin").write_bytes(os.urandom(8))
+        (root / "artifact.bin").write_bytes(b"artifact")
         return _probe_results()
 
     monkeypatch.setattr(git_broker_live_verify, "run_git_broker_batch", fake_batch)
