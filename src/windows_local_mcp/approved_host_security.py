@@ -79,6 +79,19 @@ if os.name == "nt":
         ctypes.POINTER(wintypes.DWORD),
     ]
     _advapi32.GetSecurityDescriptorControl.restype = wintypes.BOOL
+    _advapi32.GetSecurityDescriptorOwner.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.BOOL),
+    ]
+    _advapi32.GetSecurityDescriptorOwner.restype = wintypes.BOOL
+    _advapi32.GetSecurityDescriptorDacl.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.BOOL),
+        ctypes.POINTER(ctypes.POINTER(_ACL)),
+        ctypes.POINTER(wintypes.BOOL),
+    ]
+    _advapi32.GetSecurityDescriptorDacl.restype = wintypes.BOOL
     _advapi32.GetAce.argtypes = [
         ctypes.POINTER(_ACL),
         wintypes.DWORD,
@@ -237,30 +250,17 @@ def _service_security() -> tuple[str, bool, list[tuple[int, int, int, str]]]:
             raise _winerror("QueryServiceObjectSecurity")
         descriptor = ctypes.cast(buffer, ctypes.c_void_p)
         owner = ctypes.c_void_p()
-        dacl = ctypes.POINTER(_ACL)()
-
-        get_owner = _advapi32.GetSecurityDescriptorOwner
-        get_owner.argtypes = [
-            ctypes.c_void_p,
-            ctypes.POINTER(ctypes.c_void_p),
-            ctypes.POINTER(wintypes.BOOL),
-        ]
-        get_owner.restype = wintypes.BOOL
         owner_defaulted = wintypes.BOOL()
-        if not get_owner(descriptor, ctypes.byref(owner), ctypes.byref(owner_defaulted)):
+        if not _advapi32.GetSecurityDescriptorOwner(
+            descriptor,
+            ctypes.byref(owner),
+            ctypes.byref(owner_defaulted),
+        ):
             raise _winerror("GetSecurityDescriptorOwner")
-
-        get_dacl = _advapi32.GetSecurityDescriptorDacl
-        get_dacl.argtypes = [
-            ctypes.c_void_p,
-            ctypes.POINTER(wintypes.BOOL),
-            ctypes.POINTER(ctypes.POINTER(_ACL)),
-            ctypes.POINTER(wintypes.BOOL),
-        ]
-        get_dacl.restype = wintypes.BOOL
+        dacl = ctypes.POINTER(_ACL)()
         present = wintypes.BOOL()
         defaulted = wintypes.BOOL()
-        if not get_dacl(
+        if not _advapi32.GetSecurityDescriptorDacl(
             descriptor,
             ctypes.byref(present),
             ctypes.byref(dacl),
@@ -298,7 +298,7 @@ def _reject_reparse_ancestry(path: Path, *, stop: Path) -> None:
         current = current.parent
 
 
-def _assert_state_object_security(path: Path) -> None:
+def _assert_root_acl(path: Path) -> None:
     owner, protected, records = _path_security(path)
     if owner.casefold() != _SYSTEM_SID.casefold():
         raise PermissionError(
@@ -313,28 +313,29 @@ def _assert_state_object_security(path: Path) -> None:
     for ace_type, ace_flags, _mask, sid in records:
         if ace_flags & _INHERITED_ACE:
             raise PermissionError(
-                f"Approved Host authority state contains inherited ACEs: {path}"
+                f"Approved Host authority root contains inherited ACEs: {path}"
             )
         if ace_type == _ACCESS_DENIED_ACE_TYPE:
             continue
         if ace_type != _ACCESS_ALLOWED_ACE_TYPE:
             raise PermissionError(
-                f"Approved Host authority state contains unsupported ACE type {ace_type}: {path}"
+                f"Approved Host authority root contains unsupported ACE type {ace_type}: {path}"
             )
         folded = sid.casefold()
         if folded not in allowed:
             raise PermissionError(
-                f"Approved Host authority state grants access outside SYSTEM/Administrators: {path}: {sid}"
+                "Approved Host authority root grants access outside SYSTEM/Administrators: "
+                f"{path}: {sid}"
             )
         seen.add(folded)
     if not allowed.issubset(seen):
         raise PermissionError(
-            f"Approved Host authority state ACL is missing SYSTEM/Administrators: {path}"
+            f"Approved Host authority root ACL is missing SYSTEM/Administrators: {path}"
         )
 
 
 def assert_authority_state_security(root: Path) -> None:
-    """Verify the production durable-state namespace before every authority RPC."""
+    """Verify the protected ProgramData namespace and state-file identities."""
     if os.name != "nt":
         raise RuntimeError("Approved Host authority state security requires native Windows")
     program_data = Path(os.environ.get("PROGRAMDATA") or r"C:\ProgramData").absolute()
@@ -344,14 +345,12 @@ def assert_authority_state_security(root: Path) -> None:
     except ValueError as error:
         raise PermissionError("Approved Host authority state must be below ProgramData") from error
     _reject_reparse_ancestry(root, stop=program_data)
-    if not root.is_dir():
-        raise RuntimeError("Approved Host authority state root is missing")
     completed = root / "completed"
-    if not completed.is_dir():
-        raise RuntimeError("Approved Host authority completion archive is missing")
     for path in (root, completed):
+        if not path.is_dir():
+            raise RuntimeError(f"Approved Host authority directory is missing: {path}")
         _reject_unsafe_state_path(path, directory=True)
-        _assert_state_object_security(path)
+        _assert_root_acl(path)
     for child in root.iterdir():
         if child == completed:
             continue
@@ -360,16 +359,17 @@ def assert_authority_state_security(root: Path) -> None:
                 f"Approved Host authority state contains an unexpected directory: {child}"
             )
         _reject_unsafe_state_path(child, directory=False)
-        _assert_state_object_security(child)
     for child in completed.iterdir():
         _reject_unsafe_state_path(child, directory=False)
-        _assert_state_object_security(child)
 
 
 def assert_authority_service_security(runtime_sid: str) -> None:
     """Verify SCM DACL: runtime user gets query-status only; only SYSTEM/admin may mutate."""
     owner, protected, records = _service_security()
-    if owner.casefold() not in {_SYSTEM_SID.casefold(), _ADMINISTRATORS_SID.casefold()}:
+    if owner.casefold() not in {
+        _SYSTEM_SID.casefold(),
+        _ADMINISTRATORS_SID.casefold(),
+    }:
         raise PermissionError(
             f"Approved Host authority service has unexpected owner: {owner}"
         )
@@ -465,7 +465,8 @@ class HardenedAuthorityStateStore(AuthorityStateStore):
                     active[field] = status[field]
         return active
 
-    def _status_payload(self, active: Mapping[str, Any], **fields: Any) -> dict[str, Any]:
+    @staticmethod
+    def _status_payload(active: Mapping[str, Any], **fields: Any) -> dict[str, Any]:
         payload = {
             "version": APPROVED_HOST_AUTHORITY_STATE_VERSION,
             "operation_id": active["operation_id"],
@@ -477,15 +478,17 @@ class HardenedAuthorityStateStore(AuthorityStateStore):
 
     def mark_running(self, worker: AuthorityWorkerIdentity) -> dict[str, Any]:
         active = self.require_current_active()
-        status = self._status_payload(
-            active,
-            state="running",
-            worker_pid=worker.pid,
-            worker_create_time=worker.create_time,
-            worker_executable=worker.executable,
-            worker_started_at=utc_now_iso(),
+        _atomic_status_write(
+            self.status_path,
+            self._status_payload(
+                active,
+                state="running",
+                worker_pid=worker.pid,
+                worker_create_time=worker.create_time,
+                worker_executable=worker.executable,
+                worker_started_at=utc_now_iso(),
+            ),
         )
-        _atomic_status_write(self.status_path, status)
         return self.require_current_active()
 
     def mark_recovery_required(
@@ -504,7 +507,10 @@ class HardenedAuthorityStateStore(AuthorityStateStore):
         }
         if worker_exit_code is not None:
             fields["worker_exit_code"] = int(worker_exit_code)
-        _atomic_status_write(self.status_path, self._status_payload(active, **fields))
+        _atomic_status_write(
+            self.status_path,
+            self._status_payload(active, **fields),
+        )
 
     def consume_completion(self, proof_path: Path) -> dict[str, Any]:
         active = self.require_current_active()
@@ -538,8 +544,7 @@ class HardenedAuthorityStateStore(AuthorityStateStore):
             "archived_at": utc_now_iso(),
         }
         _write_json_exclusive(archive, record)
-        # Remove proof/status first and the immutable active latch last. Any interruption before
-        # the final unlink therefore remains fail closed on the next service start.
+        # Keep the immutable latch until every earlier cleanup step has completed.
         proof_path.unlink()
         self.status_path.unlink(missing_ok=True)
         self.active_path.unlink()
