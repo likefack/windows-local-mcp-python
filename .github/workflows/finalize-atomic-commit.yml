@@ -72,6 +72,31 @@ jobs:
         shell: bash
         run: git diff --check HEAD^ HEAD
 
+  stdio-python313:
+    name: MCP stdio / Python 3.13
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout tested revision
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install package and test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+          python -m pip check
+          python --version
+
+      - name: Real Windows stdio negotiation
+        run: python -m pytest -q tests/test_mcp_stdio_transport.py
+
   tests:
     name: Pytest
     runs-on: windows-latest
