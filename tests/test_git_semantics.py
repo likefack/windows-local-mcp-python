@@ -1,9 +1,15 @@
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from windows_local_mcp.config import Settings
-from windows_local_mcp.git_broker_sandbox import GitBrokerUnavailable, _safe_repository_config
+from windows_local_mcp.git_broker_sandbox import (
+    GitBrokerUnavailable,
+    _safe_repository_config,
+    stage_git_repository,
+)
 from windows_local_mcp.git_semantics import (
     GitSemanticConfigUnavailable,
     normalize_core_autocrlf,
@@ -178,3 +184,121 @@ def test_repository_config_include_semantics_fail_closed(tmp_path: Path) -> None
             byte_limit=1024 * 1024,
             inherited_core_autocrlf="true",
         )
+
+
+def test_projection_preserves_clean_crlf_worktree_semantics(tmp_path: Path) -> None:
+    git = shutil.which("git.exe") or shutil.which("git")
+    if git is None:
+        pytest.skip("Git is not installed")
+    settings = _settings(tmp_path)
+    subprocess.run(
+        [git, "init", str(settings.workspace_root)],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        check=True,
+        shell=False,
+    )
+    tracked = settings.workspace_root / "tracked.txt"
+    tracked.write_bytes(b"tracked\n")
+    subprocess.run(
+        [
+            git,
+            "-c",
+            "core.autocrlf=true",
+            "-C",
+            str(settings.workspace_root),
+            "add",
+            "tracked.txt",
+        ],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        check=True,
+        shell=False,
+    )
+    subprocess.run(
+        [
+            git,
+            "-C",
+            str(settings.workspace_root),
+            "-c",
+            "user.name=Automatic Git EOL Regression",
+            "-c",
+            "user.email=regression@example.invalid",
+            "commit",
+            "-m",
+            "initial",
+        ],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        check=True,
+        shell=False,
+    )
+    tracked.write_bytes(b"tracked\r\n")
+
+    source_status = subprocess.run(
+        [
+            git,
+            "-c",
+            "core.autocrlf=true",
+            "-C",
+            str(settings.workspace_root),
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=no",
+        ],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        check=True,
+        shell=False,
+    ).stdout
+    assert source_status == b""
+
+    stage = stage_git_repository(
+        settings,
+        "crlf-clean",
+        commands=((git, "status", "--porcelain=v1", "--untracked-files=no"),),
+        inherited_core_autocrlf="true",
+    )
+    try:
+        projected_status = subprocess.run(
+            [
+                git,
+                "-C",
+                str(stage.repository),
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=no",
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            check=True,
+            shell=False,
+        ).stdout
+        assert projected_status == b""
+    finally:
+        shutil.rmtree(stage.root, ignore_errors=True)
+
+    control = stage_git_repository(
+        settings,
+        "crlf-false-control",
+        commands=((git, "status", "--porcelain=v1", "--untracked-files=no"),),
+        inherited_core_autocrlf="false",
+    )
+    try:
+        false_status = subprocess.run(
+            [
+                git,
+                "-C",
+                str(control.repository),
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=no",
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            check=True,
+            shell=False,
+        ).stdout
+        assert b"tracked.txt" in false_status
+    finally:
+        shutil.rmtree(control.root, ignore_errors=True)
