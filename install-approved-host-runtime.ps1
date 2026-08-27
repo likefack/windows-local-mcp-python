@@ -14,6 +14,7 @@ $ErrorActionPreference = "Stop"
 $AuthorityServiceName = "WindowsLocalMCPApprovedHost"
 $AuthorityStateRoot = Join-Path $env:ProgramData "WindowsLocalMCP\ApprovedHostAuthority"
 $AuthorityActiveState = Join-Path $AuthorityStateRoot "active.json"
+$AuthorityStatusState = Join-Path $AuthorityStateRoot "active-status.json"
 $AuthorityRecoveryState = Join-Path $AuthorityStateRoot "recovery_required"
 
 function Assert-UnderProgramFiles {
@@ -82,6 +83,7 @@ if ((Test-Path -LiteralPath $InstallRoot) -and -not $Replace) {
 if ($Replace) {
     if (
         (Test-Path -LiteralPath $AuthorityActiveState -PathType Leaf) -or
+        (Test-Path -LiteralPath $AuthorityStatusState -PathType Leaf) -or
         (Test-Path -LiteralPath $AuthorityRecoveryState)
     ) {
         throw "Approved Host authority has active/recovery state. Review and recover it before replacing the immutable runtime."
@@ -144,6 +146,7 @@ try {
         "run-approvals.ps1",
         "install-approved-host-authority.ps1",
         "recover-approved-host-authority.ps1",
+        "recover-approved-host-postflight.ps1",
         "verify-approved-host-runtime.ps1",
         "verify-approved-host-authority.ps1",
         "verify-approved-host-authority-abnormal.ps1"
@@ -231,7 +234,7 @@ try {
         Write-Output "2. Existing Approved Host authority service was preserved; re-run its installer with -Replace if service configuration changed."
     }
     Write-Output "3. Run verify-approved-host-authority.ps1 from normal non-elevated $RuntimeUser."
-    Write-Output "4. Before claiming WLMCP-R2-001 fixed, run verify-approved-host-authority-abnormal.ps1 through Arm / KillAndRestart / Check."
+    Write-Output "4. Before claiming WLMCP-R2-001 fixed, run verify-approved-host-authority-abnormal.ps1 through Arm / KillAndRestart / Check, coordinated recovery, and post-recovery normal verification."
 } finally {
     if (Test-Path -LiteralPath $StagingRoot) {
         Remove-Item -LiteralPath $StagingRoot -Recurse -Force -ErrorAction SilentlyContinue
