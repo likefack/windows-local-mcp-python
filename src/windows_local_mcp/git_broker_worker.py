@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import runpy
 import sys
 import time
 from pathlib import Path
@@ -16,12 +15,13 @@ from .control_plane import (
     load_worker_context,
     verify_control_plane_generation,
 )
+from .git_broker_live_verify import require_git_broker_live_verification
 from .git_broker_sandbox import GitBrokerUnavailable, run_git_broker_command
+from .paths import Workspace
 from .policy import CommandPolicy
 from .process_utils import capture_process_identity
 from .redaction import redact_text
 from .util import canonical_json, utc_now_iso
-from .paths import Workspace
 
 
 def isolated_git_broker_worker_argv(
@@ -118,7 +118,7 @@ def run_operation(operation_id: str, settings: Settings) -> int:
             raise RuntimeError("effective MCP settings changed before Automatic Git execution")
         safe_request = request.get("safe_request")
         if not isinstance(safe_request, dict):
-            raise RuntimeError("Automatic Git command is missing its original validated request")
+            raise TypeError("Automatic Git command is missing its original validated request")
         policy = CommandPolicy(settings, Workspace(settings))
         fresh = policy.normalize_safe(
             program=str(safe_request["program"]),
@@ -193,9 +193,19 @@ def run_operation(operation_id: str, settings: Settings) -> int:
     exit_code: int | None = None
     broker_result: Any | None = None
     try:
+        git_identity = dict(fresh.executable_identity or {})
+        live_marker = require_git_broker_live_verification(settings, git_identity)
+        audit.add_event(
+            operation_id,
+            "git_broker_live_verification_rechecked",
+            {
+                "version": live_marker["version"],
+                "context_digest": live_marker["context_digest"],
+            },
+        )
         broker_result = run_git_broker_command(
             settings=settings,
-            git_identity=dict(fresh.executable_identity or {}),
+            git_identity=git_identity,
             command=[fresh.executable, *fresh.args],
             cwd=fresh.cwd,
             timeout=float(max_runtime),
@@ -251,7 +261,7 @@ def run_operation(operation_id: str, settings: Settings) -> int:
         "stdout_path": str(stdout_path),
         "stderr_path": str(stderr_path),
         "execution_tier": "broker",
-        "git_broker_sandbox": "live-verified-codex-windows-sandbox",
+        "git_broker_sandbox": "git-live-verified-codex-windows-sandbox",
         "sandbox_backend_version": (
             broker_result.backend_version if broker_result is not None else None
         ),
