@@ -71,7 +71,7 @@ def _inspect_marker_path(
         except (UnicodeDecodeError, ValueError) as error:
             raise RuntimeError("Approved Host postflight marker is unreadable") from error
         if not isinstance(payload, dict):
-            raise RuntimeError("Approved Host postflight marker is not an object")
+            raise TypeError("Approved Host postflight marker is not an object")
         if payload.get("version") != 1:
             raise RuntimeError("Approved Host postflight marker version changed")
         if payload.get("state") != "postflight_pending":
