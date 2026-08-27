@@ -126,7 +126,7 @@ def arm_abnormal(cwd: str, handoff: Path) -> dict[str, Any]:
         reason="WLMCP-R2-001 WMI helper plus SYSTEM-worker-loss verification",
         network_required=False,
         risk_summary="Win32_Process.Create creates a same-user process outside the Host Job",
-        workspace_write=False,
+        workspace_write=True,
         max_runtime_seconds=45,
     )
     legacy = server.request_host_command(
@@ -135,7 +135,7 @@ def arm_abnormal(cwd: str, handoff: Path) -> dict[str, Any]:
         reason="legacy pending approval bypass regression",
         network_required=False,
         risk_summary="must remain blocked after abnormal Host recovery latch",
-        workspace_write=False,
+        workspace_write=True,
         max_runtime_seconds=20,
     )
     operation_id = str(victim["approval_id"])

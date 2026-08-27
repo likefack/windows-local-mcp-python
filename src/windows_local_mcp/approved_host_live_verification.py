@@ -273,7 +273,7 @@ def _stage_and_launch_live_operation(cwd: str) -> tuple[Any, str]:
         reason="WLMCP-R2-001 LocalSystem authority live verification",
         network_required=True,
         risk_summary="Loopback-only timing command for security-boundary verification",
-        workspace_write=False,
+        workspace_write=True,
         max_runtime_seconds=30,
     )
     operation_id = str(staged["approval_id"])

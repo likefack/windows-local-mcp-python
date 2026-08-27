@@ -149,4 +149,6 @@ WMIC optional feature がない PC では mandatory WMI abnormal-path live verif
 
 この branch では LocalSystem authority、requester-token launch、durable state、restart recovery、WMI requester-user census、runtime-user monitor-stop denial、unit/integration regressions、live verification scripts を実装しています。
 
+R2-001 専用 live verifier は別 finding WLMCP-R3-002 の `workspace_write=false` materialization 経路に依存しないよう、non-project-controlled command を `workspace_write=true` で実行します。
+
 ただし GitHub Hosted Windows CI は実際の installed service／SCM ACL／ProgramData ACL／runtime-user-vs-SYSTEM process authority を証明しません。normal path と abnormal path の実 Windows live verification が未実施である限り、WLMCP-R2-001 は `valid / remediation implemented / live verification pending` のままです。main へ merge して `fixed / closed` と記録する条件は、CI と両 live verification の成功です。

@@ -152,6 +152,12 @@ def test_executor_delegates_approved_host_worker_to_system_authority(
         "windows_local_mcp.executor.ApprovedHostAuthorityClient",
         FakeAuthority,
     )
+    # The test forbids executor-side Popen. Avoid coupling that monkeypatch to the
+    # global subprocess module used by the SCM existence probe during context creation.
+    monkeypatch.setattr(
+        "windows_local_mcp.approved_host_policy._authority_service_installed",
+        lambda: False,
+    )
 
     def forbidden_spawn(*_args: object, **_kwargs: object) -> object:
         raise AssertionError("Approved Host must not use same-user subprocess.Popen")
