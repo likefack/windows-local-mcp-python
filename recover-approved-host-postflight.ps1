@@ -111,23 +111,25 @@ if ($null -ne $service -and $service.Status -ne [ServiceProcess.ServiceControlle
     )
 }
 
-$compatibilityId = "postflight-recovery-{0}-{1}.json" -f ([DateTime]::UtcNow.ToString("yyyyMMddTHHmmssfffZ")), ([Guid]::NewGuid().ToString("N"))
-$compatibilityArchive = Join-Path $CompletedRoot $compatibilityId
-$compatibilityEvidence = @{
-    version = 1
-    state = "postflight_recovery_in_progress"
-    started_at = [DateTimeOffset]::UtcNow.ToString("o")
-    service_name = $ServiceName
-    operation_id = $operationId
-    authority_recovery_archive = $archiveResolved
-    authority_recovery_archive_sha256 = (Get-FileHash -LiteralPath $archiveResolved -Algorithm SHA256).Hash
-    postflight_preflight = $postflight
-    postflight_quarantine = $null
-    acknowledgement = "administrator reviewed historical split recovery state"
-}
-$compatibilityEvidence | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $compatibilityArchive -Encoding UTF8 -NoNewline
-
+$compatibilityArchive = $null
+$compatibilityEvidence = $null
 try {
+    $compatibilityId = "postflight-recovery-{0}-{1}.json" -f ([DateTime]::UtcNow.ToString("yyyyMMddTHHmmssfffZ")), ([Guid]::NewGuid().ToString("N"))
+    $compatibilityArchive = Join-Path $CompletedRoot $compatibilityId
+    $compatibilityEvidence = @{
+        version = 1
+        state = "postflight_recovery_in_progress"
+        started_at = [DateTimeOffset]::UtcNow.ToString("o")
+        service_name = $ServiceName
+        operation_id = $operationId
+        authority_recovery_archive = $archiveResolved
+        authority_recovery_archive_sha256 = (Get-FileHash -LiteralPath $archiveResolved -Algorithm SHA256).Hash
+        postflight_preflight = $postflight
+        postflight_quarantine = $null
+        acknowledgement = "administrator reviewed historical split recovery state"
+    }
+    $compatibilityEvidence | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $compatibilityArchive -Encoding UTF8 -NoNewline
+
     $recovered = Invoke-RecoveryPythonJson -Arguments @(
         "quarantine",
         "--config", $ConfigPath,
