@@ -16,8 +16,10 @@ def capture_git_snapshot(
     settings: Settings,
     operation_id: str,
     stage: str,
-    required: bool = False,
+    required: bool = True,
 ) -> str | None:
+    """Capture Git state, preserving the root cause for required model-facing snapshots."""
+
     if not settings.git_enabled:
         if required:
             raise PermissionError("git capability is disabled")
