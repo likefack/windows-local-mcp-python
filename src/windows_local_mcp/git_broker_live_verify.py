@@ -191,7 +191,7 @@ def verify_git_broker_live(settings: Settings) -> dict[str, Any]:
             "Automatic Git Broker live verification returned an incomplete probe set"
         )
     inside, top_level, status = results
-    inside_ok = inside.returncode == 0 and inside.stdout.strip().casefold() == b"true"
+    inside_ok = inside.returncode == 0 and inside.stdout.strip().lower() == b"true"
     try:
         top_level_path = Path(
             top_level.stdout.decode("utf-8", errors="strict").strip()
