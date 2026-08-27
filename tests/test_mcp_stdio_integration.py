@@ -10,6 +10,15 @@ from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
 
+def _tool_result_text(result: object) -> str:
+    content = getattr(result, "content", [])
+    return "\n".join(
+        str(getattr(item, "text", ""))
+        for item in content
+        if getattr(item, "text", None) is not None
+    )
+
+
 def test_real_stdio_tools_list_and_file_round_trip(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -114,6 +123,18 @@ def test_real_stdio_tools_list_and_file_round_trip(tmp_path: Path) -> None:
                 "execute_readonly", {"program": "git", "args": ["status", "--short"]}
             )
             assert git_status.is_error
+
+            for rejected_args in (
+                ["show", "--patch"],
+                ["diff", "--patch"],
+                ["diff", "--check"],
+            ):
+                rejected = await session.call_tool(
+                    "execute_readonly",
+                    {"program": "git", "args": rejected_args},
+                )
+                assert rejected.is_error
+                assert "request_sandbox_command" in _tool_result_text(rejected)
 
             wrong_surface = await session.call_tool(
                 "execute_workspace_write",
