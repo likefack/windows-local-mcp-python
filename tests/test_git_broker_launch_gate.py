@@ -1,9 +1,17 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from windows_local_mcp import git_broker_live_verify
-from windows_local_mcp.git_broker_sandbox import _require_current_git_live_marker
+from windows_local_mcp.git_broker_sandbox import (
+    GitBrokerStage,
+    _prepare_git_launch,
+    _require_current_git_live_marker,
+)
+
+
+_BUILTINS = b"status diff log show rev-parse ls-files\n"
 
 
 def test_ordinary_git_launch_rechecks_git_specific_marker(
@@ -46,6 +54,49 @@ def test_explicit_live_verification_probe_is_the_only_marker_bootstrap_bypass(
         {"sha256": "a" * 64},
         live_verification_probe=True,
     )
+
+
+def test_prepare_git_launch_keeps_process_cwd_outside_projection(tmp_path: Path) -> None:
+    source = tmp_path / "workspace"
+    source_subdir = source / "sub"
+    source_subdir.mkdir(parents=True)
+    root = tmp_path / "scratch" / "git-broker" / "operation"
+    repository = root / "repository"
+    staged_subdir = repository / "sub"
+    staged_subdir.mkdir(parents=True)
+    runtime = root / "runtime"
+    runtime.mkdir()
+    executable = tmp_path / "trusted" / "mingw64" / "bin" / "git.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"git")
+    stage = GitBrokerStage(
+        root=root,
+        repository=repository,
+        runtime=runtime,
+        source_root=source,
+        snapshot_digest="a" * 64,
+        file_count=0,
+        total_bytes=0,
+    )
+    identity = {"path": str(executable.resolve())}
+
+    command, process_cwd = _prepare_git_launch(
+        [str(executable), "--no-pager", "status"],
+        stage,
+        identity,
+        str(source_subdir),
+    )
+
+    assert process_cwd == executable.parent.resolve()
+    assert process_cwd != repository
+    assert process_cwd != staged_subdir
+    assert command == [
+        str(executable),
+        "-C",
+        str(staged_subdir),
+        "--no-pager",
+        "status",
+    ]
 
 
 def test_verify_git_broker_live_uses_bootstrap_probe_mode(
@@ -110,6 +161,12 @@ def test_verify_git_broker_live_uses_bootstrap_probe_mode(
                 stderr=b"",
                 snapshot_digest=snapshot_digest,
             ),
+            SimpleNamespace(
+                returncode=0,
+                stdout=_BUILTINS,
+                stderr=b"",
+                snapshot_digest=snapshot_digest,
+            ),
         ]
 
     monkeypatch.setattr(git_broker_live_verify, "run_git_broker_batch", fake_batch)
@@ -118,4 +175,5 @@ def test_verify_git_broker_live_uses_bootstrap_probe_mode(
 
     assert marker["route_eligible"] is True
     assert marker["checks"]["git_projection_snapshot_bound"] is True
+    assert marker["checks"]["git_allowed_commands_builtin"] is True
     assert seen["live_verification_probe"] is True
