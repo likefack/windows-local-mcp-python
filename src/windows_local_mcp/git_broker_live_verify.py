@@ -188,6 +188,7 @@ def verify_git_broker_live(settings: Settings) -> dict[str, Any]:
         cwd=str(settings.workspace_root),
         timeout=60,
         output_limit=64 * 1024,
+        live_verification_probe=True,
     )
     if len(results) != 3:
         raise GitBrokerUnavailable(
