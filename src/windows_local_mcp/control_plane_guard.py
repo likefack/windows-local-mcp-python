@@ -624,8 +624,14 @@ def _acl_state_digest(settings: Settings, roots: list[Path]) -> tuple[str | None
     for root in roots:
         if not root.exists():
             continue
+        if root.is_file():
+            command = [windows_system_executable("icacls.exe"), str(root), "/C"]
+        elif root.is_dir():
+            command = [windows_system_executable("icacls.exe"), str(root), "/T", "/C"]
+        else:
+            raise RuntimeError(f"control-plane ACL root has unsupported type: {root}")
         completed = subprocess.run(
-            [windows_system_executable("icacls.exe"), str(root), "/T", "/C"],
+            command,
             capture_output=True,
             timeout=30,
             check=False,
