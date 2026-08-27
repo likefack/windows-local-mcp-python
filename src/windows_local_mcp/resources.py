@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import threading
 import time
 from collections import deque
@@ -490,35 +491,49 @@ def prune_artifacts(settings: Settings, *, protected_ids: set[str] | None = None
             settings.sandbox_scratch_dir / "live-verification",
             settings.sandbox_scratch_dir / "git-broker",
         ):
-            if not root.exists() or root.is_symlink():
-                continue
-            for candidate in root.iterdir():
-                if candidate.is_symlink() or candidate.name in protected_ids:
+            try:
+                if not root.exists() or root.is_symlink():
                     continue
+                entries = list(root.iterdir())
+            except OSError:
+                continue
+            for candidate in entries:
                 try:
+                    if candidate.is_symlink() or candidate.name in protected_ids:
+                        continue
                     modified = datetime.fromtimestamp(candidate.stat().st_mtime, UTC)
                 except FileNotFoundError:
                     continue
+                except OSError:
+                    continue
                 if modified < cutoff:
-                    _remove_artifact(candidate)
-                    removed += 1
+                    if _try_remove_disposable_artifact(candidate):
+                        removed += 1
+                    else:
+                        scratch_candidates.append((modified.timestamp(), candidate))
                 else:
                     scratch_candidates.append((modified.timestamp(), candidate))
-        scratch_used = directory_size(
-            settings.sandbox_scratch_dir,
-            stop_after=settings.max_sandbox_scratch_bytes,
-        )
+        try:
+            scratch_used = directory_size(
+                settings.sandbox_scratch_dir,
+                stop_after=settings.max_sandbox_scratch_bytes,
+            )
+        except OSError:
+            scratch_used = settings.max_sandbox_scratch_bytes + 1
         for _, candidate in sorted(scratch_candidates):
             if scratch_used <= settings.max_sandbox_scratch_bytes:
                 break
-            size = (
-                directory_size(candidate)
-                if candidate.is_dir()
-                else candidate.stat().st_size
-            )
-            _remove_artifact(candidate)
-            scratch_used -= size
-            removed += 1
+            try:
+                size = (
+                    directory_size(candidate)
+                    if candidate.is_dir()
+                    else candidate.stat().st_size
+                )
+            except OSError:
+                size = 0
+            if _try_remove_disposable_artifact(candidate):
+                scratch_used = max(0, scratch_used - size)
+                removed += 1
     return removed
 
 
@@ -574,8 +589,38 @@ def _garbage_collect_workspace_blobs(operations: Path, blobs: Path) -> int:
     return removed
 
 
+def _retry_windows_readonly_delete(
+    function: Any,
+    path: str,
+    exc_info: tuple[type[BaseException], BaseException, Any],
+) -> None:
+    error = exc_info[1]
+    if os.name == "nt" and isinstance(error, PermissionError):
+        try:
+            os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
+            function(path)
+            return
+        except OSError:
+            pass
+    raise error
+
+
 def _remove_artifact(path: Path) -> None:
     if path.is_dir():
-        shutil.rmtree(path)
-    else:
+        shutil.rmtree(path, onerror=_retry_windows_readonly_delete)
+        return
+    try:
         path.unlink(missing_ok=True)
+    except PermissionError:
+        if os.name != "nt":
+            raise
+        os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
+        path.unlink(missing_ok=True)
+
+
+def _try_remove_disposable_artifact(path: Path) -> bool:
+    try:
+        _remove_artifact(path)
+    except OSError:
+        return False
+    return True
