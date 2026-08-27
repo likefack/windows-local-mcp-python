@@ -17,6 +17,11 @@ from typing import Any
 
 from .child_env import build_command_environment, sanitize_executable_search_path
 from .config import Settings
+from .git_semantics import (
+    GitSemanticConfigUnavailable,
+    normalize_core_autocrlf,
+    resolve_trusted_core_autocrlf,
+)
 from .paths import hold_verified_path, read_verified_bytes, release_verified_hold
 from .resources import BoundedStreamCapture, scan_directory_bounded
 from .sandbox_backend import (
@@ -33,7 +38,7 @@ from .util import canonical_json, sha256_bytes, sha256_text
 from .wfp_guard_identity import hold_wfp_guard_implementation
 from .windows_job import WindowsJobLimits
 
-GIT_BROKER_POLICY_VERSION = 5
+GIT_BROKER_POLICY_VERSION = 6
 _GIT_PROCESS_LIMIT = 16
 _GIT_MEMORY_LIMIT = 1024 * 1024 * 1024
 _GIT_CONFIG_LIMIT = 1024 * 1024
@@ -130,6 +135,8 @@ def require_git_broker_containment(
             "version": GIT_BROKER_POLICY_VERSION,
             "git_executable": git_identity,
             "git_process_cwd": "trusted-executable-directory-before-fixed--C",
+            "git_repository_trust": "command-scope-safe-directory-exact-projection",
+            "git_eol_semantics": "sanitized-core-autocrlf-scalar",
             "sandbox_backend": backend.as_dict(),
             "sandbox_isolation_context_digest": isolation_context_digest(settings, backend),
             "workspace_root": str(settings.workspace_root.resolve(strict=True)),
@@ -746,7 +753,12 @@ def _parse_bool(value: str | None, *, default: bool) -> bool:
     raise GitBrokerUnavailable("automatic Git repository has an invalid boolean core setting")
 
 
-def _safe_repository_config(source_config: Path, *, byte_limit: int) -> bytes:
+def _safe_repository_config(
+    source_config: Path,
+    *,
+    byte_limit: int,
+    inherited_core_autocrlf: str = "false",
+) -> bytes:
     """Parse source config in trusted memory and emit only inert core settings."""
 
     held = hold_verified_path(
@@ -782,6 +794,12 @@ def _safe_repository_config(source_config: Path, *, byte_limit: int) -> bytes:
         raise GitBrokerUnavailable(
             "automatic Git repository config is not safely parseable"
         ) from error
+    for section in parser.sections():
+        folded = section.strip().casefold()
+        if folded == "include" or folded.startswith("includeif "):
+            raise GitBrokerUnavailable(
+                "automatic Git does not accept repository config include semantics"
+            )
     repository_format = parser.get("core", "repositoryformatversion", fallback="0").strip()
     if repository_format != "0":
         raise GitBrokerUnavailable(
@@ -796,6 +814,15 @@ def _safe_repository_config(source_config: Path, *, byte_limit: int) -> bytes:
     ignorecase = _parse_bool(
         parser.get("core", "ignorecase", fallback=None), default=os.name == "nt"
     )
+    try:
+        autocrlf = normalize_core_autocrlf(
+            parser.get("core", "autocrlf", fallback=None),
+            default=inherited_core_autocrlf,
+        )
+    except GitSemanticConfigUnavailable as error:
+        raise GitBrokerUnavailable(
+            "automatic Git repository has an invalid core.autocrlf setting"
+        ) from error
     return (
         "[core]\n"
         "\trepositoryformatversion = 0\n"
@@ -803,6 +830,7 @@ def _safe_repository_config(source_config: Path, *, byte_limit: int) -> bytes:
         "\tbare = false\n"
         "\tlogallrefupdates = true\n"
         f"\tignorecase = {'true' if ignorecase else 'false'}\n"
+        f"\tautocrlf = {autocrlf}\n"
     ).encode()
 
 
@@ -857,6 +885,7 @@ def _copy_repository_tree(
     entry_limit: int,
     prune_policy: _ProjectionPrunePolicy | None = None,
     metadata_policy: _MetadataProjectionPolicy | None = None,
+    inherited_core_autocrlf: str = "false",
 ) -> tuple[int, int, str]:
     prune_policy = prune_policy or _ProjectionPrunePolicy()
     metadata_policy = metadata_policy or _MetadataProjectionPolicy()
@@ -954,7 +983,11 @@ def _copy_repository_tree(
 
             target = destination / relative
             if folded == ".git/config":
-                data = _safe_repository_config(candidate, byte_limit=remaining)
+                data = _safe_repository_config(
+                    candidate,
+                    byte_limit=remaining,
+                    inherited_core_autocrlf=inherited_core_autocrlf,
+                )
                 _write_projection_bytes(target, data)
                 size = len(data)
                 _record_snapshot_file(digest, relative, data)
@@ -1009,11 +1042,20 @@ def stage_git_repository(
     token: str,
     *,
     commands: Sequence[Sequence[str]] = (),
+    inherited_core_autocrlf: str = "false",
 ) -> GitBrokerStage:
     """Create a bounded, sanitized repository projection outside the live workspace."""
 
     if settings.sandbox_scratch_dir is None:
         raise GitBrokerUnavailable("sandbox_scratch_dir is required for Automatic Git Broker")
+    try:
+        inherited_core_autocrlf = normalize_core_autocrlf(
+            None, default=inherited_core_autocrlf
+        )
+    except GitSemanticConfigUnavailable as error:
+        raise GitBrokerUnavailable(
+            "automatic Git inherited core.autocrlf setting is invalid"
+        ) from error
     source = _validate_source_repository(settings)
     byte_limit, entry_limit = _repo_limits(settings)
     prune_policy = _build_projection_prune_policy(
@@ -1053,6 +1095,7 @@ def stage_git_repository(
             entry_limit=entry_limit,
             prune_policy=prune_policy,
             metadata_policy=metadata_policy,
+            inherited_core_autocrlf=inherited_core_autocrlf,
         )
         verification = scan_directory_bounded(
             repository,
@@ -1126,7 +1169,7 @@ def _rewrite_cwd(cwd: str, stage: GitBrokerStage) -> Path:
 def _prepare_git_launch(
     command: Sequence[str], stage: GitBrokerStage, git_identity: dict[str, Any], cwd: str
 ) -> tuple[list[str], Path]:
-    """Keep the Windows process cwd trusted and move Git itself with a fixed -C operand."""
+    """Keep process cwd trusted and trust only the Broker-created repository projection."""
 
     rewritten = _rewrite_command(command, stage)
     staged_cwd = _rewrite_cwd(cwd, stage)
@@ -1134,7 +1177,14 @@ def _prepare_git_launch(
     if Path(rewritten[0]).resolve(strict=True) != bound_executable:
         raise GitBrokerUnavailable("Automatic Git command does not match the bound executable")
     trusted_launch_cwd = bound_executable.parent.resolve(strict=True)
-    return [rewritten[0], "-C", str(staged_cwd), *rewritten[1:]], trusted_launch_cwd
+    return [
+        rewritten[0],
+        "-c",
+        f"safe.directory={stage.repository}",
+        "-C",
+        str(staged_cwd),
+        *rewritten[1:],
+    ], trusted_launch_cwd
 
 
 def _map_output_paths(data: bytes, stage: GitBrokerStage) -> bytes:
@@ -1352,10 +1402,17 @@ def run_git_broker_batch(
     if not commands:
         return []
     containment = require_git_broker_containment(settings, git_identity)
+    try:
+        inherited_core_autocrlf = resolve_trusted_core_autocrlf(settings, git_identity)
+    except GitSemanticConfigUnavailable as error:
+        raise GitBrokerUnavailable(
+            "Automatic Git could not safely reconstruct core.autocrlf semantics"
+        ) from error
     stage = stage_git_repository(
         settings,
         token or uuid.uuid4().hex,
         commands=commands,
+        inherited_core_autocrlf=inherited_core_autocrlf,
     )
     deadline = time.monotonic() + max(0.0, timeout)
     try:
