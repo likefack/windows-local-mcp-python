@@ -10,6 +10,7 @@ from .audit import TERMINAL_STATUSES, AuditStore
 from .child_env import build_worker_environment
 from .config import Settings
 from .control_plane import create_worker_context, isolated_worker_argv
+from .git_broker_worker import isolated_git_broker_worker_argv
 from .process_utils import (
     ProcessIdentity,
     capture_process_identity,
@@ -62,13 +63,30 @@ class Executor:
             nonce=nonce,
         )
         context_path, context_sha256 = create_worker_context(self.settings, operation_id)
-        process = subprocess.Popen(
-            isolated_worker_argv(
+        request = operation.get("request")
+        normalized = request.get("normalized_command") if isinstance(request, dict) else None
+        git_broker_worker = bool(
+            tier == "broker"
+            and isinstance(normalized, dict)
+            and normalized.get("program_key") == "git"
+        )
+        worker_argv = (
+            isolated_git_broker_worker_argv(
                 self.settings,
                 operation_id=operation_id,
                 context_path=context_path,
                 context_sha256=context_sha256,
-            ),
+            )
+            if git_broker_worker
+            else isolated_worker_argv(
+                self.settings,
+                operation_id=operation_id,
+                context_path=context_path,
+                context_sha256=context_sha256,
+            )
+        )
+        process = subprocess.Popen(
+            worker_argv,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -100,6 +118,9 @@ class Executor:
                 "operation_identity_updated": bootstrap_identity_recorded,
                 "immutable_context_sha256": context_sha256,
                 "isolated_import_mode": True,
+                "worker_route": (
+                    "git_broker_sandbox" if git_broker_worker else "standard_worker"
+                ),
             },
         )
 
