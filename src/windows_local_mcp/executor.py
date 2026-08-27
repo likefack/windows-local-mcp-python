@@ -6,6 +6,10 @@ import time
 import uuid
 from typing import Any
 
+import psutil
+
+from .approved_host_authority import ApprovedHostAuthorityClient
+from .approved_host_policy import assert_approved_host_authority_available
 from .audit import TERMINAL_STATUSES, AuditStore
 from .child_env import build_worker_environment
 from .config import Settings
@@ -46,6 +50,15 @@ class Executor:
                     {"error": f"{type(error).__name__}: {error}"[:1000]},
                 )
                 raise
+            try:
+                authority_trust = assert_approved_host_authority_available()
+            except Exception as error:
+                self.audit.add_event(
+                    operation_id,
+                    "approved_host_authority_preflight_failed",
+                    {"error": f"{type(error).__name__}: {error}"[:1000]},
+                )
+                raise
             self.audit.add_event(
                 operation_id,
                 "approved_host_runtime_immutability_verified",
@@ -56,6 +69,15 @@ class Executor:
                     "directory_count": runtime_trust["directory_count"],
                 },
             )
+            self.audit.add_event(
+                operation_id,
+                "approved_host_authority_verified",
+                {
+                    "service_epoch": authority_trust.get("service_epoch"),
+                    "healthy": bool(authority_trust.get("healthy")),
+                },
+            )
+
         nonce = uuid.uuid4().hex
         child_env = build_worker_environment(
             os.environ,
@@ -63,6 +85,7 @@ class Executor:
             nonce=nonce,
         )
         context_path, context_sha256 = create_worker_context(self.settings, operation_id)
+
         request = operation.get("request")
         normalized = request.get("normalized_command") if isinstance(request, dict) else None
         git_broker_worker = bool(
@@ -70,32 +93,59 @@ class Executor:
             and isinstance(normalized, dict)
             and normalized.get("program_key") == "git"
         )
-        worker_argv = (
-            isolated_git_broker_worker_argv(
-                self.settings,
+
+        if tier == "approved_host":
+            requester_pid = os.getpid()
+            requester_create_time = float(psutil.Process(requester_pid).create_time())
+            launched = ApprovedHostAuthorityClient().launch(
                 operation_id=operation_id,
                 context_path=context_path,
                 context_sha256=context_sha256,
+                process_nonce=nonce,
+                worker_environment=child_env,
+                requester_pid=requester_pid,
+                requester_create_time=requester_create_time,
             )
-            if git_broker_worker
-            else isolated_worker_argv(
-                self.settings,
-                operation_id=operation_id,
-                context_path=context_path,
-                context_sha256=context_sha256,
+            identity = ProcessIdentity(
+                pid=launched.worker.pid,
+                create_time=launched.worker.create_time,
+                executable=launched.worker.executable,
+                nonce=nonce,
             )
-        )
-        process = subprocess.Popen(
-            worker_argv,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            shell=False,
-            creationflags=creation_flags(),
-            start_new_session=(os.name != "nt"),
-            env=child_env,
-        )
-        identity = capture_process_identity(process.pid, nonce)
+            spawned_pid = launched.worker.pid
+            identity_role = "system_authority_worker"
+            worker_route = "approved_host_authority"
+        else:
+            worker_argv = (
+                isolated_git_broker_worker_argv(
+                    self.settings,
+                    operation_id=operation_id,
+                    context_path=context_path,
+                    context_sha256=context_sha256,
+                )
+                if git_broker_worker
+                else isolated_worker_argv(
+                    self.settings,
+                    operation_id=operation_id,
+                    context_path=context_path,
+                    context_sha256=context_sha256,
+                )
+            )
+            process = subprocess.Popen(
+                worker_argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                shell=False,
+                creationflags=creation_flags(),
+                start_new_session=(os.name != "nt"),
+                env=child_env,
+            )
+            identity = capture_process_identity(process.pid, nonce)
+            spawned_pid = process.pid
+            identity_role = "bootstrap_launcher"
+            worker_route = "git_broker_sandbox" if git_broker_worker else "standard_worker"
+
         bootstrap_identity_recorded = self.audit.transition_operation(
             operation_id,
             from_statuses={"queued"},
@@ -109,18 +159,17 @@ class Executor:
             operation_id,
             "worker_spawned",
             {
-                "worker_pid": process.pid,
+                "worker_pid": spawned_pid,
                 "launcher_pid": identity.pid,
                 "launcher_create_time": identity.create_time,
                 "launcher_executable": identity.executable,
-                "identity_role": "bootstrap_launcher",
+                "identity_role": identity_role,
                 "identity_verified": True,
                 "operation_identity_updated": bootstrap_identity_recorded,
                 "immutable_context_sha256": context_sha256,
                 "isolated_import_mode": True,
-                "worker_route": (
-                    "git_broker_sandbox" if git_broker_worker else "standard_worker"
-                ),
+                "authority_separated": tier == "approved_host",
+                "worker_route": worker_route,
             },
         )
 
@@ -145,6 +194,17 @@ class Executor:
         return self._public_result(self.audit.get_operation(operation_id, include_events=False))
 
     def stop(self, operation_id: str) -> dict[str, Any]:
+        operation = self.audit.get_operation(operation_id, include_events=False)
+        tier = {
+            "host_approval": "approved_host",
+        }.get(str(operation.get("tier")), str(operation.get("tier")))
+        if tier == "approved_host" and operation["status"] not in TERMINAL_STATUSES:
+            raise PermissionError(
+                "active Approved Host operations cannot be stopped from the runtime-user "
+                "control plane because the independently privileged monitor must survive "
+                "until security postflight completes; poll the operation instead"
+            )
+
         while True:
             operation = self.audit.get_operation(operation_id, include_events=False)
             if operation["status"] in TERMINAL_STATUSES:
@@ -152,7 +212,9 @@ class Executor:
 
             identities = self._identities(operation)
             if not identities:
-                raise RuntimeError("job has no verifiable live process identity; refusing PID-only stop")
+                raise RuntimeError(
+                    "job has no verifiable live process identity; refusing PID-only stop"
+                )
             matched = False
             for identity in identities:
                 if terminate_process_tree(identity):
@@ -196,6 +258,8 @@ class Executor:
                 current_status = str(current["status"])
                 if current_status not in {"queued", "running"}:
                     break
+                if self._authority_owns_operation(current):
+                    break
                 identities = self._identities(current)
                 if identities and any(
                     process_identity_matches(identity) for identity in identities
@@ -206,11 +270,27 @@ class Executor:
                     from_statuses={current_status},
                     status="interrupted",
                     finished_at=utc_now_iso(),
-                    error="stale job reconciled at server startup; no PID-only termination attempted",
+                    error=(
+                        "stale job reconciled at server startup; "
+                        "no PID-only termination attempted"
+                    ),
                 )
                 if transitioned:
                     self.audit.add_event(operation["id"], "stale_job_reconciled", {})
                     break
+
+    @staticmethod
+    def _authority_owns_operation(operation: dict[str, Any]) -> bool:
+        tier = {
+            "host_approval": "approved_host",
+        }.get(str(operation.get("tier")), str(operation.get("tier")))
+        if tier != "approved_host":
+            return False
+        try:
+            probe = ApprovedHostAuthorityClient().probe()
+        except (OSError, PermissionError, RuntimeError, TypeError, ValueError):
+            return False
+        return str(probe.get("active_operation_id") or "") == str(operation["id"])
 
     @staticmethod
     def _identities(operation: dict[str, Any]) -> list[ProcessIdentity]:
