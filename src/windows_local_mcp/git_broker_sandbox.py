@@ -33,13 +33,15 @@ from .util import canonical_json, sha256_bytes, sha256_text
 from .wfp_guard_identity import hold_wfp_guard_implementation
 from .windows_job import WindowsJobLimits
 
-GIT_BROKER_POLICY_VERSION = 3
+GIT_BROKER_POLICY_VERSION = 4
 _GIT_PROCESS_LIMIT = 16
 _GIT_MEMORY_LIMIT = 1024 * 1024 * 1024
 _GIT_CONFIG_LIMIT = 1024 * 1024
 _GIT_IGNORE_LIMIT = 1024 * 1024
 _GIT_INDEX_LIMIT = 128 * 1024 * 1024
 _GIT_INDEX_EXTENDED = 0x4000
+_WINDOWS_LEGACY_FILE_PATH_LIMIT = 260
+_WINDOWS_LEGACY_DIRECTORY_PATH_LIMIT = 248
 
 
 class GitBrokerUnavailable(RuntimeError):
@@ -191,6 +193,46 @@ def _protected_worktree_path(relative: Path, settings: Settings) -> bool:
     return name.startswith(".env.") and name != ".env.example"
 
 
+def _windows_path_units(path: Path) -> int:
+    return len(str(path).encode("utf-16-le", errors="surrogatepass")) // 2
+
+
+def _ensure_projection_path_supported(
+    path: Path,
+    *,
+    directory: bool,
+    platform_name: str | None = None,
+) -> None:
+    """Fail clearly before legacy Windows path handling turns a valid source into ENOENT."""
+
+    platform = os.name if platform_name is None else platform_name
+    if platform != "nt":
+        return
+    limit = (
+        _WINDOWS_LEGACY_DIRECTORY_PATH_LIMIT
+        if directory
+        else _WINDOWS_LEGACY_FILE_PATH_LIMIT
+    )
+    if _windows_path_units(path) < limit:
+        return
+    kind = "directory" if directory else "file"
+    raise GitBrokerUnavailable(
+        "automatic Git projection path exceeds the supported Windows path length for a "
+        f"required {kind}: {path}"
+    )
+
+
+def _mkdir_projection(path: Path, *, exist_ok: bool = True) -> None:
+    _ensure_projection_path_supported(path, directory=True)
+    path.mkdir(parents=True, exist_ok=exist_ok)
+
+
+def _write_projection_bytes(path: Path, data: bytes) -> None:
+    _mkdir_projection(path.parent)
+    _ensure_projection_path_supported(path, directory=False)
+    path.write_bytes(data)
+
+
 def _copy_held_file(
     held: Path,
     destination: Path,
@@ -201,8 +243,7 @@ def _copy_held_file(
     if details.st_nlink > 1:
         raise GitBrokerUnavailable(f"hard-linked Git input is denied: {held}")
     data = read_verified_bytes(held, byte_limit)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_bytes(data)
+    _write_projection_bytes(destination, data)
     try:
         shutil.copystat(held, destination, follow_symlinks=False)
     except OSError:
@@ -306,7 +347,7 @@ def _parse_index_tracked_paths(data: bytes) -> frozenset[str] | None:
 
 
 def _safe_root_ignore_globs(data: bytes) -> tuple[str, ...]:
-    """Extract a conservative subset that proves a root directory is wholly ignored."""
+    """Extract simple directory-only patterns that prove matching root trees are ignored."""
 
     try:
         text = data.decode("utf-8", errors="strict")
@@ -322,11 +363,12 @@ def _safe_root_ignore_globs(data: bytes) -> tuple[str, ...]:
             not line
             or line.startswith("#")
             or line != line.strip()
-            or not line.startswith("/")
             or not line.endswith("/")
         ):
             continue
-        body = line[1:-1]
+        body = line[:-1]
+        if body.startswith("/"):
+            body = body[1:]
         if (
             not body
             or "/" in body
@@ -613,7 +655,7 @@ def _copy_repository_tree(
                         raise GitBrokerUnavailable(
                             "automatic Git requires .git to remain a regular directory"
                         )
-                    (destination / relative).mkdir(parents=True, exist_ok=True)
+                    _mkdir_projection(destination / relative)
                     pending.append((candidate, relative))
                     continue
                 metadata_parts = [part.casefold() for part in relative.parts[1:]]
@@ -636,7 +678,7 @@ def _copy_repository_tree(
             if entry.is_dir(follow_symlinks=False):
                 if _can_prune_root_directory(relative, prune_policy=prune_policy):
                     continue
-                (destination / relative).mkdir(parents=True, exist_ok=True)
+                _mkdir_projection(destination / relative)
                 pending.append((candidate, relative))
                 continue
             if not entry.is_file(follow_symlinks=False):
@@ -653,8 +695,7 @@ def _copy_repository_tree(
             folded = relative.as_posix().casefold()
             if folded == ".git/config":
                 data = _safe_repository_config(candidate, byte_limit=remaining)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(data)
+                _write_projection_bytes(target, data)
                 size = len(data)
                 _record_snapshot_file(digest, relative, data)
             elif folded in prune_policy.pinned_files:
@@ -662,8 +703,7 @@ def _copy_repository_tree(
                 data = prune_policy.pinned_bytes[folded]
                 if len(data) > remaining:
                     raise GitBrokerUnavailable("automatic Git snapshot exceeds its byte limit")
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(data)
+                _write_projection_bytes(target, data)
                 try:
                     shutil.copystat(held, target, follow_symlinks=False)
                 except OSError:
@@ -717,8 +757,8 @@ def stage_git_repository(
         raise GitBrokerUnavailable("Automatic Git snapshot directory already exists")
     repository = root / "repository"
     runtime = root / "runtime"
-    repository.mkdir(parents=True, exist_ok=False)
-    runtime.mkdir(parents=True, exist_ok=False)
+    _mkdir_projection(repository, exist_ok=False)
+    _mkdir_projection(runtime, exist_ok=False)
     try:
         file_count, total_bytes, snapshot_digest = _copy_repository_tree(
             source,
