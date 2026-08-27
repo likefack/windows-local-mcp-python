@@ -19,7 +19,7 @@ def _literal_toml_path(path: Path) -> str:
 
 
 def test_cli_stdio_negotiates_and_serves_a_tool() -> None:
-    """Pin the real Windows subprocess/wire path that production MCP hosts use."""
+    """Pin the real isolated Windows subprocess/wire path that production MCP hosts use."""
 
     root = Path(tempfile.mkdtemp(prefix="wlmcp-stdio-e2e-"))
     try:
@@ -49,13 +49,13 @@ def test_cli_stdio_negotiates_and_serves_a_tool() -> None:
         environment = os.environ.copy()
         environment["LOCAL_MCP_CONFIG"] = str(config)
         environment["LOCAL_MCP_TRANSPORT"] = "stdio"
-        environment["PYTHONPATH"] = str(repository / "src")
         environment.pop("LOCAL_MCP_ROOT", None)
+        environment.pop("PYTHONPATH", None)
 
         async def exercise() -> None:
             server = StdioServerParameters(
                 command=sys.executable,
-                args=["-m", "windows_local_mcp.cli", "server"],
+                args=["-I", "-B", "-m", "windows_local_mcp.cli", "server"],
                 env=environment,
                 cwd=str(repository),
             )
