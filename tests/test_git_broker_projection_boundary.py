@@ -76,6 +76,12 @@ def _status_command(git: str) -> tuple[str, ...]:
     return (git, "status", "--porcelain=v1")
 
 
+def test_simple_root_ignore_patterns_accept_anchored_and_unanchored_directories() -> None:
+    assert git_broker._safe_root_ignore_globs(
+        b"/.dev-tmp/\n.venv/\ncache-*/\nsub/tree/\n"
+    ) == (".dev-tmp", ".venv", "cache-*")
+
+
 def test_ignored_untracked_root_directory_is_not_opened(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -115,15 +121,51 @@ def test_ignored_untracked_root_directory_is_not_opened(
         shutil.rmtree(stage.root, ignore_errors=True)
 
 
+def test_unanchored_ignored_root_directory_is_not_opened(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    git, settings = _init_repository(tmp_path)
+    (settings.workspace_root / ".gitignore").write_text(".venv/\n", encoding="utf-8")
+    subprocess.run(
+        [git, "-C", str(settings.workspace_root), "add", ".gitignore"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        check=True,
+        shell=False,
+    )
+    artifact = settings.workspace_root / ".venv"
+    artifact.mkdir()
+    (artifact / "deep-generated-output.bin").write_bytes(b"test-only")
+
+    original_hold = git_broker.hold_verified_path
+
+    def guarded_hold(path: str | Path, **kwargs: object) -> Path:
+        if Path(path) == artifact:
+            raise PermissionError("simulated unreadable unanchored ignored tree")
+        return original_hold(path, **kwargs)
+
+    monkeypatch.setattr(git_broker, "hold_verified_path", guarded_hold)
+    stage = stage_git_repository(
+        settings,
+        "unanchored-ignored-unreadable",
+        commands=(_status_command(git),),
+    )
+    try:
+        assert not (stage.repository / artifact.name).exists()
+        assert (stage.repository / ".gitignore").is_file()
+    finally:
+        shutil.rmtree(stage.root, ignore_errors=True)
+
+
 def test_tracked_path_prevents_ignored_directory_pruning(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     git, settings = _init_repository(tmp_path)
     (settings.workspace_root / ".gitignore").write_text(
-        "/generated-*/\n",
+        ".venv/\n",
         encoding="utf-8",
     )
-    tracked = settings.workspace_root / "generated-state" / "tracked.txt"
+    tracked = settings.workspace_root / ".venv" / "tracked.txt"
     tracked.parent.mkdir()
     tracked.write_text("tracked\n", encoding="utf-8")
     subprocess.run(
@@ -134,7 +176,7 @@ def test_tracked_path_prevents_ignored_directory_pruning(
             "add",
             "-f",
             ".gitignore",
-            "generated-state/tracked.txt",
+            ".venv/tracked.txt",
         ],
         stdin=subprocess.DEVNULL,
         capture_output=True,
@@ -163,10 +205,10 @@ def test_ls_files_others_without_exclude_standard_disables_ignored_pruning(
 ) -> None:
     git, settings = _init_repository(tmp_path)
     (settings.workspace_root / ".gitignore").write_text(
-        "/generated-*/\n",
+        ".venv/\n",
         encoding="utf-8",
     )
-    artifact = settings.workspace_root / "generated-cache"
+    artifact = settings.workspace_root / ".venv"
     artifact.mkdir()
     (artifact / "cache.bin").write_bytes(b"cache")
     original_hold = git_broker.hold_verified_path
@@ -183,6 +225,41 @@ def test_ls_files_others_without_exclude_standard_disables_ignored_pruning(
             "ls-files-others",
             commands=((git, "ls-files", "--others"),),
         )
+
+
+def test_projection_path_guard_catches_destination_only_windows_overflow() -> None:
+    relative = Path("pkg") / ("x" * 200 + ".py")
+    source = Path("C:/src") / relative
+    projection = (
+        Path(
+            "C:/Users/example/AppData/Local/WindowsLocalMCP/"
+            "68114767576356cb35cb4669-sandbox-scratch/git-broker/"
+            "0123456789abcdef0123456789abcdef/repository"
+        )
+        / relative
+    )
+
+    assert git_broker._windows_path_units(source) < git_broker._WINDOWS_LEGACY_FILE_PATH_LIMIT
+    assert (
+        git_broker._windows_path_units(projection)
+        >= git_broker._WINDOWS_LEGACY_FILE_PATH_LIMIT
+    )
+    git_broker._ensure_projection_path_supported(
+        source,
+        directory=False,
+        platform_name="nt",
+    )
+    with pytest.raises(GitBrokerUnavailable, match="supported Windows path length"):
+        git_broker._ensure_projection_path_supported(
+            projection,
+            directory=False,
+            platform_name="nt",
+        )
+    git_broker._ensure_projection_path_supported(
+        projection,
+        directory=False,
+        platform_name="posix",
+    )
 
 
 def test_security_relevant_git_metadata_remains_fail_closed(
