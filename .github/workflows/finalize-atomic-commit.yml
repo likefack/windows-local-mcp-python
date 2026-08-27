@@ -144,6 +144,7 @@ jobs:
           tests/test_git_ref_projection.py
           tests/test_git_broker_resource_limits.py
           tests/test_git_object_access.py
+          tests/test_git_snapshot_diagnostics.py
           tests/test_git_worker_routing.py
           tests/test_security_regressions_git_staging.py
           tests/test_tool_safety.py
