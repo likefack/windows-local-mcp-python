@@ -14,7 +14,7 @@ from windows_local_mcp.git_broker_sandbox import GitBrokerUnavailable
 from windows_local_mcp.sandbox_backend import SANDBOX_SECURITY_PROPERTIES
 
 
-def _settings(tmp_path: Path) -> Settings:
+def _settings(tmp_path: Path, **overrides: object) -> Settings:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     settings = Settings(
@@ -23,6 +23,7 @@ def _settings(tmp_path: Path) -> Settings:
         sandbox_scratch_dir=tmp_path / "scratch",
         protect_data_dir_acl=False,
         git_enabled=True,
+        **overrides,
     )
     settings.ensure_directories()
     return settings
@@ -78,6 +79,35 @@ def test_git_live_context_rejects_generic_sandbox_residual_property(
 
     with pytest.raises(GitBrokerUnavailable, match="every Sandbox security property"):
         git_broker_live_context(settings, identity)
+
+
+def test_git_live_context_rejects_scratch_quota_below_projection_floor(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path, max_sandbox_scratch_bytes=1024 * 1024)
+    identity = _identity(tmp_path)
+
+    with pytest.raises(GitBrokerUnavailable, match="at least 16 MiB"):
+        git_broker_live_context(
+            settings,
+            identity,
+            containment=_containment(_evidence()),
+        )
+
+
+def test_git_live_context_binds_scratch_quota(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path, max_sandbox_scratch_bytes=16 * 1024 * 1024)
+    identity = _identity(tmp_path)
+
+    context = git_broker_live_context(
+        settings,
+        identity,
+        containment=_containment(_evidence()),
+    )
+
+    assert context["max_sandbox_scratch_bytes"] == 16 * 1024 * 1024
 
 
 def test_git_live_verifier_writes_exact_context_marker(
