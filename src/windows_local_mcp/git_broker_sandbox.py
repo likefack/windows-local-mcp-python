@@ -33,13 +33,15 @@ from .util import canonical_json, sha256_bytes, sha256_text
 from .wfp_guard_identity import hold_wfp_guard_implementation
 from .windows_job import WindowsJobLimits
 
-GIT_BROKER_POLICY_VERSION = 4
+GIT_BROKER_POLICY_VERSION = 5
 _GIT_PROCESS_LIMIT = 16
 _GIT_MEMORY_LIMIT = 1024 * 1024 * 1024
 _GIT_CONFIG_LIMIT = 1024 * 1024
 _GIT_IGNORE_LIMIT = 1024 * 1024
 _GIT_INDEX_LIMIT = 128 * 1024 * 1024
+_GIT_REF_FILE_LIMIT = 64 * 1024
 _GIT_INDEX_EXTENDED = 0x4000
+_GIT_SYMREF_MAX_DEPTH = 8
 _WINDOWS_LEGACY_FILE_PATH_LIMIT = 260
 _WINDOWS_LEGACY_DIRECTORY_PATH_LIMIT = 248
 
@@ -95,6 +97,23 @@ class _ProjectionPrunePolicy:
             release_verified_hold(held)
         self.pinned_files.clear()
         self.pinned_bytes.clear()
+
+
+@dataclass
+class _MetadataProjectionPolicy:
+    retain_all_refs: bool = True
+    required_ref_paths: set[str] = field(default_factory=set)
+    expected_absent: set[str] = field(default_factory=set)
+    pinned_files: dict[str, Path] = field(default_factory=dict)
+    pinned_bytes: dict[str, bytes] = field(default_factory=dict)
+
+    def close(self) -> None:
+        for held in self.pinned_files.values():
+            release_verified_hold(held)
+        self.pinned_files.clear()
+        self.pinned_bytes.clear()
+        self.required_ref_paths.clear()
+        self.expected_absent.clear()
 
 
 def require_git_broker_containment(
@@ -286,6 +305,231 @@ def _hold_projection_file(path: Path, *, byte_limit: int) -> tuple[Path, bytes]:
     except Exception:
         release_verified_hold(held)
         raise
+
+
+def _git_subcommand_and_tail(command: Sequence[str]) -> tuple[str | None, list[str]]:
+    values = list(command[1:])
+    index = 0
+    while index < len(values):
+        value = values[index]
+        if value == "--list-cmds=builtins":
+            return "__list_cmds_builtins__", []
+        if value in {"--no-pager", "--no-optional-locks"}:
+            index += 1
+            continue
+        if value in {"-c", "-C"}:
+            if index + 1 >= len(values):
+                return None, []
+            index += 2
+            continue
+        if value.startswith("-"):
+            return None, []
+        return value.casefold(), values[index + 1 :]
+    return None, []
+
+
+def _revision_is_head_derived(value: str) -> bool:
+    for separator in ("...", ".."):
+        if separator not in value:
+            continue
+        if value.count(separator) != 1:
+            return False
+        left, right = value.split(separator, 1)
+        return bool(left and right) and _revision_is_head_derived(
+            left
+        ) and _revision_is_head_derived(right)
+    if "@{" in value or not value.startswith("HEAD"):
+        return False
+    suffix = value[4:]
+    if not suffix:
+        return True
+    if suffix[0] not in {"~", "^"}:
+        return False
+    return all(character.isalnum() or character in "~^{}" for character in suffix)
+
+
+def _command_requires_full_refs(command: Sequence[str]) -> bool:
+    subcommand, tail = _git_subcommand_and_tail(command)
+    if subcommand == "__list_cmds_builtins__":
+        return False
+    if subcommand in {"status", "ls-files"}:
+        return False
+    if subcommand == "symbolic-ref":
+        positional = [value for value in tail if not value.startswith("-")]
+        return positional != ["HEAD"]
+    if subcommand == "rev-parse":
+        positional = [value for value in tail if not value.startswith("-")]
+        return any(not _revision_is_head_derived(value) for value in positional)
+    if subcommand not in {"diff", "log", "show"}:
+        return True
+
+    head = tail[: tail.index("--")] if "--" in tail else tail
+    if any(
+        value in {"--all", "--branches", "--tags"}
+        or value.startswith("--branches=")
+        or value.startswith("--tags=")
+        for value in head
+    ):
+        return True
+    revisions = [value for value in head if not value.startswith("-")]
+    return any(not _revision_is_head_derived(value) for value in revisions)
+
+
+def _commands_require_full_refs(commands: Sequence[Sequence[str]]) -> bool:
+    return any(_command_requires_full_refs(command) for command in commands)
+
+
+def _validate_symbolic_ref_target(value: str) -> str:
+    if (
+        not value.startswith("refs/")
+        or value.endswith(("/", "."))
+        or "//" in value
+        or ".." in value
+        or "@{" in value
+    ):
+        raise GitBrokerUnavailable("automatic Git HEAD contains an unsafe symbolic ref")
+    components = value.split("/")
+    if any(
+        not component
+        or component in {".", ".."}
+        or component.startswith(".")
+        or component.casefold().endswith(".lock")
+        for component in components
+    ):
+        raise GitBrokerUnavailable("automatic Git HEAD contains an unsafe symbolic ref")
+    if any(
+        ord(character) < 32
+        or ord(character) == 127
+        or character in " ~^:?*[\\"
+        for character in value
+    ):
+        raise GitBrokerUnavailable("automatic Git HEAD contains an unsafe symbolic ref")
+    return value
+
+
+def _symbolic_ref_target(data: bytes) -> str | None:
+    stripped = data.strip()
+    if not stripped.startswith(b"ref:"):
+        return None
+    if not stripped.startswith(b"ref: "):
+        raise GitBrokerUnavailable("automatic Git symbolic ref is malformed")
+    try:
+        target = stripped[5:].decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise GitBrokerUnavailable("automatic Git symbolic ref is not UTF-8") from error
+    return _validate_symbolic_ref_target(target)
+
+
+def _pin_metadata_file(
+    policy: _MetadataProjectionPolicy,
+    source_path: Path,
+    relative: Path,
+    *,
+    byte_limit: int,
+) -> bytes:
+    held, data = _hold_projection_file(source_path, byte_limit=byte_limit)
+    folded = relative.as_posix().casefold()
+    policy.pinned_files[folded] = held
+    policy.pinned_bytes[folded] = data
+    return data
+
+
+def _build_metadata_projection_policy(
+    source: Path,
+    commands: Sequence[Sequence[str]],
+    *,
+    byte_limit: int,
+) -> _MetadataProjectionPolicy:
+    if _commands_require_full_refs(commands):
+        return _MetadataProjectionPolicy(retain_all_refs=True)
+
+    policy = _MetadataProjectionPolicy(retain_all_refs=False)
+    metadata = source / ".git"
+    try:
+        head_data = _pin_metadata_file(
+            policy,
+            metadata / "HEAD",
+            Path(".git") / "HEAD",
+            byte_limit=min(byte_limit, _GIT_REF_FILE_LIMIT),
+        )
+
+        packed = metadata / "packed-refs"
+        packed_relative = Path(".git") / "packed-refs"
+        try:
+            packed.lstat()
+        except FileNotFoundError:
+            policy.expected_absent.add(packed_relative.as_posix().casefold())
+        except OSError as error:
+            raise GitBrokerUnavailable(
+                "automatic Git packed-refs presence is not safely inspectable"
+            ) from error
+        else:
+            _pin_metadata_file(
+                policy,
+                packed,
+                packed_relative,
+                byte_limit=byte_limit,
+            )
+
+        target = _symbolic_ref_target(head_data)
+        seen: set[str] = set()
+        depth = 0
+        while target is not None:
+            if target in seen or depth >= _GIT_SYMREF_MAX_DEPTH:
+                raise GitBrokerUnavailable(
+                    "automatic Git symbolic ref chain is cyclic or too deep"
+                )
+            seen.add(target)
+            depth += 1
+            relative = Path(".git", *target.split("/"))
+            folded = relative.as_posix().casefold()
+            policy.required_ref_paths.add(folded)
+            candidate = metadata.joinpath(*target.split("/"))
+            try:
+                candidate.lstat()
+            except FileNotFoundError:
+                policy.expected_absent.add(folded)
+                break
+            except OSError as error:
+                raise GitBrokerUnavailable(
+                    "automatic Git current ref presence is not safely inspectable"
+                ) from error
+            ref_data = _pin_metadata_file(
+                policy,
+                candidate,
+                relative,
+                byte_limit=min(byte_limit, _GIT_REF_FILE_LIMIT),
+            )
+            target = _symbolic_ref_target(ref_data)
+        return policy
+    except Exception:
+        policy.close()
+        raise
+
+
+def _metadata_entry_is_unobserved(
+    relative: Path,
+    *,
+    metadata_policy: _MetadataProjectionPolicy,
+) -> bool:
+    if metadata_policy.retain_all_refs:
+        return False
+    folded = relative.as_posix().casefold()
+    if folded == ".git/logs" or folded.startswith(".git/logs/"):
+        return True
+    if folded == ".git/refs":
+        return False
+    prefix = ".git/refs/"
+    if not folded.startswith(prefix):
+        return False
+    ref_path = folded[len(prefix) :]
+    if ref_path == "replace" or ref_path.startswith("replace/"):
+        # Replace refs are an implicit input to object lookup even when no ref is named.
+        return False
+    return not any(
+        required == folded or required.startswith(folded + "/")
+        for required in metadata_policy.required_ref_paths
+    )
 
 
 def _parse_index_tracked_paths(data: bytes) -> frozenset[str] | None:
@@ -611,8 +855,10 @@ def _copy_repository_tree(
     byte_limit: int,
     entry_limit: int,
     prune_policy: _ProjectionPrunePolicy | None = None,
+    metadata_policy: _MetadataProjectionPolicy | None = None,
 ) -> tuple[int, int, str]:
     prune_policy = prune_policy or _ProjectionPrunePolicy()
+    metadata_policy = metadata_policy or _MetadataProjectionPolicy()
     file_count = 0
     entry_count = 0
     total_bytes = 0
@@ -635,6 +881,16 @@ def _copy_repository_tree(
             if entry_count > entry_limit:
                 raise GitBrokerUnavailable("automatic Git snapshot exceeds its entry-count limit")
             relative = relative_root / entry.name
+            folded = relative.as_posix().casefold()
+            if folded in metadata_policy.expected_absent:
+                raise GitBrokerUnavailable(
+                    "automatic Git current ref metadata changed during projection planning"
+                )
+            if _metadata_entry_is_unobserved(
+                relative,
+                metadata_policy=metadata_policy,
+            ):
+                continue
             candidate = Path(entry.path)
             try:
                 details = entry.stat(follow_symlinks=False)
@@ -673,6 +929,12 @@ def _copy_repository_tree(
             ) or relative.name.casefold() == ".gitattributes":
                 continue
 
+            if folded in metadata_policy.pinned_files and not entry.is_file(
+                follow_symlinks=False
+            ):
+                raise GitBrokerUnavailable(
+                    "automatic Git pinned ref metadata changed type during projection"
+                )
             if entry.is_dir(follow_symlinks=False):
                 if _can_prune_root_directory(relative, prune_policy=prune_policy):
                     continue
@@ -690,10 +952,21 @@ def _copy_repository_tree(
                 raise GitBrokerUnavailable("automatic Git snapshot exceeds its byte limit")
 
             target = destination / relative
-            folded = relative.as_posix().casefold()
             if folded == ".git/config":
                 data = _safe_repository_config(candidate, byte_limit=remaining)
                 _write_projection_bytes(target, data)
+                size = len(data)
+                _record_snapshot_file(digest, relative, data)
+            elif folded in metadata_policy.pinned_files:
+                held = metadata_policy.pinned_files[folded]
+                data = metadata_policy.pinned_bytes[folded]
+                if len(data) > remaining:
+                    raise GitBrokerUnavailable("automatic Git snapshot exceeds its byte limit")
+                _write_projection_bytes(target, data)
+                try:
+                    shutil.copystat(held, target, follow_symlinks=False)
+                except OSError:
+                    pass
                 size = len(data)
                 _record_snapshot_file(digest, relative, data)
             elif folded in prune_policy.pinned_files:
@@ -725,6 +998,8 @@ def _copy_repository_tree(
                 raise GitBrokerUnavailable("automatic Git snapshot exceeds its byte limit")
     if not (destination / ".git" / "config").is_file():
         raise GitBrokerUnavailable("automatic Git repository has no .git/config")
+    if not (destination / ".git" / "HEAD").is_file():
+        raise GitBrokerUnavailable("automatic Git repository has no .git/HEAD")
     return file_count, total_bytes, digest.hexdigest()
 
 
@@ -745,13 +1020,24 @@ def stage_git_repository(
         commands,
         byte_limit=byte_limit,
     )
+    try:
+        metadata_policy = _build_metadata_projection_policy(
+            source,
+            commands,
+            byte_limit=byte_limit,
+        )
+    except Exception:
+        prune_policy.close()
+        raise
     safe_token = "".join(ch for ch in token if ch.isalnum() or ch in "-_")[:120]
     if not safe_token:
         prune_policy.close()
+        metadata_policy.close()
         raise ValueError("invalid Automatic Git snapshot token")
     root = settings.sandbox_scratch_dir / "git-broker" / safe_token
     if root.exists():
         prune_policy.close()
+        metadata_policy.close()
         raise GitBrokerUnavailable("Automatic Git snapshot directory already exists")
     repository = root / "repository"
     runtime = root / "runtime"
@@ -765,6 +1051,7 @@ def stage_git_repository(
             byte_limit=byte_limit,
             entry_limit=entry_limit,
             prune_policy=prune_policy,
+            metadata_policy=metadata_policy,
         )
         verification = scan_directory_bounded(
             repository,
@@ -797,6 +1084,7 @@ def stage_git_repository(
         raise
     finally:
         prune_policy.close()
+        metadata_policy.close()
 
 
 def _rewrite_path(value: str, source: Path, destination: Path) -> str:
