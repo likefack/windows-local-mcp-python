@@ -134,8 +134,10 @@ New-Service `
     -StartupType Automatic | Out-Null
 
 # Runtime user may query the service PID so the client can authenticate the named-pipe server,
-# but receives no start/stop/change-config/delete/WRITE_DAC/WRITE_OWNER rights.
-$ServiceSddl = "D:P(A;;CCLCSWRPWPDTLOCRSDRCWDWO;;;SY)(A;;CCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;LC;;;$RuntimeSid)"
+# but receives no start/stop/change-config/delete/WRITE_DAC/WRITE_OWNER rights. SYSTEM and
+# Administrators retain complete service control, including SERVICE_CHANGE_CONFIG (DC), so the
+# installer can set failure actions after installing the final service DACL.
+$ServiceSddl = "D:P(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;LC;;;$RuntimeSid)"
 Invoke-Sc -Arguments @("sdset", $ServiceName, $ServiceSddl)
 Invoke-Sc -Arguments @("failure", $ServiceName, "reset=", "0", "actions=", "restart/5000")
 Invoke-Sc -Arguments @("failureflag", $ServiceName, "1")
