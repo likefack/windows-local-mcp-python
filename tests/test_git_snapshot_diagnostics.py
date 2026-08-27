@@ -71,6 +71,40 @@ def test_optional_git_snapshot_remains_best_effort(
     )
 
 
+def test_git_snapshot_uses_fixed_command_count_batch_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(
+        git_snapshot,
+        "trusted_helper_identity",
+        lambda _settings, _program: {"path": str(tmp_path / "git.exe")},
+    )
+    monkeypatch.setattr(
+        git_snapshot,
+        "hold_verified_path",
+        lambda path, **_kwargs: Path(path),
+    )
+    monkeypatch.setattr(git_snapshot, "release_verified_hold", lambda _path: None)
+
+    def inspect_batch(**kwargs: object) -> list[object]:
+        seen.update(kwargs)
+        raise RuntimeError("stop after timeout capture")
+
+    monkeypatch.setattr(git_snapshot, "run_git_broker_batch", inspect_batch)
+
+    with pytest.raises(RuntimeError, match="stop after timeout capture"):
+        git_snapshot.capture_git_snapshot(
+            settings=settings,
+            operation_id="operation",
+            stage="requested",
+        )
+
+    assert len(seen["commands"]) == 7  # type: ignore[arg-type]
+    assert seen["timeout"] == 420.0
+
+
 def test_git_snapshot_batch_budget_scales_with_fixed_command_count() -> None:
     assert git_snapshot._git_snapshot_batch_timeout(1) == 60.0
     assert git_snapshot._git_snapshot_batch_timeout(7) == 420.0
