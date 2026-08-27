@@ -15,15 +15,19 @@ from .git_broker_sandbox import (
 )
 from .resources import NamedControlPlaneLock
 from .sandbox_backend import SANDBOX_SECURITY_PROPERTIES
-from .tool_safety import capture_executable_identity, ensure_external_tool_executable
+from .tool_safety import pinned_helper_identity
 from .util import canonical_json, sha256_text, utc_now_iso
 
 GIT_BROKER_LIVE_MARKER_VERSION = 1
-GIT_BROKER_COMMAND_POLICY_VERSION = 2
+GIT_BROKER_COMMAND_POLICY_VERSION = 3
+_GIT_BROKER_ALLOWED_BUILTINS = frozenset(
+    {"status", "diff", "log", "show", "rev-parse", "ls-files"}
+)
 _GIT_BROKER_REQUIRED_CHECKS = (
     "git_inside_worktree",
     "git_projection_snapshot_bound",
     "git_status_readonly",
+    "git_allowed_commands_builtin",
 )
 
 
@@ -36,21 +40,10 @@ def configured_git_identity(settings: Settings) -> dict[str, Any]:
 
     if not settings.git_enabled:
         raise GitBrokerUnavailable("Automatic Git Broker is disabled by configuration")
-    if settings.git_executable_path is None or settings.git_executable_sha256 is None:
-        raise GitBrokerUnavailable(
-            "Automatic Git Broker requires git_executable_path and git_executable_sha256"
-        )
-    executable = ensure_external_tool_executable(
-        settings.git_executable_path,
-        workspace_root=settings.workspace_root,
-        data_dir=settings.data_dir,
-        sandbox_scratch_dir=settings.sandbox_scratch_dir,
-    )
-    return capture_executable_identity(
-        executable,
-        expected_sha256=settings.git_executable_sha256,
-        provenance="explicit-local-config",
-    )
+    try:
+        return pinned_helper_identity(settings, "git")
+    except (FileNotFoundError, OSError, PermissionError, ValueError) as error:
+        raise GitBrokerUnavailable(str(error)) from error
 
 
 def _require_strict_sandbox_properties(evidence: dict[str, Any]) -> None:
@@ -86,6 +79,8 @@ def git_broker_live_context(
         "version": GIT_BROKER_LIVE_MARKER_VERSION,
         "command_policy_version": GIT_BROKER_COMMAND_POLICY_VERSION,
         "git_executable_identity": git_identity,
+        "git_process_cwd": "trusted-executable-directory-before-fixed--C",
+        "git_subcommand_execution": "required-automatic-commands-must-be-builtins",
         "containment_policy_digest": containment.policy_digest,
         "sandbox_backend": containment.backend.as_dict(),
         "sandbox_live_evidence_digest": sha256_text(
@@ -140,6 +135,10 @@ def _git_probe_base(git: str) -> list[str]:
         "-c",
         "core.untrackedCache=false",
         "-c",
+        "maintenance.auto=false",
+        "-c",
+        "gc.auto=0",
+        "-c",
         "diff.autoRefreshIndex=false",
         "-c",
         "diff.external=",
@@ -154,6 +153,13 @@ def _valid_snapshot_digest(value: object) -> bool:
         and len(value) == 64
         and all(character in "0123456789abcdef" for character in value.casefold())
     )
+
+
+def _builtins_from_output(data: bytes) -> set[str]:
+    try:
+        return set(data.decode("utf-8", errors="strict").split())
+    except UnicodeDecodeError:
+        return set()
 
 
 def _atomic_write_marker(settings: Settings, payload: dict[str, Any]) -> None:
@@ -191,17 +197,18 @@ def verify_git_broker_live(settings: Settings) -> dict[str, Any]:
         commands=(
             [*base, "rev-parse", "--is-inside-work-tree"],
             [*base, "status", "--porcelain=v1", "--untracked-files=no"],
+            [*base, "--list-cmds=builtins"],
         ),
         cwd=str(settings.workspace_root),
         timeout=60,
         output_limit=64 * 1024,
         live_verification_probe=True,
     )
-    if len(results) != 2:
+    if len(results) != 3:
         raise GitBrokerUnavailable(
             "Automatic Git Broker live verification returned an incomplete probe set"
         )
-    inside, status = results
+    inside, status, builtins = results
     inside_ok = inside.returncode == 0 and inside.stdout.strip().lower() == b"true"
     snapshot_digests = {
         getattr(result, "snapshot_digest", None)
@@ -213,10 +220,15 @@ def verify_git_broker_live(settings: Settings) -> dict[str, Any]:
         for result in results
     )
     status_ok = status.returncode == 0
+    builtin_names = _builtins_from_output(builtins.stdout)
+    builtins_ok = (
+        builtins.returncode == 0 and _GIT_BROKER_ALLOWED_BUILTINS.issubset(builtin_names)
+    )
     checks = {
         "git_inside_worktree": inside_ok,
         "git_projection_snapshot_bound": snapshot_bound,
         "git_status_readonly": status_ok,
+        "git_allowed_commands_builtin": builtins_ok,
     }
     payload = {
         "version": GIT_BROKER_LIVE_MARKER_VERSION,
