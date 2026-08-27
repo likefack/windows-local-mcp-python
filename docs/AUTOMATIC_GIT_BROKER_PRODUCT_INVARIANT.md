@@ -14,7 +14,7 @@ Automatic Git Broker は、`git_info` および `execute_readonly` の固定 Git
 4. repository-controlled `.git/config`、attributes、filters、hooks、object alternates、gitfile、reparse point、external helper 等を trusted input とみなしません。危険な metadata が存在しても workspace 外 read/write、control-plane access、network access、project-controlled executable executionへ作用を拡大できないことを主境界とします。
 5. Git executable は trusted operator が固定した絶対 path、SHA-256、stable file identity を実行直前まで binding し、replacement を拒否します。Git for Windows の既知 wrapper／redirector を primary trust anchor とせず、実際に Git command を実装する runtime executable を直接 pin します。
 6. Automatic route は repository metadata root が workspace 内の実 `.git` directory である場合だけ許可します。外部 gitdir、reparse/junction、security-relevant hardlink、nested `.git`、external/extended metadata、検証不能な required input は fail closed とします。source file の named NTFS ADS は Git が受け取る unnamed data stream とは別の metadata として projection boundary で切り落とし、staged projection に named ADS が存在することは引き続き拒否します。
-7. Git process の Windows process cwd を project-controlled projection にしません。process は trusted runtime executable directory から起動し、repository selection は Broker が固定挿入する `git -C <sanitized projection cwd>` によって行います。
+7. Git process の Windows process cwd を project-controlled projection にしません。process は trusted runtime executable directory から起動し、repository selection は Broker が固定挿入する `git -C <sanitized projection cwd>` によって行います。repository ownership trust は command-scope `safe.directory=<exact operation projection>` に限定し、wildcard／source workspace／scratch parent／global persistent trust を使いません。
 8. network capability は付与しません。Internet、LAN、未許可 loopback を OS-level boundary と live verification で deny します。
 9. process tree は Job Object の process/memory/kill-on-close boundary に収容し、Job 外 process creation を live verification で否定できない環境では automatic Git を available と表示しません。
 10. protected information への read access は Broker policy と OS boundary の両方で deny し、Git config/filter 等を経由した stdout/stderr への持ち出しを許可しません。projection 内の Git object database に protected file の historical blob が存在し得ることを前提にし、raw object ID、commit/tree path、index entry のいずれも protected-content provenance の根拠にはしません。
@@ -28,6 +28,8 @@ Automatic Git は第五の policy tier ではありません。固定 Git gramma
 
 Git child は live `workspace_root` や `data_dir` を直接読みません。Broker は operation ごとに `sandbox_scratch_dir/git-broker/` 配下へ bounded disposable repository projection を作成し、protected worktree file、`.gitattributes`、`.git/info/attributes`、hooks、submodule metadata、external object alternates、extended repository metadata、nested `.git` を除外または拒否します。source `.git/config` は raw bytes を scratch へ書かず trusted Broker memory 上で解析し、1 MiB を越える config は解析前に fail closed とし、repository format v0 の必要な inert `core` settings だけを sanitized config として projection に生成します。
 
+Repository ownership と line-ending semantics は security boundary を弱めずに source と一致させます。Git child の argv には exact operation projection だけを `-c safe.directory=...` として挿入し、global/system config へ persistent trust を書き込みません。raw system/global Git config は child へ公開せず、trusted Broker が Git for Windows の trusted config locations から `core.autocrlf` の direct scalar 値だけを `true`／`false`／`input` として解決します。repository-local direct scalar override は通常の precedence を維持します。include/includeIf、workspace／`data_dir`／scratch と重なる config path、invalid value、未知で安全に再構成できない config/runtime layout は fail closed します。
+
 Source workspace 全体を projection 作成前に一括で「安全」と認定する blanket scan は security boundary としません。security property は、Git child が実際に受け取る sanitized projection を構成する入力ごとに、必要になった時点で verified handle を用いて検証します。`.git` metadata、index、refs、objects、projection へ取り込む worktree content など security-relevant input が読み取り不能・検証不能なら fail closed します。一方、Git operation の意味論上観測されず projection に取り込まれない artifact の存在だけを repository 全体の失格理由にはしません。
 
 Ignored/generated tree の省略は「unreadable だから skip」ではありません。現在の実装は、対象 batch が ignored untracked entry を観測しないこと、root `.gitignore` の保守的に解釈可能な whole-directory pattern に一致すること、整合した通常 Git index からその subtree に tracked entry がないことを証明できる場合だけ root subtree を projection から省略します。whole-directory pattern は `/generated-*/` のような root-anchored form に加えて、`.venv/` のような single-component directory-only form も root entry との一致判定に利用できますが、nested pattern、negation、複雑な wildmatch、または安全に解釈できない形式を一般化して受理しません。`ls-files --others` のように ignored entry を観測し得る command、unsupported/malformed/split index、複雑または否定規則を含む ignore semantics、tracked descendant がある tree では pruning を行わず、required tree が検査不能なら fail closed します。planning に使う `.git/index` と `.gitignore` は projection copy 中も verified handle で pin し、同じ verified bytes を staged input として使用します。
@@ -40,7 +42,7 @@ Git object database は repository semantics のため projection に含まれ�
 
 Git for Windows では `cmd\git.exe` や install-root の `bin\git.exe` が別 runtime へ委譲する構成を取り得ます。Automatic Git はその wrapper／redirector の hash だけを execution identity として受理せず、通常は `mingw64\bin\git.exe`、architecture に応じて `clangarm64\bin\git.exe`／`mingw32\bin\git.exe` のような実 runtime を直接 operator pin します。Git process の process cwd はこの trusted executable directory とし、Broker が argv へ固定 `-C <sanitized projection cwd>` を挿入します。これにより projection を current-directory DLL search surface として利用しません。
 
-Git child の environment は system/global Git config、system attributes、credential prompt、optional lock、Git protocol access を無効化し、PATH は workspace、`data_dir`、scratch を除外した trusted dependency path に限定します。さらに Broker runner は `maintenance.auto=false` と `gc.auto=0` を固定し、automatic maintenance／GC を command semantics から除外します。Git child と descendant は disposable projection 以外へ write capability を持たず、source workspace と control-plane は Sandbox policy で deny します。Approved Host への automatic fallback はありません。
+Git child の environment は raw system/global Git config、system attributes、credential prompt、optional lock、Git protocol access を無効化し、PATH は workspace、`data_dir`、scratch を除外した trusted dependency path に限定します。host config のうち Git status/diff semantics に必要な `core.autocrlf` だけは上記の trusted scalar extraction で sanitized repository config へ移送します。さらに Broker runner は `maintenance.auto=false` と `gc.auto=0` を固定し、automatic maintenance／GC を command semantics から除外します。Git child と descendant は disposable projection 以外へ write capability を持たず、source workspace と control-plane は Sandbox policy で deny します。Approved Host への automatic fallback はありません。
 
 Current `broker` operation だけでなく upgrade 前に残り得る legacy `safe_command`／`safe_sandbox` Git operation も `Executor` で dedicated Git worker へ収束させます。legacy row が standard worker の unrestricted child path を復活させることを許可しません。worker は original safe request、normalized command、settings digest、control-plane generation、process nonce を再検証します。
 
@@ -56,8 +58,10 @@ Git-specific marker は次へ exact binding します。
 
 - pinned Git runtime executable の path、SHA-256、stable file identity、size、mtime/provenance
 - trusted executable-directory process cwd と Broker-fixed `-C` repository selection policy
+- exact operation projection だけを trust する command-scope `safe.directory` policy
+- sanitized `core.autocrlf` scalar reconstruction policy
 - Automatic grammar の required subcommand が pinned runtime の builtin であるという policy
-- Codex Sandbox backend identity と Automatic Git containment policy digest
+- Codex Sandbox backend identity と Automatic Git containment policy digest（current generation v6）
 - Automatic Git command-policy generation v4
 - current generic Sandbox live evidence 全体の digest
 - current `workspace_root`
@@ -80,4 +84,6 @@ Source／CI evidence と Windows machine-local evidence の記録は `docs/AUTOM
 
 2026-08-28 の projection-boundary remediation では、source workspace 全体への blanket preflight を security guarantee として使わず、sanitized projection が実際に consume する input に検証を集中させる方針を追加しました。benign named ADS や、意味論上観測されないことを証明できる ignored/generated subtree は projection 外に切り落とせますが、security-relevant input が検証不能な場合の fail-closed rule は維持します。
 
-実装と unit/CI regression が存在しても、その PC で `verify-git-broker` が成功して current marker が存在するまでは `available=false` が正しい表示です。real-machine verification を実施していない branch/CI の結果を Windows live verification の代替にはしません。
+同日の ownership/EOL remediation では、Git の `dubious ownership` を wildcard trust で回避せず exact disposable projection だけを `safe.directory` として trust し、host Git config を child に再公開せず `core.autocrlf` の trusted scalar semantics だけを sanitized config に継承する方針を追加しました。この policy change は containment generation v6 として旧 Git-specific marker を stale にします。
+
+2026-08-28 JST、source/test freeze `7f2382f4a9a7d6140523c7f58f405edb916a13f3` で Windows CI #346 が green となり、target Windows PC で generic `verify-codex-sandbox` と `verify-git-broker` がともに成功しました。Git-specific marker schema v1 は containment generation v6、command-policy generation v4、exact pinned Git runtime、source deny、network deny、host fallback prohibition に結合して `route_eligible=true` です。model-facing `session_info`／`git_info`／`execute_readonly` E2E は別証拠として完了条件に残ります。
