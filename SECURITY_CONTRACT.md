@@ -118,8 +118,9 @@ monitor／postflight は LocalSystem worker が所有し、実 child は pipe re
 `CreateProcessAsUserW` で使用します。same-desktop UAC elevation を security boundary としません。
 
 service-owned durable `active.json` は normal verified completion まで immutable とし、worker kill、service restart、channel
-loss、postflight mismatch、Job 外 helper 残存では解除しません。active Approved Host monitor は runtime-user `stop_job` から
-停止できません。異常 state の解除は elevated Administrator による explicit reviewed recovery だけです。
+loss、postflight mismatch、Job 外 helper 残存では解除しません。authority service が provision 済みである限り、user-owned
+configuration の `approved_host_enabled=false` は active／recovery latch の global health gate を無効化しません。active Approved Host
+monitor は runtime-user `stop_job` から停止できません。異常 state の解除は elevated Administrator による explicit reviewed recovery だけです。
 
 この route の source／CI implementation と Windows live verification を混同しません。release status は normal-path と
 WMI helper＋SYSTEM-worker-loss＋service-restart abnormal-path live verification が通るまで pending のままです。

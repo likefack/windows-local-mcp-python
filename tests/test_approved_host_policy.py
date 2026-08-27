@@ -17,3 +17,29 @@ def test_service_query_treats_only_service_does_not_exist_as_absent() -> None:
 def test_service_query_other_failures_fail_closed(returncode: int) -> None:
     with pytest.raises(RuntimeError, match="SCM query failed closed"):
         _service_query_indicates_installed(returncode)
+
+def test_provisioned_authority_latch_is_checked_even_when_host_config_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from windows_local_mcp import approved_host_policy, control_plane_guard
+
+    calls: list[str] = []
+
+    class DisabledSettings:
+        approved_host_enabled = False
+
+    class FakeAuthorityClient:
+        def assert_available(self) -> dict[str, object]:
+            calls.append("checked")
+            return {"healthy": True}
+
+    monkeypatch.setattr(control_plane_guard, "assert_control_plane_healthy", lambda _settings: None)
+    monkeypatch.setattr(approved_host_policy.os, "name", "nt")
+    monkeypatch.delenv("WINDOWS_LOCAL_MCP_AUTHORITY_WORKER", raising=False)
+    monkeypatch.setattr(approved_host_policy, "_authority_service_installed", lambda: True)
+    monkeypatch.setattr(approved_host_policy, "ApprovedHostAuthorityClient", FakeAuthorityClient)
+
+    approved_host_policy.install_approved_host_authority_health_gate()
+    control_plane_guard.assert_control_plane_healthy(DisabledSettings())
+
+    assert calls == ["checked"]

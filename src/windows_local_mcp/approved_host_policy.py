@@ -62,8 +62,6 @@ def install_approved_host_authority_health_gate() -> None:
         if os.environ.get("WINDOWS_LOCAL_MCP_AUTHORITY_WORKER") == "1":
             # The active durable latch is expected while the SYSTEM worker owns postflight.
             return
-        if not bool(getattr(settings, "approved_host_enabled", False)):
-            return
         if not _authority_service_installed():
             # Broker and Sandbox remain usable on installations that never provisioned Host.
             # Approved Host launch itself separately requires the authority service.

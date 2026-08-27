@@ -42,6 +42,14 @@ class Executor:
         if tier == "approved_host":
             try:
                 runtime_trust = assert_approved_host_runtime_immutable()
+            except Exception as error:
+                self.audit.add_event(
+                    operation_id,
+                    "approved_host_runtime_immutability_failed",
+                    {"error": f"{type(error).__name__}: {error}"[:1000]},
+                )
+                raise
+            try:
                 authority_trust = assert_approved_host_authority_available()
             except Exception as error:
                 self.audit.add_event(

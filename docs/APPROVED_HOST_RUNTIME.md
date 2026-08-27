@@ -93,7 +93,7 @@ active latch は少なくとも次へ binding されます。
 
 worker が child を一度でも作成した場合、completion proof には SYSTEM worker 内で control-plane postflight が expected state と一致したことが必要です。さらに production worker が `run_operation()` から正常 return した場合だけ `worker_returned_normally=true` の proof を作れます。
 
-worker kill、unhandled exception、thread/process termination、channel loss、postflight failure、WMI／CIM helper 残存、service restart、epoch mismatch では normal proof が成立せず、`active.json` は残ります。service restart 中に active state を見つけた場合は `recovery_required` にします。旧 service epoch の proof を新 epoch で受理しません。
+worker kill、unhandled exception、thread/process termination、channel loss、postflight failure、WMI／CIM helper 残存、service restart、epoch mismatch では normal proof が成立せず、`active.json` は残ります。service restart 中に active state を見つけた場合は `recovery_required` にします。旧 service epoch の proof を新 epoch で受理しません。service が provision 済みなら、user-owned config で `approved_host_enabled=false` に変更しても active／recovery latch の global health check は継続します。
 
 service が valid proof を消費する際は completion record を `completed/` に archive してから proof／status を消し、immutable `active.json` を最後に unlink します。途中 power loss／exception では active latch が残る方向に倒します。
 

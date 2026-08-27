@@ -546,6 +546,3 @@ class ApprovedHostAuthorityClient:
             ),
             service_epoch=str(response["service_epoch"]),
         )
-
-    def cancel(self, operation_id: str) -> dict[str, Any]:
-        return _authority_request({"action": "cancel", "operation_id": operation_id})

@@ -53,3 +53,8 @@ def test_runtime_user_stop_cannot_terminate_active_approved_host_monitor(
 
     operation = audit.get_operation(operation_id, include_events=False)
     assert operation["status"] == "running"
+
+def test_authority_client_exposes_no_runtime_user_monitor_cancel_rpc() -> None:
+    from windows_local_mcp.approved_host_authority import ApprovedHostAuthorityClient
+
+    assert not hasattr(ApprovedHostAuthorityClient(), "cancel")
