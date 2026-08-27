@@ -49,10 +49,16 @@ Automatic Git の route eligibility は generic Codex Sandbox の利用可能性
 受容済み residual risk として route を許容する `protected_information_read` と `lan` を含め、Automatic Git では
 filesystem read/write、protected-information read、Internet、LAN、loopback、descendant containment、termination、
 resource bound の全 property が `verified` であることを要求します。さらに pinned `git.exe` identity、Sandbox backend、
-current generic live evidence digest、workspace、Automatic Git containment policy に結合した Git-specific live marker
-schema v1 と、同じ containment 内での固定 Git E2E を要求します。通常 operation は missing/stale marker を自動 repair
-せず fail closed し、worker は child launch 直前にも marker を再検証します。この PC で `verify-git-broker` が未実施、
-失敗、または stale の場合、実装や設定が存在しても Automatic Git は `available=false` です。
+current generic live evidence digest、workspace、scratch quota、Automatic Git containment policy と command-policy generation
+に結合した Git-specific live marker schema v1 と、同じ containment 内での固定 Git E2E を要求します。通常 operation は
+missing/stale marker を自動 repair せず fail closed し、worker は child launch 直前にも marker を再検証します。この PC で
+`verify-git-broker` が未実施、失敗、または stale の場合、実装や設定が存在しても Automatic Git は `available=false` です。
+
+Automatic Git の protected-information boundary では、Git object database の blob が tree／commit／index 上で安全に見える
+path へ再結合できることを前提にします。current workspace path の Broker validation や commit type binding だけを blob
+content provenance の根拠にしません。このため automatic `diff`／`show` は metadata-only output に限定し、patch、binary
+patch、`--check`、pathspec 付き暗黙 patch 等の content-bearing mode は `request_sandbox_command` へ送ります。status、
+metadata-only diff/show、log metadata、rev-parse、ls-files、`git_info` snapshot は Automatic Git capability として維持します。
 
 同日、Approved Host の guarded interval について、same Windows user authority の child が worker／監視 process を
 停止して postflight を回避でき、再起動時の stale reconciliation だけでは永続 tamper latch が残らないことを
@@ -105,8 +111,9 @@ WLMCP が入力、出力、対象 path、resource 上限、filesystem／network�
 Automatic Git は `git_info` と `execute_readonly` の deny-by-default 固定文法だけを対象にします。Git child は
 live workspace ではなく sanitized disposable repository projection を入力とし、live-verified Sandbox/WFP/Job 境界内で
 実行します。pinned Git identity、全 required Sandbox property、Git-specific live marker のいずれかが欠ける場合は
-fail closed します。open-ended Git、network Git、workspace metadata semantics を完全に維持する必要がある Git 操作は
-automatic Broker route の対象外です。
+fail closed します。`diff`／`show` は metadata-only output に限定し、object-backed blob bytes を返し得る patch／binary／
+`--check`／暗黙 patch mode は automatic route の対象外です。open-ended Git、network Git、workspace metadata semantics を
+完全に維持する必要がある Git 操作も automatic Broker route の対象外です。
 
 ### 2.2 Structured Processing
 
@@ -161,9 +168,15 @@ same-desktop UAC elevation だけをこの boundary の根拠にしません。
 - Automatic Git は executable identity だけでは Broker helper として十分とみなしません。repository metadata、
   config、attributes、helper resolution 等の workspace-controlled behavior input を sanitized disposable projection
   へ閉じ、raw `.git/config` を scratch へ永続化せず、dangerous config／attributes／hooks／external alternates を
- 除外または拒否します。source workspace／`data_dir` は child から deny し、Internet／LAN／loopback、descendant、
+  除外または拒否します。source workspace／`data_dir` は child から deny し、Internet／LAN／loopback、descendant、
   termination、resource boundary を含む全 required property と Git-specific live marker が current identity に
   結合していない場合は fail closed します。
+- Automatic Git は Git object graph 上の path 名を protected-content provenance とみなしません。`diff`／`show` の
+  automatic mode は metadata-only とし、blob bytes を stdout/stderr へ materialize し得る content-bearing mode を
+  human-approved Sandbox route へ送ります。revision の `^{commit}` binding は defense-in-depth として維持します。
+- Automatic Git repository projection は configured `max_sandbox_scratch_bytes` の 1/2 以下に bound し、operator quota を
+  上回る hard-coded byte floor を持ちません。scratch quota と command-policy generation は Git-specific marker context に
+  binding し、変更時は stale とします。
 - Automatic Git の normal worker への unrestricted fallback、Approved Host fallback、stale live marker の
   silent repair／自動再検証を禁止します。
 - Broker が作用を閉じられない場合は、承認済み Codex Sandbox へ送るか fail closed します。
@@ -318,7 +331,9 @@ fail closed します。upgrade 前の pending／approved operation も同じ ex
 - policy で保護した `.env`、credential、secret を Broker read、automatic helper／snapshot、audit／UI、
   Sandbox staging、artifact processing から意図せず model へ露出させません。Automatic Git Broker の disposable
   projection は protected worktree file を除外し、source `.git/config` は raw bytes を scratch へ書かず trusted
-  Broker memory 上で inert core settings だけへ変換します。
+  Broker memory 上で inert core settings だけへ変換します。Git object database に historical protected blob が残る
+  場合を考慮し、Automatic `diff`／`show` は metadata-only output に限定して object graph から blob bytes を model へ
+  materialize する経路を残しません。
 - workspace 外の protected path は、Codex Sandbox process とその descendant からも実効 OS capability で
   直接読めないことを必要とします。
 - workspace 内 protected information は general Sandbox staging へ自動追加せず、original source workspace への read deny を
@@ -392,8 +407,10 @@ transport も capability truthfulness の対象です。stdio／HTTP 等の各 t
 Git も capability truthfulness の対象です。`git_enabled=true`、Git executable path/hash の設定、generic Codex Sandbox
 marker、または `git_info`／`execute_readonly` surface の公開を Automatic Git availability と同一視しません。
 Automatic Git は pinned executable identity、sanitized disposable projection policy、全 required Sandbox property、
-Git-specific live marker schema v1 が current identity に一致した場合だけ `available=true`／`windows_live_verified=true`
-と表示します。実機で `verify-git-broker` を実行していない branch/PC、または marker が stale の状態は unavailable です。
+Git-specific live marker schema v1 が current identity、scratch quota、command-policy generation に一致した場合だけ
+`available=true`／`windows_live_verified=true` と表示します。実機で `verify-git-broker` を実行していない branch/PC、
+または marker が stale の状態は unavailable です。`available=true` でも content-bearing Git diff/show が Automatic
+capability に含まれることは意味しません。
 
 Approved Host も capability truthfulness の対象です。`approved_host_enabled=true`、`request_host_command` surface、
 または既存 pending／approved row の存在を execution availability と同一視しません。WLMCP-R2-001 の capability
@@ -415,7 +432,7 @@ Automatic Git E2E、MCP ADB E2E、Tunnel、deployment の代替にしません�
 - stale approval、replay、double execution、cancel race、ordinary TOCTOU
 - crash／timeout／cancellation、stale source／destination、path／filesystem race
 - Broker helper の PATH shadowing、差し替え、stale executable identity
-- Automatic Git Broker の repository metadata confinement、sanitized projection、Git-specific live-marker binding、dedicated-worker routing、capability 表示の不一致
+- Automatic Git Broker の repository metadata confinement、object-content provenance、sanitized projection、Git-specific live-marker binding、dedicated-worker routing、capability 表示の不一致
 - Codex Sandbox の一般 source workspace read／write、workspace 外 protected information direct read、workspace 外 read／write、Internet／loopback／control-plane／必須 descendant boundary 不足。ただし Section 5 の general Sandbox workspace 内 protected-information direct read は除く
 - Approved Host を再有効化する場合の monitor／postflight kill・bypass・restart persistence と capability 表示の不一致
 - ordinary non-admin Windows user 権限で成立する現実的な攻撃
@@ -456,7 +473,7 @@ current v1 は当該 capability を停止して解消し、将来再有効化す
 | 重点確認項目 | 主な契約項目 |
 | --- | --- |
 | Broker helper executable の provenance／path／hash／file identity と差し替え耐性 | A, B, O |
-| Automatic Git Broker の repository metadata confinement、Git-specific live marker、fail-closed capability 表示 | B, K, O |
+| Automatic Git Broker の repository metadata/object-content confinement、Git-specific live marker、fail-closed capability 表示 | B, K, O |
 | legacy `:workspace` と `workspace_write=false` の実効 filesystem boundary | C, D, O |
 | workspace 外 protected information の read denial | D, K, O |
 | workspace 内 `.env`／credential／secret の直接 read は general Sandbox の受容済み残存 risk として正確に表示されるか | D, K, O |
