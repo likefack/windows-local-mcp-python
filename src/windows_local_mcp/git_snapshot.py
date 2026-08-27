@@ -10,6 +10,20 @@ from .redaction import redact_text
 from .resources import enforce_data_quota
 from .tool_safety import trusted_helper_identity
 
+_GIT_SNAPSHOT_BUDGET_PER_COMMAND_SECONDS = 60.0
+_GIT_SNAPSHOT_MAX_BATCH_BUDGET_SECONDS = 10 * 60.0
+
+
+def _git_snapshot_batch_timeout(command_count: int) -> float:
+    """Bound the shared batch deadline without charging later commands for a 1-command budget."""
+
+    if command_count < 1:
+        raise ValueError("Git snapshot requires at least one command")
+    return min(
+        _GIT_SNAPSHOT_MAX_BATCH_BUDGET_SECONDS,
+        _GIT_SNAPSHOT_BUDGET_PER_COMMAND_SECONDS * command_count,
+    )
+
 
 def capture_git_snapshot(
     *,
@@ -123,13 +137,20 @@ def capture_git_snapshot(
             ),
         ]
         per_stream_limit = max(4096, settings.max_diff_bytes // len(commands) // 2)
+        # run_git_broker_batch uses one shared deadline for the entire fixed command set.  A
+        # one-command 60 s budget therefore cannot be reused unchanged for seven sequential
+        # sandbox launches: normal launch/guard overhead would consume later commands' budget.
+        # Scale the total allowance with this trusted, fixed command count while retaining a hard
+        # upper bound.  Individual Git processes remain inside the same Sandbox/Job/resource
+        # boundary, and the batch still has a finite overall deadline.
+        batch_timeout = _git_snapshot_batch_timeout(len(commands))
         try:
             results = run_git_broker_batch(
                 settings=settings,
                 git_identity=identity,
                 commands=[command for _name, command in commands],
                 cwd=str(root),
-                timeout=60,
+                timeout=batch_timeout,
                 output_limit=per_stream_limit,
                 token=f"snapshot-{operation_id}-{stage}",
             )
