@@ -69,3 +69,15 @@ def test_optional_git_snapshot_remains_best_effort(
         )
         is None
     )
+
+
+def test_git_snapshot_batch_budget_scales_with_fixed_command_count() -> None:
+    assert git_snapshot._git_snapshot_batch_timeout(1) == 60.0
+    assert git_snapshot._git_snapshot_batch_timeout(7) == 420.0
+    assert git_snapshot._git_snapshot_batch_timeout(10) == 600.0
+    assert git_snapshot._git_snapshot_batch_timeout(11) == 600.0
+
+
+def test_git_snapshot_batch_budget_rejects_empty_batch() -> None:
+    with pytest.raises(ValueError, match="at least one command"):
+        git_snapshot._git_snapshot_batch_timeout(0)
