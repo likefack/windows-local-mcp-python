@@ -23,6 +23,26 @@
 - runtime-user `stop_job`／pipe cancel は active Host monitor を停止できない。
 - legacy pending approval は abnormal Host latch 後に current generation／authority gate を bypassできないことを mandatory abnormal live verification に含める。
 
+### 2026-08-28 runtime preflight live blockers discovered and remediated
+
+- 初回 non-elevated runtime verifier は、volume root `C:\` 自身への object-scoped `DELETE (0x00010000)` を deeper runtime descendant の replacement authority と誤判定して fail closed した。current implementation は volume root の DELETE-only だけを ancestor replacement mask から除外し、`FILE_DELETE_CHILD`／`WRITE_DAC`／`WRITE_OWNER`、non-root ancestor DELETE、protected runtime object DELETE は拒否を維持する。
+- 初版 installer は inheritance を explicit grants より先に再帰削除し、elevated installer 自身の inherited access を途中で失わせて `Access is denied` を出し得た。security-critical `icacls` から `/C` を削除し、ACL error は install failure とする。
+- 次版 installer は recursive grant 後に recursive `/inheritance:r` を実行したため、descendant の runtime-user `RX` が最終 ACL から消える環境があり、実機で `runtime\Scripts\python.exe` 起動が `Access is denied` になった。current ACL model は protected install root に SYSTEM/Admin=F、runtime user=RX の inheritable explicit ACE を設定し、root のみ inheritance を遮断、descendant は `/reset /T` で root から継承、最後に `/verify /T` を実行する。
+- 上記 broken installer で作られた旧 immutable runtime を `-Replace` すると、旧 descendant から Administrators ACE が消えているため `Remove-Item -Recurse -Force` が `.pyc` で `Access is denied` になった。current replace path は active/recovery latch がないことを service 有無に関係なく先に確認し、旧 tree の owner を Administrators へ戻し Administrators Full Control を再帰復旧してから削除し、新 staging runtime を move する。これは退役する旧 tree だけを maintenance 中に mutable にし、新 staging runtime の immutable ACL は変更しない。
+- replace gate は `active.json` だけでなく `recovery_required` も service installation state と独立して確認する。どちらかが存在すれば runtime replace は拒否する。
+
+### Latest hosted regression checkpoint
+
+- candidate head at this checkpoint: `47767d1ff89234efe69929980efc56a6f8f831d7`。
+- Windows CI run #307 / run id `33092713486`: all jobs passed。
+- focused process identity regression: `17 passed`。
+- focused race/recovery/transaction regression: `38 passed`。
+- focused WLMCP-R2-001 authority regression: `49 passed`。
+- full pytest: `474 passed`。
+- runtime-installer static regressions: `6 passed`。
+- Ruff、compileall、PowerShell parser、diff whitespace: pass。
+- この checkpoint は installer／policy regression evidence であり、実 PC の immutable runtime preflight、SCM／SYSTEM authority、normal／abnormal live sequence の代替ではない。
+
 ## 2026-08-27 historical WLMCP-R2-001 capability-reduction record — SUPERSEDED
 
 この節は total fail-closed mitigation を採用した時点の履歴です。以下の `current v1`／`closed` 表現は上記 current remediation section により supersede されています。
@@ -205,14 +225,14 @@ C7 実装後、通常 Windows user / production route で未検証だった境�
 - 作業開始時は `81c8e86d39900d9ca0fcf4bb75ea1bc91b7dba31` だったが、作業中に別プロセスの `git pull origin main` が `0bcac0e` と `30cd90f` を fast-forward した。巻き戻さず、追加された Timeline 実装と回帰も含む現在の `main` で再検証した。
 - 基準: `SECURITY_CONTRACT.md`、SHA-256 `abc0c0bf47dd2952d97dbbc52b01f65e8b091fd8ce1f49cb98d955dc4e54c0e1`
 - `SECURITY_CONTRACT.md` 自体は変更していない。
-- 作業開始時の working tree は clean で、既存 user changes はなかった。commit／push は実施していない。
+- 作業開始時の working tree は clean で、既存 user changes はなかった。commit／pushも実施していない。
 
 ### Section 6 の判定
 
 判定は修正前の現行コードを基準にし、右端にこの作業後の扱いを記録する。
 
 | # | 重点確認項目 | 判定 | この作業後の扱い |
-| --- | --- | --- | --- |
+| --- | --- | --- |
 | 1 | Broker helper executable の provenance／path／hash／file identity と差し替え耐性 | still valid | Git／ADB を明示 path・SHA-256・file identity に固定し、Windows では実行中の差し替えを拒否 |
 | 2 | legacy `:workspace` と `workspace_write=false` の実効 filesystem boundary | reformulated | profile 名や staging 表示を OS 境界の証拠にせず、必要 property 未検証時は実行経路を unavailable にする |
 | 3 | Sandbox runtime から protected information を直接読める可能性 | reformulated | staging 漏えいを除去し、process／descendant の直接 read denial が実機未検証なら実行不可 |
