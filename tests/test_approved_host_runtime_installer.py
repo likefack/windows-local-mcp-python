@@ -70,18 +70,32 @@ def test_runtime_installer_reclaims_legacy_runtime_before_recursive_delete() -> 
         '$TakeownExe = Join-Path $env:SystemRoot "System32\\takeown.exe"'
     )
     takeown = replace_block.index("& $TakeownExe /F $InstallRoot /A /R /D Y /SKIPSL")
+    reset_dacl = replace_block.index("icacls.exe $InstallRoot /reset /T")
     admin_grant = replace_block.index(
         'icacls.exe $InstallRoot /grant:r "*S-1-5-32-544:(OI)(CI)F" /T'
     )
     remove_tree = replace_block.index("Remove-Item -LiteralPath $InstallRoot -Recurse -Force")
 
-    assert takeown_path < takeown < admin_grant < remove_tree
+    assert takeown_path < takeown < reset_dacl < admin_grant < remove_tree
     assert 'icacls.exe $InstallRoot /setowner "*S-1-5-32-544" /T' not in replace_block
     assert " /C" not in replace_block and " /c" not in replace_block
     assert "Reclaiming ownership of the previous Approved Host runtime failed." in replace_block
+    assert "Resetting the previous Approved Host runtime DACL failed." in replace_block
     assert "Reclaiming Administrators access to the previous Approved Host runtime failed." in (
         replace_block
     )
+
+
+def test_runtime_installer_legacy_recovery_replaces_dacl_before_admin_grant() -> None:
+    replace_block = _replace_block()
+
+    reset_dacl = replace_block.index("icacls.exe $InstallRoot /reset /T")
+    admin_grant = replace_block.index(
+        'icacls.exe $InstallRoot /grant:r "*S-1-5-32-544:(OI)(CI)F" /T'
+    )
+
+    assert reset_dacl < admin_grant
+    assert "existing deny ACE still wins access evaluation" in replace_block
 
 
 def test_runtime_installer_takeown_recovery_is_noninteractive_and_does_not_follow_links() -> None:
