@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import ClassVar
 
+from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import BaseModel, PrivateAttr
 
 from .config import Settings
@@ -13,6 +14,10 @@ from .git_metadata import force_structural_commit_output
 from .paths import Workspace
 from .tool_safety import capture_executable_identity, trusted_helper_identity
 from .util import canonical_json, sha256_text
+
+
+class SandboxRouteRequiredError(PermissionError, ToolError):
+    """Policy rejection that is intentionally safe to surface to the MCP model."""
 
 
 class NormalizedCommand(BaseModel):
@@ -109,7 +114,7 @@ class CommandPolicy:
             return self._result(identity, normalized_args, cwd_path, "git")
 
         if key in {"flutter", "dart"}:
-            raise PermissionError(
+            raise SandboxRouteRequiredError(
                 f"{key} processing may load project-controlled code or plugins; "
                 "use request_sandbox_command"
             )
@@ -120,8 +125,8 @@ class CommandPolicy:
             identity = self._resolve_safe_executable("adb")
             return self._result(identity, normalized_args, cwd_path, "adb")
 
-        raise PermissionError(
-            f"{program} is not eligible for automatic execution; use request_sandbox_command"
+        raise SandboxRouteRequiredError(
+            "program is not eligible for automatic execution; use request_sandbox_command"
         )
 
     def normalize_host(
@@ -188,7 +193,9 @@ class CommandPolicy:
     def _normalize_git(self, args: list[str]) -> list[str]:
         subcommand = args[0].casefold()
         if subcommand not in self.GIT_SUBCOMMANDS:
-            raise PermissionError(f"git {args[0]} requires human approval")
+            raise SandboxRouteRequiredError(
+                "Git subcommand is not eligible for Automatic Git; use request_sandbox_command"
+            )
         tail = list(args[1:])
 
         if subcommand == "status":
@@ -207,7 +214,7 @@ class CommandPolicy:
         elif subcommand == "diff":
             has_paths = "--" in tail and bool(tail[tail.index("--") + 1 :])
             if any(value in {"--patch", "-p", "--binary", "--check"} for value in tail):
-                raise PermissionError(
+                raise SandboxRouteRequiredError(
                     "content-bearing Git diff output is not eligible for Automatic Git; "
                     "use request_sandbox_command"
                 )
@@ -216,7 +223,7 @@ class CommandPolicy:
                 for value in tail
             )
             if has_paths and not metadata_only:
-                raise PermissionError(
+                raise SandboxRouteRequiredError(
                     "Automatic Git diff with a pathspec requires an explicit metadata-only "
                     "output mode; use request_sandbox_command for patch content"
                 )
@@ -246,7 +253,7 @@ class CommandPolicy:
         elif subcommand == "show":
             has_paths = "--" in tail and bool(tail[tail.index("--") + 1 :])
             if any(value in {"--patch", "-p"} for value in tail):
-                raise PermissionError(
+                raise SandboxRouteRequiredError(
                     "content-bearing Git show output is not eligible for Automatic Git; "
                     "use request_sandbox_command"
                 )
@@ -255,7 +262,7 @@ class CommandPolicy:
                 for value in tail
             )
             if has_paths and not metadata_only:
-                raise PermissionError(
+                raise SandboxRouteRequiredError(
                     "Automatic Git show with a pathspec requires an explicit metadata-only "
                     "output mode; use request_sandbox_command for patch content"
                 )
