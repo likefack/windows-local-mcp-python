@@ -21,6 +21,8 @@ from .audit import TERMINAL_STATUSES
 from .control_plane import verify_control_plane_generation
 from .policy import approved_request_hash
 
+_LIVE_CHILD_START_TIMEOUT_SECONDS = 120.0
+
 if os.name == "nt":
     _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     _advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
@@ -303,7 +305,15 @@ def _stage_and_launch_live_operation(cwd: str) -> tuple[Any, str]:
     return server.runtime, operation_id
 
 
-def _wait_for_child(runtime: Any, operation_id: str, timeout: float = 20.0) -> dict[str, Any]:
+def _wait_for_child(
+    runtime: Any,
+    operation_id: str,
+    timeout: float = _LIVE_CHILD_START_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    # The verifier process itself is the authority-bound requester. Approved Host preflight can
+    # legitimately spend tens of seconds hashing the immutable runtime and control plane before
+    # CreateProcessAsUser runs. Exiting this verifier early would make the requester PID disappear
+    # and correctly force the SYSTEM worker to fail closed, producing a false verification failure.
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         operation = runtime.audit.get_operation(operation_id, include_events=False)
