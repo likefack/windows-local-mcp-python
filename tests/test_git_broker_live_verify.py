@@ -14,7 +14,6 @@ from windows_local_mcp.git_broker_live_verify import (
 from windows_local_mcp.git_broker_sandbox import GitBrokerUnavailable
 from windows_local_mcp.sandbox_backend import SANDBOX_SECURITY_PROPERTIES
 
-
 _BUILTINS = b"status diff log show rev-parse ls-files\n"
 
 
