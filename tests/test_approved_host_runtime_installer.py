@@ -66,18 +66,35 @@ def test_runtime_installer_does_not_continue_after_acl_errors() -> None:
 def test_runtime_installer_reclaims_legacy_runtime_before_recursive_delete() -> None:
     replace_block = _replace_block()
 
-    setowner = replace_block.index('icacls.exe $InstallRoot /setowner "*S-1-5-32-544" /T')
+    takeown_path = replace_block.index(
+        '$TakeownExe = Join-Path $env:SystemRoot "System32\\takeown.exe"'
+    )
+    takeown = replace_block.index("& $TakeownExe /F $InstallRoot /A /R /D Y /SKIPSL")
     admin_grant = replace_block.index(
         'icacls.exe $InstallRoot /grant:r "*S-1-5-32-544:(OI)(CI)F" /T'
     )
     remove_tree = replace_block.index("Remove-Item -LiteralPath $InstallRoot -Recurse -Force")
 
-    assert setowner < admin_grant < remove_tree
+    assert takeown_path < takeown < admin_grant < remove_tree
+    assert 'icacls.exe $InstallRoot /setowner "*S-1-5-32-544" /T' not in replace_block
     assert " /C" not in replace_block and " /c" not in replace_block
     assert "Reclaiming ownership of the previous Approved Host runtime failed." in replace_block
     assert "Reclaiming Administrators access to the previous Approved Host runtime failed." in (
         replace_block
     )
+
+
+def test_runtime_installer_takeown_recovery_is_noninteractive_and_does_not_follow_links() -> None:
+    replace_block = _replace_block()
+    takeown_line = next(
+        line.strip() for line in replace_block.splitlines() if "& $TakeownExe /F $InstallRoot" in line
+    )
+
+    assert " /A" in takeown_line
+    assert " /R" in takeown_line
+    assert " /D Y" in takeown_line
+    assert " /SKIPSL" in takeown_line
+    assert "Test-Path -LiteralPath $TakeownExe -PathType Leaf" in replace_block
 
 
 def test_runtime_installer_replace_gate_checks_recovery_state_without_service_dependency() -> None:
