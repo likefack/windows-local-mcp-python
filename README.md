@@ -68,7 +68,7 @@ $env:LOCAL_MCP_CONFIG = 'C:\path\to\config.local.toml'
 .\.venv\Scripts\python.exe -m windows_local_mcp.cli verify-git-broker
 ```
 
-`verify-git-broker` は通常 operation から自動実行されません。Git runtime identity、Sandbox backend、generic live evidence、workspace、scratch quota、Automatic Git containment-policy generation v6、command-policy generation v4、trusted process-cwd policy、exact projection ownership-trust policy、sanitized `core.autocrlf` semantics、required-builtin policy のいずれかが変わった場合は marker が stale になり、再検証するまで Automatic Git は `available=false` です。verifier は `status`／`diff`／`log`／`show`／`rev-parse`／`ls-files` が exact pinned runtime の builtin command であることも確認します。Git-specific route は general Sandbox で residual risk として許容する `protected_information_read`／LAN を継承せず、全 Sandbox security property が `verified` の場合だけ route eligible です。
+`verify-git-broker` は通常 operation から自動実行されません。Git runtime identity、Sandbox backend、generic live evidence、workspace、scratch quota、Automatic Git containment-policy generation v6、command-policy generation v5、trusted process-cwd policy、exact projection ownership-trust policy、sanitized `core.autocrlf` semantics、required-builtin policy のいずれかが変わった場合は marker が stale になり、再検証するまで Automatic Git は `available=false` です。verifier は `status`／`diff`／`log`／`show`／`rev-parse`／`ls-files` が exact pinned runtime の builtin command であることも確認します。Git-specific route は general Sandbox で residual risk として許容する `protected_information_read`／LAN を継承せず、全 Sandbox security property が `verified` の場合だけ route eligible です。
 
 開発 server は次のとおり起動します。設定が不正な場合は、workspace を操作する前に起動を拒否します。
 
@@ -213,7 +213,7 @@ unit／integration test、Windows 上の Sandbox／Automatic Git 実機検証、
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-Automatic Git の unit／CI regression が green でも、この PC で `verify-git-broker` が成功して current Git-specific marker が存在するまでは `available=false` が正しい状態です。通常 operation は marker を作成・repair しません。Git runtime identity、Sandbox backend／live evidence、workspace、scratch quota、Automatic Git containment-policy generation v6、command-policy generation v4、trusted process-cwd policy、exact projection ownership-trust policy、sanitized `core.autocrlf` semantics、required-builtin policy が変われば marker は stale になり、Git child spawn 前に fail closed します。
+Automatic Git の unit／CI regression が green でも、この PC で `verify-git-broker` が成功して current Git-specific marker が存在するまでは `available=false` が正しい状態です。通常 operation は marker を作成・repair しません。Git runtime identity、Sandbox backend／live evidence、workspace、scratch quota、Automatic Git containment-policy generation v6、command-policy generation v5、trusted process-cwd policy、exact projection ownership-trust policy、sanitized `core.autocrlf` semantics、required-builtin policy が変われば marker は stale になり、Git child spawn 前に fail closed します。
 
 Sandbox が利用不能、必須境界が未検証、timeout、setup failure、command failure の場合は、その operation を unavailable／failed として表示します。一般 Sandbox で受容済み残存 risk の `protected_information_read`／LAN failure はそのまま表示し、その他の mandatory route gate と分離します。Automatic Git はこの residual-risk allowance を使用せず、全 property が verified でなければ unavailable です。Approved Host へ自動 fallback しません。
 
