@@ -62,7 +62,7 @@ Git-specific marker は次へ exact binding します。
 - sanitized `core.autocrlf` scalar reconstruction policy
 - Automatic grammar の required subcommand が pinned runtime の builtin であるという policy
 - Codex Sandbox backend identity と Automatic Git containment policy digest（current generation v6）
-- Automatic Git command-policy generation v4
+- Automatic Git command-policy generation v5
 - current generic Sandbox live evidence 全体の digest
 - current `workspace_root`
 - `max_sandbox_scratch_bytes`
@@ -86,4 +86,4 @@ Source／CI evidence と Windows machine-local evidence の記録は `docs/AUTOM
 
 同日の ownership/EOL remediation では、Git の `dubious ownership` を wildcard trust で回避せず exact disposable projection だけを `safe.directory` として trust し、host Git config を child に再公開せず `core.autocrlf` の trusted scalar semantics だけを sanitized config に継承する方針を追加しました。この policy change は containment generation v6 として旧 Git-specific marker を stale にします。
 
-2026-08-28 JST、source/test freeze `7f2382f4a9a7d6140523c7f58f405edb916a13f3` で Windows CI #346 が green となり、target Windows PC で generic `verify-codex-sandbox` と `verify-git-broker` がともに成功しました。Git-specific marker schema v1 は containment generation v6、command-policy generation v4、exact pinned Git runtime、source deny、network deny、host fallback prohibition に結合して `route_eligible=true` です。model-facing `session_info`／`git_info`／`execute_readonly` E2E は別証拠として完了条件に残ります。
+2026-08-28 JST、final source/test head `bca06c6f40767e857820342536208f5edeb21f89` で Windows CI #414 が green となり、target Windows PC で current external runtime を使った generic `verify-codex-sandbox`、`verify-git-broker`、model-facing MCP E2E がすべて成功しました。Git-specific marker schema v1 は containment generation v6、command-policy generation v5、exact pinned Git runtime、source deny、network deny、host fallback prohibition に結合して `route_eligible=true` です。`session_info` は helper を available/live-verified と報告し、`git_info`、`git status --short`、metadata-only `git diff --stat` が Broker route で成功しました。`git show --patch`、`git diff --patch`、`git diff --check` は Automatic Git で実行されず、MCP 越しに `request_sandbox_command` guidance を保持したまま拒否されました。wheel reinstall による runtime identity drift では旧 marker が自動 repair されず fail closed し、明示 verifier 後にのみ route が復旧することも実機で確認しています。
