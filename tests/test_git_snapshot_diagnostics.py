@@ -1,8 +1,10 @@
+import ast
+import inspect
 from pathlib import Path
 
 import pytest
 
-from windows_local_mcp import git_snapshot
+from windows_local_mcp import git_snapshot, worker
 from windows_local_mcp.config import Settings
 
 
@@ -69,6 +71,23 @@ def test_optional_git_snapshot_remains_best_effort(
         )
         is None
     )
+
+
+def test_worker_git_snapshots_are_explicitly_optional_telemetry() -> None:
+    tree = ast.parse(inspect.getsource(worker.run_operation))
+    calls: dict[str, bool] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+            continue
+        if node.func.id != "capture_git_snapshot":
+            continue
+        keywords = {keyword.arg: keyword.value for keyword in node.keywords if keyword.arg}
+        stage = keywords.get("stage")
+        required = keywords.get("required")
+        if isinstance(stage, ast.Constant) and isinstance(stage.value, str):
+            calls[stage.value] = isinstance(required, ast.Constant) and required.value is False
+
+    assert calls == {"before": True, "after": True}
 
 
 def test_git_snapshot_uses_fixed_command_count_batch_budget(
