@@ -366,9 +366,7 @@ def _safe_root_ignore_globs(data: bytes) -> tuple[str, ...]:
             or not line.endswith("/")
         ):
             continue
-        body = line[:-1]
-        if body.startswith("/"):
-            body = body[1:]
+        body = line[:-1].removeprefix("/")
         if (
             not body
             or "/" in body
