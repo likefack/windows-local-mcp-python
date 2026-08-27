@@ -110,9 +110,12 @@ def require_git_broker_containment(
 
 
 def _repo_limits(settings: Settings) -> tuple[int, int]:
+    # Keep at least half of the configured scratch budget available for the operation-specific
+    # runtime tree and transient bounded stdout/stderr files. Do not invent a repository-size
+    # floor that can exceed the operator-configured scratch quota.
     byte_limit = max(
-        16 * 1024 * 1024,
-        min(settings.max_sandbox_scratch_bytes * 3 // 4, 1024 * 1024 * 1024),
+        1024,
+        min(settings.max_sandbox_scratch_bytes // 2, 1024 * 1024 * 1024),
     )
     entry_limit = max(4096, min(settings.approval_manifest_max_files * 8, 200_000))
     return byte_limit, entry_limit
