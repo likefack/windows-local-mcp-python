@@ -171,9 +171,7 @@ def verify_git_broker_live(settings: Settings) -> dict[str, Any]:
 
     git_identity = configured_git_identity(settings)
     containment = require_git_broker_containment(settings, git_identity)
-    context = git_broker_live_context(
-        settings, git_identity, containment=containment
-    )
+    context = git_broker_live_context(settings, git_identity, containment=containment)
     git = str(git_identity["path"])
     base = _git_probe_base(git)
     results = run_git_broker_batch(
@@ -187,7 +185,6 @@ def verify_git_broker_live(settings: Settings) -> dict[str, Any]:
         cwd=str(settings.workspace_root),
         timeout=60,
         output_limit=64 * 1024,
-        token="live-verification",
     )
     if len(results) != 3:
         raise GitBrokerUnavailable(
