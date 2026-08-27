@@ -16,10 +16,7 @@ from .approved_host_authority import (
     ApprovedHostRecoveryRequired,
     default_authority_state_root,
 )
-from .approved_host_process_census import (
-    capture_user_processes,
-    requester_username,
-)
+from .approved_host_process_census import capture_user_processes, requester_username
 from .approved_host_service import _process_token_details
 from .audit import TERMINAL_STATUSES
 from .control_plane import verify_control_plane_generation
