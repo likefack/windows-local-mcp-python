@@ -25,6 +25,10 @@ def _install_authority_hooks(
     original_capture = control_plane_guard.capture_critical_state
     expected_state: dict[str, Any] | None = None
 
+    # windows_user_process deliberately receives the existing Job object. Expose the
+    # same-package kernel32 binding on the class rather than duplicating Job internals.
+    windows_job.WindowsSandboxJob._kernel32 = windows_job._kernel32  # type: ignore[attr-defined]  # noqa: SLF001
+
     def authority_popen(self: Any, argv: list[str], **kwargs: Any) -> Any:
         stdin = kwargs.pop("stdin", subprocess.DEVNULL)
         stdout = kwargs.pop("stdout", subprocess.PIPE)
@@ -34,7 +38,9 @@ def _install_authority_hooks(
         environment = kwargs.pop("env", None)
         cwd = kwargs.pop("cwd", None)
         if kwargs:
-            raise TypeError(f"unsupported Approved Host authority launch arguments: {sorted(kwargs)}")
+            raise TypeError(
+                f"unsupported Approved Host authority launch arguments: {sorted(kwargs)}"
+            )
         if stdin != subprocess.DEVNULL or stdout != subprocess.PIPE or stderr != subprocess.PIPE:
             raise RuntimeError("Approved Host authority requires bounded inherited stdio pipes")
         if shell is not False:
@@ -75,8 +81,6 @@ def _install_authority_hooks(
     control_plane_guard.expected_critical_state = authority_expected
     control_plane_guard.capture_critical_state = authority_capture
 
-    # Preserve a reference for defensive diagnostics and tests. The authority worker never
-    # calls this path directly after installing its launch hook.
     authority_popen.__wlmcp_original_popen__ = original_popen  # type: ignore[attr-defined]
 
 
@@ -113,13 +117,10 @@ def main() -> None:
     exit_code = 1
     try:
         exit_code = int(run_operation(args.operation_id, settings))
-        return
     finally:
         lease.finalize(exit_code)
+    raise SystemExit(exit_code)
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except SystemExit:
-        raise
+    main()
