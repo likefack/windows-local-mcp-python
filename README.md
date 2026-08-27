@@ -25,7 +25,7 @@ ChatGPT から、指定した 1 つの Windows 作業領域を安全に読み書
    - monitor／postflight worker は LocalSystem service が所有し、実 command は verified non-elevated requester token で起動します。same-desktop UAC elevation を security boundary としません。
    - `%ProgramData%\WindowsLocalMCP\ApprovedHostAuthority` の LocalSystem-owned durable latch は normal verified completion まで残り、worker kill／service restart／postflight failure では explicit administrator recovery を要求します。
    - project-controlled code-loader と workspace executable は引き続き Host で拒否し、Sandbox failure から Host へ automatic fallback しません。
-   - WLMCP-R2-001 はこの root-remediation branch で implementation 済みですが、required Windows normal／abnormal live verification が終わるまで fixed／closed と扱いません。
+   - WLMCP-R2-001 はこの root-remediation branch で implementation と required Windows normal／abnormal／recovery live verification を完了し、2026-08-28 の実機 evidence に基づき `fixed / live verified` とします。per-machine execution availability は引き続き immutable runtime と authenticated LocalSystem authority service の current preflight を必要とします。
 
 旧 Safe Tier／AppContainer は現行の方針には存在しません。旧設定が残っている場合は、弱い互換動作へ移らず起動を拒否します。
 
@@ -81,9 +81,9 @@ powershell.exe -NoProfile -File C:\dev\windows-local-mcp-python\run-server.ps1 -
 
 Approved Host の production route は immutable runtime と LocalSystem authority service の両方を前提にします。`approved_host_enabled=true` や `request_host_command` surface、pending／approved row だけでは execution availability を意味しません。
 
-通常の導入順序は `install-approved-host-runtime.ps1` → non-elevated `verify-approved-host-runtime.ps1` → elevated `install-approved-host-authority.ps1` → non-elevated `verify-approved-host-authority.ps1` です。WLMCP-R2-001 を fixed と判定する前に `verify-approved-host-authority-abnormal.ps1` の Arm／KillAndRestart／Check も通します。
+通常の導入順序は `install-approved-host-runtime.ps1` → non-elevated `verify-approved-host-runtime.ps1` → elevated `install-approved-host-authority.ps1` → non-elevated `verify-approved-host-authority.ps1` です。WLMCP-R2-001 の security boundary を変更する場合は `verify-approved-host-authority-abnormal.ps1` の Arm／KillAndRestart／Check、coordinated recovery、post-recovery normal path まで再検証します。
 
-`session_info()` の `available=true` は immutable runtime と authenticated authority service の current preflight が通ったことだけを意味します。Hosted CI や service health を full capability の `live_verified`／`windows_live_verified` へ昇格しません。この branch の release status は Windows live verification pending です。
+`session_info()` の `available=true` は immutable runtime と authenticated authority service の current preflight が通ったことだけを意味します。Hosted CI や service health を full capability の `live_verified`／`windows_live_verified` へ自動昇格しません。WLMCP-R2-001 の root-remediation branch 自体は 2026-08-28 に normal → SYSTEM worker loss／WMI Job 外 helper survival → service restart／`recovery_required` → stale execution rejection → coordinated recovery → post-recovery normal の実機 lifecycle を完了し、`fixed / live verified` です。
 
 詳細は `docs/APPROVED_HOST_RUNTIME.md` と `docs/APPROVED_HOST_PRODUCT_INVARIANT.md` を参照してください。
 
@@ -120,13 +120,13 @@ ADB helper は設定済み path、SHA-256、file identity を正規化時と wor
 
 ## 承認と実行時 binding
 
-`request_sandbox_command` と `request_host_command` は要求を作るだけで、その呼び出し時にはコマンドを実行しません。`request_sandbox_command` はローカル承認 UI で承認された要求を 1 回だけ claim して Sandbox 実行へ進みます。`request_host_command` は current v1 では compatibility staging に留まり、承認済みでも `Executor` の production gate が worker spawn 前に拒否します。
+`request_sandbox_command` と `request_host_command` は要求を作るだけで、その呼び出し時にはコマンドを実行しません。`request_sandbox_command` はローカル承認 UI で承認された要求を 1 回だけ claim して Sandbox 実行へ進みます。`request_host_command` も separately human-approved one-shot request として current generation、immutable manifest、TTL、executable identity を検証し、authenticated LocalSystem authority service の SYSTEM worker から verified non-elevated requester token の child を起動します。Sandbox failure からの implicit fallback や model-facing `execute_approved` surface はありません。
 
 承認には、argv、cwd、実行ファイルと入力の hash、checkpoint、workspace／data_dir の実体 identity、設定、WLMCP build と policy generation、Sandbox backend を結合します。更新や設定変更後の古い承認、二重 claim、replay は拒否します。
 
 承認後の Sandbox 実行ファイルも実行直前に path、SHA-256、device／inode、size、mtime を照合し、Windows では実行終了まで差し替えを拒否する handle を保持します。
 
-Approved Host 用に既存の runtime immutability、Job Object、same-user process census、control-plane preflight／postflight code は残っていますが、WLMCP-R2-001 capability reduction 中は active security guarantee として扱いません。same-user child が監視側を停止できる architecture のままこれらを組み合わせても、postflight の実行そのものを保証できないためです。再有効化には monitor／postflight owner と durable tamper state を child から保護する別 authority boundary が必要です。
+Approved Host は runtime immutability、LocalSystem-owned Job Object／monitor、requester-user WMI／CIM process census、control-plane preflight／postflight、SYSTEM-owned durable `active.json` latch と user-owned bound postflight latch を組み合わせます。normal verified completion の場合だけ latch を解除し、SYSTEM worker loss／service restart／postflight uncertainty は `recovery_required` のまま fail closed にし、elevated Administrator の reviewed coordinated recovery を要求します。
 
 ## Codex Sandbox
 
@@ -203,6 +203,6 @@ unit／integration test、Windows 上の Sandbox 実機検証、Secure MCP Tunne
 
 Sandbox が利用不能、必須境界が未検証、timeout、setup failure、command failure の場合は、その operation を unavailable／failed として表示します。受容済み残存 risk の `protected_information_read`／LAN failure はそのまま表示し、その他の mandatory route gate と分離します。Approved Host へ自動 fallback しません。
 
-Approved Host は current v1 では execution unavailable です。この capability reduction の回帰では「Host worker が一度も spawn されないこと」を検証し、将来再有効化する場合にだけ別 Windows authority boundary の live verification を要求します。
+Approved Host は current v1 で、`approved_host_enabled=true`、immutable runtime、authenticated LocalSystem authority service、current approval／generation／manifest checks が成立する eligible command に限って production execution を許可します。WLMCP-R2-001 の authority separation は 2026-08-28 に実 Windows normal／abnormal／recovery lifecycle で検証済みですが、別 PC や runtime／service／policy 変更後の current preflight を省略できる意味ではありません。
 
 `session_info.transport` は stdio と HTTP を別々に `configured`／`enabled`／`available` で表示します。現行版で利用可能なのは single-user local stdio だけで、HTTP は loopback 指定であっても startup validation が拒否します。
