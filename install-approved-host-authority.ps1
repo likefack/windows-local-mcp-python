@@ -49,11 +49,25 @@ function Invoke-Sc {
     }
 }
 
+function Protect-AuthorityDirectory {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Label
+    )
+    & "$env:SystemRoot\System32\icacls.exe" $Path /grant:r `
+        "*S-1-5-18:(OI)(CI)F" `
+        "*S-1-5-32-544:(OI)(CI)F" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Applying $Label ACL failed." }
+    & "$env:SystemRoot\System32\icacls.exe" $Path /inheritance:r | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "Protecting $Label ACL failed." }
+}
+
 Assert-Administrator
 $RuntimeSid = Resolve-AccountSid -Account $RuntimeUser
 $InstallRoot = [IO.Path]::GetFullPath($InstallRoot).TrimEnd('\', '/')
 $AuthorityStateRoot = Assert-AuthorityStateRoot -Path $AuthorityStateRoot
 $AuthorityBase = Split-Path -Parent $AuthorityStateRoot
+$CompletedStateRoot = Join-Path $AuthorityStateRoot "completed"
 $RuntimePython = Join-Path $InstallRoot "runtime\Scripts\python.exe"
 
 if (-not (Test-Path -LiteralPath $RuntimePython -PathType Leaf)) {
@@ -84,23 +98,16 @@ if (-not $PSCmdlet.ShouldProcess($ServiceName, "install LocalSystem Approved Hos
 }
 
 New-Item -ItemType Directory -Path $AuthorityStateRoot -Force | Out-Null
-New-Item -ItemType Directory -Path (Join-Path $AuthorityStateRoot "completed") -Force | Out-Null
+New-Item -ItemType Directory -Path $CompletedStateRoot -Force | Out-Null
 
-# Build one protected ACL boundary for the complete WLMCP ProgramData authority namespace, then
-# make every descendant inherit from that root. The runtime user intentionally receives no
-# file-system access: all health/launch interaction goes through the authenticated named pipe,
-# and only LocalSystem writes durable state or completion proofs. Explicit SYSTEM/Admin grants
-# must exist before inheritance is removed so the elevated installer cannot lock itself out
-# mid-recursion. Do not use /C for security-critical ACL operations: one error aborts install.
-& "$env:SystemRoot\System32\icacls.exe" $AuthorityBase /grant:r `
-    "*S-1-5-18:(OI)(CI)F" `
-    "*S-1-5-32-544:(OI)(CI)F" | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "Applying authority state root ACL failed." }
-& "$env:SystemRoot\System32\icacls.exe" $AuthorityBase /inheritance:r | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "Protecting authority state root ACL failed." }
-$AuthorityChildren = Join-Path $AuthorityBase "*"
-& "$env:SystemRoot\System32\icacls.exe" $AuthorityChildren /reset /T | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "Resetting authority state descendants to the protected root ACL failed." }
+# Protect every replacement boundary in the durable authority namespace. The parent prevents
+# replacement of ApprovedHostAuthority itself; the state root and completed root satisfy the
+# service's runtime verifier and keep future state/proof files inheriting only SYSTEM/Admin.
+# Explicit grants are installed before inheritance is removed so the elevated installer cannot
+# lock itself out. Do not use /C for security-critical ACL operations: one error aborts install.
+Protect-AuthorityDirectory -Path $AuthorityBase -Label "authority parent"
+Protect-AuthorityDirectory -Path $AuthorityStateRoot -Label "authority state root"
+Protect-AuthorityDirectory -Path $CompletedStateRoot -Label "authority completed root"
 & "$env:SystemRoot\System32\icacls.exe" $AuthorityBase /setowner "*S-1-5-18" /T | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "Setting authority state owner failed." }
 & "$env:SystemRoot\System32\icacls.exe" $AuthorityBase /verify /T | Out-Null
