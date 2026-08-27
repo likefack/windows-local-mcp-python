@@ -106,5 +106,17 @@ jobs:
           tests/test_server_operations.py
           tests/test_timeline_and_rollback.py
 
+      - name: Focused WLMCP-R2-001 authority regressions
+        run: >-
+          python -m pytest -q
+          tests/test_approved_host_authority_state.py
+          tests/test_approved_host_hardened_state.py
+          tests/test_approved_host_fail_closed.py
+          tests/test_approved_host_stop_boundary.py
+          tests/test_approved_host_service_entry.py
+          tests/test_approved_host_crash_recovery.py
+          tests/test_approved_host_audit_integrity.py
+          tests/test_approval_execution_integration.py
+
       - name: Full pytest
         run: python -m pytest
