@@ -3,11 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 
 from .config import Settings
+from .git_broker_sandbox import run_git_broker_batch
 from .paths import hold_verified_path, release_verified_hold
 from .redaction import redact_text
 from .resources import enforce_data_quota
-from .safe_process import run_safe_process, run_safe_process_batch
-from .tool_safety import hold_executable_identity, trusted_helper_identity
+from .tool_safety import trusted_helper_identity
 
 
 def capture_git_snapshot(
@@ -21,7 +21,7 @@ def capture_git_snapshot(
     try:
         identity = trusted_helper_identity(settings, "git")
         git = str(identity["path"])
-    except (FileNotFoundError, PermissionError):
+    except (FileNotFoundError, PermissionError, RuntimeError):
         return None
 
     root = settings.workspace_root.resolve(strict=True)
@@ -120,40 +120,19 @@ def capture_git_snapshot(
             ),
         ]
         per_stream_limit = max(4096, settings.max_diff_bytes // len(commands) // 2)
-        parts: list[str] = []
-        with hold_executable_identity(identity):
-            probe = run_safe_process(
+        try:
+            results = run_git_broker_batch(
                 settings=settings,
-                program_key="git",
-                command=[*git_base, "-C", str(root), "rev-parse", "--show-toplevel"],
-                cwd=str(root),
-                timeout=15,
-                output_limit=4096,
-                executable_identity=identity,
-                executable_already_held=True,
-            )
-            if probe.returncode != 0:
-                return None
-            try:
-                discovered_root = Path(
-                    probe.stdout.decode("utf-8", errors="replace").strip()
-                ).resolve(strict=True)
-            except (FileNotFoundError, OSError):
-                return None
-            if discovered_root != root:
-                # Do not let a workspace nested inside a larger repository expose
-                # parent-repository state through automatic snapshots or git_info.
-                return None
-            results = run_safe_process_batch(
-                settings=settings,
-                program_key="git",
+                git_identity=identity,
                 commands=[command for _name, command in commands],
                 cwd=str(root),
-                timeout=30,
+                timeout=60,
                 output_limit=per_stream_limit,
-                executable_identity=identity,
-                executable_already_held=True,
+                token=f"snapshot-{operation_id}-{stage}",
             )
+        except (OSError, PermissionError, RuntimeError, TimeoutError):
+            return None
+        parts: list[str] = []
         for (name, _command), result in zip(commands, results, strict=True):
             parts.append(
                 f"===== {name} exit={result.returncode} =====\n"
