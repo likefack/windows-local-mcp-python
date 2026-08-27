@@ -539,6 +539,21 @@ def _git_environment(
     return environment
 
 
+def _require_current_git_live_marker(
+    settings: Settings,
+    git_identity: dict[str, Any],
+    *,
+    live_verification_probe: bool,
+) -> None:
+    if live_verification_probe:
+        return
+    # Local import avoids a module cycle: the explicit verifier uses this runner to create the
+    # first marker, while every ordinary execution must already have a current marker.
+    from .git_broker_live_verify import require_git_broker_live_verification
+
+    require_git_broker_live_verification(settings, git_identity)
+
+
 def _run_one(
     *,
     settings: Settings,
@@ -550,6 +565,7 @@ def _run_one(
     deadline: float,
     output_limit: int,
     output_paths: tuple[Path, Path] | None,
+    live_verification_probe: bool,
     on_launch: Callable[
         [subprocess.Popen[Any], dict[str, object], CodexSandboxBackend], None
     ]
@@ -579,6 +595,11 @@ def _run_one(
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("Automatic Git operation deadline exceeded before launch")
+        _require_current_git_live_marker(
+            settings,
+            git_identity,
+            live_verification_probe=live_verification_probe,
+        )
         process, job, _argv, guard_payload = guard_and_launch_codex_sandbox(
             containment.backend,
             settings=settings,
@@ -667,6 +688,7 @@ def run_git_broker_batch(
     output_limit: int,
     token: str | None = None,
     output_paths: tuple[Path, Path] | None = None,
+    live_verification_probe: bool = False,
     on_launch: Callable[
         [subprocess.Popen[Any], dict[str, object], CodexSandboxBackend], None
     ]
@@ -697,6 +719,7 @@ def run_git_broker_batch(
                         deadline=deadline,
                         output_limit=output_limit,
                         output_paths=persistent_paths,
+                        live_verification_probe=live_verification_probe,
                         on_launch=on_launch if index == 0 else None,
                     )
                 )
@@ -715,6 +738,7 @@ def run_git_broker_command(
     output_limit: int,
     token: str | None = None,
     output_paths: tuple[Path, Path] | None = None,
+    live_verification_probe: bool = False,
     on_launch: Callable[
         [subprocess.Popen[Any], dict[str, object], CodexSandboxBackend], None
     ]
@@ -729,6 +753,7 @@ def run_git_broker_command(
         output_limit=output_limit,
         token=token,
         output_paths=output_paths,
+        live_verification_probe=live_verification_probe,
         on_launch=on_launch,
     )
     return results[0]
