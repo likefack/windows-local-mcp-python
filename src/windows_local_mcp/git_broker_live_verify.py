@@ -30,6 +30,7 @@ _GIT_BROKER_REQUIRED_CHECKS = (
     "git_status_readonly",
     "git_allowed_commands_builtin",
 )
+_GIT_LIVE_PROBE_BUDGET_PER_COMMAND_SECONDS = 60.0
 
 
 def _marker_path(settings: Settings) -> Path:
@@ -192,6 +193,11 @@ def verify_git_broker_live(settings: Settings) -> dict[str, Any]:
     context = git_broker_live_context(settings, git_identity, containment=containment)
     git = str(git_identity["path"])
     base = _git_probe_base(git)
+    commands = (
+        [*base, "rev-parse", "--is-inside-work-tree"],
+        [*base, "status", "--porcelain=v1", "--untracked-files=no"],
+        [*base, "--list-cmds=builtins"],
+    )
     token = f"live-{uuid.uuid4().hex}"
     stage_root = (
         settings.sandbox_scratch_dir / "git-broker" / token
@@ -199,16 +205,15 @@ def verify_git_broker_live(settings: Settings) -> dict[str, Any]:
         else None
     )
     try:
+        # The runner's timeout is a shared batch deadline.  Budget each trusted verifier launch
+        # the same 60-second allowance used for one command, rather than forcing three sequential
+        # Sandbox launches to compete for a single-command budget.
         results = run_git_broker_batch(
             settings=settings,
             git_identity=git_identity,
-            commands=(
-                [*base, "rev-parse", "--is-inside-work-tree"],
-                [*base, "status", "--porcelain=v1", "--untracked-files=no"],
-                [*base, "--list-cmds=builtins"],
-            ),
+            commands=commands,
             cwd=str(settings.workspace_root),
-            timeout=60,
+            timeout=_GIT_LIVE_PROBE_BUDGET_PER_COMMAND_SECONDS * len(commands),
             output_limit=64 * 1024,
             token=token,
             live_verification_probe=True,
