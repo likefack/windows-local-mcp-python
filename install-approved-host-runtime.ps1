@@ -11,6 +11,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$AuthorityServiceName = "WindowsLocalMCPApprovedHost"
+$AuthorityActiveState = Join-Path $env:ProgramData "WindowsLocalMCP\ApprovedHostAuthority\active.json"
 
 function Assert-UnderProgramFiles {
     param(
@@ -69,9 +71,24 @@ try {
 $BuildRoot = Join-Path $SourceRoot ".dev-tmp\approved-host-runtime"
 $WheelRoot = Join-Path $BuildRoot "wheel"
 $StagingRoot = "$InstallRoot.staging-$PID"
+$existingAuthorityService = Get-Service -Name $AuthorityServiceName -ErrorAction SilentlyContinue
+$restartAuthorityService = $false
 
 if ((Test-Path -LiteralPath $InstallRoot) -and -not $Replace) {
     throw "InstallRoot already exists. Use -Replace to replace it: $InstallRoot"
+}
+if ($Replace -and $null -ne $existingAuthorityService) {
+    if (Test-Path -LiteralPath $AuthorityActiveState -PathType Leaf) {
+        throw "Approved Host authority has active/recovery state. Review and recover it before replacing the immutable runtime."
+    }
+    if ($existingAuthorityService.Status -ne [ServiceProcess.ServiceControllerStatus]::Stopped) {
+        Stop-Service -Name $AuthorityServiceName
+        (Get-Service -Name $AuthorityServiceName).WaitForStatus(
+            [ServiceProcess.ServiceControllerStatus]::Stopped,
+            [TimeSpan]::FromSeconds(30)
+        )
+        $restartAuthorityService = $true
+    }
 }
 if (Test-Path -LiteralPath $StagingRoot) {
     Remove-Item -LiteralPath $StagingRoot -Recurse -Force
@@ -115,9 +132,17 @@ try {
         throw "Installing the WLMCP wheel and dependencies failed."
     }
 
-    Copy-Item -LiteralPath (Join-Path $SourceRoot "run-server.ps1") -Destination $StagingRoot
-    Copy-Item -LiteralPath (Join-Path $SourceRoot "run-approvals.ps1") -Destination $StagingRoot
-    Copy-Item -LiteralPath (Join-Path $SourceRoot "verify-approved-host-runtime.ps1") -Destination $StagingRoot
+    foreach ($script in @(
+        "run-server.ps1",
+        "run-approvals.ps1",
+        "install-approved-host-authority.ps1",
+        "recover-approved-host-authority.ps1",
+        "verify-approved-host-runtime.ps1",
+        "verify-approved-host-authority.ps1",
+        "verify-approved-host-authority-abnormal.ps1"
+    )) {
+        Copy-Item -LiteralPath (Join-Path $SourceRoot $script) -Destination $StagingRoot
+    }
     Copy-Item -LiteralPath (Join-Path $SourceRoot "config.example.toml") -Destination $StagingRoot
 
     # Secure the complete staged runtime before it becomes the active installation.
@@ -139,11 +164,26 @@ try {
     }
     Move-Item -LiteralPath $StagingRoot -Destination $InstallRoot
 
+    if ($restartAuthorityService) {
+        Start-Service -Name $AuthorityServiceName
+        (Get-Service -Name $AuthorityServiceName).WaitForStatus(
+            [ServiceProcess.ServiceControllerStatus]::Running,
+            [TimeSpan]::FromSeconds(30)
+        )
+    }
+
     Write-Output "Approved Host runtime installed at: $InstallRoot"
     Write-Output "Runtime user: $RuntimeUser ($runtimeSid)"
     Write-Output "Base Python: $BasePython"
     Write-Output "Base Python prefix: $BasePrefix"
-    Write-Output "Run verify-approved-host-runtime.ps1 from a normal non-elevated $RuntimeUser session before enabling Approved Host use."
+    Write-Output "1. Run verify-approved-host-runtime.ps1 from normal non-elevated $RuntimeUser."
+    if ($null -eq $existingAuthorityService) {
+        Write-Output "2. Run install-approved-host-authority.ps1 from an elevated Administrator session."
+    } else {
+        Write-Output "2. Existing Approved Host authority service was preserved; re-run its installer with -Replace if service configuration changed."
+    }
+    Write-Output "3. Run verify-approved-host-authority.ps1 from normal non-elevated $RuntimeUser."
+    Write-Output "4. Before claiming WLMCP-R2-001 fixed, run verify-approved-host-authority-abnormal.ps1 through Arm / KillAndRestart / Check."
 } finally {
     if (Test-Path -LiteralPath $StagingRoot) {
         Remove-Item -LiteralPath $StagingRoot -Recurse -Force -ErrorAction SilentlyContinue
