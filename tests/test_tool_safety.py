@@ -9,6 +9,7 @@ from windows_local_mcp.git_broker_sandbox import GitBrokerUnavailable
 from windows_local_mcp.tool_safety import (
     capture_executable_identity,
     hold_executable_identity,
+    pinned_helper_identity,
     trusted_helper_identity,
     verify_executable_identity,
 )
@@ -74,6 +75,51 @@ def test_automatic_git_broker_helper_accepts_pinned_git_after_live_verification(
     assert identity["path"] == str(executable.resolve())
     assert identity["sha256"] == digest
     assert observed["sha256"] == digest
+
+
+def test_git_for_windows_cmd_wrapper_is_not_accepted_as_pinned_runtime(tmp_path: Path) -> None:
+    install_root = tmp_path / "Git"
+    wrapper = install_root / "cmd" / "git.exe"
+    runtime = install_root / "mingw64" / "bin" / "git.exe"
+    wrapper.parent.mkdir(parents=True)
+    runtime.parent.mkdir(parents=True)
+    wrapper.write_bytes(b"wrapper")
+    runtime.write_bytes(b"real-runtime")
+    settings = make_settings(tmp_path, wrapper, sha256(wrapper.read_bytes()).hexdigest())
+
+    with pytest.raises(PermissionError, match="real Git for Windows runtime") as error:
+        pinned_helper_identity(settings, "git")
+
+    assert str(runtime.resolve()) in str(error.value)
+
+
+def test_git_for_windows_root_bin_redirector_is_not_accepted_as_pinned_runtime(
+    tmp_path: Path,
+) -> None:
+    install_root = tmp_path / "PortableGit"
+    redirector = install_root / "bin" / "git.exe"
+    runtime = install_root / "mingw64" / "bin" / "git.exe"
+    redirector.parent.mkdir(parents=True)
+    runtime.parent.mkdir(parents=True)
+    redirector.write_bytes(b"redirector")
+    runtime.write_bytes(b"real-runtime")
+    settings = make_settings(tmp_path, redirector, sha256(redirector.read_bytes()).hexdigest())
+
+    with pytest.raises(PermissionError, match="real Git for Windows runtime"):
+        pinned_helper_identity(settings, "git")
+
+
+def test_git_for_windows_direct_runtime_is_accepted_as_pinned_identity(tmp_path: Path) -> None:
+    runtime = tmp_path / "Git" / "mingw64" / "bin" / "git.exe"
+    runtime.parent.mkdir(parents=True)
+    runtime.write_bytes(b"real-runtime")
+    digest = sha256(runtime.read_bytes()).hexdigest()
+    settings = make_settings(tmp_path, runtime, digest)
+
+    identity = pinned_helper_identity(settings, "git")
+
+    assert identity["path"] == str(runtime.resolve())
+    assert identity["sha256"] == digest
 
 
 def test_adb_broker_helper_requires_matching_explicit_hash(tmp_path: Path) -> None:
