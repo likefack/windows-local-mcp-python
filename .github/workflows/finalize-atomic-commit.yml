@@ -113,6 +113,7 @@ jobs:
           tests/test_git_broker_launch_gate.py
           tests/test_git_broker_live_verify.py
           tests/test_git_broker_projection_boundary.py
+          tests/test_git_ref_projection.py
           tests/test_git_broker_resource_limits.py
           tests/test_git_object_access.py
           tests/test_git_worker_routing.py
