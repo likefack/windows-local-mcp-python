@@ -25,7 +25,6 @@ from .audit import TERMINAL_STATUSES
 from .control_plane import verify_control_plane_generation
 from .policy import approved_request_hash
 
-
 _ABNORMAL_CHILD_START_TIMEOUT_SECONDS = 120.0
 _ABNORMAL_OPERATION_RUNTIME_SECONDS = 300
 # Windows ping sends the first packet immediately, so 601 loopback requests keep the WMI-created
