@@ -25,6 +25,10 @@ def test_production_service_rejects_runtime_user_cancel_before_base_dispatch(
     calls: list[tuple[str, object]] = []
 
     monkeypatch.setattr(
+        "windows_local_mcp.approved_host_service_entry._assert_root_acl",
+        lambda root: calls.append(("parent", root)),
+    )
+    monkeypatch.setattr(
         "windows_local_mcp.approved_host_service_entry.assert_authority_state_security",
         lambda root: calls.append(("state", root)),
     )
@@ -49,6 +53,7 @@ def test_production_service_rejects_runtime_user_cancel_before_base_dispatch(
         server.handle_request(123, {"action": "cancel"})
 
     assert calls == [
+        ("parent", tmp_path),
         ("state", tmp_path / "authority"),
         ("service", "S-1-5-21-test"),
     ]
