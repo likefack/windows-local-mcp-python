@@ -52,7 +52,7 @@ Git-specific marker は次へ exact binding します。
 
 Automatic Git は generic Sandbox で受容済み residual risk とされる property を継承して自動実行を許可しません。Git-specific route では `filesystem_read`、`filesystem_write`、`protected_information_read`、`internet`、`lan`、`loopback`、`descendant_containment`、`termination`、`resource_bound` の全 property が `verified` であることを要求します。
 
-明示的な `verify-git-broker` は pinned Git を同じ containment 内で実際に起動し、少なくとも worktree 認識、top-level projection binding、read-only status の E2E を確認してから marker を atomic に更新します。通常 operation は marker を自動生成・repair せず、missing/stale/failed marker なら fail closed します。worker は queue 時の validation だけに依存せず、child launch 直前にも Git-specific marker を再検証します。
+明示的な `verify-git-broker` は pinned Git を同じ containment 内で実際に起動し、worktree 認識、strict source-workspace deny 下での read-only `status` 成功、および同一 sanitized projection snapshot digest への probe batch binding を確認してから marker を atomic に更新します。user-facing path remap 後の `--show-toplevel` 文字列を projection 実行の独立証拠として扱いません。通常 operation は marker を自動生成・repair せず、missing/stale/failed marker なら fail closed します。dedicated worker と `git_info` が共有する runner は child launch 直前にも Git-specific marker を再検証します。
 
 Source／CI evidence と Windows machine-local evidence の記録は `docs/AUTOMATIC_GIT_BROKER_VERIFICATION.md` に分離します。
 
