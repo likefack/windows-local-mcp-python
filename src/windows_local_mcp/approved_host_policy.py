@@ -57,7 +57,7 @@ def _authority_worker_bypass_allowed() -> bool:
         from .approved_host_service import _current_process_sid
 
         return _current_process_sid().casefold() == _LOCAL_SYSTEM_SID.casefold()
-    except Exception:
+    except (ImportError, OSError, RuntimeError):
         # Failure to prove LocalSystem identity must never turn a user-controlled
         # environment variable into a durable-latch bypass.
         return False
