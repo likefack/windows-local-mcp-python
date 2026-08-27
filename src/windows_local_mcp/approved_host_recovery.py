@@ -90,6 +90,42 @@ def _inspect_marker_path(
     }
 
 
+def _existing_quarantine(
+    marker: Path,
+    *,
+    operation_id: str,
+) -> dict[str, Any] | None:
+    prefix = f"approved-host-postflight-recovered-{operation_id}-"
+    candidates = [
+        candidate
+        for candidate in marker.parent.glob(f"{prefix}*.json")
+        if candidate.name.startswith(prefix)
+    ]
+    if not candidates:
+        return None
+    if len(candidates) != 1:
+        raise RuntimeError(
+            "multiple Approved Host postflight recovery quarantines exist for the same operation"
+        )
+    candidate = candidates[0]
+    evidence = _inspect_marker_path(
+        candidate,
+        expected_operation_id=operation_id,
+    )
+    digest = str(evidence["marker_identity"]["sha256"]).casefold()
+    expected_name = f"{prefix}{digest[:16]}.json"
+    if candidate.name != expected_name:
+        raise RuntimeError("Approved Host postflight recovery quarantine name is not digest-bound")
+    evidence.update(
+        {
+            "present": False,
+            "quarantined": True,
+            "quarantine_path": str(candidate.resolve(strict=True)),
+        }
+    )
+    return evidence
+
+
 def inspect_postflight_recovery(
     settings: Settings,
     expected_operation_id: str,
@@ -104,17 +140,24 @@ def inspect_postflight_recovery(
         )
 
     marker = _approved_host_postflight_marker(settings)
-    if not marker.exists():
-        return {
-            "version": _RECOVERY_VERSION,
-            "operation_id": operation_id,
-            "present": False,
-            "marker_path": str(marker.absolute()),
-        }
-
-    evidence = _inspect_marker_path(marker, expected_operation_id=operation_id)
-    evidence["present"] = True
-    return evidence
+    quarantine = _existing_quarantine(marker, operation_id=operation_id)
+    if marker.exists():
+        if quarantine is not None:
+            raise RuntimeError(
+                "both pending and quarantined Approved Host postflight recovery markers exist"
+            )
+        evidence = _inspect_marker_path(marker, expected_operation_id=operation_id)
+        evidence.update({"present": True, "quarantined": False})
+        return evidence
+    if quarantine is not None:
+        return quarantine
+    return {
+        "version": _RECOVERY_VERSION,
+        "operation_id": operation_id,
+        "present": False,
+        "quarantined": False,
+        "marker_path": str(marker.absolute()),
+    }
 
 
 def quarantine_postflight_recovery(
@@ -134,26 +177,21 @@ def quarantine_postflight_recovery(
         f"approved-host-postflight-recovered-{operation_id}-{digest[:16]}.json"
     )
 
-    if not bool(evidence.get("present")):
-        if not quarantine.exists():
-            raise RuntimeError(
-                "Approved Host postflight marker disappeared before explicit recovery"
-            )
-        recovered = _inspect_marker_path(
-            quarantine,
-            expected_operation_id=operation_id,
-        )
-        if str(recovered["marker_identity"]["sha256"]).casefold() != digest:
+    if bool(evidence.get("quarantined")):
+        if Path(str(evidence["quarantine_path"])).resolve(strict=True) != quarantine.resolve(
+            strict=True
+        ):
+            raise RuntimeError("quarantined Approved Host postflight marker path changed")
+        if str(evidence["marker_identity"]["sha256"]).casefold() != digest:
             raise RuntimeError("quarantined Approved Host postflight marker digest changed")
-        recovered.update(
-            {
-                "present": False,
-                "quarantined": True,
-                "resumed_partial_recovery": True,
-                "quarantine_path": str(quarantine.resolve(strict=True)),
-            }
+        assert_control_plane_healthy(settings)
+        evidence["resumed_partial_recovery"] = True
+        return evidence
+
+    if not bool(evidence.get("present")):
+        raise RuntimeError(
+            "Approved Host postflight marker disappeared before explicit recovery"
         )
-        return recovered
 
     identity = dict(evidence["marker_identity"])
     if str(identity.get("sha256") or "").casefold() != digest:
