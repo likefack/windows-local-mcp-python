@@ -19,7 +19,7 @@ Security objectives:
 
 `adb_enabled` does not make its broker helper available by itself. Automatic ADB helper execution requires an explicit absolute executable path and operator-pinned SHA-256. PATH discovery is not a trust source.
 
-`git_enabled` also does not make Automatic Git available by itself. Automatic Git requires an explicit Git path/hash identity, the current generic Codex Sandbox live evidence, every Sandbox security property verified for the stricter Automatic Git policy, and an exact Git-specific live marker produced by `verify-git-broker`. `git_info` / `execute_readonly` remain public surfaces regardless of current availability, so session capability data must keep configured, enabled, available, and Windows-live-verified separate. A missing, failed, or stale Git-specific marker is a fail-closed unavailable state, not a reason to run a weaker Git child.
+`git_enabled` also does not make Automatic Git available by itself. Automatic Git requires an explicit Git path/hash identity, the current generic Codex Sandbox live evidence, every Sandbox security property verified for the stricter Automatic Git policy, and an exact Git-specific live marker produced by `verify-git-broker`. The marker is bound to the Git identity, Sandbox/backend evidence, workspace, configured scratch quota, containment policy, and Automatic Git command-policy generation. `git_info` / `execute_readonly` remain public surfaces regardless of current availability, so session capability data must keep configured, enabled, available, and Windows-live-verified separate. A missing, failed, or stale Git-specific marker is a fail-closed unavailable state, not a reason to run a weaker Git child.
 
 `approved_host_enabled` remains a configuration-intent field for compatibility, but current v1 deliberately makes the Approved Host execution route unavailable after validating WLMCP-R2-001. The presence of this setting, `request_host_command`, or pending/approved rows does not imply that an Approved Host worker can start. The production runtime gate rejects the route before worker spawn. Re-enabling it requires an independently justified Windows security boundary for the monitor/postflight owner and durable tamper state; same-desktop UAC elevation alone is not accepted as that boundary.
 
@@ -73,7 +73,7 @@ Automatic broker execution uses complete subcommand grammars, not a first-token 
 
 The MCP surface is split after the deny-by-default grammar succeeds:
 
-- `execute_readonly`: narrow read-only command surface. Fixed Git reads use the dedicated Automatic Git Broker worker only when Git-specific live verification is current.
+- `execute_readonly`: narrow read-only command surface. Fixed metadata-only Git reads use the dedicated Automatic Git Broker worker only when Git-specific live verification is current.
 - `execute_workspace_write`: retained as a compatibility tool surface, but project-controlled formatting is rejected and directed to Codex Sandbox.
 - `adb_read`: only the fixed read-only ADB grammar.
 
@@ -81,25 +81,29 @@ The split is presentation and host-policy metadata, not a second authorization s
 
 ### Automatic Git Broker
 
-Automatic Git is a Broker primitive, not a fifth policy tier. Its candidate grammar is limited to `status`, `diff`, `log`, `show`, restricted `rev-parse`, and `ls-files`.
+Automatic Git is a Broker primitive, not a fifth policy tier. Its candidate grammar is limited to `status`, metadata-only `diff`, `log`, metadata-only `show`, restricted `rev-parse`, and `ls-files`.
 
 Controls required for every Automatic Git operation:
 
 - Force no pager; diff/show force `--no-ext-diff --no-textconv`.
 - Disallow `-C`, `--git-dir`, `--work-tree`, `--output`, config injection, pager/external helpers, and unknown flags.
-- Pathspec is accepted only after `--` and resolved inside workspace; absolute workspace operands are rewritten to the disposable projection before launch.
+- `diff`／`show` are metadata-only. `--patch`, `-p`, `--binary`, `--check`, and pathspec forms that would otherwise imply patch/body output are not Automatic Git operations and are directed to `request_sandbox_command`.
+- A current workspace path that passes Broker path validation is not evidence that a blob reached through a tree, commit, or index is provenance-safe. An attacker can attach protected historical blob bytes to a safe-looking path. Therefore no Automatic Git mode may materialize object-backed file bodies merely because the path looks allowed.
+- User-supplied `diff`／`show` revisions are forced through `^{commit}` and both endpoints of a revision range are commit-bound as defense-in-depth. Commit binding is not treated as a substitute for the metadata-only output boundary.
+- Pathspec is accepted only after `--`, only for explicit metadata-only forms, and resolved inside workspace; absolute workspace operands are rewritten to the disposable projection before launch.
 - Git repository/config override environment variables are removed. System/global Git config and system attributes are disabled. Credential prompting, optional locking, and Git protocol access are disabled.
 - Git is resolved only from the explicitly configured path/hash identity. The worker revalidates it and holds a Windows FILE_SHARE_READ-only handle against writes/replacement through process completion.
 - The live repository is never the Git child filesystem. Broker creates `sandbox_scratch_dir/git-broker/<operation>/repository`, verifies bounded size/entry count, rejects reparse/ADS/hardlink/external gitdir/commondir/config.worktree/object-alternate forms, and removes project-controlled hooks, modules, `.gitattributes`, and `.git/info/attributes`.
 - Source `.git/config` raw bytes are read through a verified Broker handle and parsed in trusted memory. Raw config is not written to scratch. Only inert `core.repositoryformatversion=0`, `filemode`, `bare=false`, `logallrefupdates`, and `ignorecase` values are emitted to the projection. Repository extensions are rejected.
 - Protected worktree paths such as `.env`/configured blocked names are not copied into the projection.
+- Repository projection bytes are limited to at most half of configured `max_sandbox_scratch_bytes`, leaving the remaining scratch budget for operation runtime/transient output. The implementation does not introduce a hard-coded repository-size floor that can exceed the configured quota.
 - The child runs through the installed Codex Windows Sandbox containment engine with original `workspace_root` and `data_dir` denied, only the disposable Git operation root writable, direct network disabled, WFP loopback guard verified, Windows Job process/memory/kill-on-close limits active, and brokered `Win32_Process.Create` denial rechecked.
 - Generic Codex Sandbox residual-risk acceptance does not authorize Automatic Git. Every security property (`filesystem_read`, `filesystem_write`, `protected_information_read`, `internet`, `lan`, `loopback`, `descendant_containment`, `termination`, `resource_bound`) must be `verified`.
-- Git-specific live marker schema v1 binds pinned Git identity, current Sandbox backend, current generic live-evidence digest, containment policy, and workspace. `verify-git-broker` runs real pinned-Git `rev-parse --is-inside-work-tree`, top-level projection binding, and read-only `status` inside that same containment before atomically issuing the marker.
+- Git-specific live marker schema v1 binds pinned Git identity, current Sandbox backend, current generic live-evidence digest, containment policy, workspace, configured scratch quota, and Automatic Git command-policy generation. `verify-git-broker` runs real pinned-Git `rev-parse --is-inside-work-tree`, top-level projection binding, and read-only `status` inside that same containment before atomically issuing the marker.
 - Normal operations never create or silently repair the Git-specific marker. The dedicated worker rechecks it immediately before Git execution.
 - Sandbox/marker failure never falls back to the normal Broker worker or Approved Host.
 
-`git_info` batches its fixed snapshot commands through this same runner. `execute_readonly` Git commands queue a dedicated worker. Thus both public Git surfaces converge on one containment primitive.
+`git_info` batches its fixed snapshot commands through this same runner. Its snapshot is limited to branch/HEAD/status, diff/staged stat or name-status, recent log metadata, and changed-file metadata; it does not intentionally emit blob bodies. `execute_readonly` Git commands queue the same dedicated worker. Thus both public Git surfaces converge on one containment primitive.
 
 ### Project-controlled tools
 
@@ -204,7 +208,7 @@ Every normalized Sandbox target executable is identity-bound. Automatic Git addi
 - command count/argument/reason limits;
 - approval file-count/byte limits;
 - stdout/stderr pipes drained by bounded head/tail collectors;
-- bounded Automatic Git repository projection and output capture;
+- bounded Automatic Git repository projection and output capture; repository projection is at most half of configured Sandbox scratch quota;
 - bounded broker snapshots and approval metadata inventories;
 - total `data_dir` quota;
 - Codex Sandbox staging/runtime byte and filesystem-entry quotas, with reparse points, non-regular entries, and NTFS alternate data streams rejected;
@@ -239,7 +243,7 @@ ADB receives a loopback-only requested profile and the fixed `ADB_SERVER_SOCKET=
 
 ### Execution boundary policy
 
-1. `broker`: closed-world file, Automatic Git fixed read, fixed ADB-read, checkpoint, transaction, rollback, and audit operations. Automatic Git internally borrows the live-verified Codex Windows containment engine but remains a Broker primitive with stricter Git-specific availability gates.
+1. `broker`: closed-world file, Automatic Git fixed metadata read, fixed ADB-read, checkpoint, transaction, rollback, and audit operations. Automatic Git internally borrows the live-verified Codex Windows containment engine but remains a Broker primitive with stricter Git-specific availability gates.
 2. `structured_processing`: declarative DOCX/XLSX/CSV/TSV/ZIP/image processing and hash-bound artifact commit.
 3. `codex_sandbox`: open-ended or project-controlled execution after one-shot local approval.
 4. `approved_host`: compatibility/configuration surface only in current v1; execution is unavailable and fails closed before worker spawn.
@@ -280,7 +284,7 @@ Authenticated multi-principal HTTP is not implemented. Setting `http_multi_princ
 
 Annotations describe the real action performed by each model-facing call:
 
-- pure local reads and `execute_readonly`: read-only, non-destructive, closed-world. Git requests either execute through the verified Automatic Git Broker or fail closed before Git child creation;
+- pure local reads and `execute_readonly`: read-only, non-destructive, closed-world. Git requests either execute through the verified metadata-only Automatic Git Broker or fail closed before Git child creation;
 - `adb_read`: read-only, non-destructive, closed-world;
 - `write_file` and `execute_workspace_write`: non-read-only, destructive, closed-world;
 - `request_host_command`: non-read-only, non-destructive, closed-world because it only creates an approval request; current v1 rejects any resulting Approved Host execution before worker spawn;
