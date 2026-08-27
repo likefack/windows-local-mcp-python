@@ -15,6 +15,8 @@ powershell_enabled = false
 
 # Broker の Git／ADB helper は PATH から探索しません。各 capability を使う場合は、
 # workspace／data_dir／scratch 外の実行ファイルの絶対 path と SHA-256 を対で固定します。
+# Automatic Git は Git for Windows の cmd\git.exe や install-root bin\git.exe のような
+# wrapper／redirector ではなく、実際の runtime（通常 mingw64\bin\git.exe）を直接 pin してください。
 # 未設定でも server は起動しますが、enabled と available は別表示になり、実行は拒否されます。
 git_executable_path = ""
 git_executable_sha256 = ""
