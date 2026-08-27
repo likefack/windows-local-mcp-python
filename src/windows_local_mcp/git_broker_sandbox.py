@@ -33,6 +33,7 @@ from .windows_job import WindowsJobLimits
 GIT_BROKER_POLICY_VERSION = 1
 _GIT_PROCESS_LIMIT = 16
 _GIT_MEMORY_LIMIT = 1024 * 1024 * 1024
+_GIT_CONFIG_LIMIT = 1024 * 1024
 
 
 class GitBrokerUnavailable(RuntimeError):
@@ -241,7 +242,12 @@ def _safe_repository_config(source_config: Path, *, byte_limit: int) -> bytes:
         details = held.stat()
         if details.st_nlink > 1:
             raise GitBrokerUnavailable("automatic Git repository config is hard-linked")
-        raw = read_verified_bytes(held, byte_limit)
+        config_limit = min(byte_limit, _GIT_CONFIG_LIMIT)
+        if details.st_size > config_limit:
+            raise GitBrokerUnavailable(
+                "automatic Git repository config exceeds the 1 MiB parsing limit"
+            )
+        raw = read_verified_bytes(held, config_limit)
     finally:
         release_verified_hold(held)
     try:
@@ -278,12 +284,10 @@ def _safe_repository_config(source_config: Path, *, byte_limit: int) -> bytes:
         "\tbare = false\n"
         "\tlogallrefupdates = true\n"
         f"\tignorecase = {'true' if ignorecase else 'false'}\n"
-    ).encode("utf-8")
+    ).encode()
 
 
-def _record_snapshot_file(
-    digest: Any, relative: Path, data: bytes
-) -> None:
+def _record_snapshot_file(digest: Any, relative: Path, data: bytes) -> None:
     digest.update(relative.as_posix().encode("utf-8"))
     digest.update(b"\0")
     digest.update(str(len(data)).encode("ascii"))
@@ -332,9 +336,13 @@ def _copy_repository_tree(
                     ".git/objects/info/http-alternates",
                 }:
                     continue
-            elif _protected_worktree_path(relative, settings):
-                continue
-            elif relative.name.casefold() == ".gitattributes":
+            elif relative.name.casefold() == ".git":
+                raise GitBrokerUnavailable(
+                    f"automatic Git does not accept nested .git metadata: {relative}"
+                )
+            elif _protected_worktree_path(
+                relative, settings
+            ) or relative.name.casefold() == ".gitattributes":
                 continue
 
             candidate = Path(entry.path)
