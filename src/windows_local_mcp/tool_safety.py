@@ -177,7 +177,7 @@ def capture_executable_identity(
 
 
 def trusted_helper_identity(settings: Any, program_key: str) -> dict[str, Any]:
-    """Resolve a broker helper only from an explicit path and SHA-256 trust anchor."""
+    """Resolve a Broker helper from a pinned identity and its required containment."""
     if program_key not in {"git", "adb"}:
         raise ValueError(f"no broker helper trust policy exists for {program_key}")
     configured_path = getattr(settings, f"{program_key}_executable_path")
@@ -187,23 +187,25 @@ def trusted_helper_identity(settings: Any, program_key: str) -> dict[str, Any]:
             f"{program_key} is enabled but unavailable: configure both "
             f"{program_key}_executable_path and {program_key}_executable_sha256"
         )
-    if program_key == "git":
-        raise PermissionError(
-            "automatic Git broker execution is disabled because workspace-controlled "
-            "repository metadata cannot be safely confined to workspace_root; "
-            "use an explicitly human-approved execution route"
-        )
     executable = ensure_external_tool_executable(
         configured_path,
         workspace_root=settings.workspace_root,
         data_dir=settings.data_dir,
         sandbox_scratch_dir=settings.sandbox_scratch_dir,
     )
-    return capture_executable_identity(
+    identity = capture_executable_identity(
         executable,
         expected_sha256=configured_sha256,
         provenance="explicit-local-config",
     )
+    if program_key == "git":
+        # Import lazily so the low-level identity helpers remain acyclic. Automatic Git is
+        # available only when the same Windows sandbox/WFP/Job boundary used at execution has
+        # current machine-bound live evidence; a valid git.exe hash alone is never sufficient.
+        from .git_broker_sandbox import require_git_broker_containment
+
+        require_git_broker_containment(settings, identity)
+    return identity
 
 
 def verify_file_identity(expected: dict[str, Any]) -> Path:
