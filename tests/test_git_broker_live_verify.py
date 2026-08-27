@@ -15,6 +15,9 @@ from windows_local_mcp.git_broker_sandbox import GitBrokerUnavailable
 from windows_local_mcp.sandbox_backend import SANDBOX_SECURITY_PROPERTIES
 
 
+_BUILTINS = b"status diff log show rev-parse ls-files\n"
+
+
 def _settings(tmp_path: Path, **overrides: object) -> Settings:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -77,6 +80,12 @@ def _probe_results(digest: str = "c" * 64) -> list[SimpleNamespace]:
             stderr=b"",
             snapshot_digest=digest,
         ),
+        SimpleNamespace(
+            returncode=0,
+            stdout=_BUILTINS,
+            stderr=b"",
+            snapshot_digest=digest,
+        ),
     ]
 
 
@@ -113,6 +122,8 @@ def test_git_live_context_binds_small_scratch_quota_without_artificial_floor(
 
     assert context["max_sandbox_scratch_bytes"] == 1024 * 1024
     assert context["command_policy_version"] == GIT_BROKER_COMMAND_POLICY_VERSION
+    assert context["git_process_cwd"] == "trusted-executable-directory-before-fixed--C"
+    assert context["git_subcommand_execution"] == "required-automatic-commands-must-be-builtins"
 
 
 def test_git_live_context_binds_scratch_quota(
@@ -158,6 +169,7 @@ def test_git_live_verifier_writes_exact_context_marker(
     assert marker["context"]["command_policy_version"] == GIT_BROKER_COMMAND_POLICY_VERSION
     assert marker["route_eligible"] is True
     assert marker["checks"]["git_projection_snapshot_bound"] is True
+    assert marker["checks"]["git_allowed_commands_builtin"] is True
     assert all(marker["checks"].values())
     assert require_git_broker_live_verification(settings, identity) == marker
 
@@ -180,6 +192,34 @@ def test_git_live_verifier_rejects_mismatched_projection_snapshot(
     )
     results = _probe_results()
     results[1].snapshot_digest = "d" * 64
+    monkeypatch.setattr(
+        git_broker_live_verify,
+        "run_git_broker_batch",
+        lambda **_kwargs: results,
+    )
+
+    with pytest.raises(GitBrokerUnavailable, match="live verification failed"):
+        verify_git_broker_live(settings)
+
+
+def test_git_live_verifier_rejects_externalized_automatic_subcommand(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    identity = _identity(tmp_path)
+    containment = _containment(_evidence())
+    from windows_local_mcp import git_broker_live_verify
+
+    monkeypatch.setattr(
+        git_broker_live_verify, "configured_git_identity", lambda _settings: identity
+    )
+    monkeypatch.setattr(
+        git_broker_live_verify,
+        "require_git_broker_containment",
+        lambda _settings, _identity: containment,
+    )
+    results = _probe_results()
+    results[2].stdout = b"status diff log show rev-parse\n"
     monkeypatch.setattr(
         git_broker_live_verify,
         "run_git_broker_batch",
