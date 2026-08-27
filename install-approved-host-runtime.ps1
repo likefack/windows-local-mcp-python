@@ -182,11 +182,18 @@ try {
 
     if ($Replace -and (Test-Path -LiteralPath $InstallRoot)) {
         # An existing immutable runtime can come from an older installer whose descendant ACLs
-        # accidentally removed the Administrators ACE. Replacement is an explicit elevated
-        # maintenance action, so first reclaim the retired tree for Administrators and only then
-        # delete it. This changes only the old tree after active/recovery state has been excluded;
-        # the newly staged runtime remains protected and is moved into place afterwards.
-        & icacls.exe $InstallRoot /setowner "*S-1-5-32-544" /T | Out-Null
+        # accidentally removed the Administrators ACE. icacls /setowner cannot necessarily walk
+        # such a tree because it still needs traversal/access to every descendant. Replacement is
+        # an explicit elevated maintenance action, so use takeown with SeTakeOwnershipPrivilege to
+        # make Administrators the owner of the retired tree first, then restore Administrators full
+        # control and delete it. /SKIPSL prevents recursive ownership recovery from following links.
+        # This runs only after active/recovery state has been excluded and any authority service has
+        # been stopped; the newly staged immutable runtime is not weakened by this recovery step.
+        $TakeownExe = Join-Path $env:SystemRoot "System32\takeown.exe"
+        if (-not (Test-Path -LiteralPath $TakeownExe -PathType Leaf)) {
+            throw "Windows takeown.exe is required to replace a previous Approved Host runtime: $TakeownExe"
+        }
+        & $TakeownExe /F $InstallRoot /A /R /D Y /SKIPSL | Out-Null
         if ($LASTEXITCODE -ne 0) {
             throw "Reclaiming ownership of the previous Approved Host runtime failed."
         }
