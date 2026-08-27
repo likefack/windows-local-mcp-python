@@ -30,7 +30,7 @@ from .util import canonical_json, sha256_bytes, sha256_text
 from .wfp_guard_identity import hold_wfp_guard_implementation
 from .windows_job import WindowsJobLimits
 
-GIT_BROKER_POLICY_VERSION = 1
+GIT_BROKER_POLICY_VERSION = 2
 _GIT_PROCESS_LIMIT = 16
 _GIT_MEMORY_LIMIT = 1024 * 1024 * 1024
 _GIT_CONFIG_LIMIT = 1024 * 1024
@@ -84,6 +84,7 @@ def require_git_broker_containment(
         context = {
             "version": GIT_BROKER_POLICY_VERSION,
             "git_executable": git_identity,
+            "git_process_cwd": "trusted-executable-directory-before-fixed--C",
             "sandbox_backend": backend.as_dict(),
             "sandbox_isolation_context_digest": isolation_context_digest(settings, backend),
             "workspace_root": str(settings.workspace_root.resolve(strict=True)),
@@ -479,6 +480,20 @@ def _rewrite_cwd(cwd: str, stage: GitBrokerStage) -> Path:
     return staged
 
 
+def _prepare_git_launch(
+    command: Sequence[str], stage: GitBrokerStage, git_identity: dict[str, Any], cwd: str
+) -> tuple[list[str], Path]:
+    """Keep the Windows process cwd trusted and move Git itself with a fixed -C operand."""
+
+    rewritten = _rewrite_command(command, stage)
+    staged_cwd = _rewrite_cwd(cwd, stage)
+    bound_executable = Path(str(git_identity["path"])).resolve(strict=True)
+    if Path(rewritten[0]).resolve(strict=True) != bound_executable:
+        raise GitBrokerUnavailable("Automatic Git command does not match the bound executable")
+    trusted_launch_cwd = bound_executable.parent.resolve(strict=True)
+    return [rewritten[0], "-C", str(staged_cwd), *rewritten[1:]], trusted_launch_cwd
+
+
 def _map_output_paths(data: bytes, stage: GitBrokerStage) -> bytes:
     replacements = (
         (str(stage.repository).encode(), str(stage.source_root).encode()),
@@ -573,12 +588,7 @@ def _run_one(
     ]
     | None,
 ) -> GitBrokerResult:
-    rewritten = _rewrite_command(command, stage)
-    staged_cwd = _rewrite_cwd(cwd, stage)
-    if Path(rewritten[0]).resolve(strict=True) != Path(
-        str(git_identity["path"])
-    ).resolve(strict=True):
-        raise GitBrokerUnavailable("Automatic Git command does not match the bound executable")
+    launch_command, launch_cwd = _prepare_git_launch(command, stage, git_identity, cwd)
     environment = _git_environment(settings, containment, stage, git_identity)
     if output_paths is None:
         token = uuid.uuid4().hex
@@ -605,8 +615,8 @@ def _run_one(
         process, job, _argv, guard_payload = guard_and_launch_codex_sandbox(
             containment.backend,
             settings=settings,
-            command=rewritten,
-            cwd=staged_cwd,
+            command=launch_command,
+            cwd=launch_cwd,
             writable_roots=(stage.root,),
             environment=environment,
             stdin=subprocess.DEVNULL,
