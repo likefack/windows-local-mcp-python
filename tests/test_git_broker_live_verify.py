@@ -63,6 +63,23 @@ def _containment(evidence: dict[str, object]) -> SimpleNamespace:
     )
 
 
+def _probe_results(digest: str = "c" * 64) -> list[SimpleNamespace]:
+    return [
+        SimpleNamespace(
+            returncode=0,
+            stdout=b"true\n",
+            stderr=b"",
+            snapshot_digest=digest,
+        ),
+        SimpleNamespace(
+            returncode=0,
+            stdout=b"",
+            stderr=b"",
+            snapshot_digest=digest,
+        ),
+    ]
+
+
 def test_git_live_context_rejects_generic_sandbox_residual_property(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -129,27 +146,48 @@ def test_git_live_verifier_writes_exact_context_marker(
         "require_git_broker_containment",
         lambda _settings, _identity: containment,
     )
-
-    def fake_batch(**_kwargs: object) -> list[SimpleNamespace]:
-        return [
-            SimpleNamespace(returncode=0, stdout=b"true\n", stderr=b""),
-            SimpleNamespace(
-                returncode=0,
-                stdout=(str(settings.workspace_root.resolve()) + "\n").encode(),
-                stderr=b"",
-            ),
-            SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
-        ]
-
-    monkeypatch.setattr(git_broker_live_verify, "run_git_broker_batch", fake_batch)
+    monkeypatch.setattr(
+        git_broker_live_verify,
+        "run_git_broker_batch",
+        lambda **_kwargs: _probe_results(),
+    )
 
     marker = verify_git_broker_live(settings)
 
     assert marker["version"] == GIT_BROKER_LIVE_MARKER_VERSION
     assert marker["context"]["command_policy_version"] == GIT_BROKER_COMMAND_POLICY_VERSION
     assert marker["route_eligible"] is True
+    assert marker["checks"]["git_projection_snapshot_bound"] is True
     assert all(marker["checks"].values())
     assert require_git_broker_live_verification(settings, identity) == marker
+
+
+def test_git_live_verifier_rejects_mismatched_projection_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    identity = _identity(tmp_path)
+    containment = _containment(_evidence())
+    from windows_local_mcp import git_broker_live_verify
+
+    monkeypatch.setattr(
+        git_broker_live_verify, "configured_git_identity", lambda _settings: identity
+    )
+    monkeypatch.setattr(
+        git_broker_live_verify,
+        "require_git_broker_containment",
+        lambda _settings, _identity: containment,
+    )
+    results = _probe_results()
+    results[1].snapshot_digest = "d" * 64
+    monkeypatch.setattr(
+        git_broker_live_verify,
+        "run_git_broker_batch",
+        lambda **_kwargs: results,
+    )
+
+    with pytest.raises(GitBrokerUnavailable, match="live verification failed"):
+        verify_git_broker_live(settings)
 
 
 def test_git_live_marker_is_stale_when_pinned_git_identity_changes(
@@ -171,15 +209,7 @@ def test_git_live_marker_is_stale_when_pinned_git_identity_changes(
     monkeypatch.setattr(
         git_broker_live_verify,
         "run_git_broker_batch",
-        lambda **_kwargs: [
-            SimpleNamespace(returncode=0, stdout=b"true\n", stderr=b""),
-            SimpleNamespace(
-                returncode=0,
-                stdout=(str(settings.workspace_root.resolve()) + "\n").encode(),
-                stderr=b"",
-            ),
-            SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
-        ],
+        lambda **_kwargs: _probe_results(),
     )
     verify_git_broker_live(settings)
 
@@ -208,15 +238,7 @@ def test_git_live_marker_is_stale_when_command_policy_generation_changes(
     monkeypatch.setattr(
         git_broker_live_verify,
         "run_git_broker_batch",
-        lambda **_kwargs: [
-            SimpleNamespace(returncode=0, stdout=b"true\n", stderr=b""),
-            SimpleNamespace(
-                returncode=0,
-                stdout=(str(settings.workspace_root.resolve()) + "\n").encode(),
-                stderr=b"",
-            ),
-            SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
-        ],
+        lambda **_kwargs: _probe_results(),
     )
     verify_git_broker_live(settings)
 
