@@ -207,14 +207,13 @@ class CommandPolicy:
             has_paths = "--" in tail and bool(tail[tail.index("--") + 1 :])
             explicit_content = any(value in {"--patch", "-p", "--binary"} for value in tail)
             metadata_only = any(
-                value in {"--stat", "--name-only", "--name-status", "--check", "--quiet"}
+                value in {"--stat", "--name-only", "--name-status", "--quiet"}
                 for value in tail
             )
             content_output = has_paths and (explicit_content or not metadata_only)
             allowed = self.GIT_COMMON_FLAGS | {
                 "--cached",
                 "--staged",
-                "--check",
                 "--quiet",
                 "--exit-code",
                 "--no-renames",
@@ -222,10 +221,13 @@ class CommandPolicy:
             if has_paths:
                 allowed |= {"--patch", "-p", "--binary"}
             normalized = self._git_revisions_flags_paths(
-                tail, allowed, files_only=content_output
+                tail,
+                allowed,
+                files_only=content_output,
+                require_commitish=True,
             )
             if not has_paths and not any(
-                value in {"--stat", "--name-only", "--name-status", "--check", "--quiet"}
+                value in {"--stat", "--name-only", "--name-status", "--quiet"}
                 for value in normalized
             ):
                 normalized.insert(0, "--stat")
@@ -330,7 +332,7 @@ class CommandPolicy:
             elif self.SAFE_REVISION.fullmatch(value) and not value.startswith("-"):
                 if require_commitish and ".." in value:
                     raise PermissionError(
-                        "automatic git show accepts individual commit-ish revisions only"
+                        "automatic Git accepts individual commit-ish revisions only"
                     )
                 revision_count += 1
                 normalized_head.append(
@@ -338,9 +340,7 @@ class CommandPolicy:
                 )
             else:
                 raise PermissionError("Git revision or option is not in the safe grammar")
-        if require_commitish and revision_count == 0:
-            if default_revision is None:
-                raise PermissionError("automatic Git command requires a commit-ish revision")
+        if require_commitish and revision_count == 0 and default_revision is not None:
             normalized_head.append(f"{default_revision}^{{commit}}")
         if paths:
             return [
