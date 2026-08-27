@@ -29,10 +29,27 @@ trusted operator はこの対処を product concept に反するとして拒否�
 このため、以下を current operator decision として固定します。
 
 - Approved Host を全面停止することは WLMCP-R2-001 の受容可能な最終修正ではありません。
-- `VERIFICATION.md` にある `fixed by capability reduction / closed` という記録は、その時点で exploit sink を停止した技術的 mitigation の履歴としてのみ扱います。product requirement を満たした root remediation の受容記録として扱ってはなりません。
-- 現在の実装が Approved Host execution を停止している間、その状態は security mitigation であると同時に既知の product regression です。
+- `VERIFICATION.md` にある旧 `fixed by capability reduction / closed` 記録は、その時点で exploit sink を停止した temporary mitigation の履歴としてのみ扱います。product requirement を満たした root remediation の受容記録ではありません。
 - WLMCP-R2-001 の最終 remediation は、Approved Host の intended function を復元したうえで、same-user monitor termination / postflight bypass を成立させない security boundary を実装・検証する必要があります。
-- 将来の agent は、現在の全面停止状態を precedent として別 finding に capability reduction を適用してはなりません。
+- 将来の agent は旧全面停止状態を precedent として別 finding に capability reduction を適用してはなりません。
+
+## Current root-remediation candidate
+
+この branch では上記 operator decision に従い、Approved Host を停止するのではなく authority boundary を変更しています。
+
+- monitor／postflight worker は LocalSystem service `WindowsLocalMCPApprovedHost` 配下で実行する。
+- 実 Approved Host command は、verified named-pipe requester の元の非昇格 Windows user token を `CreateProcessAsUserW` で使用する。child を SYSTEM に昇格しない。
+- SYSTEM worker は child を suspended 作成し Job Object に割り当ててから resume する。
+- WMI／CIM provider が Job 外に作る process の census は SYSTEM user ではなく元 requester user の PID／create-time を追う。
+- durable `active.json` は `%ProgramData%\WindowsLocalMCP\ApprovedHostAuthority` の LocalSystem-owned protected namespace に置き、normal completion まで immutable とする。
+- running／recovery 状態は sidecar に分け、service epoch、authority nonce、requester identity、worker context を binding する。
+- worker kill、service restart、channel loss、unhandled exception、postflight mismatch、Job 外 helper 残存では valid normal-completion proof が成立せず latch を解除しない。
+- runtime user／Approved Host child には service stop/change-config、monitor cancel、SYSTEM worker terminate/suspend/duplicate-handle/VM-write/token-manipulation 等の authority を与えない。
+- active Approved Host の `stop_job` は runtime-user control plane から monitor を停止する primitive にならないよう拒否する。これは Host execution capability の削除ではなく、independent monitor survival の security invariant とする。
+
+この architecture は source／tests 上で実装されていても、実 Windows の SCM DACL、ProgramData DACL、process/thread/token access、requester-token child authority、WMI job-external helper、worker kill、service restart を live verification するまでは受容済み root fix ではありません。
+
+Current status は `valid / remediation implemented / Windows live verification pending` とします。Windows live verification 成功前に `fixed`／`closed` と記録したり main へ merge したりしません。
 
 ## セキュリティ修正時の判断手順
 
@@ -46,24 +63,39 @@ Approved Host または他の中核 capability に security finding がある場
 6. 一時 mitigation が必要なら、temporary であること、失われる capability、未解決 finding を明記する。
 7. 最終 verification は security invariant と intended product function の両方を regression test / live verification の対象にする。
 
-## Approved Host を安全に再設計する場合の最低条件
+## Approved Host の最低 security conditions
 
-具体的な実装方式は固定しません。ただし、WLMCP-R2-001 のような monitor termination / postflight bypass を閉じる場合、少なくとも次を同時に満たす設計を要求します。
+具体的な実装方式の名前だけを保証とみなしません。少なくとも次を同時に実証する必要があります。
 
-- Approved Host child が monitor / postflight owner を停止・改変できないこと。
-- Approved Host child が durable tamper / pending state を削除・偽造できないこと。
-- worker / server abnormal termination 後も security-relevant state が restart を跨いで fail closed に残ること。
-- 正常 operation と crash / kill / out-of-Job helper / restart recovery を区別して検証できること。
-- one-shot human approval と immutable input binding を維持すること。
-- Approved Host が本来必要とする通常 Windows user authority を失わないこと。
-- Codex Sandbox / Broker で代替不能な処理を Approved Host で実行できることを regression で確認すること。
+- Approved Host child が monitor / postflight owner を terminate、suspend、thread-kill、inject、VM-write、handle-duplicate、token-manipulate、security-descriptor rewrite できないこと。
+- Approved Host child が durable tamper / pending / recovery / epoch state を削除・置換・偽造・rollback できないこと。
+- worker / server / UI / service abnormal termination 後も security-relevant state が restart を跨いで fail closed に残ること。
+- 正常 operation と crash / kill / out-of-Job helper / channel loss / restart recovery を自律的に区別し、child が normal completion を偽造できないこと。
+- one-shot human approval、TTL、immutable input／manifest／executable identity binding を維持すること。
+- project-controlled code-loader と workspace executable を Approved Host で実行しない既存境界を維持すること。
+- Approved Host command 自体は本来必要とする通常 Windows user authority を失わないこと。
+- Codex Sandbox / Broker で代替不能な non-project-controlled command を Approved Host で正常実行できることを regression／live E2E で確認すること。
+- Sandbox／Broker の既存 security regressions を弱めないこと。
 
-別 user、別 session、SYSTEM service、service-owned durable state、ACL / token separation 等は候補になり得ますが、特定方式の採用自体を保証とみなしません。実際の Windows authority boundary と bypass resistance を検証して初めて根拠とします。
+## Required Windows live verification
+
+最終受容には少なくとも以下を要求します。
+
+1. normal path: request → local one-shot approval → SYSTEM worker → ordinary non-elevated requester-user child → postflight → latch clear。
+2. runtime-user token から authority service／SYSTEM worker の sensitive process/thread/token/SCM rights が拒否されること。
+3. durable ProgramData state の enumerate／create／delete／replace が runtime user から拒否されること。
+4. `Win32_Process.Create` で requester-user の Job 外 helper が実在する状態を確認すること。
+5. verified SYSTEM worker identity を fault injection で kill しても immutable latch が残ること。
+6. service restart 後も同じ latch が残り `recovery_required` であること。
+7. abnormal Host 前に作った legacy pending approval が generation check／Executor authority gate を bypass できないこと。
+8. explicit administrator recovery が live monitor の stop API にならず、review 後だけ新 epoch を開始できること。
+
+GitHub Hosted Windows の unit/integration test はこの OS-level live evidence の代替ではありません。
 
 ## ドキュメントの優先関係
 
 この文書は Approved Host の product intent に関する trusted operator の明示決定を記録します。
 
-`SECURITY_CONTRACT.md`、`SPEC.md`、`README.md`、`VERIFICATION.md` に current implementation の全面停止を permanent / accepted design と読める記述が残っている場合、それはこの operator decision と衝突します。その衝突を理由に全面停止を正当化せず、差異を報告し、Approved Host の安全な機能復元に合わせて関連文書を整合させます。
+`SECURITY_CONTRACT.md`、`SPEC.md`、`README.md`、`VERIFICATION.md` に旧 temporary capability reduction を permanent / accepted current design と読める記述が残っている場合、それはこの operator decision と衝突します。その衝突を理由に全面停止を正当化せず、LocalSystem authority remediation と検証状態に合わせて関連文書を整合させます。
 
-security invariant を弱める指示ではありません。要求は「安全性を下げて機能を残す」ことではなく、「安全性と Approved Host の中核機能の両方を満たす修正を行う。両立できない間は未解決として扱う」ことです。
+security invariant を弱める指示ではありません。要求は「安全性を下げて機能を残す」ことではなく、「安全性と Approved Host の中核機能の両方を満たす修正を行う。両立を実証できない間は未解決として扱う」ことです。
