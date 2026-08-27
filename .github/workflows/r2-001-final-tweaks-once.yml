@@ -1,0 +1,99 @@
+name: R2-001 Final Tweaks Once
+
+on:
+  push:
+    branches:
+      - fix/wlmcp-r2-001-root
+
+permissions:
+  contents: write
+
+jobs:
+  tweak:
+    if: github.event.head_commit.message != 'Apply WLMCP-R2-001 final tweaks'
+    runs-on: windows-latest
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v7
+        with:
+          ref: fix/wlmcp-r2-001-root
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install dev checks
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+          python -m pip check
+
+      - name: Apply exact tweaks
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+
+          def replace(path: str, old: str, new: str, count: int = 1) -> None:
+              target = Path(path)
+              text = target.read_text(encoding="utf-8")
+              actual = text.count(old)
+              if actual != count:
+                  raise SystemExit(f"{path}: expected {count} exact matches, got {actual}")
+              target.write_text(text.replace(old, new, count), encoding="utf-8", newline="\n")
+
+          replace(
+              "tests/test_approved_host_fail_closed.py",
+              '''    monkeypatch.setattr(\n        "windows_local_mcp.executor.ApprovedHostAuthorityClient",\n        FakeAuthority,\n    )\n\n    def forbidden_spawn(*_args: object, **_kwargs: object) -> object:\n''',
+              '''    monkeypatch.setattr(\n        "windows_local_mcp.executor.ApprovedHostAuthorityClient",\n        FakeAuthority,\n    )\n    # The test forbids executor-side Popen. Avoid coupling that monkeypatch to the\n    # global subprocess module used by the SCM existence probe during context creation.\n    monkeypatch.setattr(\n        "windows_local_mcp.approved_host_policy._authority_service_installed",\n        lambda: False,\n    )\n\n    def forbidden_spawn(*_args: object, **_kwargs: object) -> object:\n''',
+          )
+          replace(
+              "src/windows_local_mcp/approved_host_live_verification.py",
+              "        workspace_write=False,\n",
+              "        workspace_write=True,\n",
+          )
+          replace(
+              "src/windows_local_mcp/approved_host_abnormal_verification.py",
+              "        workspace_write=False,\n",
+              "        workspace_write=True,\n",
+              count=2,
+          )
+          replace(
+              "docs/APPROVED_HOST_RUNTIME.md",
+              "Hosted CI は service／state ACL の synthetic verification と source-level regression までです。\n",
+              "Hosted CI は service／state ACL の synthetic verification と source-level regression までです。R2-001 専用 live verifier は別 finding WLMCP-R3-002 の `workspace_write=false` materialization 経路に依存しないよう、non-project-controlled command を `workspace_write=true` で実行します。\n",
+          )
+          '@ | Set-Content -LiteralPath .dev-r2-final-tweaks.py -Encoding utf8
+          python .dev-r2-final-tweaks.py
+          Remove-Item -LiteralPath .dev-r2-final-tweaks.py -Force
+
+      - name: Ruff
+        run: python -m ruff check src tests
+
+      - name: Whitespace
+        shell: bash
+        run: git diff --check
+
+      - name: Deterministic focused tests
+        run: >-
+          python -m pytest -q
+          tests/test_approved_host_fail_closed.py
+          tests/test_approved_host_policy.py
+          tests/test_approved_host_service_entry.py
+          tests/test_approved_host_stop_boundary.py
+
+      - name: Recheck timeout regression
+        run: >-
+          python -m pytest -q
+          tests/test_approval_execution_integration.py::test_approved_host_terminates_descendants_at_runtime_limit
+
+      - name: Commit source changes
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src tests docs/APPROVED_HOST_RUNTIME.md
+          git commit -m 'Apply WLMCP-R2-001 final tweaks'
+          git push origin HEAD:fix/wlmcp-r2-001-root
