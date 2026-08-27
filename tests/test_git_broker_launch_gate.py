@@ -181,3 +181,4 @@ def test_verify_git_broker_live_uses_bootstrap_probe_mode(
     assert marker["checks"]["git_projection_snapshot_bound"] is True
     assert marker["checks"]["git_allowed_commands_builtin"] is True
     assert seen["live_verification_probe"] is True
+    assert seen["timeout"] == 180.0
