@@ -308,6 +308,7 @@ def _copy_repository_tree(
     entry_limit: int,
 ) -> tuple[int, int, str]:
     file_count = 0
+    entry_count = 0
     total_bytes = 0
     digest = hashlib.sha256()
     pending: list[tuple[Path, Path]] = [(source, Path())]
@@ -324,6 +325,9 @@ def _copy_repository_tree(
         finally:
             release_verified_hold(held_directory)
         for entry in entries:
+            entry_count += 1
+            if entry_count > entry_limit:
+                raise GitBrokerUnavailable("automatic Git snapshot exceeds its entry-count limit")
             relative = relative_root / entry.name
             if relative.parts and relative.parts[0].casefold() == ".git":
                 if len(relative.parts) == 1:
@@ -361,8 +365,6 @@ def _copy_repository_tree(
             if not entry.is_file(follow_symlinks=False):
                 raise GitBrokerUnavailable(f"non-regular Git input is denied: {relative}")
             file_count += 1
-            if file_count > entry_limit:
-                raise GitBrokerUnavailable("automatic Git snapshot exceeds its file-count limit")
             remaining = byte_limit - total_bytes
             if remaining < 0:
                 raise GitBrokerUnavailable("automatic Git snapshot exceeds its byte limit")
