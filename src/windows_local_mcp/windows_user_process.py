@@ -4,9 +4,10 @@ import ctypes
 import msvcrt
 import os
 import subprocess
+from collections.abc import Callable, Mapping
 from ctypes import wintypes
 from pathlib import Path
-from typing import Any, BinaryIO, Mapping
+from typing import Any, BinaryIO
 
 import psutil
 
@@ -103,6 +104,8 @@ if os.name == "nt":
         wintypes.HANDLE,
     ]
     _kernel32.CreateFileW.restype = wintypes.HANDLE
+    _kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    _kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
     _kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
     _kernel32.WaitForSingleObject.restype = wintypes.DWORD
     _kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
@@ -231,11 +234,7 @@ def _create_output_pipe() -> tuple[wintypes.HANDLE, wintypes.HANDLE]:
         0,
     ):
         raise _winerror("CreatePipe")
-    if not _kernel32.SetHandleInformation(
-        read_handle,
-        _HANDLE_FLAG_INHERIT,
-        0,
-    ):
+    if not _kernel32.SetHandleInformation(read_handle, _HANDLE_FLAG_INHERIT, 0):
         _kernel32.CloseHandle(read_handle)
         _kernel32.CloseHandle(write_handle)
         raise _winerror("SetHandleInformation")
@@ -296,7 +295,11 @@ class WindowsCreatedProcess:
         return self.returncode
 
     def wait(self, timeout: float | None = None) -> int:
-        milliseconds = _INFINITE if timeout is None else max(0, min(0xFFFFFFFE, int(timeout * 1000)))
+        milliseconds = (
+            _INFINITE
+            if timeout is None
+            else max(0, min(0xFFFFFFFE, int(timeout * 1000)))
+        )
         result = _kernel32.WaitForSingleObject(self._handle, milliseconds)
         if result == _WAIT_TIMEOUT:
             raise subprocess.TimeoutExpired(["approved-host-user-process"], timeout)
@@ -334,8 +337,9 @@ def popen_as_requester_in_job(
     cwd: str | Path,
     environment: Mapping[str, str],
     creationflags: int = 0,
+    on_process_created: Callable[[], None] | None = None,
 ) -> WindowsCreatedProcess:
-    """Create a medium-user process suspended, bind it to the SYSTEM worker Job, then resume."""
+    """Create a user process suspended, bind it to the SYSTEM-owned Job, then resume."""
     if os.name != "nt":
         raise WindowsUserProcessUnavailable("Approved Host user-token launch requires native Windows")
     _validate_requester_identity(requester_pid, requester_create_time)
@@ -376,11 +380,13 @@ def popen_as_requester_in_job(
         ):
             raise _winerror("CreateProcessAsUserW")
         process_created = True
-        if not job._job:  # noqa: SLF001 - same-package security boundary integration
+        if on_process_created is not None:
+            on_process_created()
+        if not job._job:  # noqa: SLF001 - same-package Job boundary integration
             raise WindowsUserProcessUnavailable("Approved Host Job Object is unavailable")
-        if not job._kernel32.AssignProcessToJobObject(job._job, process_info.hProcess):  # type: ignore[attr-defined]  # noqa: SLF001
+        if not _kernel32.AssignProcessToJobObject(job._job, process_info.hProcess):  # noqa: SLF001
             raise _winerror("AssignProcessToJobObject")
-        job._start_watcher()  # noqa: SLF001 - same-package security boundary integration
+        job._start_watcher()  # noqa: SLF001 - same-package Job boundary integration
         resumed = _kernel32.ResumeThread(process_info.hThread)
         if resumed == 0xFFFFFFFF:
             raise _winerror("ResumeThread")
@@ -396,8 +402,10 @@ def popen_as_requester_in_job(
         stdout_read = wintypes.HANDLE()
         stderr = _binary_reader_from_handle(stderr_read)
         stderr_read = wintypes.HANDLE()
+        owned_process_handle = process_info.hProcess
+        process_info.hProcess = wintypes.HANDLE()
         return WindowsCreatedProcess(
-            process_handle=process_info.hProcess,
+            process_handle=owned_process_handle,
             pid=int(process_info.dwProcessId),
             stdout=stdout,
             stderr=stderr,
@@ -407,10 +415,19 @@ def popen_as_requester_in_job(
             _kernel32.TerminateProcess(process_info.hProcess, 1)
         if process_info.hThread:
             _kernel32.CloseHandle(process_info.hThread)
+            process_info.hThread = wintypes.HANDLE()
         if process_info.hProcess:
             _kernel32.CloseHandle(process_info.hProcess)
+            process_info.hProcess = wintypes.HANDLE()
         raise
     finally:
-        for handle in (stdout_read, stdout_write, stderr_read, stderr_write, stdin_handle, primary_token):
+        for handle in (
+            stdout_read,
+            stdout_write,
+            stderr_read,
+            stderr_write,
+            stdin_handle,
+            primary_token,
+        ):
             if handle:
                 _kernel32.CloseHandle(handle)
