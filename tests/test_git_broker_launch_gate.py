@@ -10,7 +10,7 @@ from windows_local_mcp.git_broker_sandbox import (
     _require_current_git_live_marker,
 )
 
-_BUILTINS = b"status diff log show rev-parse ls-files\n"
+_BUILTINS = b"status diff log show rev-parse ls-files symbolic-ref\n"
 
 
 def test_ordinary_git_launch_rechecks_git_specific_marker(
