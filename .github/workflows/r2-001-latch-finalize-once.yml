@@ -87,6 +87,15 @@ jobs:
               "worker kill、unhandled exception、thread/process termination、channel loss、postflight failure、WMI／CIM helper 残存、service restart、epoch mismatch では normal proof が成立せず、`active.json` は残ります。service restart 中に active state を見つけた場合は `recovery_required` にします。旧 service epoch の proof を新 epoch で受理しません。\n",
               "worker kill、unhandled exception、thread/process termination、channel loss、postflight failure、WMI／CIM helper 残存、service restart、epoch mismatch では normal proof が成立せず、`active.json` は残ります。service restart 中に active state を見つけた場合は `recovery_required` にします。旧 service epoch の proof を新 epoch で受理しません。service が provision 済みなら、user-owned config で `approved_host_enabled=false` に変更しても active／recovery latch の global health check は継続します。\n",
           )
+
+          for path in (
+              "src/windows_local_mcp/approved_host_authority.py",
+              "tests/test_approved_host_policy.py",
+              "tests/test_approved_host_stop_boundary.py",
+          ):
+              target = Path(path)
+              text = target.read_text(encoding="utf-8")
+              target.write_text(text.rstrip() + "\n", encoding="utf-8", newline="\n")
           '@ | Set-Content -LiteralPath .dev-r2-latch-finalize.py -Encoding utf8
           python .dev-r2-latch-finalize.py
           Remove-Item -LiteralPath .dev-r2-latch-finalize.py -Force
