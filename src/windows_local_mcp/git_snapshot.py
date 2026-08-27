@@ -4,6 +4,7 @@ from pathlib import Path
 
 from .config import Settings
 from .git_broker_sandbox import run_git_broker_batch
+from .git_metadata import GIT_STRUCTURAL_COMMIT_FORMAT
 from .paths import hold_verified_path, release_verified_hold
 from .redaction import redact_text
 from .resources import enforce_data_quota
@@ -43,6 +44,10 @@ def capture_git_snapshot(
             "-c",
             "core.untrackedCache=false",
             "-c",
+            "maintenance.auto=false",
+            "-c",
+            "gc.auto=0",
+            "-c",
             "diff.autoRefreshIndex=false",
             "-c",
             "diff.external=",
@@ -50,14 +55,12 @@ def capture_git_snapshot(
             "credential.helper=",
         ]
         commands = [
-            ("branch", [*git_base, "-C", str(root), "symbolic-ref", "--short", "HEAD"]),
-            ("head", [*git_base, "-C", str(root), "rev-parse", "HEAD"]),
+            ("branch", [*git_base, "symbolic-ref", "--short", "HEAD"]),
+            ("head", [*git_base, "rev-parse", "HEAD"]),
             (
                 "status",
                 [
                     *git_base,
-                    "-C",
-                    str(root),
                     "status",
                     "--porcelain=v1",
                     "--branch",
@@ -68,8 +71,6 @@ def capture_git_snapshot(
                 "diff",
                 [
                     *git_base,
-                    "-C",
-                    str(root),
                     "diff",
                     "--stat",
                     "--name-status",
@@ -81,8 +82,6 @@ def capture_git_snapshot(
                 "staged",
                 [
                     *git_base,
-                    "-C",
-                    str(root),
                     "diff",
                     "--cached",
                     "--stat",
@@ -95,12 +94,9 @@ def capture_git_snapshot(
                 "recent",
                 [
                     *git_base,
-                    "-C",
-                    str(root),
                     "log",
                     "-10",
-                    "--oneline",
-                    "--decorate",
+                    GIT_STRUCTURAL_COMMIT_FORMAT,
                     "--no-ext-diff",
                     "--no-textconv",
                 ],
@@ -109,8 +105,6 @@ def capture_git_snapshot(
                 "changed-files",
                 [
                     *git_base,
-                    "-C",
-                    str(root),
                     "diff",
                     "--name-status",
                     "--no-ext-diff",
