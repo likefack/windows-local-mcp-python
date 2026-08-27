@@ -15,6 +15,8 @@ APPROVED_HOST_UNAVAILABLE_REASON = (
     "LocalSystem authority service and a healthy durable authority state."
 )
 _SERVICE_DOES_NOT_EXIST_EXIT_CODE = 1060
+_AUTHORITY_WORKER_ENV = "WINDOWS_LOCAL_MCP_AUTHORITY_WORKER"
+_LOCAL_SYSTEM_SID = "S-1-5-18"
 
 
 def _service_query_indicates_installed(returncode: int) -> bool:
@@ -47,6 +49,20 @@ def _authority_service_installed() -> bool:
     return _service_query_indicates_installed(completed.returncode)
 
 
+def _authority_worker_bypass_allowed() -> bool:
+    """Allow the active-latch bypass only inside the independently privileged worker."""
+    if os.name != "nt" or os.environ.get(_AUTHORITY_WORKER_ENV) != "1":
+        return False
+    try:
+        from .approved_host_service import _current_process_sid
+
+        return _current_process_sid().casefold() == _LOCAL_SYSTEM_SID.casefold()
+    except Exception:
+        # Failure to prove LocalSystem identity must never turn a user-controlled
+        # environment variable into a durable-latch bypass.
+        return False
+
+
 def install_approved_host_authority_health_gate() -> None:
     """Bind global control-plane health to a provisioned SYSTEM authority latch."""
     from . import control_plane_guard
@@ -59,8 +75,10 @@ def install_approved_host_authority_health_gate() -> None:
         original(settings)
         if os.name != "nt":
             return
-        if os.environ.get("WINDOWS_LOCAL_MCP_AUTHORITY_WORKER") == "1":
-            # The active durable latch is expected while the SYSTEM worker owns postflight.
+        if _authority_worker_bypass_allowed():
+            # The active durable latch is expected while the verified LocalSystem worker
+            # owns postflight. A normal user process cannot obtain this bypass by setting
+            # the environment variable alone.
             return
         if not _authority_service_installed():
             # Broker and Sandbox remain usable on installations that never provisioned Host.
