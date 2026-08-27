@@ -205,14 +205,20 @@ class CommandPolicy:
             normalized = self._flags_and_pathspec(tail, allowed)
         elif subcommand == "diff":
             has_paths = "--" in tail and bool(tail[tail.index("--") + 1 :])
-            explicit_content = any(
-                value in {"--patch", "-p", "--binary", "--check"} for value in tail
-            )
+            if any(value in {"--patch", "-p", "--binary", "--check"} for value in tail):
+                raise PermissionError(
+                    "content-bearing Git diff output is not eligible for Automatic Git; "
+                    "use request_sandbox_command"
+                )
             metadata_only = any(
-                value in {"--stat", "--name-only", "--name-status", "--quiet"}
+                value in {"--stat", "--name-only", "--name-status", "--quiet", "--no-patch"}
                 for value in tail
             )
-            content_output = has_paths and (explicit_content or not metadata_only)
+            if has_paths and not metadata_only:
+                raise PermissionError(
+                    "Automatic Git diff with a pathspec requires an explicit metadata-only "
+                    "output mode; use request_sandbox_command for patch content"
+                )
             allowed = self.GIT_COMMON_FLAGS | {
                 "--cached",
                 "--staged",
@@ -220,16 +226,13 @@ class CommandPolicy:
                 "--exit-code",
                 "--no-renames",
             }
-            if has_paths:
-                allowed |= {"--patch", "-p", "--binary", "--check"}
             normalized = self._git_revisions_flags_paths(
                 tail,
                 allowed,
-                files_only=content_output,
                 require_commitish=True,
             )
-            if not has_paths and not any(
-                value in {"--stat", "--name-only", "--name-status", "--quiet"}
+            if not any(
+                value in {"--stat", "--name-only", "--name-status", "--quiet", "--no-patch"}
                 for value in normalized
             ):
                 normalized.insert(0, "--stat")
@@ -240,17 +243,23 @@ class CommandPolicy:
             normalized = ["--no-ext-diff", "--no-textconv", *normalized]
         elif subcommand == "show":
             has_paths = "--" in tail and bool(tail[tail.index("--") + 1 :])
-            explicit_content = any(value in {"--patch", "-p"} for value in tail)
+            if any(value in {"--patch", "-p"} for value in tail):
+                raise PermissionError(
+                    "content-bearing Git show output is not eligible for Automatic Git; "
+                    "use request_sandbox_command"
+                )
             metadata_only = any(
                 value in {"--stat", "--name-only", "--name-status", "--no-patch"}
                 for value in tail
             )
-            content_output = has_paths and (explicit_content or not metadata_only)
-            allowed = self.GIT_COMMON_FLAGS | ({"--patch", "-p"} if has_paths else set())
+            if has_paths and not metadata_only:
+                raise PermissionError(
+                    "Automatic Git show with a pathspec requires an explicit metadata-only "
+                    "output mode; use request_sandbox_command for patch content"
+                )
             normalized = self._git_revisions_flags_paths(
                 tail,
-                allowed,
-                files_only=content_output,
+                self.GIT_COMMON_FLAGS,
                 require_commitish=True,
                 default_revision="HEAD",
             )
