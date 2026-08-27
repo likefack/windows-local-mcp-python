@@ -110,6 +110,7 @@ jobs:
         run: >-
           python -m pytest -q
           tests/test_git_environment.py
+          tests/test_git_broker_launch_gate.py
           tests/test_git_broker_live_verify.py
           tests/test_git_broker_resource_limits.py
           tests/test_git_object_access.py
