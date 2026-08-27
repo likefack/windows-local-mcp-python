@@ -121,6 +121,7 @@ jobs:
           tests/test_security_regressions_git_staging.py
           tests/test_tool_safety.py
           tests/test_directory_toctou.py
+          tests/test_mcp_stdio_transport.py
 
       - name: Full pytest
         run: python -m pytest
