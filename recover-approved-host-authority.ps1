@@ -116,56 +116,67 @@ if ($null -ne $service -and $service.Status -ne [ServiceProcess.ServiceControlle
     )
 }
 
-New-Item -ItemType Directory -Path $CompletedRoot -Force | Out-Null
-$proofs = @(
-    Get-ChildItem -LiteralPath $AuthorityStateRoot -Filter "completion-*.json" -File -ErrorAction SilentlyContinue |
-        Select-Object -ExpandProperty Name
-)
-$recoveryId = "recovery-{0}-{1}.json" -f ([DateTime]::UtcNow.ToString("yyyyMMddTHHmmssfffZ")), ([Guid]::NewGuid().ToString("N"))
-$recoveryArchive = Join-Path $CompletedRoot $recoveryId
-$archive = @{
-    version = 2
-    state = "operator_recovered"
-    recovered_at = [DateTimeOffset]::UtcNow.ToString("o")
-    service_name = $ServiceName
-    active = $active
-    status = $status
-    abandoned_completion_proofs = $proofs
-    postflight_preflight = $postflight
-    postflight_quarantine = $null
-    acknowledgement = "administrator reviewed durable authority and bound postflight state"
-}
-$archive | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $recoveryArchive -Encoding UTF8 -NoNewline
-
-# The user-owned postflight marker is subordinate to the independently privileged authority
-# latch. Quarantine the exact reviewed marker first. If this step races, mismatches, or fails,
-# active.json is still present and the product remains fail closed. If a previous recovery was
-# interrupted after quarantine, the immutable runtime verifies that exact digest-bound object and
-# resumes without requiring the operator to weaken the missing-marker rule.
-if ($hasBoundPostflight) {
-    $postflightRecovered = Invoke-RecoveryPythonJson -Arguments @(
-        "quarantine",
-        "--config", $ConfigPath,
-        "--operation-id", $operationId,
-        "--expected-sha256", ([string]$postflight.marker_identity.sha256)
+$recoveryArchive = $null
+$archive = $null
+try {
+    New-Item -ItemType Directory -Path $CompletedRoot -Force | Out-Null
+    $proofs = @(
+        Get-ChildItem -LiteralPath $AuthorityStateRoot -Filter "completion-*.json" -File -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty Name
     )
-    $archive.postflight_quarantine = $postflightRecovered
+    $recoveryId = "recovery-{0}-{1}.json" -f ([DateTime]::UtcNow.ToString("yyyyMMddTHHmmssfffZ")), ([Guid]::NewGuid().ToString("N"))
+    $recoveryArchive = Join-Path $CompletedRoot $recoveryId
+    $archive = @{
+        version = 2
+        state = "operator_recovered"
+        recovered_at = [DateTimeOffset]::UtcNow.ToString("o")
+        service_name = $ServiceName
+        active = $active
+        status = $status
+        abandoned_completion_proofs = $proofs
+        postflight_preflight = $postflight
+        postflight_quarantine = $null
+        acknowledgement = "administrator reviewed durable authority and bound postflight state"
+    }
     $archive | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $recoveryArchive -Encoding UTF8 -NoNewline
+
+    # The user-owned postflight marker is subordinate to the independently privileged authority
+    # latch. Quarantine the exact reviewed marker first. If this step races, mismatches, or fails,
+    # active.json is still present and the product remains fail closed. If a previous recovery was
+    # interrupted after quarantine, the immutable runtime verifies that exact digest-bound object
+    # and resumes without requiring the operator to weaken the missing-marker rule.
+    if ($hasBoundPostflight) {
+        $postflightRecovered = Invoke-RecoveryPythonJson -Arguments @(
+            "quarantine",
+            "--config", $ConfigPath,
+            "--operation-id", $operationId,
+            "--expected-sha256", ([string]$postflight.marker_identity.sha256)
+        )
+        $archive.postflight_quarantine = $postflightRecovered
+        $archive | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $recoveryArchive -Encoding UTF8 -NoNewline
+    }
+
+    # Completion proofs/status and the user-owned postflight marker are subordinate to the
+    # immutable SYSTEM latch. Remove active.json last so interruption at every earlier point stays
+    # fail closed.
+    Get-ChildItem -LiteralPath $AuthorityStateRoot -Filter "completion-*.json" -File -ErrorAction SilentlyContinue |
+        Remove-Item -Force
+    Remove-Item -LiteralPath $StatusState -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $ActiveState -Force
 }
-
-# Completion proofs/status and the user-owned postflight marker are subordinate to the immutable
-# SYSTEM latch. Remove active.json last so interruption at every earlier point stays fail closed.
-Get-ChildItem -LiteralPath $AuthorityStateRoot -Filter "completion-*.json" -File -ErrorAction SilentlyContinue |
-    Remove-Item -Force
-Remove-Item -LiteralPath $StatusState -Force -ErrorAction SilentlyContinue
-Remove-Item -LiteralPath $ActiveState -Force
-
-if ($null -ne $service) {
-    Start-Service -Name $ServiceName
-    (Get-Service -Name $ServiceName).WaitForStatus(
-        [ServiceProcess.ServiceControllerStatus]::Running,
-        [TimeSpan]::FromSeconds(30)
-    )
+finally {
+    # A failed recovery remains latched, but it must not strand the authority service stopped.
+    # Restarting with active.json still present deterministically returns to recovery_required.
+    if ($null -ne $service) {
+        $currentService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        if ($null -ne $currentService -and $currentService.Status -ne [ServiceProcess.ServiceControllerStatus]::Running) {
+            Start-Service -Name $ServiceName
+            (Get-Service -Name $ServiceName).WaitForStatus(
+                [ServiceProcess.ServiceControllerStatus]::Running,
+                [TimeSpan]::FromSeconds(30)
+            )
+        }
+    }
 }
 
 Write-Output "Approved Host authority and bound postflight recovery state cleared after explicit administrator acknowledgement."
