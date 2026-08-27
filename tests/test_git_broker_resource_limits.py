@@ -1,7 +1,13 @@
 from pathlib import Path
 
+import pytest
+
 from windows_local_mcp.config import Settings
-from windows_local_mcp.git_broker_sandbox import _repo_limits
+from windows_local_mcp.git_broker_sandbox import (
+    GitBrokerUnavailable,
+    _copy_repository_tree,
+    _repo_limits,
+)
 
 
 def _settings(tmp_path: Path, scratch_bytes: int) -> Settings:
@@ -32,3 +38,27 @@ def test_git_repository_projection_has_no_legacy_16_mib_floor(tmp_path: Path) ->
     byte_limit, _entry_limit = _repo_limits(settings)
 
     assert byte_limit == 512 * 1024
+
+
+def test_git_repository_copy_bounds_directories_as_entries(tmp_path: Path) -> None:
+    settings = _settings(tmp_path, 1024 * 1024)
+    source = settings.workspace_root
+    metadata = source / ".git"
+    metadata.mkdir()
+    (metadata / "config").write_text(
+        "[core]\n\trepositoryformatversion = 0\n",
+        encoding="utf-8",
+    )
+    (source / "empty-a").mkdir()
+    (source / "empty-b").mkdir()
+    destination = tmp_path / "projection"
+    destination.mkdir()
+
+    with pytest.raises(GitBrokerUnavailable, match="entry-count"):
+        _copy_repository_tree(
+            source,
+            destination,
+            settings,
+            byte_limit=512 * 1024,
+            entry_limit=2,
+        )
