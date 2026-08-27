@@ -66,7 +66,7 @@ class Executor:
         request = operation.get("request")
         normalized = request.get("normalized_command") if isinstance(request, dict) else None
         git_broker_worker = bool(
-            tier == "broker"
+            tier in {"broker", "safe_command", "safe_sandbox"}
             and isinstance(normalized, dict)
             and normalized.get("program_key") == "git"
         )
