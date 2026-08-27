@@ -19,6 +19,7 @@ from .tool_safety import capture_executable_identity, ensure_external_tool_execu
 from .util import canonical_json, sha256_text, utc_now_iso
 
 GIT_BROKER_LIVE_MARKER_VERSION = 1
+GIT_BROKER_COMMAND_POLICY_VERSION = 2
 _GIT_BROKER_REQUIRED_CHECKS = (
     "git_inside_worktree",
     "git_top_level_projection",
@@ -83,6 +84,7 @@ def git_broker_live_context(
     _require_strict_sandbox_properties(containment.live_evidence)
     return {
         "version": GIT_BROKER_LIVE_MARKER_VERSION,
+        "command_policy_version": GIT_BROKER_COMMAND_POLICY_VERSION,
         "git_executable_identity": git_identity,
         "containment_policy_digest": containment.policy_digest,
         "sandbox_backend": containment.backend.as_dict(),
