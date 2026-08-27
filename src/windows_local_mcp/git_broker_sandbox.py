@@ -5,12 +5,12 @@ import hashlib
 import os
 import shutil
 import subprocess
-import tempfile
 import time
 import uuid
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any
 
 from .child_env import build_command_environment, sanitize_executable_search_path
 from .config import Settings
@@ -172,14 +172,16 @@ def _validate_source_repository(settings: Settings) -> tuple[Path, int, int]:
             except OSError:
                 pass
             raise GitBrokerUnavailable(
-                f"automatic Git does not accept external/extended repository metadata: {unsafe_relative}"
+                "automatic Git does not accept external/extended repository metadata: "
+                f"{unsafe_relative}"
             )
     return source, scan.total_bytes, scan.entry_count
 
 
 def _protected_worktree_path(relative: Path, settings: Settings) -> bool:
     parts = [part.casefold() for part in relative.parts]
-    if any(part in {name.casefold() for name in settings.read_denied_directories} for part in parts[:-1]):
+    denied_directories = {name.casefold() for name in settings.read_denied_directories}
+    if any(part in denied_directories for part in parts[:-1]):
         return True
     name = relative.name.casefold()
     if name in {value.casefold() for value in settings.blocked_file_names}:
@@ -209,11 +211,85 @@ def _copy_verified_file(
         try:
             shutil.copystat(held, destination, follow_symlinks=False)
         except OSError:
-            # Timestamp/mode fidelity improves Git status performance but is not the security boundary.
             pass
         return len(data), sha256_bytes(data)
     finally:
         release_verified_hold(held)
+
+
+def _parse_bool(value: str | None, *, default: bool) -> bool:
+    if value is None:
+        return default
+    folded = value.strip().casefold()
+    if folded in {"true", "yes", "on", "1"}:
+        return True
+    if folded in {"false", "no", "off", "0"}:
+        return False
+    raise GitBrokerUnavailable("automatic Git repository has an invalid boolean core setting")
+
+
+def _safe_repository_config(source_config: Path, *, byte_limit: int) -> bytes:
+    """Parse source config in trusted memory and emit only inert core settings."""
+
+    held = hold_verified_path(
+        source_config,
+        allow_directory=False,
+        allow_hardlinks=False,
+        readable=True,
+    )
+    try:
+        details = held.stat()
+        if details.st_nlink > 1:
+            raise GitBrokerUnavailable("automatic Git repository config is hard-linked")
+        raw = read_verified_bytes(held, byte_limit)
+    finally:
+        release_verified_hold(held)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise GitBrokerUnavailable("automatic Git repository config is not UTF-8") from error
+    parser = configparser.RawConfigParser(
+        interpolation=None,
+        strict=False,
+        allow_no_value=True,
+    )
+    try:
+        parser.read_string(text)
+    except configparser.Error as error:
+        raise GitBrokerUnavailable("automatic Git repository config is not safely parseable") from error
+    repository_format = parser.get("core", "repositoryformatversion", fallback="0").strip()
+    if repository_format != "0":
+        raise GitBrokerUnavailable(
+            "automatic Git supports repositoryformatversion=0 only; extended repositories "
+            "require approval"
+        )
+    if parser.has_section("extensions") and list(parser.items("extensions")):
+        raise GitBrokerUnavailable(
+            "automatic Git does not accept repository extensions without explicit approval"
+        )
+    filemode = _parse_bool(parser.get("core", "filemode", fallback=None), default=False)
+    ignorecase = _parse_bool(
+        parser.get("core", "ignorecase", fallback=None), default=os.name == "nt"
+    )
+    return (
+        "[core]\n"
+        "\trepositoryformatversion = 0\n"
+        f"\tfilemode = {'true' if filemode else 'false'}\n"
+        "\tbare = false\n"
+        "\tlogallrefupdates = true\n"
+        f"\tignorecase = {'true' if ignorecase else 'false'}\n"
+    ).encode("utf-8")
+
+
+def _record_snapshot_file(
+    digest: Any, relative: Path, data: bytes
+) -> None:
+    digest.update(relative.as_posix().encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(str(len(data)).encode("ascii"))
+    digest.update(b"\0")
+    digest.update(sha256_bytes(data).encode("ascii"))
+    digest.update(b"\n")
 
 
 def _copy_repository_tree(
@@ -259,13 +335,13 @@ def _copy_repository_tree(
             elif _protected_worktree_path(relative, settings):
                 continue
             elif relative.name.casefold() == ".gitattributes":
-                # Attributes can select project-controlled filters/textconv drivers. The automatic
-                # projection intentionally removes them; advanced attribute semantics use approval.
                 continue
 
             candidate = Path(entry.path)
             details = entry.stat(follow_symlinks=False)
-            if entry.is_symlink() or bool(int(getattr(details, "st_file_attributes", 0)) & 0x400):
+            if entry.is_symlink() or bool(
+                int(getattr(details, "st_file_attributes", 0)) & 0x400
+            ):
                 raise GitBrokerUnavailable(f"reparse input is denied: {relative}")
             if entry.is_dir(follow_symlinks=False):
                 (destination / relative).mkdir(parents=True, exist_ok=True)
@@ -279,71 +355,32 @@ def _copy_repository_tree(
             remaining = byte_limit - total_bytes
             if remaining < 0:
                 raise GitBrokerUnavailable("automatic Git snapshot exceeds its byte limit")
-            size, file_digest = _copy_verified_file(
-                candidate,
-                destination / relative,
-                byte_limit=remaining,
-            )
+
+            target = destination / relative
+            if relative.as_posix().casefold() == ".git/config":
+                data = _safe_repository_config(candidate, byte_limit=remaining)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
+                size = len(data)
+                _record_snapshot_file(digest, relative, data)
+            else:
+                size, file_digest = _copy_verified_file(
+                    candidate,
+                    target,
+                    byte_limit=remaining,
+                )
+                digest.update(relative.as_posix().encode("utf-8"))
+                digest.update(b"\0")
+                digest.update(str(size).encode("ascii"))
+                digest.update(b"\0")
+                digest.update(file_digest.encode("ascii"))
+                digest.update(b"\n")
             total_bytes += size
             if total_bytes > byte_limit:
                 raise GitBrokerUnavailable("automatic Git snapshot exceeds its byte limit")
-            digest.update(relative.as_posix().encode("utf-8"))
-            digest.update(b"\0")
-            digest.update(str(size).encode("ascii"))
-            digest.update(b"\0")
-            digest.update(file_digest.encode("ascii"))
-            digest.update(b"\n")
-    return file_count, total_bytes, digest.hexdigest()
-
-
-def _parse_bool(value: str | None, *, default: bool) -> bool:
-    if value is None:
-        return default
-    folded = value.strip().casefold()
-    if folded in {"true", "yes", "on", "1"}:
-        return True
-    if folded in {"false", "no", "off", "0"}:
-        return False
-    raise GitBrokerUnavailable("automatic Git repository has an invalid boolean core setting")
-
-
-def _sanitize_repository_config(repository: Path) -> None:
-    config_path = repository / ".git" / "config"
-    if not config_path.is_file():
+    if not (destination / ".git" / "config").is_file():
         raise GitBrokerUnavailable("automatic Git repository has no .git/config")
-    try:
-        raw = config_path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as error:
-        raise GitBrokerUnavailable("automatic Git repository config is unreadable") from error
-    parser = configparser.RawConfigParser(
-        interpolation=None,
-        strict=False,
-        allow_no_value=True,
-    )
-    try:
-        parser.read_string(raw)
-    except configparser.Error as error:
-        raise GitBrokerUnavailable("automatic Git repository config is not safely parseable") from error
-    repository_format = parser.get("core", "repositoryformatversion", fallback="0").strip()
-    if repository_format != "0":
-        raise GitBrokerUnavailable(
-            "automatic Git supports repositoryformatversion=0 only; extended repositories require approval"
-        )
-    if parser.has_section("extensions") and list(parser.items("extensions")):
-        raise GitBrokerUnavailable(
-            "automatic Git does not accept repository extensions without explicit approval"
-        )
-    filemode = _parse_bool(parser.get("core", "filemode", fallback=None), default=False)
-    ignorecase = _parse_bool(parser.get("core", "ignorecase", fallback=None), default=os.name == "nt")
-    safe = (
-        "[core]\n"
-        "\trepositoryformatversion = 0\n"
-        f"\tfilemode = {'true' if filemode else 'false'}\n"
-        "\tbare = false\n"
-        "\tlogallrefupdates = true\n"
-        f"\tignorecase = {'true' if ignorecase else 'false'}\n"
-    )
-    config_path.write_text(safe, encoding="utf-8", newline="\n")
+    return file_count, total_bytes, digest.hexdigest()
 
 
 def stage_git_repository(settings: Settings, token: str) -> GitBrokerStage:
@@ -371,7 +408,6 @@ def stage_git_repository(settings: Settings, token: str) -> GitBrokerStage:
             byte_limit=byte_limit,
             entry_limit=entry_limit,
         )
-        _sanitize_repository_config(repository)
         verification = scan_directory_bounded(
             repository,
             stop_after_bytes=byte_limit,
@@ -409,7 +445,13 @@ def _rewrite_path(value: str, source: Path, destination: Path) -> str:
 def _rewrite_command(command: Sequence[str], stage: GitBrokerStage) -> list[str]:
     if not command:
         raise ValueError("Git Broker command cannot be empty")
-    return [command[0], *(_rewrite_path(value, stage.source_root, stage.repository) for value in command[1:])]
+    return [
+        command[0],
+        *(
+            _rewrite_path(value, stage.source_root, stage.repository)
+            for value in command[1:]
+        ),
+    ]
 
 
 def _rewrite_cwd(cwd: str, stage: GitBrokerStage) -> Path:
@@ -470,6 +512,7 @@ def _git_environment(
             "GCM_INTERACTIVE": "Never",
         }
     )
+    assert settings.sandbox_scratch_dir is not None
     sanitize_executable_search_path(
         environment,
         forbidden_roots=(
@@ -496,11 +539,16 @@ def _run_one(
     deadline: float,
     output_limit: int,
     output_paths: tuple[Path, Path] | None,
-    on_launch: Callable[[subprocess.Popen[Any], dict[str, object], CodexSandboxBackend], None] | None,
+    on_launch: Callable[
+        [subprocess.Popen[Any], dict[str, object], CodexSandboxBackend], None
+    ]
+    | None,
 ) -> GitBrokerResult:
     rewritten = _rewrite_command(command, stage)
     staged_cwd = _rewrite_cwd(cwd, stage)
-    if Path(rewritten[0]).resolve(strict=True) != Path(str(git_identity["path"])).resolve(strict=True):
+    if Path(rewritten[0]).resolve(strict=True) != Path(
+        str(git_identity["path"])
+    ).resolve(strict=True):
         raise GitBrokerUnavailable("Automatic Git command does not match the bound executable")
     environment = _git_environment(settings, containment, stage, git_identity)
     if output_paths is None:
@@ -532,7 +580,9 @@ def _run_one(
             stderr=subprocess.PIPE,
             limits=WindowsJobLimits(
                 max_processes=min(_GIT_PROCESS_LIMIT, containment.backend.max_processes),
-                max_memory_bytes=min(_GIT_MEMORY_LIMIT, containment.backend.max_memory_bytes),
+                max_memory_bytes=min(
+                    _GIT_MEMORY_LIMIT, containment.backend.max_memory_bytes
+                ),
             ),
             expected_live_evidence=containment.live_evidence,
         )
@@ -606,7 +656,10 @@ def run_git_broker_batch(
     output_limit: int,
     token: str | None = None,
     output_paths: tuple[Path, Path] | None = None,
-    on_launch: Callable[[subprocess.Popen[Any], dict[str, object], CodexSandboxBackend], None] | None = None,
+    on_launch: Callable[
+        [subprocess.Popen[Any], dict[str, object], CodexSandboxBackend], None
+    ]
+    | None = None,
 ) -> list[GitBrokerResult]:
     if not commands:
         return []
@@ -651,7 +704,10 @@ def run_git_broker_command(
     output_limit: int,
     token: str | None = None,
     output_paths: tuple[Path, Path] | None = None,
-    on_launch: Callable[[subprocess.Popen[Any], dict[str, object], CodexSandboxBackend], None] | None = None,
+    on_launch: Callable[
+        [subprocess.Popen[Any], dict[str, object], CodexSandboxBackend], None
+    ]
+    | None = None,
 ) -> GitBrokerResult:
     results = run_git_broker_batch(
         settings=settings,
