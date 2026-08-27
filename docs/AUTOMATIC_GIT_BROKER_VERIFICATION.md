@@ -21,7 +21,7 @@ Current implementation requires all of the following before a model-facing Autom
 2. Current generic Codex Windows Sandbox live evidence for the exact backend/isolation context.
 3. Automatic Git-specific strict gating: every Sandbox security property, including `protected_information_read` and LAN, must be `verified`; generic Sandbox residual-risk acceptance is not inherited.
 4. Git-specific marker schema v1 bound to the pinned Git identity, Sandbox backend, complete generic live-evidence digest, workspace root, scratch quota, Automatic Git containment-policy digest, and command-policy generation.
-5. Worker-side marker revalidation before Git execution.
+5. The common Git runner revalidates the Git-specific marker immediately before every ordinary child launch, including direct `git_info` snapshot execution. Only the explicit `verify-git-broker` bootstrap probe may bypass the marker it is creating.
 6. Dedicated Git worker routing for current `broker` and legacy queued `safe_command` / `safe_sandbox` Git operations. These operations do not fall through to the standard worker.
 7. A bounded disposable repository projection. The Git child does not receive the original workspace as its repository filesystem.
 8. Project-controlled execution metadata is removed or rejected: hooks, attributes, external alternates, extended/worktree metadata, nested `.git`, reparse points, hardlinks, and NTFS ADS are not accepted as Automatic Git behavior inputs.
@@ -32,10 +32,11 @@ Current implementation requires all of the following before a model-facing Autom
 13. Git executable, Codex backend, and WFP Guard implementation identities are held against replacement during the batch. Scratch projection cleanup runs in `finally`, and stale `git-broker` scratch roots are included in retention cleanup.
 14. Repository projection bytes are limited to at most half of configured `max_sandbox_scratch_bytes`, leaving the remaining budget for operation runtime/transient output. No hard-coded repository-size floor may exceed the operator quota.
 15. No Automatic Git failure falls back to Approved Host.
+16. The explicit Git-specific verifier does not use remapped `git rev-parse --show-toplevel` output as independent projection proof. It requires pinned Git worktree recognition and read-only status success under the stricter source-workspace-deny containment, and requires all probe results from the batch to carry the same valid sanitized-projection snapshot digest before a marker can be issued.
 
 ## Regression coverage
 
-Focused Windows CI includes the Automatic Git environment/staging tests, Git-specific marker tests, scratch-resource tests, object-access tests, current/legacy worker-routing tests, helper-identity tests, and directory TOCTOU tests. Full pytest, Ruff, compileall, and diff-whitespace checks remain required before this document can record source/CI completion.
+Focused Windows CI includes the Automatic Git environment/staging tests, launch-time marker-gate tests, Git-specific marker tests, scratch-resource tests, object-access tests, current/legacy worker-routing tests, helper-identity tests, and directory TOCTOU tests. Full pytest, Ruff, compileall, and diff-whitespace checks remain required before this document can record source/CI completion.
 
 The object-access regressions cover two distinct unsafe Git behaviors:
 
@@ -43,6 +44,8 @@ The object-access regressions cover two distinct unsafe Git behaviors:
 - A protected blob can be attached to an apparently safe path in an attacker-controlled tree/commit. Normal `git show --patch <commit> -- safe.txt` then prints the protected blob even when the current workspace `safe.txt` is benign. Therefore path validation plus commit binding alone is not a protected-content boundary; Automatic content-bearing output is denied.
 
 The scratch-resource regressions verify that projection byte limits never exceed half of configured scratch quota and that the old 16 MiB floor is not reintroduced.
+
+The live-verifier regressions also require a consistent sanitized-projection snapshot digest across the explicit probe batch and reject mismatched digests. This avoids treating the user-facing source-path remap performed on Git output as evidence that the child actually executed against the disposable projection.
 
 ## Required real-machine completion step
 
@@ -58,4 +61,4 @@ A successful `verify-git-broker` must create a schema-v1 marker whose exact cont
 
 ## Finalization record
 
-The final branch SHA, focused-test count, full pytest count, and Windows CI run will be recorded here after the source/CI tree is frozen. Real-machine evidence will remain explicitly `NOT RUN` until it is actually performed.
+The source/code-freeze SHA, focused-test count, full pytest count, and Windows CI run will be recorded here after the source/CI tree is frozen. The later documentation-only verification-record commit is not treated as a self-referential code-freeze identifier. Real-machine evidence will remain explicitly `NOT RUN` until it is actually performed.
