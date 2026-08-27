@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import windows_local_mcp.approved_host_recovery as recovery_module
 from windows_local_mcp.approved_host_recovery import (
     inspect_postflight_recovery,
     quarantine_postflight_recovery,
@@ -43,6 +44,24 @@ def _write_pending(settings: Settings, operation_id: str) -> Path:
         encoding="utf-8",
     )
     return marker
+
+
+def _make_global_health_gate_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    def unavailable(_settings: Settings) -> None:
+        raise AssertionError(
+            "explicit postflight recovery must not consult the normal authority health gate"
+        )
+
+    # Before the regression fix, approved_host_recovery imported and invoked this symbol. The
+    # production policy wrapper can require the authority pipe, but recovery deliberately stops
+    # that service while moving the reviewed marker. Keep this synthetic attribute even after the
+    # dependency is removed so the test fails again if recovery reintroduces that coupling.
+    monkeypatch.setattr(
+        recovery_module,
+        "assert_control_plane_healthy",
+        unavailable,
+        raising=False,
+    )
 
 
 def test_inspect_binds_pending_postflight_marker_to_operation(tmp_path: Path) -> None:
@@ -103,6 +122,28 @@ def test_quarantine_requires_reviewed_digest_and_restores_health(tmp_path: Path)
     assert_control_plane_healthy(settings)
 
 
+def test_quarantine_does_not_require_normal_authority_health_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path)
+    marker = _write_pending(settings, "operation-1")
+    evidence = inspect_postflight_recovery(settings, "operation-1")
+    digest = str(evidence["marker_identity"]["sha256"])
+    _make_global_health_gate_unavailable(monkeypatch)
+
+    recovered = quarantine_postflight_recovery(
+        settings,
+        "operation-1",
+        expected_sha256=digest,
+    )
+
+    assert recovered["quarantined"] is True
+    assert recovered["resumed_partial_recovery"] is False
+    assert not marker.exists()
+    assert Path(str(recovered["quarantine_path"])).is_file()
+
+
 def test_quarantine_rejects_changed_review_digest_without_clearing(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     marker = _write_pending(settings, "operation-1")
@@ -119,7 +160,10 @@ def test_quarantine_rejects_changed_review_digest_without_clearing(tmp_path: Pat
         assert_control_plane_healthy(settings)
 
 
-def test_interrupted_quarantine_is_detected_and_resumable(tmp_path: Path) -> None:
+def test_interrupted_quarantine_is_detected_and_resumable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     settings = _settings(tmp_path)
     marker = _write_pending(settings, "operation-1")
     evidence = inspect_postflight_recovery(settings, "operation-1")
@@ -132,6 +176,7 @@ def test_interrupted_quarantine_is_detected_and_resumable(tmp_path: Path) -> Non
     resumed_evidence = inspect_postflight_recovery(settings, "operation-1")
     assert resumed_evidence["present"] is False
     assert resumed_evidence["quarantined"] is True
+    _make_global_health_gate_unavailable(monkeypatch)
 
     recovered = quarantine_postflight_recovery(
         settings,
