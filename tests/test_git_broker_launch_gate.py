@@ -91,11 +91,16 @@ def test_prepare_git_launch_keeps_process_cwd_outside_projection(tmp_path: Path)
     assert process_cwd != staged_subdir
     assert command == [
         str(executable),
+        "-c",
+        f"safe.directory={repository}",
         "-C",
         str(staged_subdir),
         "--no-pager",
         "status",
     ]
+    assert "safe.directory=*" not in command
+    assert f"safe.directory={source}" not in command
+    assert f"safe.directory={root}" not in command
 
 
 def test_verify_git_broker_live_uses_bootstrap_probe_mode(
