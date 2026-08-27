@@ -51,16 +51,8 @@ jobs:
           from pathlib import Path
           path = Path('src/windows_local_mcp/approved_host_authority.py')
           text = path.read_text(encoding='utf-8')
-          old = '''        if not _kernel32.WaitNamedPipeW(APPROVED_HOST_AUTHORITY_PIPE, remaining_ms):
-            if time.monotonic() >= deadline:
-                raise _winerror("WaitNamedPipeW")
-'''
-          new = '''        if (
-            not _kernel32.WaitNamedPipeW(APPROVED_HOST_AUTHORITY_PIPE, remaining_ms)
-            and time.monotonic() >= deadline
-        ):
-            raise _winerror("WaitNamedPipeW")
-'''
+          old = '        if not _kernel32.WaitNamedPipeW(APPROVED_HOST_AUTHORITY_PIPE, remaining_ms):\n            if time.monotonic() >= deadline:\n                raise _winerror("WaitNamedPipeW")\n'
+          new = '        if (\n            not _kernel32.WaitNamedPipeW(APPROVED_HOST_AUTHORITY_PIPE, remaining_ms)\n            and time.monotonic() >= deadline\n        ):\n            raise _winerror("WaitNamedPipeW")\n'
           if text.count(old) != 1:
               raise SystemExit('WaitNamedPipeW lint target changed unexpectedly')
           path.write_text(text.replace(old, new, 1), encoding='utf-8', newline='\n')
