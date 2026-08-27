@@ -70,3 +70,20 @@ def test_authority_installer_blocks_active_or_recovery_state_before_service_rein
     assert active_decl < recovery_decl < active_check < existing_service
     assert recovery_decl < recovery_check < existing_service
     assert "Approved Host authority has active/recovery state." in script
+
+
+def test_authority_service_sddl_keeps_change_config_for_system_and_admin_only() -> None:
+    script = _installer_text()
+    sddl_line = next(line for line in script.splitlines() if line.startswith("$ServiceSddl ="))
+
+    assert "(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;SY)" in sddl_line
+    assert "(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)" in sddl_line
+    assert "(A;;LC;;;$RuntimeSid)" in sddl_line
+    assert "(A;;DCLC;;;$RuntimeSid)" not in sddl_line
+
+    sdset = script.index('Invoke-Sc -Arguments @("sdset", $ServiceName, $ServiceSddl)')
+    failure = script.index('Invoke-Sc -Arguments @("failure", $ServiceName')
+    failureflag = script.index('Invoke-Sc -Arguments @("failureflag", $ServiceName, "1")')
+    start = script.index("Start-Service -Name $ServiceName")
+
+    assert sdset < failure < failureflag < start
