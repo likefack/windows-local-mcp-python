@@ -95,8 +95,9 @@ $postflight = Invoke-RecoveryPythonJson -Arguments @(
 )
 Write-Output "Bound user-owned Approved Host postflight recovery state:"
 $postflight | ConvertTo-Json -Depth 20 | Write-Output
-if (-not [bool]$postflight.present -and -not $AcknowledgeMissingPostflightMarker) {
-    throw "The bound Approved Host postflight marker is missing. Treat absence as possible tamper or partial recovery; review it and rerun only with -AcknowledgeMissingPostflightMarker if intentional."
+$hasBoundPostflight = [bool]$postflight.present -or [bool]$postflight.quarantined
+if (-not $hasBoundPostflight -and -not $AcknowledgeMissingPostflightMarker) {
+    throw "The bound Approved Host postflight marker is missing. Treat absence as possible tamper; review it and rerun only with -AcknowledgeMissingPostflightMarker if intentional."
 }
 
 if (-not $PSCmdlet.ShouldProcess(
@@ -138,8 +139,10 @@ $archive | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $recoveryArchive 
 
 # The user-owned postflight marker is subordinate to the independently privileged authority
 # latch. Quarantine the exact reviewed marker first. If this step races, mismatches, or fails,
-# active.json is still present and the product remains fail closed.
-if ([bool]$postflight.present) {
+# active.json is still present and the product remains fail closed. If a previous recovery was
+# interrupted after quarantine, the immutable runtime verifies that exact digest-bound object and
+# resumes without requiring the operator to weaken the missing-marker rule.
+if ($hasBoundPostflight) {
     $postflightRecovered = Invoke-RecoveryPythonJson -Arguments @(
         "quarantine",
         "--config", $ConfigPath,
@@ -167,7 +170,7 @@ if ($null -ne $service) {
 
 Write-Output "Approved Host authority and bound postflight recovery state cleared after explicit administrator acknowledgement."
 Write-Output "Recovery evidence archived at: $recoveryArchive"
-if ([bool]$postflight.present) {
+if ($hasBoundPostflight) {
     Write-Output "Reviewed postflight marker quarantined at: $($archive.postflight_quarantine.quarantine_path)"
 }
 Write-Output "Independent control-plane tamper markers are never cleared by this recovery path."
