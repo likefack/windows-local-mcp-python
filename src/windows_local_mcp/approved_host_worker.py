@@ -7,6 +7,11 @@ from pathlib import Path
 from typing import Any
 
 from .approved_host_authority import AuthorityWorkerLease
+from .approved_host_process_census import (
+    capture_user_processes,
+    requester_username,
+    wait_for_untracked_user_processes,
+)
 from .control_plane import load_worker_context
 from .windows_user_process import popen_as_requester_in_job
 
@@ -18,16 +23,13 @@ def _install_authority_hooks(
     requester_create_time: float,
 ) -> None:
     """Move Approved Host launch/postflight authority into this LocalSystem worker."""
-    from . import control_plane_guard, windows_job
+    from . import control_plane_guard, process_utils, windows_job
 
     original_popen = windows_job.WindowsSandboxJob.popen
     original_expected = control_plane_guard.expected_critical_state
     original_capture = control_plane_guard.capture_critical_state
     expected_state: dict[str, Any] | None = None
-
-    # windows_user_process deliberately receives the existing Job object. Expose the
-    # same-package kernel32 binding on the class rather than duplicating Job internals.
-    windows_job.WindowsSandboxJob._kernel32 = windows_job._kernel32  # type: ignore[attr-defined]  # noqa: SLF001
+    username = requester_username(requester_pid, requester_create_time)
 
     def authority_popen(self: Any, argv: list[str], **kwargs: Any) -> Any:
         stdin = kwargs.pop("stdin", subprocess.DEVNULL)
@@ -47,7 +49,7 @@ def _install_authority_hooks(
             raise RuntimeError("Approved Host authority never launches through a shell")
         if not isinstance(environment, dict) or cwd is None:
             raise RuntimeError("Approved Host authority child environment or cwd is missing")
-        process = popen_as_requester_in_job(
+        return popen_as_requester_in_job(
             self,
             argv,
             requester_pid=requester_pid,
@@ -55,9 +57,8 @@ def _install_authority_hooks(
             cwd=str(cwd),
             environment={str(key): str(value) for key, value in environment.items()},
             creationflags=creationflags,
+            on_process_created=lease.mark_child_started,
         )
-        lease.mark_child_started()
-        return process
 
     def authority_expected(settings: Any, operation_id: str) -> dict[str, Any]:
         nonlocal expected_state
@@ -77,9 +78,27 @@ def _install_authority_hooks(
             lease.mark_postflight_verified()
         return state
 
+    def authority_process_baseline() -> set[tuple[int, float]]:
+        return capture_user_processes(username)
+
+    def authority_wait_for_untracked(
+        baseline: set[tuple[int, float]],
+        *,
+        deadline: float,
+        excluded_pids: set[int] | None = None,
+    ) -> set[tuple[int, float]]:
+        return wait_for_untracked_user_processes(
+            username,
+            baseline,
+            deadline=deadline,
+            excluded_pids=excluded_pids or (),
+        )
+
     windows_job.WindowsSandboxJob.popen = authority_popen
     control_plane_guard.expected_critical_state = authority_expected
     control_plane_guard.capture_critical_state = authority_capture
+    process_utils.capture_current_user_processes = authority_process_baseline
+    process_utils.wait_for_untracked_current_user_processes = authority_wait_for_untracked
 
     authority_popen.__wlmcp_original_popen__ = original_popen  # type: ignore[attr-defined]
 
@@ -110,8 +129,8 @@ def main() -> None:
     )
     settings = load_worker_context(args.context, args.context_sha256, args.operation_id)
 
-    # Import only after the control-plane and Job Object hooks are installed so worker.py's
-    # direct function imports bind to the independently privileged implementations.
+    # Import only after the control-plane, census, and Job hooks are installed so worker.py's
+    # direct imports bind to the independently privileged implementations.
     from .worker import run_operation
 
     exit_code = 1
