@@ -1,3 +1,4 @@
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -19,12 +20,10 @@ def test_prune_artifacts_removes_stale_git_broker_scratch(tmp_path: Path) -> Non
 
     stale = settings.sandbox_scratch_dir / "git-broker" / "stale-operation"
     stale.mkdir(parents=True)
-    (stale / "repository.bin").write_bytes(b"stale")
+    payload = stale / "repository.bin"
+    payload.write_bytes(b"stale")
     old = (datetime.now(UTC) - timedelta(days=2)).timestamp()
-    for path in (stale / "repository.bin", stale):
-        path.touch()
-        import os
-
+    for path in (payload, stale):
         os.utime(path, (old, old))
 
     removed = prune_artifacts(settings)
