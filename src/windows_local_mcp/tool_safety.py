@@ -176,8 +176,36 @@ def capture_executable_identity(
     )
 
 
-def trusted_helper_identity(settings: Any, program_key: str) -> dict[str, Any]:
-    """Resolve a Broker helper from a pinned identity and its required containment."""
+def _git_for_windows_runtime_candidate(executable: Path) -> Path | None:
+    """Return the real Git for Windows runtime when a known wrapper/redirector was pinned."""
+
+    if executable.name.casefold() != "git.exe":
+        return None
+    parent = executable.parent
+    root: Path | None = None
+    if parent.name.casefold() == "cmd":
+        root = parent.parent
+    elif parent.name.casefold() == "bin" and parent.parent.name.casefold() not in {
+        "mingw64",
+        "mingw32",
+        "clangarm64",
+    }:
+        root = parent.parent
+    if root is None:
+        return None
+    for runtime_root in ("mingw64", "clangarm64", "mingw32"):
+        candidate = root / runtime_root / "bin" / "git.exe"
+        try:
+            if candidate.is_file() and not candidate.is_symlink():
+                return candidate.resolve(strict=True)
+        except OSError:
+            continue
+    return None
+
+
+def pinned_helper_identity(settings: Any, program_key: str) -> dict[str, Any]:
+    """Resolve an operator-pinned Broker helper without consulting route availability."""
+
     if program_key not in {"git", "adb"}:
         raise ValueError(f"no broker helper trust policy exists for {program_key}")
     configured_path = getattr(settings, f"{program_key}_executable_path")
@@ -187,17 +215,33 @@ def trusted_helper_identity(settings: Any, program_key: str) -> dict[str, Any]:
             f"{program_key} is enabled but unavailable: configure both "
             f"{program_key}_executable_path and {program_key}_executable_sha256"
         )
-    executable = ensure_external_tool_executable(
-        configured_path,
-        workspace_root=settings.workspace_root,
-        data_dir=settings.data_dir,
-        sandbox_scratch_dir=settings.sandbox_scratch_dir,
-    )
-    identity = capture_executable_identity(
+    executable = Path(
+        ensure_external_tool_executable(
+            configured_path,
+            workspace_root=settings.workspace_root,
+            data_dir=settings.data_dir,
+            sandbox_scratch_dir=settings.sandbox_scratch_dir,
+        )
+    ).resolve(strict=True)
+    if program_key == "git":
+        runtime = _git_for_windows_runtime_candidate(executable)
+        if runtime is not None and runtime != executable:
+            raise PermissionError(
+                "Automatic Git requires the real Git for Windows runtime executable, not "
+                "cmd/bin wrapper or redirector; configure git_executable_path="
+                f"{runtime} and pin that file's SHA-256"
+            )
+    return capture_executable_identity(
         executable,
         expected_sha256=configured_sha256,
         provenance="explicit-local-config",
     )
+
+
+def trusted_helper_identity(settings: Any, program_key: str) -> dict[str, Any]:
+    """Resolve a Broker helper from a pinned identity and its required containment."""
+
+    identity = pinned_helper_identity(settings, program_key)
     if program_key == "git":
         from .git_broker_live_verify import require_git_broker_live_verification
 
