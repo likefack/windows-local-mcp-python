@@ -6,7 +6,7 @@ from windows_local_mcp.git_broker_sandbox import _repo_limits
 
 def _settings(tmp_path: Path, scratch_bytes: int) -> Settings:
     workspace = tmp_path / "workspace"
-    workspace.mkdir()
+    workspace.mkdir(parents=True)
     settings = Settings(
         workspace_root=workspace,
         data_dir=tmp_path / "data",
@@ -20,7 +20,9 @@ def _settings(tmp_path: Path, scratch_bytes: int) -> Settings:
 
 def test_git_repository_projection_never_exceeds_half_scratch_quota(tmp_path: Path) -> None:
     for scratch_bytes in (1024 * 1024, 16 * 1024 * 1024, 512 * 1024 * 1024):
-        byte_limit, _entry_limit = _repo_limits(_settings(tmp_path / str(scratch_bytes), scratch_bytes))
+        byte_limit, _entry_limit = _repo_limits(
+            _settings(tmp_path / str(scratch_bytes), scratch_bytes)
+        )
         assert byte_limit <= scratch_bytes // 2
 
 
