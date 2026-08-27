@@ -11,7 +11,6 @@ from .control_plane_guard import (
     _approved_host_postflight_marker,
     _is_reparse,
     _tamper_marker,
-    assert_control_plane_healthy,
 )
 from .tool_safety import capture_file_identity, hold_file_identity
 from .util import sha256_bytes
@@ -44,6 +43,27 @@ def _assert_control_plane_directory_safe(settings: Settings) -> Path:
     except ValueError as error:
         raise RuntimeError("control-plane directory escaped configured data_dir") from error
     return root
+
+
+def _assert_recovery_control_plane_markers_cleared(settings: Settings) -> None:
+    """Verify only the user-owned marker boundary relevant to explicit recovery.
+
+    The normal control-plane health function is intentionally wrapped by Approved Host policy
+    so ordinary operations also require the authenticated LocalSystem authority service. Recovery
+    scripts deliberately stop that service while moving the reviewed marker, so invoking the
+    policy-wrapped health function here would make recovery self-contradictory. The independently
+    privileged authority latch is validated and cleared by the PowerShell recovery transaction;
+    this helper only proves that no independent tamper latch or pending postflight marker became
+    usable during the user-owned marker transition.
+    """
+    if _tamper_marker(settings).exists():
+        raise RuntimeError(
+            "control-plane tamper marker appeared during Approved Host postflight recovery"
+        )
+    if _approved_host_postflight_marker(settings).exists():
+        raise RuntimeError(
+            "Approved Host postflight marker path reappeared during explicit recovery"
+        )
 
 
 def _inspect_marker_path(
@@ -184,7 +204,7 @@ def quarantine_postflight_recovery(
             raise RuntimeError("quarantined Approved Host postflight marker path changed")
         if str(evidence["marker_identity"]["sha256"]).casefold() != digest:
             raise RuntimeError("quarantined Approved Host postflight marker digest changed")
-        assert_control_plane_healthy(settings)
+        _assert_recovery_control_plane_markers_cleared(settings)
         evidence["resumed_partial_recovery"] = True
         return evidence
 
@@ -225,8 +245,9 @@ def quarantine_postflight_recovery(
         )
 
     # This proves the user-owned guard no longer blocks operation creation. The independently
-    # privileged authority latch must still exist at this point in the integrated recovery path.
-    assert_control_plane_healthy(settings)
+    # privileged authority latch is checked and cleared separately by the recovery script, which
+    # intentionally has the authority service stopped while this marker transition is verified.
+    _assert_recovery_control_plane_markers_cleared(settings)
     recovered.update(
         {
             "present": False,
