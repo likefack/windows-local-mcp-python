@@ -233,7 +233,27 @@ def test_projection_preserves_clean_crlf_worktree_semantics(tmp_path: Path) -> N
         check=True,
         shell=False,
     )
-    tracked.write_bytes(b"tracked\r\n")
+
+    # Re-materialize the worktree with Git itself so this fixture models a normal Windows
+    # checkout under core.autocrlf=true instead of guessing at Git's stat/EOL semantics.
+    tracked.unlink()
+    subprocess.run(
+        [
+            git,
+            "-c",
+            "core.autocrlf=true",
+            "-C",
+            str(settings.workspace_root),
+            "checkout",
+            "--",
+            "tracked.txt",
+        ],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        check=True,
+        shell=False,
+    )
+    assert tracked.read_bytes() == b"tracked\r\n"
 
     source_status = subprocess.run(
         [
