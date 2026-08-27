@@ -14,10 +14,19 @@ from . import approved_host_service as _service
 from .approved_host_authority import default_authority_state_root
 from .approved_host_security import (
     HardenedAuthorityStateStore,
+    _assert_root_acl,
     assert_authority_service_security,
     assert_authority_state_security,
 )
 from .approved_host_service import ApprovedHostAuthorityServer, _WindowsServiceHost
+
+
+def _assert_provisioned_authority_security(*, runtime_sid: str, state_root: Path) -> None:
+    # The parent is itself a replacement boundary: if it became writable to the runtime user,
+    # ApprovedHostAuthority could be deleted/replaced even while the child DACL stayed protected.
+    _assert_root_acl(state_root.parent)
+    assert_authority_state_security(state_root)
+    assert_authority_service_security(runtime_sid)
 
 
 class HardenedApprovedHostAuthorityServer(ApprovedHostAuthorityServer):
@@ -33,8 +42,10 @@ class HardenedApprovedHostAuthorityServer(ApprovedHostAuthorityServer):
         self.store = HardenedAuthorityStateStore(state_root, self.service_epoch)
         # Provisioning, owner and DACL are security preconditions. The service never creates
         # an unprotected ProgramData namespace as a fallback.
-        assert_authority_state_security(state_root)
-        assert_authority_service_security(runtime_sid)
+        _assert_provisioned_authority_security(
+            runtime_sid=runtime_sid,
+            state_root=state_root,
+        )
         if self.store.read_active() is not None:
             self.store.mark_recovery_required(
                 "authority service restarted while an operation was active"
@@ -52,8 +63,10 @@ class HardenedApprovedHostAuthorityServer(ApprovedHostAuthorityServer):
     ) -> dict[str, Any]:
         # Re-check the persistent boundary on every RPC. A weakened service/state ACL must
         # never be treated as a transient configuration issue while Host is available.
-        assert_authority_state_security(self.store.root)
-        assert_authority_service_security(self.runtime_sid)
+        _assert_provisioned_authority_security(
+            runtime_sid=self.runtime_sid,
+            state_root=self.store.root,
+        )
         if str(request.get("action") or "") == "cancel":
             raise PermissionError(
                 "Approved Host monitor cancellation is not exposed to the runtime user"
