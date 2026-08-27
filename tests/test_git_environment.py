@@ -2,14 +2,17 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from windows_local_mcp.config import Settings, load_settings
+from windows_local_mcp.git_broker_sandbox import (
+    GitBrokerUnavailable,
+    stage_git_repository,
+)
 from windows_local_mcp.git_env import sanitized_git_environment
 from windows_local_mcp.git_snapshot import capture_git_snapshot
-from windows_local_mcp.paths import Workspace
-from windows_local_mcp.policy import CommandPolicy
 from windows_local_mcp.util import sha256_file
 
 
@@ -83,11 +86,10 @@ def test_load_settings_strips_unapproved_process_environment(
     assert os.environ["LOCAL_MCP_CONFIG"] == str(config)
 
 
-def test_git_snapshot_is_disabled_even_with_trusted_git_executable(tmp_path: Path) -> None:
+def _git_settings(tmp_path: Path) -> tuple[Settings, Path]:
     git = shutil.which("git.exe") or shutil.which("git")
     if git is None:
         pytest.skip("Git is not installed")
-
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     subprocess.run(
@@ -100,20 +102,74 @@ def test_git_snapshot_is_disabled_even_with_trusted_git_executable(tmp_path: Pat
     settings = Settings(
         workspace_root=workspace,
         data_dir=tmp_path / "data",
+        sandbox_scratch_dir=tmp_path / "scratch",
         protect_data_dir_acl=False,
         git_enabled=True,
         git_executable_path=Path(git),
         git_executable_sha256=sha256_file(Path(git))[0],
     )
     settings.ensure_directories()
+    return settings, Path(git)
 
+
+def test_git_snapshot_runs_through_sandboxed_broker_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings, _git = _git_settings(tmp_path)
+    from windows_local_mcp import git_broker_sandbox, git_snapshot
+
+    monkeypatch.setattr(
+        git_broker_sandbox,
+        "require_git_broker_containment",
+        lambda _settings, _identity: None,
+    )
+
+    def fake_batch(**kwargs: object) -> list[SimpleNamespace]:
+        commands = list(kwargs["commands"])  # type: ignore[index]
+        return [
+            SimpleNamespace(returncode=0, stdout=f"result-{index}".encode(), stderr=b"")
+            for index, _command in enumerate(commands)
+        ]
+
+    monkeypatch.setattr(git_snapshot, "run_git_broker_batch", fake_batch)
     snapshot = capture_git_snapshot(
         settings=settings,
-        operation_id="git-disabled",
+        operation_id="git-restored",
         stage="test",
     )
 
-    assert snapshot is None
+    assert snapshot is not None
+    content = Path(snapshot).read_text(encoding="utf-8")
+    assert "===== status exit=0 =====" in content
+    assert "result-2" in content
+
+
+def test_git_snapshot_excludes_secrets_and_project_behavior_metadata(tmp_path: Path) -> None:
+    settings, _git = _git_settings(tmp_path)
+    workspace = settings.workspace_root
+    (workspace / "ordinary.txt").write_text("ordinary", encoding="utf-8")
+    (workspace / ".env").write_text("TOP_SECRET=value", encoding="utf-8")
+    (workspace / ".gitattributes").write_text(
+        "*.txt diff=attacker\n", encoding="utf-8"
+    )
+    hooks = workspace / ".git" / "hooks"
+    hooks.mkdir(exist_ok=True)
+    (hooks / "post-checkout").write_text("attacker", encoding="utf-8")
+    config = workspace / ".git" / "config"
+    with config.open("a", encoding="utf-8") as output:
+        output.write("\n[diff \"attacker\"]\n\tcommand = cmd.exe /c echo leaked\n")
+
+    stage = stage_git_repository(settings, "sanitize")
+    try:
+        assert (stage.repository / "ordinary.txt").read_text(encoding="utf-8") == "ordinary"
+        assert not (stage.repository / ".env").exists()
+        assert not (stage.repository / ".gitattributes").exists()
+        assert not (stage.repository / ".git" / "hooks").exists()
+        staged_config = (stage.repository / ".git" / "config").read_text(encoding="utf-8")
+        assert "attacker" not in staged_config
+        assert "repositoryformatversion = 0" in staged_config
+    finally:
+        shutil.rmtree(stage.root, ignore_errors=True)
 
 
 def test_automatic_git_rejects_workspace_gitfile_pointing_outside(tmp_path: Path) -> None:
@@ -139,6 +195,7 @@ def test_automatic_git_rejects_workspace_gitfile_pointing_outside(tmp_path: Path
     settings = Settings(
         workspace_root=workspace,
         data_dir=tmp_path / "data",
+        sandbox_scratch_dir=tmp_path / "scratch",
         protect_data_dir_acl=False,
         git_enabled=True,
         git_executable_path=Path(git),
@@ -146,15 +203,15 @@ def test_automatic_git_rejects_workspace_gitfile_pointing_outside(tmp_path: Path
     )
     settings.ensure_directories()
 
-    policy = CommandPolicy(settings, Workspace(settings))
-    with pytest.raises(
-        PermissionError, match="automatic Git broker execution is disabled"
-    ):
-        policy.normalize_safe(program="git", args=["status", "--short"], cwd=".")
+    with pytest.raises(GitBrokerUnavailable, match="regular .git directory"):
+        stage_git_repository(settings, "external-gitdir")
 
-    snapshot = capture_git_snapshot(
-        settings=settings,
-        operation_id="external-gitdir",
-        stage="test",
-    )
-    assert snapshot is None
+
+def test_automatic_git_rejects_object_alternates(tmp_path: Path) -> None:
+    settings, _git = _git_settings(tmp_path)
+    info = settings.workspace_root / ".git" / "objects" / "info"
+    info.mkdir(parents=True, exist_ok=True)
+    (info / "alternates").write_text(str(tmp_path / "outside-objects"), encoding="utf-8")
+
+    with pytest.raises(GitBrokerUnavailable, match="external/extended repository metadata"):
+        stage_git_repository(settings, "alternates")
