@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +14,7 @@ from .git_broker_sandbox import (
     require_git_broker_containment,
     run_git_broker_batch,
 )
-from .resources import NamedControlPlaneLock
+from .resources import NamedControlPlaneLock, _try_remove_disposable_artifact
 from .sandbox_backend import SANDBOX_SECURITY_PROPERTIES
 from .tool_safety import pinned_helper_identity
 from .util import canonical_json, sha256_text, utc_now_iso
@@ -191,19 +192,30 @@ def verify_git_broker_live(settings: Settings) -> dict[str, Any]:
     context = git_broker_live_context(settings, git_identity, containment=containment)
     git = str(git_identity["path"])
     base = _git_probe_base(git)
-    results = run_git_broker_batch(
-        settings=settings,
-        git_identity=git_identity,
-        commands=(
-            [*base, "rev-parse", "--is-inside-work-tree"],
-            [*base, "status", "--porcelain=v1", "--untracked-files=no"],
-            [*base, "--list-cmds=builtins"],
-        ),
-        cwd=str(settings.workspace_root),
-        timeout=60,
-        output_limit=64 * 1024,
-        live_verification_probe=True,
+    token = f"live-{uuid.uuid4().hex}"
+    stage_root = (
+        settings.sandbox_scratch_dir / "git-broker" / token
+        if settings.sandbox_scratch_dir is not None
+        else None
     )
+    try:
+        results = run_git_broker_batch(
+            settings=settings,
+            git_identity=git_identity,
+            commands=(
+                [*base, "rev-parse", "--is-inside-work-tree"],
+                [*base, "status", "--porcelain=v1", "--untracked-files=no"],
+                [*base, "--list-cmds=builtins"],
+            ),
+            cwd=str(settings.workspace_root),
+            timeout=60,
+            output_limit=64 * 1024,
+            token=token,
+            live_verification_probe=True,
+        )
+    finally:
+        if stage_root is not None:
+            _try_remove_disposable_artifact(stage_root)
     if len(results) != 3:
         raise GitBrokerUnavailable(
             "Automatic Git Broker live verification returned an incomplete probe set"
