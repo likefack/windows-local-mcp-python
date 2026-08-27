@@ -54,6 +54,31 @@ function Assert-WorkerIdentity {
     return $process
 }
 
+function Assert-WmiHelperIdentities {
+    param(
+        [Parameter(Mandatory = $true)]$Handoff,
+        [Parameter(Mandatory = $true)][string]$Stage
+    )
+    $helpers = @($Handoff.wmi_job_external_helpers)
+    if ($helpers.Count -lt 1) {
+        throw "No verified WMI job-external helper identities were recorded."
+    }
+    foreach ($helper in $helpers) {
+        $pidValue = [int]$helper.pid
+        $process = Get-Process -Id $pidValue -ErrorAction Stop
+        $actualCreate = Get-UnixCreateTimeSeconds -Process $process
+        $expectedCreate = [double]$helper.create_time
+        if ([Math]::Abs($actualCreate - $expectedCreate) -gt 1.0) {
+            throw "WMI helper PID was reused $Stage: PID=$pidValue"
+        }
+        $actualPath = [IO.Path]::GetFullPath($process.Path)
+        $expectedPath = [IO.Path]::GetFullPath([string]$helper.executable)
+        if (-not $actualPath.Equals($expectedPath, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "WMI helper executable identity changed $Stage: expected=$expectedPath actual=$actualPath"
+        }
+    }
+}
+
 function Read-JsonFile {
     param([Parameter(Mandatory = $true)][string]$Path)
     return Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -74,6 +99,8 @@ switch ($Phase) {
         if ($confirmation -cne "ARM") {
             throw "Abnormal verification arm phase cancelled by operator."
         }
+        Write-Output "After ABNORMAL_ARM_READY appears, leave this non-elevated PowerShell running."
+        Write-Output "Then use a separate elevated Administrator PowerShell for -Phase KillAndRestart."
         & $Python -I -B -m windows_local_mcp.approved_host_abnormal_verification `
             arm `
             --config $ConfigPath `
@@ -82,15 +109,18 @@ switch ($Phase) {
         if ($LASTEXITCODE -ne 0) {
             throw "Abnormal verification arm phase failed with exit code $LASTEXITCODE."
         }
-        Write-Output "Arm phase PASSED."
-        Write-Output "The handoff file records a live LocalSystem worker and an observed requester-user Win32_Process.Create helper."
-        Write-Output "Next run this script as Administrator with -Phase KillAndRestart -HandoffPath `"$HandoffPath`"."
+        Write-Output "Arm/recovery handshake PASSED."
+        Write-Output "The non-elevated verifier observed authenticated recovery state after the authority service epoch changed."
+        Write-Output "If KillAndRestart also passed, run this script from the normal non-elevated session with -Phase Check."
     }
 
     "KillAndRestart" {
         Assert-Administrator
         $HandoffPath = (Resolve-Path -LiteralPath $HandoffPath).Path
         $handoff = Read-JsonFile -Path $HandoffPath
+        if ([int]$handoff.version -lt 2 -or -not [bool]$handoff.synchronized_fault_injection) {
+            throw "Handoff was not produced by the synchronized abnormal verifier. Re-run -Phase Arm."
+        }
         $stateRoot = [IO.Path]::GetFullPath([string]$handoff.authority_state_root)
         $activePath = Join-Path $stateRoot "active.json"
         $statusPath = Join-Path $stateRoot "active-status.json"
@@ -100,6 +130,7 @@ switch ($Phase) {
         $activeBeforeHash = (Get-FileHash -LiteralPath $activePath -Algorithm SHA256).Hash
 
         $worker = Assert-WorkerIdentity -Handoff $handoff
+        Assert-WmiHelperIdentities -Handoff $handoff -Stage "before worker loss"
         $confirmation = Read-Host "Type KILL to terminate only the verified LocalSystem worker and restart the service"
         if ($confirmation -cne "KILL") {
             throw "Fault injection cancelled by operator."
@@ -112,6 +143,7 @@ switch ($Phase) {
         if (Get-Process -Id $worker.Id -ErrorAction SilentlyContinue) {
             throw "SYSTEM worker did not terminate after fault injection."
         }
+        Assert-WmiHelperIdentities -Handoff $handoff -Stage "after SYSTEM worker loss"
 
         $deadline = [DateTime]::UtcNow.AddSeconds(15)
         $status = $null
@@ -152,13 +184,17 @@ switch ($Phase) {
         if ([string]$status.state -ne "recovery_required") {
             throw "Authority restart did not retain recovery_required state."
         }
+        Assert-WmiHelperIdentities -Handoff $handoff -Stage "after authority service restart"
 
         $adminEvidencePath = "$HandoffPath.admin.json"
         @{
-            version = 1
+            version = 2
             operation_id = [string]$handoff.operation_id
             worker_pid = [int]$handoff.worker_pid
             worker_identity_verified_before_kill = $true
+            wmi_helpers_verified_before_worker_loss = $true
+            wmi_helpers_verified_after_worker_loss = $true
+            wmi_helpers_verified_after_service_restart = $true
             active_hash_before = $activeBeforeHash
             active_hash_after_kill = $activeAfterKillHash
             active_hash_after_restart = $activeAfterRestartHash
@@ -170,7 +206,8 @@ switch ($Phase) {
 
         Write-Output "KillAndRestart phase PASSED."
         Write-Output "The same immutable active latch survived worker termination and service restart."
-        Write-Output "Next return to the normal non-elevated runtime-user session and run -Phase Check."
+        Write-Output "The exact WMI-created helper identity survived both worker loss and service restart."
+        Write-Output "Return to the still-running normal non-elevated Arm session and wait for Arm/recovery handshake PASSED."
     }
 
     "Check" {
@@ -180,6 +217,17 @@ switch ($Phase) {
         if (-not (Test-Path -LiteralPath $adminEvidencePath -PathType Leaf)) {
             throw "Administrator fault-injection evidence is missing: $adminEvidencePath"
         }
+        $adminEvidence = Read-JsonFile -Path $adminEvidencePath
+        if (
+            [int]$adminEvidence.version -lt 2 -or
+            -not [bool]$adminEvidence.worker_identity_verified_before_kill -or
+            -not [bool]$adminEvidence.wmi_helpers_verified_before_worker_loss -or
+            -not [bool]$adminEvidence.wmi_helpers_verified_after_worker_loss -or
+            -not [bool]$adminEvidence.wmi_helpers_verified_after_service_restart -or
+            -not [bool]$adminEvidence.service_restarted
+        ) {
+            throw "Administrator fault-injection evidence is incomplete."
+        }
         & $Python -I -B -m windows_local_mcp.approved_host_abnormal_verification `
             check `
             --handoff $HandoffPath
@@ -187,6 +235,7 @@ switch ($Phase) {
             throw "Abnormal verification check phase failed with exit code $LASTEXITCODE."
         }
         Write-Output "Abnormal worker-loss/WMI/restart/legacy-approval verification PASSED."
+        Write-Output "The verified WMI helper was cleaned up after the security assertions."
         Write-Output "The authority intentionally remains recovery_required. Review the evidence before running recover-approved-host-authority.ps1."
     }
 }
