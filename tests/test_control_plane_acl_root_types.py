@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import windows_local_mcp.control_plane_guard as control_plane_guard
+from windows_local_mcp import control_plane_guard
 
 
 @pytest.mark.skipif(os.name != "nt", reason="icacls command shape is Windows-specific")
@@ -35,7 +35,7 @@ def test_acl_state_digest_recurses_directories_but_not_single_files(
     monkeypatch.setattr(control_plane_guard.subprocess, "run", fake_run)
 
     settings = SimpleNamespace(approval_manifest_max_bytes=1024 * 1024)
-    digest, byte_count = control_plane_guard._acl_state_digest(  # noqa: SLF001
+    digest, byte_count = control_plane_guard._acl_state_digest(
         settings,  # type: ignore[arg-type]
         [directory, config],
     )
