@@ -2,26 +2,27 @@
 
 ## Status
 
-Automatic Git Broker の source／unit／Windows CI remediation と、実機 route verification を分離して記録します。
+Automatic Git Broker の source／unit／Windows CI remediation、Windows real-machine route verification、model-facing MCP E2E を分離して記録します。
 
-- implementation source/test freeze: `3e14f04a2323a34e52f70fe4622b83078b1ad108`
-- focused-CI integration head: `f8d84f71c55c23f34d248a0f223822e1f6ac2ac2`
-- Git-specific live marker schema: v1 implemented
+- implementation source/test freeze: `7f2382f4a9a7d6140523c7f58f405edb916a13f3`
+- Git-specific live marker schema: v1
 - Automatic Git command-policy generation: v4
-- Automatic Git containment-policy generation: v5
+- Automatic Git containment-policy generation: v6
 - ordinary-operation auto verification/repair: prohibited
-- Windows CI: run #329 succeeded for the PR state containing the frozen source/tests and the dedicated ref-projection focused regression
+- Windows CI: run #346 succeeded on source/test freeze `7f2382f4a9a7d6140523c7f58f405edb916a13f3`
 - focused process-identity security regression: 17 passed
 - focused race/recovery/transaction regression: 38 passed
-- focused Automatic Git Broker regression: 90 passed
-- full pytest: 495 passed
+- focused Automatic Git Broker regression: 106 passed
+- full pytest: 511 passed
 - Ruff: passed
 - compileall: passed
 - diff whitespace: passed
-- Windows real-machine `verify-git-broker` on this final remediation source: NOT RUN
-- merge state: PR #26 remains draft/unmerged until the required real-machine verification is completed
+- Windows real-machine generic `verify-codex-sandbox`: PASS
+- Windows real-machine `verify-git-broker`: PASS
+- model-facing MCP `session_info` / `git_info` / `execute_readonly` E2E on this final remediation source: NOT RUN
+- merge state: PR #26 remains draft/unmerged until the model-facing MCP E2E and final documentation/security review are completed
 
-CI が green であっても、この PC で `verify-git-broker` を実行して current Git-specific marker が生成されるまでは Automatic Git の machine-local execution availability を証明しません。
+CI と machine-local verification は別の証拠です。2026-08-28 JST に target Windows PC で current source/test freeze を fast-forward し、clean source status のまま generic Sandbox verification と Git-specific verification を明示実行しました。Git-specific marker は schema v1、`route_eligible=true` で生成されています。通常 operation は marker を作成・repair しません。
 
 ## Source-level security properties
 
@@ -31,74 +32,100 @@ Current implementation requires all of the following before a model-facing Autom
 2. Git for Windows の既知 `cmd\git.exe`／root `bin\git.exe` wrapper・redirector を trust anchor として受理せず、実際の runtime executable（通常 `mingw64\bin\git.exe`、architecture により `clangarm64\bin\git.exe`／`mingw32\bin\git.exe`）を直接 pin します。
 3. Current generic Codex Windows Sandbox live evidence for the exact backend/isolation context.
 4. Automatic Git-specific strict gating: every Sandbox security property, including `protected_information_read` and LAN, must be `verified`; generic Sandbox residual-risk acceptance is not inherited.
-5. Git-specific marker schema v1 bound to the pinned Git identity, Sandbox backend, complete generic live-evidence digest, workspace root, scratch quota, Automatic Git containment-policy digest, command-policy generation, trusted process-cwd policy, and required-builtin policy.
+5. Git-specific marker schema v1 bound to the pinned Git identity, Sandbox backend, complete generic live-evidence digest, workspace root, scratch quota, Automatic Git containment-policy digest, command-policy generation, trusted process-cwd policy, required-builtin policy, exact projection ownership-trust policy, and sanitized EOL-semantics policy.
 6. The common Git runner revalidates the Git-specific marker immediately before every ordinary child launch, including direct `git_info` snapshot execution. Only the explicit `verify-git-broker` bootstrap probe may bypass the marker it is creating.
 7. Dedicated Git worker routing for current `broker` and legacy queued `safe_command` / `safe_sandbox` Git operations. These operations do not fall through to the standard worker.
 8. A bounded disposable repository projection. The Git child does not receive the original workspace as its repository filesystem.
-9. The Windows Git process itself starts with the pinned runtime executable directory as its process cwd. The Broker inserts a fixed `git -C <sanitized-projection-cwd>` operand so repository selection does not require an attacker-controlled process cwd. This closes the projection-current-directory DLL preload surface without removing the Automatic Git capability.
-10. Project-controlled execution metadata is removed or rejected: hooks, attributes, external alternates, extended/worktree metadata, nested `.git`, reparse points, and security-relevant hardlinks are not accepted as Automatic Git behavior inputs. Source named ADS are not copied into newly materialized projection files, while the completed projection is still checked fail-closed for named ADS.
-11. Source `.git/config` is parsed only in Broker memory, is capped at 1 MiB, requires repository format v0, and produces only an inert sanitized `core` configuration in the projection.
-12. Git object database bytes are not considered provenance-safe merely because a tree/index path looks safe. Automatic `diff` / `show` are therefore metadata-only: patch, binary patch, `--check`, and implicit patch output are rejected and directed to `request_sandbox_command`. Revisions remain commit-bound with `^{commit}` and ranges bind both endpoints as defense-in-depth.
-13. The fixed Automatic Git capability remains available for status, metadata-only diff/show, log metadata, rev-parse, ls-files, and `git_info` snapshots; the hardening does not globally disable Automatic Git.
-14. `verify-git-broker` queries the exact pinned runtime with `--list-cmds=builtins` and requires all Automatic subcommands (`status`, `diff`, `log`, `show`, `rev-parse`, `ls-files`) to be builtin in that runtime. A runtime that would delegate one of these commands to an external `git-*` helper does not receive a current marker.
-15. Every Automatic Git launch fixes `maintenance.auto=false` and `gc.auto=0` in the Broker runner, in addition to disabling fsmonitor, untracked cache, external diff/textconv, credentials, optional locks, protocol access, system/global config, and system attributes.
-16. The Git process runs through the live-verified Codex Windows Sandbox/WFP/Job boundary with source workspace/data_dir deny, network deny, descendant/resource controls, and brokered-process-creation denial.
-17. Git executable, Codex backend, and WFP Guard implementation identities are held against replacement during the batch. Scratch projection cleanup runs in `finally`, and stale `git-broker` scratch roots are included in retention cleanup.
-18. Repository projection bytes are limited to at most half of configured `max_sandbox_scratch_bytes`, leaving the remaining budget for operation runtime/transient output. No hard-coded repository-size floor may exceed the operator quota. Entry count is enforced during the copy itself as well as bounded scans.
-19. Projection pruning is input-driven rather than filename-whitelisted. A root ignored/generated subtree is omitted only when the batch does not observe ignored untracked entries, a conservatively parsed root `.gitignore` single-component directory-only pattern matches it, and the pinned ordinary Git index proves that no tracked descendant exists. Both root-anchored forms such as `/.dev-tmp/` and unanchored forms such as `.venv/` may prove the corresponding root entry ignored. Unsupported/split index, negation/complex ignore semantics, a tracked descendant, or an observable ignored-tree command disables pruning and required unreadable input remains fail closed.
-20. Loose-ref projection is command-observability driven rather than a blanket copy of `.git/refs`. For batches whose allowed semantics are HEAD-derived, the Broker pins `.git/HEAD`, the current symbolic loose-ref chain, and `packed-refs` when present, then omits unrelated loose-ref namespaces and reflogs before opening or materializing them. Commands that can observe unrelated refs, such as `log --all`, `--branches`, `--tags`, or non-HEAD revisions, retain the full required ref namespace and remain fail closed if those inputs are unsafe or unreadable. `refs/replace` remains conservatively retained because replace refs can affect object lookup without being named explicitly.
-21. Source paths that are valid in the live workspace but would cross the currently supported Windows legacy path boundary only after the scratch/projection prefix is added are classified explicitly as `GitBrokerUnavailable` before materialization instead of leaking a raw `FileNotFoundError`. Extended-length path execution is not silently enabled without a verified security/TOCTOU integration.
-22. No Automatic Git failure falls back to the normal Broker worker or Approved Host.
-23. The explicit Git-specific verifier does not use remapped `git rev-parse --show-toplevel` output as independent projection proof. It requires pinned Git worktree recognition and read-only status success under the stricter source-workspace-deny containment, requires the allowed command set to be builtin, and requires all probe results from the batch to carry the same valid sanitized-projection snapshot digest before a marker can be issued.
+9. The Windows Git process starts with the pinned runtime executable directory as process cwd. The Broker inserts a fixed `git -C <sanitized-projection-cwd>` operand so repository selection does not require an attacker-controlled process cwd.
+10. Repository ownership trust is granted only to the operation-specific disposable projection with command-scope `-c safe.directory=<exact stage.repository>`. Wildcard trust, source-workspace trust, scratch-parent trust, and global persistent `safe.directory` changes are not used by Automatic Git.
+11. Project-controlled execution metadata is removed or rejected: hooks, attributes, external alternates, extended/worktree metadata, nested `.git`, reparse points, and security-relevant hardlinks are not accepted as Automatic Git behavior inputs. Source named ADS are not copied into newly materialized projection files, while the completed projection is still checked fail-closed for named ADS.
+12. Source `.git/config` is parsed only in Broker memory, is capped at 1 MiB, requires repository format v0, and produces only an inert sanitized `core` configuration in the projection.
+13. `core.autocrlf` semantics are reconstructed without exposing raw system/global Git config to the child. The Broker resolves only the trusted scalar value (`true` / `false` / `input`), rejects include/includeIf semantics or config paths overlapping workspace/`data_dir`/scratch, and emits the scalar into sanitized repository config. A direct repository-local scalar override retains normal precedence; invalid or unverifiable semantics fail closed.
+14. Git object database bytes are not considered provenance-safe merely because a tree/index path looks safe. Automatic `diff` / `show` are therefore metadata-only: patch, binary patch, `--check`, and implicit patch output are rejected and directed to `request_sandbox_command`. Revisions remain commit-bound with `^{commit}` and ranges bind both endpoints as defense-in-depth.
+15. The fixed Automatic Git capability remains available for status, metadata-only diff/show, log metadata, rev-parse, ls-files, and `git_info` snapshots; the hardening does not globally disable Automatic Git.
+16. `verify-git-broker` queries the exact pinned runtime with `--list-cmds=builtins` and requires all Automatic subcommands (`status`, `diff`, `log`, `show`, `rev-parse`, `ls-files`) to be builtin in that runtime. A runtime that would delegate one of these commands to an external `git-*` helper does not receive a current marker.
+17. Every Automatic Git launch fixes `maintenance.auto=false` and `gc.auto=0` in the Broker runner, in addition to disabling fsmonitor, untracked cache, external diff/textconv, credentials, optional locks, protocol access, raw system/global config in the child, and system attributes.
+18. The Git process runs through the live-verified Codex Windows Sandbox/WFP/Job boundary with source workspace/data_dir deny, network deny, descendant/resource controls, and brokered-process-creation denial.
+19. Git executable, Codex backend, and WFP Guard implementation identities are held against replacement during the batch. Scratch projection cleanup runs in `finally`, and stale `git-broker` scratch roots are included in retention cleanup.
+20. Repository projection bytes are limited to at most half of configured `max_sandbox_scratch_bytes`, leaving the remaining budget for operation runtime/transient output. No hard-coded repository-size floor may exceed the operator quota. Entry count is enforced during the copy itself as well as bounded scans.
+21. Projection pruning is input-driven rather than filename-whitelisted. A root ignored/generated subtree is omitted only when the batch does not observe ignored untracked entries, a conservatively parsed root `.gitignore` single-component directory-only pattern matches it, and the pinned ordinary Git index proves that no tracked descendant exists. Unsupported/split index, negation/complex ignore semantics, a tracked descendant, or an observable ignored-tree command disables pruning and required unreadable input remains fail closed.
+22. Loose-ref projection is command-observability driven rather than a blanket copy of `.git/refs`. HEAD-derived batches pin `.git/HEAD`, the current symbolic loose-ref chain, and `packed-refs` when present, then omit unrelated loose-ref namespaces and reflogs before opening or materializing them. Commands that can observe unrelated refs retain the full required namespace and remain fail closed if those inputs are unsafe or unreadable. `refs/replace` remains conservatively retained.
+23. Source paths that are valid in the live workspace but would cross the currently supported Windows legacy path boundary only after the scratch/projection prefix is added are classified explicitly as `GitBrokerUnavailable` before materialization. Extended-length path execution is not silently enabled without verified security/TOCTOU integration.
+24. No Automatic Git failure falls back to the normal Broker worker or Approved Host.
+25. The explicit Git-specific verifier requires pinned Git worktree recognition, read-only status success under the stricter source-workspace-deny containment, required builtin commands, and one consistent sanitized-projection snapshot digest across the probe batch before a marker can be issued.
 
 ## Regression coverage
 
-Focused Windows CI includes the Automatic Git environment/staging tests, launch-time marker-gate tests, Git-specific marker tests, scratch-resource tests, object-access tests, current/legacy worker-routing tests, helper/runtime-identity tests, trusted-cwd/fixed-`-C` tests, builtin-command tests, projection-boundary tests, ref-projection tests, and directory TOCTOU tests.
-
-At implementation source/test freeze `3e14f04a2323a34e52f70fe4622b83078b1ad108`, the focused-CI integration head `f8d84f71c55c23f34d248a0f223822e1f6ac2ac2` was validated by Windows CI run #329:
+Windows CI run #346 validated source/test freeze `7f2382f4a9a7d6140523c7f58f405edb916a13f3`:
 
 - focused process-identity security regression: 17 passed
 - focused race/recovery/transaction regression: 38 passed
-- focused Automatic Git Broker regression: 90 passed
-- full pytest: 495 passed
+- focused Automatic Git Broker regression: 106 passed
+- full pytest: 511 passed
 - Ruff: success
 - compileall: success
 - diff whitespace: success
 
-The projection-boundary regressions cover the original whole-workspace availability failure and its follow-up cases. They verify that a proven ignored/untracked root tree is not opened, including the repository's real-world unanchored `.venv/` form; that a tracked descendant prevents pruning; that `ls-files --others` without `--exclude-standard` prevents pruning because ignored/untracked entries become observable; that source named ADS such as `Zone.Identifier` do not cross the projection boundary; and that reparse points, relevant hardlinks, nested `.git`, external alternates, and unreadable security-relevant Git metadata remain fail closed. A dedicated path regression verifies the case where the source path is below the Windows legacy limit but the longer scratch projection path crosses it and must produce an explicit broker-unavailable classification.
+The focused Automatic Git set includes environment/staging, trusted EOL semantics, exact `safe.directory` launch ownership trust, launch-time marker gate, Git-specific marker, scratch-resource, object-access, current/legacy worker routing, helper/runtime identity, trusted-cwd/fixed-`-C`, builtin-command, projection-boundary, ref-projection, and directory TOCTOU regressions.
 
-The ref-projection regressions cover the machine-observed `.git/refs/codex/turn-diffs/checkpoints/...` path-length availability failure. They create an unrelated deeply nested loose-ref namespace, make opening that namespace a test failure, and verify that the verifier/status-style HEAD-only projection neither opens nor materializes it while retaining the current loose HEAD ref and executing staged `git status` successfully. Separate regressions verify packed current-branch resolution and require full-ref commands such as `log --all` to retain/fail closed on an unreadable required ref namespace instead of silently pruning it.
+The EOL regression creates a real Git-for-Windows `core.autocrlf=true` checkout rather than manually rewriting bytes. It proves that the source repository is clean, the projection remains clean when the trusted scalar is preserved, and a control projection with `core.autocrlf=false` becomes dirty. This prevents a test fixture from masking or inventing the Windows line-ending semantics being protected.
 
-The object-access regressions cover two distinct unsafe Git behaviors:
+The ownership-trust regression requires `_prepare_git_launch` to insert exactly one command-scope `safe.directory` for the generated projection and not for the source workspace or a wildcard/parent scope.
 
-- `git show --no-patch <blob-sha>` prints blob bytes unless the revision is forced through a commit peel.
-- A protected blob can be attached to an apparently safe path in an attacker-controlled tree/commit. Normal `git show --patch <commit> -- safe.txt` then prints the protected blob even when the current workspace `safe.txt` is benign. Therefore path validation plus commit binding alone is not a protected-content boundary; Automatic content-bearing output is denied.
+The projection-boundary regressions cover ignored/untracked generated trees, workspace-local `.venv/`, named ADS, reparse points, hardlinks, nested `.git`, external alternates, required unreadable metadata, and destination-only Windows path-length overflow. Ref-projection regressions verify that unrelated deep `.git/refs/codex/...` namespaces are not opened by HEAD-only batches while full-ref commands remain fail closed on required unreadable refs.
 
-The runtime-dependency regressions verify that known Git for Windows wrapper/redirector paths are rejected when an actual architecture runtime exists, the direct runtime is accepted, the child process cwd is the trusted runtime directory, repository selection is broker-inserted through `-C`, and the Git-specific verifier refuses a runtime whose allowed Automatic commands are not all builtin.
+## Windows real-machine evidence
 
-The scratch-resource regressions verify that projection byte limits never exceed half of configured scratch quota, the old 16 MiB floor is not reintroduced, and copy-time entry growth is bounded before final post-copy validation.
+Target machine verification was executed on source/test freeze `7f2382f4a9a7d6140523c7f58f405edb916a13f3` after `git fetch`, `git switch`, clean `git status`, and `git merge --ff-only` confirmed the local branch was current.
 
-The live-verifier regressions require a consistent sanitized-projection snapshot digest across the explicit probe batch and reject mismatched digests. This avoids treating the user-facing source-path remap performed on Git output as evidence that the child actually executed against the disposable projection.
+Generic `verify-codex-sandbox` evidence:
 
-## Required real-machine completion step
+- live marker schema: v5
+- backend: OpenAI Codex Windows Sandbox `0.150.0-alpha.8`
+- `passed=true`
+- `route_eligible=true`
+- source workspace read/write denial: verified
+- control-plane read/write denial: verified
+- protected-information denial: verified
+- Internet/LAN/loopback denial: verified
+- child/grandchild containment: verified
+- timeout/process/memory/filesystem bounds: verified
+- `brokered_process_creation_denied=true`
+- WMI result: `WLMCP_WMI_STATUS=-2147217405`, `WLMCP_BROKERED_PROCESS=DENIED`
 
-Run only by explicit trusted-operator action on the target Windows PC after generic Sandbox verification is current. Configure and hash the actual Git runtime executable, not a Git for Windows wrapper/redirector. A typical 64-bit Git for Windows installation uses `C:\Program Files\Git\mingw64\bin\git.exe`.
+Git-specific `verify-git-broker` evidence:
 
-```powershell
-$gitPath = 'C:\Program Files\Git\mingw64\bin\git.exe'
-$gitHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $gitPath).Hash.ToLowerInvariant()
-```
+- marker schema: v1
+- `verified_at`: `2026-08-27T19:55:20.507898+00:00`
+- command-policy generation: v4
+- containment-policy generation: v6
+- exact Git runtime: `C:\Program Files\Git\mingw64\bin\git.exe`
+- Git SHA-256: `fe0e064c8283dc50b1ce11a8b90d2ec1b68b5dc714ff0b8a8534bb9c43d1d02e`
+- Git stable file identity: bound
+- source workspace access: `deny`
+- execution input: `sanitized-disposable-repository-snapshot`
+- network: `deny`
+- host fallback: `false`
+- `git_inside_worktree=true`
+- `git_projection_snapshot_bound=true`
+- `git_status_readonly=true`
+- `git_allowed_commands_builtin=true`
+- `route_eligible=true`
 
-Set those values as `git_executable_path` / `git_executable_sha256`, then run:
+This is valid machine-local route evidence for the current source/test freeze. It is not yet model-facing MCP E2E evidence for `session_info`, `git_info`, and `execute_readonly`.
 
-```powershell
-$env:LOCAL_MCP_CONFIG = 'C:\path\to\config.local.toml'
-.\.venv\Scripts\python.exe -m windows_local_mcp.cli verify-codex-sandbox
-.\.venv\Scripts\python.exe -m windows_local_mcp.cli verify-git-broker
-```
+## Remaining completion step
 
-A successful `verify-git-broker` must create a schema-v1 marker whose exact context, including current command-policy generation v4, containment-policy generation v5, trusted process-cwd policy, builtin-command requirement, and scratch quota, is still current. Missing, failed, stale, or mismatched evidence leaves Automatic Git fail closed. This document must not be changed to claim Windows live verification merely because CI passes.
+With the current marker loaded by the WLMCP server, complete model-facing E2E and record the results:
+
+1. `session_info()` reports the Git Broker helper truthfully configured/enabled/available/live-verified on this machine.
+2. `git_info` succeeds through Automatic Git Broker.
+3. `execute_readonly` succeeds for `git status --short` and metadata-only `git diff --stat`.
+4. content-bearing `git show --patch`, `git diff --patch`, and `git diff --check` do not execute through Automatic Git and do not fall back to Approved Host; they are rejected/routed to `request_sandbox_command` according to policy.
+5. operation/audit evidence records Broker Git containment and `host_fallback_performed=false`.
+
+PR #26 remains draft/unmerged until this E2E, final documentation synchronization, and final security review are complete.
 
 ## Finalization record
 
-Implementation source/tests are frozen at `3e14f04a2323a34e52f70fe4622b83078b1ad108`; Windows CI run #329 validates that source/test state through focused-CI integration head `f8d84f71c55c23f34d248a0f223822e1f6ac2ac2`. This verification-record update is documentation-only and does not change the source/test freeze identity. Real-machine `verify-git-broker` evidence remains explicitly `NOT RUN` on the final remediation source until it is actually performed.
+Source/tests are frozen at `7f2382f4a9a7d6140523c7f58f405edb916a13f3`. Windows CI run #346 and the Windows real-machine generic/Git-specific verifier evidence above validate that source/test state. Documentation commits after the freeze do not redefine the tested source identity. Model-facing MCP E2E remains explicitly `NOT RUN` until separately executed and recorded.
