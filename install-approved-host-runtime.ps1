@@ -12,7 +12,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 $AuthorityServiceName = "WindowsLocalMCPApprovedHost"
-$AuthorityActiveState = Join-Path $env:ProgramData "WindowsLocalMCP\ApprovedHostAuthority\active.json"
+$AuthorityStateRoot = Join-Path $env:ProgramData "WindowsLocalMCP\ApprovedHostAuthority"
+$AuthorityActiveState = Join-Path $AuthorityStateRoot "active.json"
+$AuthorityRecoveryState = Join-Path $AuthorityStateRoot "recovery_required"
 
 function Assert-UnderProgramFiles {
     param(
@@ -77,17 +79,22 @@ $restartAuthorityService = $false
 if ((Test-Path -LiteralPath $InstallRoot) -and -not $Replace) {
     throw "InstallRoot already exists. Use -Replace to replace it: $InstallRoot"
 }
-if ($Replace -and $null -ne $existingAuthorityService) {
-    if (Test-Path -LiteralPath $AuthorityActiveState -PathType Leaf) {
+if ($Replace) {
+    if (
+        (Test-Path -LiteralPath $AuthorityActiveState -PathType Leaf) -or
+        (Test-Path -LiteralPath $AuthorityRecoveryState)
+    ) {
         throw "Approved Host authority has active/recovery state. Review and recover it before replacing the immutable runtime."
     }
-    if ($existingAuthorityService.Status -ne [ServiceProcess.ServiceControllerStatus]::Stopped) {
-        Stop-Service -Name $AuthorityServiceName
-        (Get-Service -Name $AuthorityServiceName).WaitForStatus(
-            [ServiceProcess.ServiceControllerStatus]::Stopped,
-            [TimeSpan]::FromSeconds(30)
-        )
-        $restartAuthorityService = $true
+    if ($null -ne $existingAuthorityService) {
+        if ($existingAuthorityService.Status -ne [ServiceProcess.ServiceControllerStatus]::Stopped) {
+            Stop-Service -Name $AuthorityServiceName
+            (Get-Service -Name $AuthorityServiceName).WaitForStatus(
+                [ServiceProcess.ServiceControllerStatus]::Stopped,
+                [TimeSpan]::FromSeconds(30)
+            )
+            $restartAuthorityService = $true
+        }
     }
 }
 if (Test-Path -LiteralPath $StagingRoot) {
@@ -174,7 +181,23 @@ try {
     }
 
     if ($Replace -and (Test-Path -LiteralPath $InstallRoot)) {
+        # An existing immutable runtime can come from an older installer whose descendant ACLs
+        # accidentally removed the Administrators ACE. Replacement is an explicit elevated
+        # maintenance action, so first reclaim the retired tree for Administrators and only then
+        # delete it. This changes only the old tree after active/recovery state has been excluded;
+        # the newly staged runtime remains protected and is moved into place afterwards.
+        & icacls.exe $InstallRoot /setowner "*S-1-5-32-544" /T | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "Reclaiming ownership of the previous Approved Host runtime failed."
+        }
+        & icacls.exe $InstallRoot /grant:r "*S-1-5-32-544:(OI)(CI)F" /T | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "Reclaiming Administrators access to the previous Approved Host runtime failed."
+        }
         Remove-Item -LiteralPath $InstallRoot -Recurse -Force
+        if (Test-Path -LiteralPath $InstallRoot) {
+            throw "Removing the previous Approved Host runtime failed: $InstallRoot"
+        }
     }
     Move-Item -LiteralPath $StagingRoot -Destination $InstallRoot
 
