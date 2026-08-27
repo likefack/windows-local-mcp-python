@@ -9,6 +9,7 @@ from typing import ClassVar
 from pydantic import BaseModel, PrivateAttr
 
 from .config import Settings
+from .git_metadata import force_structural_commit_output
 from .paths import Workspace
 from .tool_safety import capture_executable_identity, trusted_helper_identity
 from .util import canonical_json, sha256_text
@@ -240,6 +241,7 @@ class CommandPolicy:
         elif subcommand == "log":
             allowed = self.GIT_COMMON_FLAGS | {"--all", "--branches", "--tags"}
             normalized = self._git_revisions_flags_paths(tail, allowed, allow_count=True)
+            normalized = force_structural_commit_output(normalized)
             normalized = ["--no-ext-diff", "--no-textconv", *normalized]
         elif subcommand == "show":
             has_paths = "--" in tail and bool(tail[tail.index("--") + 1 :])
@@ -268,6 +270,7 @@ class CommandPolicy:
                 for value in normalized
             ):
                 normalized.insert(0, "--no-patch")
+            normalized = force_structural_commit_output(normalized)
             normalized = ["--no-ext-diff", "--no-textconv", *normalized]
         elif subcommand == "rev-parse":
             permitted = {
