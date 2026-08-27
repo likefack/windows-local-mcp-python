@@ -182,14 +182,13 @@ def _git_for_windows_runtime_candidate(executable: Path) -> Path | None:
     if executable.name.casefold() != "git.exe":
         return None
     parent = executable.parent
+    parent_name = parent.name.casefold()
+    parent_parent_name = parent.parent.name.casefold()
     root: Path | None = None
-    if parent.name.casefold() == "cmd":
-        root = parent.parent
-    elif parent.name.casefold() == "bin" and parent.parent.name.casefold() not in {
-        "mingw64",
-        "mingw32",
-        "clangarm64",
-    }:
+    if parent_name == "cmd" or (
+        parent_name == "bin"
+        and parent_parent_name not in {"mingw64", "mingw32", "clangarm64"}
+    ):
         root = parent.parent
     if root is None:
         return None
