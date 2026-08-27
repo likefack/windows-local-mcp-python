@@ -9,6 +9,7 @@ from ctypes import wintypes
 from pathlib import Path
 from typing import Any
 
+from .approval import verify_approval_bundle
 from .approved_host_authority import (
     APPROVED_HOST_AUTHORITY_SERVICE_NAME,
     ApprovedHostAuthorityClient,
@@ -16,11 +17,9 @@ from .approved_host_authority import (
     default_authority_state_root,
 )
 from .approved_host_service import _process_token_details
-from .approval import verify_approval_bundle
 from .audit import TERMINAL_STATUSES
 from .control_plane import verify_control_plane_generation
 from .policy import approved_request_hash
-
 
 if os.name == "nt":
     _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)

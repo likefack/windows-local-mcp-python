@@ -733,10 +733,10 @@ class _WindowsServiceHost:
             self.server.close()
             thread.join(timeout=10)
             self._set_status(_SERVICE_STOPPED)
-        except Exception:
+        except Exception:  # noqa: BLE001 - SCM callback must not escape on fatal service error
             try:
                 self._set_status(_SERVICE_STOPPED, win32_exit=1)
-            except Exception:
+            except Exception:  # noqa: BLE001,S110 - SCM status channel may already be unavailable
                 pass
 
     def _handler(

@@ -1,12 +1,37 @@
 # 検証記録
 
-## 2026-08-27 WLMCP-R2-001 remediation — CLOSED
+## 2026-08-27 WLMCP-R2-001 LocalSystem authority remediation — LIVE VERIFICATION PENDING
+
+### Current verdict
+
+- finding は `High / valid` のまま。旧 same-user monitor／postflight architecture の bypass は成立する。
+- 2026-08-27 の Approved Host 全面 fail-closed は temporary exploit containment／product regression の historical record であり、trusted operator は final remediation として拒否した。
+- current branch は monitor／postflight worker を LocalSystem service へ移し、実 command を verified non-elevated requester-user token で起動する root-remediation candidate を実装する。
+- ProgramData の LocalSystem-owned immutable active latch、service epoch、normal-return＋verified-postflight completion proof、requester-user WMI process census、runtime-user monitor-stop denial を追加した。
+- GitHub Hosted Windows の Ruff／compileall／pytest は必要な regression evidence だが、SCM／ProgramData ACL、SYSTEM process/thread/token rights、requester-token child、worker kill／service restart を証明する Windows live evidence ではない。
+- `verify-approved-host-authority.ps1` normal path と `verify-approved-host-authority-abnormal.ps1` Arm／KillAndRestart／Check が実 PC で成功するまで status は `valid / remediation implemented / Windows live verification pending`。その前に `fixed`／`closed` と記録したり main へ merge したりしない。
+
+### Candidate architecture / regression scope
+
+- production service: `WindowsLocalMCPApprovedHost` / LocalSystem / protected SCM DACL。
+- durable state: `%ProgramData%\WindowsLocalMCP\ApprovedHostAuthority` / LocalSystem owner / protected SYSTEM+Administrators DACL。
+- final command: pipe requester PID／create-time／SID／non-elevated token を検証し `CreateProcessAsUserW`。SYSTEM child へ昇格しない。
+- Job Object: suspended child を SYSTEM worker Job へ assign 後 resume。
+- WMI/CIM: SYSTEM current-user census へ誤変換せず、元 requester-user PID／create-time baseline を postflight まで追跡。
+- completion: child start 後は expected control-plane postflight と正常 `run_operation()` return の両方がなければ proof を作らない。
+- restart: active latch がある service start は recovery_required。旧 service epoch proof は受理しない。
+- runtime-user `stop_job`／pipe cancel は active Host monitor を停止できない。
+- legacy pending approval は abnormal Host latch 後に current generation／authority gate を bypassできないことを mandatory abnormal live verification に含める。
+
+## 2026-08-27 historical WLMCP-R2-001 capability-reduction record — SUPERSEDED
+
+この節は total fail-closed mitigation を採用した時点の履歴です。以下の `current v1`／`closed` 表現は上記 current remediation section により supersede されています。
 
 ### 判定
 
 - WLMCP-R2-001 の finding 自体は valid のまま維持する。Approved Host child と worker／postflight monitor が同一 Windows user authority にある current architecture では、child が監視側を停止して postflight を回避でき、restart 時の stale reconciliation だけでは durable tamper latch が残らない。
 - この same-user guarded interval を安全な境界として再分類したり、受容済み残存 risk に移したりせず、current v1 の Approved Host execution capability 自体を停止する capability reduction で attack sink を除去した。
-- 下記 Security Scan Round 2 の `WLMCP-R2-001 | High | unresolved / release blocker` は scan 時点の履歴として残すが、この節が current status を supersede する。current v1 に対する WLMCP-R2-001 は `fixed by capability reduction / closed` とする。
+- 下記 Security Scan Round 2 の `WLMCP-R2-001 | High | unresolved / release blocker` と本 historical section は各時点の記録として残す。current status は上記 LocalSystem authority remediation section が supersede し、旧 `fixed by capability reduction / closed` は final product remediation の判定には使用しない。
 - `approved_host_enabled=true`、`request_host_command` surface、immutable runtime verification、pending／approved row の存在は execution availability を意味しない。`Executor.launch()` は current `approved_host` と legacy `host_approval` の双方を worker spawn 前に fail closed する。
 - same-desktop UAC elevation を monitor authority separation の security boundary として採用しない。Approved Host を将来再有効化する場合は、別 user／session、SYSTEM service その他の independently justified Windows security boundary で monitor／postflight owner と durable tamper state を untrusted child から分離し、monitor kill、worker kill、postflight bypass、restart recovery を Windows 実機で再検証することを要求する。
 

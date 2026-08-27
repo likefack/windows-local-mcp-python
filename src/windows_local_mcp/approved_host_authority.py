@@ -6,10 +6,11 @@ import os
 import stat
 import tempfile
 import time
+from collections.abc import Mapping
 from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from .util import canonical_json, utc_now_iso
 
@@ -235,7 +236,7 @@ def _reject_unsafe_state_path(path: Path, *, directory: bool) -> None:
 def _read_json_object(path: Path) -> dict[str, Any]:
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
-        raise RuntimeError(f"Approved Host authority state is not an object: {path}")
+        raise TypeError(f"Approved Host authority state is not an object: {path}")
     return value
 
 
@@ -428,9 +429,11 @@ def _open_verified_pipe(timeout_ms: int = 5000) -> wintypes.HANDLE:
         if error != _ERROR_PIPE_BUSY or time.monotonic() >= deadline:
             raise _winerror("CreateFileW(Approved Host authority pipe)")
         remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
-        if not _kernel32.WaitNamedPipeW(APPROVED_HOST_AUTHORITY_PIPE, remaining_ms):
-            if time.monotonic() >= deadline:
-                raise _winerror("WaitNamedPipeW")
+        if (
+            not _kernel32.WaitNamedPipeW(APPROVED_HOST_AUTHORITY_PIPE, remaining_ms)
+            and time.monotonic() >= deadline
+        ):
+            raise _winerror("WaitNamedPipeW")
 
 
 def _write_pipe_message(handle: wintypes.HANDLE, payload: Mapping[str, Any]) -> None:

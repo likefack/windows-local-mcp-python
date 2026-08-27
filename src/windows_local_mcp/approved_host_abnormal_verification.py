@@ -10,6 +10,7 @@ from typing import Any
 
 import psutil
 
+from .approval import verify_approval_bundle
 from .approved_host_authority import (
     ApprovedHostAuthorityClient,
     ApprovedHostRecoveryRequired,
@@ -20,7 +21,6 @@ from .approved_host_process_census import (
     requester_username,
 )
 from .approved_host_service import _process_token_details
-from .approval import verify_approval_bundle
 from .audit import TERMINAL_STATUSES
 from .control_plane import verify_control_plane_generation
 from .policy import approved_request_hash
@@ -252,7 +252,7 @@ def check_abnormal(handoff: Path) -> dict[str, Any]:
             server.runtime.settings,
             request.get("control_plane_generation"),
         )
-    except Exception:
+    except (OSError, PermissionError, RuntimeError, TypeError, ValueError):
         generation_blocked = True
     else:
         generation_blocked = False

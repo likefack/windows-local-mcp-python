@@ -23,6 +23,7 @@ from .approval import (
     prepare_approval_bundle,
     settings_digest,
 )
+from .approved_host_policy import assert_approved_host_authority_available
 from .audit import AuditStore
 from .command_traits import (
     SafeExecutionKind,
@@ -397,6 +398,10 @@ def _approved_host_capability() -> dict[str, Any]:
         name: {"status": "unverified", "unit_tested": True}
         for name in (
             "runtime_immutability",
+            "authority_service_boundary",
+            "durable_recovery_state",
+            "requester_token_child",
+            "monitor_access_denial",
             "control_plane_tamper_detection",
             "approval_integrity",
             "job_descendant_handling",
@@ -408,13 +413,15 @@ def _approved_host_capability() -> dict[str, Any]:
         "configured": runtime.settings.approved_host_enabled,
         "enabled": runtime.settings.approved_host_enabled,
         "available": False,
+        "execution_route_available": False,
         "unit_tested": True,
         "live_verified": False,
         "windows_live_verified": False,
-        "verification_scope": "runtime_immutability_preflight_only",
+        "verification_scope": "runtime_and_authority_preflight_only",
         "properties": properties,
         "execution_time_recheck": True,
         "runtime_preflight": {"status": "not_run"},
+        "authority_preflight": {"status": "not_run"},
     }
     if not runtime.settings.approved_host_enabled:
         status["unavailable_reason"] = "disabled by configuration"
@@ -433,7 +440,6 @@ def _approved_host_capability() -> dict[str, Any]:
         )
         return status
 
-    status["available"] = True
     properties["runtime_immutability"].update(
         status="verified" if os.name == "nt" else "unverified",
         verification_kind=(
@@ -450,6 +456,31 @@ def _approved_host_capability() -> dict[str, Any]:
         "ancestor_directory_count": evidence.get("ancestor_directory_count"),
         "digest": evidence.get("digest"),
     }
+    try:
+        authority = assert_approved_host_authority_available()
+    except Exception as error:  # noqa: BLE001 - capability display must remain available
+        message = redact_text(f"{type(error).__name__}: {error}")
+        status["unavailable_reason"] = message
+        status["authority_preflight"] = {"status": "failed", "error": message}
+        return status
+
+    status["available"] = True
+    status["execution_route_available"] = True
+    status["authority_preflight"] = {
+        "status": "passed",
+        "healthy": bool(authority.get("healthy")),
+        "service_epoch": authority.get("service_epoch"),
+        "active_operation_id": authority.get("active_operation_id"),
+    }
+    properties["authority_service_boundary"].update(
+        status="verified" if os.name == "nt" else "unverified",
+        verification_kind=(
+            "authenticated_service_preflight" if os.name == "nt" else "unsupported"
+        ),
+    )
+    # Full monitor-access denial, requester-token preservation, abnormal recovery, and WMI
+    # worker-loss behavior require the explicit Windows live verifiers. Availability never
+    # upgrades those release-verification properties to live-verified evidence.
     return status
 
 

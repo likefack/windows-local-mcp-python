@@ -258,7 +258,7 @@ class Executor:
             return False
         try:
             probe = ApprovedHostAuthorityClient().probe()
-        except Exception:
+        except (OSError, PermissionError, RuntimeError, TypeError, ValueError):
             return False
         return str(probe.get("active_operation_id") or "") == str(operation["id"])
 

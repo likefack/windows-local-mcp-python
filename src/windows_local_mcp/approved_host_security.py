@@ -4,9 +4,10 @@ import ctypes
 import os
 import stat
 import tempfile
+from collections.abc import Mapping
 from ctypes import wintypes
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from .approved_host_authority import (
     APPROVED_HOST_AUTHORITY_SERVICE_NAME,

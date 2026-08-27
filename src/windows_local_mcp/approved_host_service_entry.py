@@ -6,8 +6,9 @@ import os
 import secrets
 import subprocess
 import threading
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from . import approved_host_service as _service
 from .approved_host_authority import default_authority_state_root
@@ -25,7 +26,7 @@ class HardenedApprovedHostAuthorityServer(ApprovedHostAuthorityServer):
     def __init__(self, *, runtime_sid: str, state_root: Path) -> None:
         if os.name != "nt":
             raise RuntimeError("Approved Host authority requires native Windows")
-        if _service._current_process_sid() != _service._SYSTEM_SID:  # noqa: SLF001
+        if _service._current_process_sid() != _service._SYSTEM_SID:
             raise PermissionError("Approved Host authority must run as LocalSystem")
         self.runtime_sid = runtime_sid
         self.service_epoch = secrets.token_hex(32)

@@ -382,11 +382,11 @@ def popen_as_requester_in_job(
         process_created = True
         if on_process_created is not None:
             on_process_created()
-        if not job._job:  # noqa: SLF001 - same-package Job boundary integration
+        if not job._job:
             raise WindowsUserProcessUnavailable("Approved Host Job Object is unavailable")
-        if not _kernel32.AssignProcessToJobObject(job._job, process_info.hProcess):  # noqa: SLF001
+        if not _kernel32.AssignProcessToJobObject(job._job, process_info.hProcess):
             raise _winerror("AssignProcessToJobObject")
-        job._start_watcher()  # noqa: SLF001 - same-package Job boundary integration
+        job._start_watcher()
         resumed = _kernel32.ResumeThread(process_info.hThread)
         if resumed == 0xFFFFFFFF:
             raise _winerror("ResumeThread")

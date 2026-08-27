@@ -24,7 +24,7 @@ def replace_exact(path: str, old: str, new: str, *, count: int = 1) -> None:
 
 def replace_regex(path: str, pattern: str, replacement: str, *, count: int = 1) -> None:
     text = _read(path)
-    updated, actual = re.subn(pattern, replacement, text, count=count, flags=re.DOTALL)
+    updated, actual = re.subn(pattern, lambda _match: replacement, text, count=count, flags=re.DOTALL)
     if actual != count:
         raise RuntimeError(f"{path}: expected {count} regex matches, found {actual}: {pattern[:120]!r}")
     _write(path, updated)
