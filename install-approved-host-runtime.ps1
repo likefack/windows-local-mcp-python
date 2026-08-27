@@ -145,18 +145,22 @@ try {
     }
     Copy-Item -LiteralPath (Join-Path $SourceRoot "config.example.toml") -Destination $StagingRoot
 
-    # Secure the complete staged runtime before it becomes the active installation.
-    & icacls.exe $StagingRoot /setowner "*S-1-5-32-544" /T /C | Out-Null
+    # Secure the complete staged runtime before it becomes the active installation. Explicit
+    # access must be present before inheritance is stripped; otherwise the recursive ACL pass
+    # can remove the elevated installer's own inherited access before it reaches descendants.
+    # Do not use /C here: any ACL error must abort the install instead of producing a partially
+    # hardened runtime that is later mistaken for a successful installation.
+    & icacls.exe $StagingRoot /setowner "*S-1-5-32-544" /T | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "Setting the Approved Host runtime owner failed."
     }
-    & icacls.exe $StagingRoot /inheritance:r /T /C | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        throw "Removing inherited Approved Host runtime ACLs failed."
-    }
-    & icacls.exe $StagingRoot /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*${runtimeSid}:(OI)(CI)RX" /T /C | Out-Null
+    & icacls.exe $StagingRoot /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*${runtimeSid}:(OI)(CI)RX" /T | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "Applying the Approved Host runtime ACL failed."
+    }
+    & icacls.exe $StagingRoot /inheritance:r /T | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Removing inherited Approved Host runtime ACLs failed."
     }
 
     if ($Replace -and (Test-Path -LiteralPath $InstallRoot)) {
