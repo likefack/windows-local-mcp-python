@@ -116,12 +116,16 @@ def test_git_snapshot_runs_through_sandboxed_broker_runner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     settings, _git = _git_settings(tmp_path)
-    from windows_local_mcp import git_broker_sandbox, git_snapshot
+    from windows_local_mcp import git_snapshot
 
+    identity = {
+        "path": str(settings.git_executable_path),
+        "sha256": settings.git_executable_sha256,
+    }
     monkeypatch.setattr(
-        git_broker_sandbox,
-        "require_git_broker_containment",
-        lambda _settings, _identity: None,
+        git_snapshot,
+        "trusted_helper_identity",
+        lambda _settings, _program_key: identity,
     )
 
     def fake_batch(**kwargs: object) -> list[SimpleNamespace]:
