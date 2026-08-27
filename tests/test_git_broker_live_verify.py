@@ -14,7 +14,7 @@ from windows_local_mcp.git_broker_live_verify import (
 from windows_local_mcp.git_broker_sandbox import GitBrokerUnavailable
 from windows_local_mcp.sandbox_backend import SANDBOX_SECURITY_PROPERTIES
 
-_BUILTINS = b"status diff log show rev-parse ls-files\n"
+_BUILTINS = b"status diff log show rev-parse ls-files symbolic-ref\n"
 
 
 def _settings(tmp_path: Path, **overrides: object) -> Settings:
@@ -218,7 +218,7 @@ def test_git_live_verifier_rejects_externalized_automatic_subcommand(
         lambda _settings, _identity: containment,
     )
     results = _probe_results()
-    results[2].stdout = b"status diff log show rev-parse\n"
+    results[2].stdout = b"status diff log show rev-parse ls-files\n"
     monkeypatch.setattr(
         git_broker_live_verify,
         "run_git_broker_batch",
