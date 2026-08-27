@@ -10,15 +10,15 @@ ChatGPT から、指定した 1 つの Windows 作業領域を安全に読み書
 
 1. **WLMCP Broker**
    - 対象パス、入出力、容量、副作用を WLMCP が限定できる処理です。
-   - ファイル read/write、差分、固定 ADB 読み取り、固定 Git 読み取り、バイナリ転送、checkpoint、transaction、Undo／rollback を直接扱います。
-   - Automatic Git Broker は pinned `git.exe`、bounded／sanitized disposable repository projection、live-verified Codex Windows Sandbox containment、Git-specific live marker がすべて current の場合だけ `git_info`／`execute_readonly` の固定 Git grammar を実行します。marker が missing／stale／failed の PC では Git child を起動せず fail closed します。
+   - ファイル read/write、差分、固定 ADB 読み取り、固定 Git metadata 読み取り、バイナリ転送、checkpoint、transaction、Undo／rollback を直接扱います。
+   - Automatic Git Broker は pinned `git.exe`、bounded／sanitized disposable repository projection、live-verified Codex Windows Sandbox containment、Git-specific live marker がすべて current の場合だけ `git_info`／`execute_readonly` の固定 Git grammar を実行します。Automatic `diff`／`show` は metadata-only で、patch／binary patch／`--check`／暗黙 patch output は対象外です。marker が missing／stale／failed の PC では Git child を起動せず fail closed します。
 2. **構造化処理**
    - DOCX、XLSX、CSV／TSV、ZIP、一般画像を宣言的な操作として処理します。
    - 現在は WLMCP 管理処理を使用し、処理結果を artifact として検証してから Broker の transaction で反映します。将来の ChatGPT container 処理も同じバイナリ転送境界へ接続できます。
 3. **Codex Sandbox**
    - 任意コード、project script／plugin、test／build、一般コマンドなど、WLMCP だけで副作用を閉じにくい処理を実行します。
    - 承認済み workspace snapshot から作った operation 固有 run copy を project filesystem として使用し、original `workspace_root` は parent／child／grandchild から read／write deny を要求します。この snapshot-only 構成は defense-in-depth として維持します。
-   - current v1 では workspace 内 protected information の direct read denial を完全保証できません。`protected_information_read` と LAN access は受容済み残存 risk として実測結果を保持・表示し、それだけでは route を unavailable にしません。
+   - current v1 の一般 Codex Sandbox route では workspace 内 protected information の direct read denial を完全保証できません。`protected_information_read` と LAN access は受容済み残存 risk として実測結果を保持・表示し、それだけでは一般 route を unavailable にしません。この residual-risk allowance は Automatic Git には適用しません。
    - 利用にはローカル承認と、この PC での Sandbox 実機検証が必要です。その他の必須境界が失敗した場合は利用できず、Host へ自動移行しません。
 4. **Approved Host**
    - `request_host_command` と設定 schema は compatibility／将来拡張のため残っていますが、current v1 の execution route は WLMCP-R2-001 の capability reduction により unavailable です。
@@ -68,7 +68,7 @@ $env:LOCAL_MCP_CONFIG = 'C:\path\to\config.local.toml'
 .\.venv\Scripts\python.exe -m windows_local_mcp.cli verify-git-broker
 ```
 
-`verify-git-broker` は通常 operation から自動実行されません。Git executable identity、Sandbox backend、generic live evidence、workspace、containment policy のいずれかが変わった場合は marker が stale になり、再検証するまで Automatic Git は `available=false` です。Git-specific route は generic Sandbox で residual risk として許容する `protected_information_read`／LAN を継承せず、全 Sandbox security property が `verified` の場合だけ route eligible です。
+`verify-git-broker` は通常 operation から自動実行されません。Git executable identity、Sandbox backend、generic live evidence、workspace、scratch quota、containment policy、Automatic Git command-policy generation のいずれかが変わった場合は marker が stale になり、再検証するまで Automatic Git は `available=false` です。Git-specific route は general Sandbox で residual risk として許容する `protected_information_read`／LAN を継承せず、全 Sandbox security property が `verified` の場合だけ route eligible です。
 
 開発 server は次のとおり起動します。設定が不正な場合は、workspace を操作する前に起動を拒否します。
 
@@ -97,8 +97,8 @@ Approved Host の immutable runtime installer／verifier は、将来この rout
 | 用途 | 経路 | 主な tool |
 | --- | --- | --- |
 | テキスト／バイナリの読み書き | Broker | `read_file`, `write_file`, artifact transfer |
-| 固定 Git 読み取り | Automatic Git Broker | `git_info`, `execute_readonly` |
-| 一般／変更系 Git、project-controlled 処理 | Codex Sandbox（適用可能な場合） | `request_sandbox_command` |
+| 固定 Git metadata 読み取り | Automatic Git Broker | `git_info`, `execute_readonly` |
+| content-bearing／一般／変更系 Git、project-controlled 処理 | Codex Sandbox（適用可能な場合） | `request_sandbox_command` |
 | Emulator の限定読み取り | Broker | `adb_read`, `get_adb_screenshot` |
 | DOCX／XLSX／CSV／TSV／ZIP／画像 | 構造化処理 | `structured_file_inspect`, `structured_file_apply` 等 |
 | Python、PowerShell、Node、test、build、project script | Codex Sandbox | `request_sandbox_command` |
@@ -108,7 +108,11 @@ Approved Host の immutable runtime installer／verifier は、将来この rout
 
 `execute_workspace_write` は互換用の公開面を残していますが、Dart／Flutter 等の project-controlled 処理は拒否され、`request_sandbox_command` を案内します。
 
-`git_info` と `execute_readonly` の固定 Git grammar は、current Git-specific marker が成立した Windows PC では Automatic Git Broker として実行できます。Git child は live workspace を直接読まず、operation ごとの bounded／sanitized projection を処理します。`.gitattributes`、hooks、object alternates、external／extended repository metadata、nested `.git`、reparse／hardlink／ADS 等は除外または拒否し、source `.git/config` は raw bytes を scratch へ保存せず Broker memory 上で解析して inert `core` settings だけを書き出します。config parsing は 1 MiB で fail closed します。marker がない／stale な PC では従来どおり process creation 前に拒否し、Approved Host へ fallback しません。
+`git_info` と `execute_readonly` の固定 Git grammar は、current Git-specific marker が成立した Windows PC では Automatic Git Broker として実行できます。Git child は live workspace を直接読まず、operation ごとの bounded／sanitized projection を処理します。`.gitattributes`、hooks、object alternates、external／extended repository metadata、nested `.git`、reparse／hardlink／ADS 等は除外または拒否し、source `.git/config` は raw bytes を scratch へ保存せず Broker memory 上で解析して inert `core` settings だけを書き出します。config parsing は 1 MiB で fail closed します。
+
+Git object database には、現在の working-tree policy では protected な内容を含む historical blob が残り得ます。また攻撃者はその blob を一見安全な tree／commit／index path に再結合できます。そのため current workspace path の検証や `^{commit}` binding だけを content provenance とみなしません。Automatic `diff`／`show` は `--stat`、`--name-only`、`--name-status`、`--quiet`、`--no-patch` 等の metadata-only output に限定し、`--patch`／`-p`／`--binary`／`--check`／pathspec 付き暗黙 patch は `request_sandbox_command` の対象です。`git_info` snapshot も status、diff stat/name-status、log metadata 等に限定します。marker がない／stale な PC では process creation 前に拒否し、Approved Host へ fallback しません。
+
+Automatic Git repository projection の byte limit は configured `max_sandbox_scratch_bytes` の 1/2 以下です。残りを operation 固有 runtime／transient output 用に残し、operator quota を超える hard-coded repository-size floor は使用しません。
 
 ADB helper は設定済み path、SHA-256、file identity を正規化時と worker 実行直前に再検証し、Windows では child の終了まで実行ファイルを差し替え不能な共有モードで保持します。ADB の自動処理は allowlist 済み emulator serial を明示する固定読み取りだけで、`adb devices` による未許可 device の列挙は行いません。
 
@@ -136,7 +140,7 @@ Approved Host 用に既存の runtime immutability、Job Object、same-user proc
 
 ## Codex Sandbox
 
-Live verification は各 property を `verified`、`failed`、`unverified` の三値で保存します。`failed` は実際の probe が境界脱出を観測した場合だけ、`unverified` は起動失敗、タイムアウト、listener または probe 環境の準備失敗、出力を測定できない場合に使います。current v1 では workspace 内 `protected_information_read` と LAN access を受容済み残存 risk として分離します。これらの failure／unverified は隠さず保持しますが、それだけでは Sandbox route を unavailable にしません。一般 source-workspace read/write、workspace 外 user/protected read、control-plane、Internet、loopback、termination、resource bound、WMI／CIM brokered process creation denial 等の必須境界は引き続き fail closed です。Approved Host へ自動移行しません。
+Live verification は各 property を `verified`、`failed`、`unverified` の三値で保存します。`failed` は実際の probe が境界脱出を観測した場合だけ、`unverified` は起動失敗、タイムアウト、listener または probe 環境の準備失敗、出力を測定できない場合に使います。current v1 の一般 Codex Sandbox route では workspace 内 `protected_information_read` と LAN access を受容済み残存 risk として分離します。これらの failure／unverified は隠さず保持しますが、それだけでは一般 route を unavailable にしません。Automatic Git はこの例外を継承しません。一般 source-workspace read/write、workspace 外 user/protected read、control-plane、Internet、loopback、termination、resource bound、WMI／CIM brokered process creation denial 等の必須境界は引き続き fail closed です。Approved Host へ自動移行しません。
 
 live marker は schema v5 です。launcher／helper の canonical path、content SHA-256、Windows stable file identity、size、実際の version、Authenticode の Valid status・leaf signer subject・leaf certificate thumbprint に加え、実際に import された WFP Guard module 群の canonical path／SHA-256／stable file identity／size、Guard version、policy generation、Sandbox account、Windows product／build／UBR／architecture、WFP read-back identity を結合します。mtime は補助的な drift signal であり、単独では security identity として扱いません。`isolation_context_digest` はさらに workspace の実体、保護名・拒否 directory、`sandbox_dependency_readable_paths`、Sandbox policy generation、process 数・process-tree memory 上限、scratch 上限、許可環境変数などを結合します。これらを変更した場合、marker は stale として拒否され、通常 operation は live verification や UAC probe を自動実行しません。明示的に `verify-codex-sandbox` を再実行してください。v1～v4 marker から v5 を推測・移行しません。
 
@@ -169,7 +173,7 @@ Sandbox 起動直前には、この PC のコンピューター名で完全修�
 
 起動時には legacy profile 名だけに依存せず、source workspace の read deny、operation 固有 scratch の write、明示した依存 root の read、保護名の deny、network restricted を含む `sandbox-state` を Codex CLI へ渡します。さらに launcher を一時停止状態で起動し、Windows Job Object へ割り当ててから再開します。Job Object は launcher を含む子孫全体の process 数、commit memory、終了時 kill を OS で強制します。上限違反は job 全体を停止し、WLMCP は子孫が 0 になったことと終了状態を回収できたことを確認します。
 
-Sandbox staging は `.env` 等の保護対象と、`.venv`、`node_modules`、`build`、`__pycache__` 等の生成・依存 tree を一律 copy しません。必要な外部依存は `sandbox_dependency_readable_paths` 等の明示的で検証可能な入力として扱い、暗黙に source workspace を参照させません。source-workspace deny と protected-information direct-read probe は defense-in-depth として維持しますが、staging exclusion や deny policy の設定だけを workspace 内 secret の完全遮断保証とは扱いません。direct-read probe が `failed`／`unverified` の場合も、その結果を受容済み残存 risk として保持・表示します。
+Sandbox staging は `.env` 等の保護対象と、`.venv`、`node_modules`、`build`、`__pycache__` 等の生成・依存 tree を一律 copy しません。必要な外部依存は `sandbox_dependency_readable_paths` 等の明示的で検証可能な入力として扱い、暗黙に source workspace を参照させません。source-workspace deny と protected-information direct-read probe は defense-in-depth として維持しますが、staging exclusion や deny policy の設定だけを workspace 内 secret の完全遮断保証とは扱いません。direct-read probe が `failed`／`unverified` の場合も、その結果を一般 Codex Sandbox route の受容済み残存 risk として保持・表示します。
 
 設定されていること、機能が有効なこと、backend を解決できること、この PC で security boundary まで実機検証済みであることは別々に表示されます。実機検証は次を確認します。
 
@@ -180,7 +184,7 @@ $env:LOCAL_MCP_CONFIG = 'C:\path\to\config.local.toml'
 
 検証結果は `filesystem_read`、`filesystem_write`、`protected_information_read`、`internet`、`lan`、`loopback`、`descendant_containment`、`termination`、`resource_bound` の property と、必須 check `brokered_process_creation_denied` を保存します。schema v5 以外、必須 identity／check field が欠けた marker、現在の実体に結合しない marker は受理しません。`available` は依存関係と起動前提、`windows_live_verified` は OS 境界の実測、`execution_route_available` は必須 route property を満たして実行可能かを別々に示します。`approved_sandbox_require_live_verification=false` で実行条件を回避することはできません。
 
-検証器は親・child・grandchild の filesystem／network 境界に加え、process 数上限と process-tree memory 上限の超過、違反時の全子孫停止、終了状態回収、brokered process creation denial まで実測します。独立 probe が例外になった場合、その probe を `unverified` として残し、安全に続行できる残りの probe を継続します。一般 source workspace read/write、workspace 外 read、control-plane、Internet、loopback、WMI/CIM process creation denial 等の mandatory check は fail closed します。一方、workspace 内 `protected_information_read` と対応する child／grandchild protected-information denial、LAN access は受容済み残存 risk として `failed`／`unverified` を保持・表示したまま route 判定から分離します。その他の必須境界が成立する場合に限り Sandbox 経路を利用でき、利用できない場合も Approved Host へ自動移行しません。
+検証器は親・child・grandchild の filesystem／network 境界に加え、process 数上限と process-tree memory 上限の超過、違反時の全子孫停止、終了状態回収、brokered process creation denial まで実測します。独立 probe が例外になった場合、その probe を `unverified` として残し、安全に続行できる残りの probe を継続します。一般 source workspace read/write、workspace 外 read、control-plane、Internet、loopback、WMI/CIM process creation denial 等の mandatory check は fail closed します。一方、workspace 内 `protected_information_read` と対応する child／grandchild protected-information denial、LAN access は一般 Codex Sandbox route の受容済み残存 risk として `failed`／`unverified` を保持・表示したまま route 判定から分離します。Automatic Git は全 property の `verified` を要求します。その他の必須境界が成立する場合に限り一般 Sandbox 経路を利用でき、利用できない場合も Approved Host へ自動移行しません。
 
 ## ファイルと制御領域の保護
 
@@ -188,7 +192,7 @@ $env:LOCAL_MCP_CONFIG = 'C:\path\to\config.local.toml'
 - optimistic concurrency には表示用文字列ではなく raw file bytes の SHA-256 を使います。CRLF も raw identity に含まれます。
 - 書き込みは checkpoint、durable journal、atomic replacement、post-write 検証を通します。第三者変更を復旧処理が上書きしません。
 - `data_dir`、Sandbox scratch、workspace は分離し、起動時に lock／atomic replacement／filesystem identity と Windows の物理 path の前提を確認します。
-- `.env`、credential 等の保護対象は通常の Broker read、automatic helper／snapshot から返しません。Automatic Git Broker は live workspace を Git child に渡さず、sanitized projection から protected worktree file／behavior metadata を除外します。audit、approval、Activity、argv、stdout／stderr preview は secret を伏せ字にします。Codex Sandbox から workspace 内 protected information を direct read できる可能性は別途受容済み残存 risk として明示します。
+- `.env`、credential 等の保護対象は通常の Broker read、automatic helper／snapshot から返しません。Automatic Git Broker は live workspace を Git child に渡さず、sanitized projection から protected worktree file／behavior metadata を除外します。Git object database の historical blob は path validation だけで safe content とみなさず、Automatic Git の content-bearing diff/show を禁止します。audit、approval、Activity、argv、stdout／stderr preview は secret を伏せ字にします。一般 Codex Sandbox から workspace 内 protected information を direct read できる可能性は別途受容済み残存 risk として明示します。
 - 同時 job、pending approval、出力、artifact、data_dir、Sandbox scratch、structured element／pixel／archive 展開量に上限があります。
 
 ## Activity、Undo、rollback
@@ -207,9 +211,9 @@ unit／integration test、Windows 上の Sandbox／Automatic Git 実機検証、
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-Automatic Git の unit／CI regression が green でも、この PC で `verify-git-broker` が成功して current Git-specific marker が存在するまでは `available=false` が正しい状態です。通常 operation は marker を作成・repair しません。Git executable、Sandbox backend／live evidence、workspace または containment policy が変われば marker は stale になり、Git child spawn 前に fail closed します。
+Automatic Git の unit／CI regression が green でも、この PC で `verify-git-broker` が成功して current Git-specific marker が存在するまでは `available=false` が正しい状態です。通常 operation は marker を作成・repair しません。Git executable、Sandbox backend／live evidence、workspace、scratch quota、containment policy または command-policy generation が変われば marker は stale になり、Git child spawn 前に fail closed します。
 
-Sandbox が利用不能、必須境界が未検証、timeout、setup failure、command failure の場合は、その operation を unavailable／failed として表示します。受容済み残存 risk の `protected_information_read`／LAN failure はそのまま表示し、その他の mandatory route gate と分離します。Approved Host へ自動 fallback しません。
+Sandbox が利用不能、必須境界が未検証、timeout、setup failure、command failure の場合は、その operation を unavailable／failed として表示します。一般 Sandbox で受容済み残存 risk の `protected_information_read`／LAN failure はそのまま表示し、その他の mandatory route gate と分離します。Automatic Git はこの residual-risk allowance を使用せず、全 property が verified でなければ unavailable です。Approved Host へ自動 fallback しません。
 
 Approved Host は current v1 では execution unavailable です。この capability reduction の回帰では「Host worker が一度も spawn されないこと」を検証し、将来再有効化する場合にだけ別 Windows authority boundary の live verification を要求します。
 
