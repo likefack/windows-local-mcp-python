@@ -29,7 +29,7 @@ def make_settings(tmp_path: Path, executable: Path, digest: str) -> Settings:
     return settings
 
 
-def test_automatic_git_broker_helper_requires_verified_containment(
+def test_automatic_git_broker_helper_requires_git_specific_live_verification(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     executable = tmp_path / "git.exe"
@@ -37,20 +37,20 @@ def test_automatic_git_broker_helper_requires_verified_containment(
     digest = sha256(executable.read_bytes()).hexdigest()
     settings = make_settings(tmp_path, executable, digest)
 
-    from windows_local_mcp import git_broker_sandbox
+    from windows_local_mcp import git_broker_live_verify
 
     monkeypatch.setattr(
-        git_broker_sandbox,
-        "require_git_broker_containment",
+        git_broker_live_verify,
+        "require_git_broker_live_verification",
         lambda _settings, _identity: (_ for _ in ()).throw(
-            GitBrokerUnavailable("live containment is missing")
+            GitBrokerUnavailable("Git-specific live verification is missing")
         ),
     )
-    with pytest.raises(GitBrokerUnavailable, match="live containment is missing"):
+    with pytest.raises(GitBrokerUnavailable, match="Git-specific live verification is missing"):
         trusted_helper_identity(settings, "git")
 
 
-def test_automatic_git_broker_helper_accepts_pinned_git_after_containment(
+def test_automatic_git_broker_helper_accepts_pinned_git_after_live_verification(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     executable = tmp_path / "git.exe"
@@ -58,14 +58,17 @@ def test_automatic_git_broker_helper_accepts_pinned_git_after_containment(
     digest = sha256(executable.read_bytes()).hexdigest()
     settings = make_settings(tmp_path, executable, digest)
 
-    from windows_local_mcp import git_broker_sandbox
+    from windows_local_mcp import git_broker_live_verify
 
     observed: dict[str, object] = {}
 
-    def verified(_settings: Settings, identity: dict[str, object]) -> None:
+    def verified(_settings: Settings, identity: dict[str, object]) -> dict[str, object]:
         observed.update(identity)
+        return {"version": 1, "context_digest": "test"}
 
-    monkeypatch.setattr(git_broker_sandbox, "require_git_broker_containment", verified)
+    monkeypatch.setattr(
+        git_broker_live_verify, "require_git_broker_live_verification", verified
+    )
     identity = trusted_helper_identity(settings, "git")
 
     assert identity["path"] == str(executable.resolve())
@@ -99,9 +102,7 @@ def test_adb_broker_helper_requires_matching_explicit_hash(tmp_path: Path) -> No
 def test_stale_executable_identity_is_rejected(tmp_path: Path) -> None:
     executable = tmp_path / "helper.exe"
     executable.write_bytes(b"first")
-    identity = capture_executable_identity(
-        executable, provenance="test-approval"
-    )
+    identity = capture_executable_identity(executable, provenance="test-approval")
     replacement = tmp_path / "replacement.exe"
     replacement.write_bytes(b"second")
     os.replace(replacement, executable)
