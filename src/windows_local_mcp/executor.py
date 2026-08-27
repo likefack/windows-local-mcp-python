@@ -169,26 +169,10 @@ class Executor:
             "host_approval": "approved_host",
         }.get(str(operation.get("tier")), str(operation.get("tier")))
         if tier == "approved_host" and operation["status"] not in TERMINAL_STATUSES:
-            ApprovedHostAuthorityClient().cancel(operation_id)
-            transitioned = self.audit.transition_operation(
-                operation_id,
-                from_statuses={"queued", "running"},
-                status="interrupted",
-                finished_at=utc_now_iso(),
-                error=(
-                    "Approved Host cancellation was delegated to the SYSTEM authority; "
-                    "explicit authority recovery is required because trusted postflight "
-                    "completion was not proven"
-                ),
-            )
-            if transitioned:
-                self.audit.add_event(
-                    operation_id,
-                    "approved_host_cancelled_recovery_required",
-                    {"authority_separated": True},
-                )
-            return self._public_result(
-                self.audit.get_operation(operation_id, include_events=False)
+            raise PermissionError(
+                "active Approved Host operations cannot be stopped from the runtime-user "
+                "control plane because the independently privileged monitor must survive "
+                "until security postflight completes; poll the operation instead"
             )
 
         while True:
