@@ -99,7 +99,7 @@ def test_git_status_and_workspace_pathspec_remain_automatic(
     assert str(source.resolve()) in diff.args
 
 
-def test_git_patch_requires_regular_file_pathspec(
+def test_content_bearing_git_diff_and_show_require_sandbox(
     tmp_path: Path, fake_tools: Path
 ) -> None:
     settings = make_settings(tmp_path)
@@ -110,29 +110,26 @@ def test_git_patch_requires_regular_file_pathspec(
     file.write_text("print('safe')\n", encoding="utf-8")
     policy = CommandPolicy(settings, Workspace(settings))
 
-    with pytest.raises(IsADirectoryError):
-        policy.normalize_safe(
-            program="git", args=["diff", "--patch", "--", "src"], cwd="."
-        )
-    for flags in (
-        ["--patch", "--stat"],
-        ["--patch", "--name-only"],
-        ["--binary", "--stat"],
+    for args in (
+        ["diff", "--patch", "--", "src/main.py"],
+        ["diff", "--binary", "--stat", "--", "src/main.py"],
+        ["diff", "--check", "--", "src/main.py"],
+        ["diff", "--", "src/main.py"],
+        ["show", "--patch", "--stat", "--", "src/main.py"],
+        ["show", "HEAD", "--", "src/main.py"],
     ):
-        with pytest.raises(IsADirectoryError):
-            policy.normalize_safe(
-                program="git", args=["diff", *flags, "--", "src"], cwd="."
-            )
-    with pytest.raises(IsADirectoryError):
-        policy.normalize_safe(
-            program="git",
-            args=["show", "--patch", "--stat", "--", "src"],
-            cwd=".",
-        )
-    command = policy.normalize_safe(
-        program="git", args=["diff", "--patch", "--", "src/main.py"], cwd="."
+        with pytest.raises(PermissionError, match="request_sandbox_command"):
+            policy.normalize_safe(program="git", args=args, cwd=".")
+
+    diff_metadata = policy.normalize_safe(
+        program="git", args=["diff", "--stat", "--", "src/main.py"], cwd="."
     )
-    assert str(file.resolve()) in command.args
+    show_metadata = policy.normalize_safe(
+        program="git", args=["show", "--stat", "HEAD", "--", "src/main.py"], cwd="."
+    )
+    assert str(file.resolve()) in diff_metadata.args
+    assert str(file.resolve()) in show_metadata.args
+    assert "HEAD^{commit}" in show_metadata.args
 
 
 def test_automatic_git_requires_workspace_root_marker(
@@ -162,12 +159,15 @@ def test_project_controlled_tools_are_never_broker_commands(
 
 def test_git_pathspec_cannot_escape_workspace(tmp_path: Path, fake_tools: Path) -> None:
     settings = make_settings(tmp_path)
+    (settings.workspace_root / ".git").mkdir()
     outside = tmp_path / "outside.txt"
     outside.write_text("x", encoding="utf-8")
     policy = CommandPolicy(settings, Workspace(settings))
     with pytest.raises(PermissionError):
         policy.normalize_safe(
-            program="git", args=["diff", "--", "../outside.txt"], cwd="."
+            program="git",
+            args=["diff", "--name-only", "--", "../outside.txt"],
+            cwd=".",
         )
 
 
