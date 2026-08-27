@@ -290,7 +290,10 @@ def _open_inheritable_nul() -> wintypes.HANDLE:
 
 
 def _binary_reader_from_handle(handle: wintypes.HANDLE) -> BinaryIO:
-    descriptor = msvcrt.open_osfhandle(int(handle), os.O_RDONLY)
+    handle_value = handle.value
+    if handle_value is None:
+        raise WindowsUserProcessUnavailable("stdout/stderr pipe HANDLE is null")
+    descriptor = msvcrt.open_osfhandle(handle_value, os.O_RDONLY)
     return os.fdopen(descriptor, "rb", buffering=0)
 
 
