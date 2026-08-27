@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -129,20 +130,30 @@ def arm_abnormal(cwd: str, handoff: Path) -> dict[str, Any]:
 
 def _expect_state_tamper_denied(root: Path) -> None:
     active = root / "active.json"
-    attempts: list[tuple[str, Any]] = [
-        ("enumerate", lambda: list(root.iterdir())),
-        ("create", lambda: (root / "user-forge.json").write_text("{}", encoding="utf-8")),
-        ("delete", lambda: active.unlink()),
-        ("replace", lambda: os.replace(Path(__file__), active)),
-    ]
-    for label, action in attempts:
-        try:
-            action()
-        except (PermissionError, OSError):
-            continue
-        raise AssertionError(
-            f"runtime user unexpectedly succeeded in authority-state {label} operation"
-        )
+    replacement: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="wb", delete=False) as output:
+            output.write(b"{}")
+            output.flush()
+            os.fsync(output.fileno())
+            replacement = Path(output.name)
+        attempts: list[tuple[str, Any]] = [
+            ("enumerate", lambda: list(root.iterdir())),
+            ("create", lambda: (root / "user-forge.json").write_text("{}", encoding="utf-8")),
+            ("delete", lambda: active.unlink()),
+            ("replace", lambda: os.replace(replacement, active)),
+        ]
+        for label, action in attempts:
+            try:
+                action()
+            except (PermissionError, OSError):
+                continue
+            raise AssertionError(
+                f"runtime user unexpectedly succeeded in authority-state {label} operation"
+            )
+    finally:
+        if replacement is not None:
+            replacement.unlink(missing_ok=True)
 
 
 def check_abnormal(handoff: Path) -> dict[str, Any]:
