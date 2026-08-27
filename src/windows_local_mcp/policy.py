@@ -205,7 +205,9 @@ class CommandPolicy:
             normalized = self._flags_and_pathspec(tail, allowed)
         elif subcommand == "diff":
             has_paths = "--" in tail and bool(tail[tail.index("--") + 1 :])
-            explicit_content = any(value in {"--patch", "-p", "--binary"} for value in tail)
+            explicit_content = any(
+                value in {"--patch", "-p", "--binary", "--check"} for value in tail
+            )
             metadata_only = any(
                 value in {"--stat", "--name-only", "--name-status", "--quiet"}
                 for value in tail
@@ -219,7 +221,7 @@ class CommandPolicy:
                 "--no-renames",
             }
             if has_paths:
-                allowed |= {"--patch", "-p", "--binary"}
+                allowed |= {"--patch", "-p", "--binary", "--check"}
             normalized = self._git_revisions_flags_paths(
                 tail,
                 allowed,
@@ -309,6 +311,24 @@ class CommandPolicy:
             return [*flags, "--", *self._normalize_read_paths(paths)]
         return flags
 
+    @classmethod
+    def _commit_bound_revision(cls, value: str) -> str:
+        for separator in ("...", ".."):
+            if separator not in value:
+                continue
+            if value.count(separator) != 1:
+                raise PermissionError("Git revision range is not in the safe grammar")
+            left, right = value.split(separator, 1)
+            if (
+                not left
+                or not right
+                or not cls.SAFE_REVISION.fullmatch(left)
+                or not cls.SAFE_REVISION.fullmatch(right)
+            ):
+                raise PermissionError("Git revision range is not in the safe grammar")
+            return f"{left}^{{commit}}{separator}{right}^{{commit}}"
+        return f"{value}^{{commit}}"
+
     def _git_revisions_flags_paths(
         self,
         values: list[str],
@@ -330,18 +350,14 @@ class CommandPolicy:
             if value in allowed or (allow_count and self.SAFE_LOG_COUNT.fullmatch(value)):
                 normalized_head.append(value)
             elif self.SAFE_REVISION.fullmatch(value) and not value.startswith("-"):
-                if require_commitish and ".." in value:
-                    raise PermissionError(
-                        "automatic Git accepts individual commit-ish revisions only"
-                    )
                 revision_count += 1
                 normalized_head.append(
-                    f"{value}^{{commit}}" if require_commitish else value
+                    self._commit_bound_revision(value) if require_commitish else value
                 )
             else:
                 raise PermissionError("Git revision or option is not in the safe grammar")
         if require_commitish and revision_count == 0 and default_revision is not None:
-            normalized_head.append(f"{default_revision}^{{commit}}")
+            normalized_head.append(self._commit_bound_revision(default_revision))
         if paths:
             return [
                 *normalized_head,
