@@ -19,7 +19,7 @@ Security objectives:
 
 `adb_enabled` does not make its broker helper available by itself. Automatic ADB helper execution requires an explicit absolute executable path and operator-pinned SHA-256. PATH discovery is not a trust source. `git_enabled` may enable Git-related policy and approved routes, but the current release intentionally disables automatic Git Broker helper execution even when an explicit path/hash is configured, because workspace-controlled repository metadata cannot yet be safely confined for an unapproved Git child. Session capability data reports configured, enabled, and available separately; the presence of `git_info` or `execute_readonly` does not imply that automatic Git execution is available.
 
-`approved_host_enabled` remains a configuration-intent field for compatibility, but current v1 deliberately makes the Approved Host execution route unavailable after validating WLMCP-R2-001. The presence of this setting, `request_host_command`, or pending/approved rows does not imply that an Approved Host worker can start. The production runtime gate rejects the route before worker spawn. Re-enabling it requires an independently justified Windows security boundary for the monitor/postflight owner and durable tamper state; same-desktop UAC elevation alone is not accepted as that boundary.
+`approved_host_enabled` controls intent, but it does not by itself make the route available. Approved Host execution additionally requires an immutable runtime and a healthy authenticated LocalSystem authority service. The monitor/postflight worker runs as LocalSystem while the final command uses the verified non-elevated requester token. Pending/approved rows never bypass this authority gate, and same-desktop UAC elevation is not accepted as the boundary. WLMCP-R2-001 remains live-verification-pending until the required normal and abnormal Windows service/process tests pass.
 
 Dangerous configuration combinations fail startup validation:
 
@@ -90,14 +90,14 @@ If automatic Git Broker execution is re-enabled in a future revision, its candid
 - Git is resolved only from the explicitly configured path/hash identity. The worker revalidates it and holds a Windows read-only-share handle against writes/replacement through process completion.
 - Repository-controlled metadata must be proven unable to expand filesystem, helper, network, or executable behavior beyond the Broker contract.
 
-Until those conditions are implemented and verified, Git work that needs process execution requires an execution route whose security contract is currently available. Keeping the `git_info` and `execute_readonly` MCP surfaces does not constitute automatic Git availability, and the unavailable Approved Host route is not a fallback.
+Until those conditions are implemented and verified, Git work that needs process execution requires an execution route whose security contract is currently available. Keeping the `git_info` and `execute_readonly` MCP surfaces does not constitute automatic Git availability. Approved Host is a separately approved route and is never an implicit Git or Sandbox fallback.
 
 ### Project-controlled tools
 
 - Python、Node、PowerShell、Dart、Flutter、project scripts、plugins、tests、builds、formatting 等の project-controlled code-loader は Codex Sandbox 専用です。
 - Codex Sandbox は original `workspace_root` を通常の project filesystem capability として渡さず、承認時に bounded な workspace projection を snapshot 化し、実行時は operation 固有の writable run copy を使用します。source workspace deny は defense-in-depth として要求・検証しますが、workspace 内 protected-information direct read の完全遮断は current v1 の保証に含めません。
 - trusted toolchain executable と `sandbox_dependency_readable_paths` で明示した workspace／data／scratch 外 dependency だけを追加 read root として許可します。
-- Approved Host は current v1 では execution unavailable です。project-controlled code-loader と workspace 内 executable を Host request で拒否する既存 defense-in-depth は残りますが、Sandbox failure から Host への fallback はありません。
+- Approved Host は project-controlled code-loader と workspace 内 executable を Host request で拒否します。eligible non-project-controlled Host command は LocalSystem monitor／requester-user child boundaryを満たす場合だけ separate approval 後に実行でき、Sandbox failure からの fallback はありません。
 
 ### ADB
 
@@ -117,7 +117,7 @@ Approved execution は承認時 snapshot の整合性確保と Broker mutation �
 
 - snapshot／manifest 作成は workspace-wide lock 下で coherent input set を取得します。
 - Approved Sandbox は実行前 binding 検証から child／descendant 終了まで workspace-wide Broker mutation lock を保持します。
-- Approved Host 用の同種 lock／manifest code は将来 route の defense-in-depth として残り得ますが、current v1 では production gate が Host worker spawn 前に停止するため実行境界として成立したとは表示しません。
+- Approved Host は同じ workspace-wide lock／manifest binding を維持し、LocalSystem worker が postflight 完了までその control interval を所有します。
 - `write_file` は target slot を使用するため、workspace-wide approved execution と必ず競合します。
 - non-cooperating process に対しても source-workspace deny を要求しますが、workspace 内 protected-information secrecy が成立したとは表示しません。
 
@@ -133,7 +133,7 @@ request_sandbox_command
   -> ChatGPT poll_approval / poll_job
 ```
 
-`request_host_command` remains a compatibility surface that only stages local approval state and immutable inputs. In current v1 it does not lead to host execution: even an upgrade-existing queued/approved operation is rejected by the production gate before worker spawn. There is no implicit Codex Sandbox to Approved Host fallback and no model-facing `execute_approved` tool.
+`request_host_command` stages local one-shot approval state and immutable inputs. After local approve-and-claim, eligible Host operations execute only through the authenticated LocalSystem authority; old queued/approved rows still pass the same current generation, immutable manifest, executable identity, TTL, and authority checks before any worker/child launch. There is no implicit Codex Sandbox to Approved Host fallback and no model-facing `execute_approved` tool.
 
 Approval binding version 3 hashes the complete canonical security-sensitive request, including execution boundary, normalized command/cwd, executable identity, workspace-write and runtime limits, escalation facts, risk, immutable manifest fields, effective policy, and Codex Sandbox backend identity. The manifest covers:
 
@@ -163,7 +163,7 @@ Sandbox filesystem policy generation の変更は live-verification context dige
 
 Codex Sandbox の `workspace_write=true` も original workspace 上では実行しません。同じ full snapshot projection の writable run copy を処理し、終了後に bounded output tree を検査して workspace-relative delta を抽出します。Broker は承認時 source binding と workspace-wide lock を保持したまま transaction／commit-time validation を通して delta を original workspace へ反映します。source workspace の追加・削除・content change が approval 後に発生した場合は commit 前に fail closed します。
 
-Approved Host の non-project-code-loader path は current v1 では execution unavailable です。将来再有効化する場合も Codex Sandbox と同じ source-read isolation を暗黙に主張せず、別の authority-boundary contract を満たす必要があります。
+Approved Host の non-project-code-loader path は Codex Sandbox と同じ source-read isolation を暗黙に主張しません。LocalSystem monitor／durable state／requester-user child authority boundary と one-shot immutable approval contract を満たす場合だけ実行します。
 
 ### Expiry and one-shot semantics
 
@@ -178,7 +178,7 @@ Approved Host の non-project-code-loader path は current v1 では execution u
 
 Executor creates a random nonce inherited by worker and child. Durable identity contains PID, process creation time, executable path, and nonce. `stop_job` terminates only if all identity fields still match. A mismatch marks the job `interrupted` without killing a process. Server startup reconciles stale queued/running rows the same way.
 
-Current v1 does not launch Approved Host workers. Historical/future Approved Host Job Object, same-user process census, postflight, and runtime-immutability code remains defense-in-depth and testable implementation material but is not an active security guarantee while WLMCP-R2-001 capability reduction is in force. A stale or already-approved Host operation cannot revive this path because `Executor.launch()` performs the production gate before worker creation.
+Approved Host workers are launched only by the authenticated LocalSystem authority service. The SYSTEM worker owns Job Object, requester-user process census, postflight, and durable completion; the final command remains under the verified non-elevated requester token. A stale or already-approved Host operation cannot bypass runtime immutability, current control-plane generation, approval binding, or authority health gates.
 
 On Windows, Codex Sandbox parents are launched suspended, assigned to a per-operation Windows Job Object, and resumed only after assignment. A descendant that outlives the operation deadline is terminated with the complete Job and the operation times out. Codex Sandbox enforces active-process and aggregate committed-memory limits over the complete launcher/command descendant tree. WMI/CIM brokered process creation is separately denied and live-verified because a provider-created process could otherwise be outside this Job. On other platforms processes use a new session. Process groups/sessions alone are lifecycle control, not an OS sandbox.
 
@@ -226,7 +226,7 @@ Automatic Git Broker execution is disabled, so the current release does not crea
 1. `broker`: closed-world file, fixed ADB-read, checkpoint, transaction, rollback, and audit operations. Automatic Git process execution is currently unavailable and fails closed.
 2. `structured_processing`: declarative DOCX/XLSX/CSV/TSV/ZIP/image processing and hash-bound artifact commit.
 3. `codex_sandbox`: open-ended or project-controlled execution after one-shot local approval.
-4. `approved_host`: compatibility/configuration surface only in current v1; execution is unavailable and fails closed before worker spawn.
+4. `approved_host`: separate one-shot approval route using a LocalSystem monitor/postflight authority and ordinary non-elevated requester-user command token; unavailable unless runtime and authority preflight both pass.
 
 Legacy Safe Tier, AppContainer, and compatibility-mode configuration is obsolete and fails startup. Codex Sandbox failure never falls back to Approved Host. Ordinary non-zero exit, test failure, compile/lint failure, and application error remain failures in the selected boundary.
 
@@ -234,7 +234,7 @@ Codex Sandbox uses the installed Codex CLI sandbox-only entrypoint with `windows
 
 Policy input acceptance is not equivalent to a verified boundary. Live evidence schema v5 records `filesystem_read`, `filesystem_write`, `protected_information_read`, `internet`, `lan`, `loopback`, `descendant_containment`, `termination`, and `resource_bound` separately as `verified`, `failed`, or `unverified`, and additionally requires `brokered_process_creation_denied=true`. `failed` requires an executed probe to observe a boundary escape; launch failure, timeout, listener or probe setup failure, and other diagnostic inability are `unverified`. Descendant containment individually measures source-write, outside-user read, protected-information read, control-plane read/write, Internet, LAN, and loopback for child and grandchild. Resource verification exceeds both Job limits and proves violation reporting, safe termination, zero remaining descendants, and WLMCP exit-state collection. Schema v1-v4, missing mandatory fields, a changed `isolation_context_digest`, a missing/false brokered-process denial, and partially verified mandatory property sets are rejected without inference or migration. Schema v5 binds the exact imported WFP Guard module canonical paths, content SHA-256 values, Windows stable file identities, sizes, Guard version, policy generation, Windows product/build/UBR/native architecture, Sandbox account identity, and stable WFP read-back identity. The isolation context additionally binds the installed launcher/helper identities, physical roots, protected names and directories, dependency-readable paths, policy generations, scratch quota, and process/memory limits. A stale marker makes the normal operation route unavailable and never triggers automatic live verification. If every marker identity remains current and an exact static non-persistent WFP object is merely absent, the trusted Guard may recreate it, but complete read-back and `wfp_guard_verified` must precede child launch. Existing security-relevant mismatches or conflicting objects are never silently repaired. Session status keeps dependency/startup `available`, aggregate `windows_live_verified`, and policy-gated `execution_route_available` separate. Workspace-local protected-information read and LAN access are accepted residual risks for personal-use v1: `failed` or `unverified` results remain recorded and visible but do not alone block the route, including the corresponding child and grandchild checks. `execution_route_available` becomes true only when every other mandatory property, descendant check, and brokered-process denial is verified for the exact backend and isolation context. Local configuration cannot disable this requirement, and failure never creates an Approved Host fallback.
 
-The selected distribution mode is installed-Codex dependency. It reuses upstream's CLI/setup helper/command runner/security update chain without copying Windows sandbox internals into this repository. Apache-2.0 permits a future standalone distribution, but safely redistributing the coordinated binaries, versioned policy/protocol, setup behavior, signing, notices, and update channel is deferred. Missing CLI, incomplete UAC setup, incompatible backend, initialization/policy/launch failure, or timeout fails closed. A separate Approved Host request may still be staged for compatibility, but current v1 will reject execution before worker spawn.
+The selected distribution mode is installed-Codex dependency. It reuses upstream's CLI/setup helper/command runner/security update chain without copying Windows sandbox internals into this repository. Apache-2.0 permits a future standalone distribution, but safely redistributing the coordinated binaries, versioned policy/protocol, setup behavior, signing, notices, and update channel is deferred. Missing CLI, incomplete UAC setup, incompatible backend, initialization/policy/launch failure, or timeout fails closed. A separate Approved Host request is never an automatic fallback and follows its own LocalSystem authority/approval contract.
 
 The WFP Guard resolves the fixed `CodexSandboxOffline` target with this PC's computer name as the account qualifier. It accepts the result only when the returned referenced domain matches this PC's physical NetBIOS name and `SID_NAME_USE` is `SidTypeUser` (`1`); otherwise the Codex Sandbox route fails closed.
 
@@ -248,7 +248,7 @@ Public code and `config.example.toml` remain generic. Machine/private values bel
 
 `data_dir` and Sandbox scratch are resolved independently and must not lexically or effectively overlap workspace or each other. Roots must not be reparse points. On Windows, handle-resolved volume-GUID paths and stable file identities also reject aliases such as SUBST that identify the same or nested physical namespace. `protect_data_dir_acl=true` removes inherited ACLs and grants Full Control only to the current token SID and SYSTEM.
 
-ACL cannot distinguish two processes running as the same Windows user. MCP filesystem tools still cannot reach `data_dir` because it is outside workspace, and artifact paths are validated before special retrieval such as ADB screenshots. This same-user limitation is one reason current v1 does not treat Approved Host postflight monitoring as a complete security boundary and disables that execution route.
+ACL cannot distinguish two processes running as the same Windows user. MCP filesystem tools still cannot reach `data_dir` because it is outside workspace, and artifact paths are validated before special retrieval such as ADB screenshots. Approved Host therefore does not place its authoritative monitor/recovery latch in the same-user `data_dir`: LocalSystem owns the monitor and protected ProgramData authority state, while user-owned control-plane state remains an independently checked postflight input.
 
 ## 10. Transport and ownership
 
@@ -265,7 +265,7 @@ Annotations describe the real action performed by each model-facing call:
 - pure local reads and `execute_readonly`: read-only, non-destructive, closed-world; current Git requests on `execute_readonly` fail closed before process creation;
 - `adb_read`: read-only, non-destructive, closed-world;
 - `write_file` and `execute_workspace_write`: non-read-only, destructive, closed-world;
-- `request_host_command`: non-read-only, non-destructive, closed-world because it only creates an approval request; current v1 rejects any resulting Approved Host execution before worker spawn;
+- `request_host_command`: non-read-only, non-destructive, closed-world because it only creates an approval request; any later execution requires local approve-and-claim plus immutable binding and LocalSystem authority checks;
 - polls: read-only;
 - process-stop controls remain explicitly mutating/destructive where appropriate.
 

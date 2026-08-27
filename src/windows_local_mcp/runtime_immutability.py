@@ -23,17 +23,19 @@ RUNTIME_IMMUTABILITY_VERSION = 1
 # and WRITE_OWNER. If the current non-admin WLMCP token has any of these rights
 # anywhere in the trusted runtime closure, Approved Host could make a persistent
 # change that executes before the next control-plane health check.
+_DELETE_ACCESS = 0x00010000
 _MUTATING_ACCESS_MASK = (
     0x00000002
     | 0x00000004
     | 0x00000010
     | 0x00000040
     | 0x00000100
-    | 0x00010000
+    | _DELETE_ACCESS
     | 0x00040000
     | 0x00080000
 )
-_REPLACEMENT_ACCESS_MASK = 0x00000040 | 0x00010000 | 0x00040000 | 0x00080000
+_REPLACEMENT_ACCESS_MASK = 0x00000040 | _DELETE_ACCESS | 0x00040000 | 0x00080000
+_VOLUME_ROOT_REPLACEMENT_ACCESS_MASK = _REPLACEMENT_ACCESS_MASK & ~_DELETE_ACCESS
 _MAXIMUM_ALLOWED = 0x02000000
 _TOKEN_QUERY = 0x0008
 _TOKEN_DUPLICATE = 0x0002
@@ -69,6 +71,16 @@ def _ancestor_directories(path: Path) -> set[Path]:
         if current == Path(current.anchor):
             return result
         current = current.parent
+
+
+def _ancestor_replacement_access_mask(path: Path) -> int:
+    """Return rights that can replace a protected descendant through this ancestor."""
+    if path == Path(path.anchor):
+        # DELETE is object-scoped. On a volume root it describes deletion of the root object
+        # itself, not authority to delete a deeper runtime descendant. FILE_DELETE_CHILD and
+        # ACL-ownership mutation remain security-relevant even at the volume root.
+        return _VOLUME_ROOT_REPLACEMENT_ACCESS_MASK
+    return _REPLACEMENT_ACCESS_MASK
 
 
 def _tree_paths(tree: RuntimeTree) -> tuple[set[Path], set[Path]]:
@@ -445,7 +457,12 @@ def _verify_paths_immutable(
                 descriptor, access = _windows_security_descriptor(resolved)
             else:
                 access = int(access_resolver(resolved))
-            mutating = access & denied_mask
+            effective_denied_mask = (
+                _ancestor_replacement_access_mask(resolved)
+                if kind == "ancestor"
+                else denied_mask
+            )
+            mutating = access & effective_denied_mask
             if mutating:
                 raise PermissionError(
                     "Approved Host requires an immutable Python/WLMCP runtime; "

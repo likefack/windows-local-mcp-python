@@ -11,6 +11,11 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$AuthorityServiceName = "WindowsLocalMCPApprovedHost"
+$AuthorityStateRoot = Join-Path $env:ProgramData "WindowsLocalMCP\ApprovedHostAuthority"
+$AuthorityActiveState = Join-Path $AuthorityStateRoot "active.json"
+$AuthorityStatusState = Join-Path $AuthorityStateRoot "active-status.json"
+$AuthorityRecoveryState = Join-Path $AuthorityStateRoot "recovery_required"
 
 function Assert-UnderProgramFiles {
     param(
@@ -69,9 +74,30 @@ try {
 $BuildRoot = Join-Path $SourceRoot ".dev-tmp\approved-host-runtime"
 $WheelRoot = Join-Path $BuildRoot "wheel"
 $StagingRoot = "$InstallRoot.staging-$PID"
+$existingAuthorityService = Get-Service -Name $AuthorityServiceName -ErrorAction SilentlyContinue
+$restartAuthorityService = $false
 
 if ((Test-Path -LiteralPath $InstallRoot) -and -not $Replace) {
     throw "InstallRoot already exists. Use -Replace to replace it: $InstallRoot"
+}
+if ($Replace) {
+    if (
+        (Test-Path -LiteralPath $AuthorityActiveState -PathType Leaf) -or
+        (Test-Path -LiteralPath $AuthorityStatusState -PathType Leaf) -or
+        (Test-Path -LiteralPath $AuthorityRecoveryState)
+    ) {
+        throw "Approved Host authority has active/recovery state. Review and recover it before replacing the immutable runtime."
+    }
+    if ($null -ne $existingAuthorityService) {
+        if ($existingAuthorityService.Status -ne [ServiceProcess.ServiceControllerStatus]::Stopped) {
+            Stop-Service -Name $AuthorityServiceName
+            (Get-Service -Name $AuthorityServiceName).WaitForStatus(
+                [ServiceProcess.ServiceControllerStatus]::Stopped,
+                [TimeSpan]::FromSeconds(30)
+            )
+            $restartAuthorityService = $true
+        }
+    }
 }
 if (Test-Path -LiteralPath $StagingRoot) {
     Remove-Item -LiteralPath $StagingRoot -Recurse -Force
@@ -115,35 +141,100 @@ try {
         throw "Installing the WLMCP wheel and dependencies failed."
     }
 
-    Copy-Item -LiteralPath (Join-Path $SourceRoot "run-server.ps1") -Destination $StagingRoot
-    Copy-Item -LiteralPath (Join-Path $SourceRoot "run-approvals.ps1") -Destination $StagingRoot
-    Copy-Item -LiteralPath (Join-Path $SourceRoot "verify-approved-host-runtime.ps1") -Destination $StagingRoot
+    foreach ($script in @(
+        "run-server.ps1",
+        "run-approvals.ps1",
+        "install-approved-host-authority.ps1",
+        "recover-approved-host-authority.ps1",
+        "recover-approved-host-postflight.ps1",
+        "verify-approved-host-runtime.ps1",
+        "verify-approved-host-authority.ps1",
+        "verify-approved-host-authority-abnormal.ps1"
+    )) {
+        Copy-Item -LiteralPath (Join-Path $SourceRoot $script) -Destination $StagingRoot
+    }
     Copy-Item -LiteralPath (Join-Path $SourceRoot "config.example.toml") -Destination $StagingRoot
 
-    # Secure the complete staged runtime before it becomes the active installation.
-    & icacls.exe $StagingRoot /setowner "*S-1-5-32-544" /T /C | Out-Null
+    # Build one protected ACL boundary at the install root, then make every descendant inherit
+    # from that boundary. Recursively stripping inheritance after a recursive grant is unsafe:
+    # a descendant grant may still be inherited and can disappear when /inheritance:r reaches
+    # that object. The resulting tree must therefore have exactly one upstream ACL authority:
+    # the protected staging root with SYSTEM/Admin full control and runtime-user read/execute.
+    # Do not use /C for any security-critical ACL operation: one error aborts the installation.
+    & icacls.exe $StagingRoot /setowner "*S-1-5-32-544" /T | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw "Setting the Approved Host runtime owner failed."
     }
-    & icacls.exe $StagingRoot /inheritance:r /T /C | Out-Null
+    & icacls.exe $StagingRoot /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*${runtimeSid}:(OI)(CI)RX" | Out-Null
     if ($LASTEXITCODE -ne 0) {
-        throw "Removing inherited Approved Host runtime ACLs failed."
+        throw "Applying the Approved Host runtime root ACL failed."
     }
-    & icacls.exe $StagingRoot /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*${runtimeSid}:(OI)(CI)RX" /T /C | Out-Null
+    & icacls.exe $StagingRoot /inheritance:r | Out-Null
     if ($LASTEXITCODE -ne 0) {
-        throw "Applying the Approved Host runtime ACL failed."
+        throw "Protecting the Approved Host runtime root ACL failed."
+    }
+    $StagingChildren = Join-Path $StagingRoot "*"
+    & icacls.exe $StagingChildren /reset /T | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Resetting Approved Host runtime descendants to the protected root ACL failed."
+    }
+    & icacls.exe $StagingRoot /verify /T | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "Verifying the Approved Host runtime ACL tree failed."
     }
 
     if ($Replace -and (Test-Path -LiteralPath $InstallRoot)) {
+        # A previous runtime can contain malformed/protected descendant DACLs left by an older
+        # installer. takeown recovers ownership, but an Administrators allow ACE alone is not
+        # sufficient because an existing deny ACE still wins access evaluation. This is an
+        # explicit elevated maintenance action, so first take ownership without following links,
+        # then replace the retired tree's DACLs with their normal inherited defaults, restore an
+        # explicit Administrators full-control ACE, and only then delete the old tree. The reset
+        # applies only to the retired runtime after active/recovery state has been excluded and any
+        # authority service has stopped; the newly staged immutable runtime is never weakened.
+        $TakeownExe = Join-Path $env:SystemRoot "System32\takeown.exe"
+        if (-not (Test-Path -LiteralPath $TakeownExe -PathType Leaf)) {
+            throw "Windows takeown.exe is required to replace a previous Approved Host runtime: $TakeownExe"
+        }
+        & $TakeownExe /F $InstallRoot /A /R /D Y /SKIPSL | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "Reclaiming ownership of the previous Approved Host runtime failed."
+        }
+        & icacls.exe $InstallRoot /reset /T | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "Resetting the previous Approved Host runtime DACL failed."
+        }
+        & icacls.exe $InstallRoot /grant:r "*S-1-5-32-544:(OI)(CI)F" /T | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "Reclaiming Administrators access to the previous Approved Host runtime failed."
+        }
         Remove-Item -LiteralPath $InstallRoot -Recurse -Force
+        if (Test-Path -LiteralPath $InstallRoot) {
+            throw "Removing the previous Approved Host runtime failed: $InstallRoot"
+        }
     }
     Move-Item -LiteralPath $StagingRoot -Destination $InstallRoot
+
+    if ($restartAuthorityService) {
+        Start-Service -Name $AuthorityServiceName
+        (Get-Service -Name $AuthorityServiceName).WaitForStatus(
+            [ServiceProcess.ServiceControllerStatus]::Running,
+            [TimeSpan]::FromSeconds(30)
+        )
+    }
 
     Write-Output "Approved Host runtime installed at: $InstallRoot"
     Write-Output "Runtime user: $RuntimeUser ($runtimeSid)"
     Write-Output "Base Python: $BasePython"
     Write-Output "Base Python prefix: $BasePrefix"
-    Write-Output "Run verify-approved-host-runtime.ps1 from a normal non-elevated $RuntimeUser session before enabling Approved Host use."
+    Write-Output "1. Run verify-approved-host-runtime.ps1 from normal non-elevated $RuntimeUser."
+    if ($null -eq $existingAuthorityService) {
+        Write-Output "2. Run install-approved-host-authority.ps1 from an elevated Administrator session."
+    } else {
+        Write-Output "2. Existing Approved Host authority service was preserved; re-run its installer with -Replace if service configuration changed."
+    }
+    Write-Output "3. Run verify-approved-host-authority.ps1 from normal non-elevated $RuntimeUser."
+    Write-Output "4. Before claiming WLMCP-R2-001 fixed, run verify-approved-host-authority-abnormal.ps1 through Arm / KillAndRestart / Check, coordinated recovery, and post-recovery normal verification."
 } finally {
     if (Test-Path -LiteralPath $StagingRoot) {
         Remove-Item -LiteralPath $StagingRoot -Recurse -Force -ErrorAction SilentlyContinue

@@ -364,17 +364,33 @@ def test_approved_host_runtime_preflight_is_not_promoted_to_capability_live_veri
             "digest": "a" * 64,
         },
     )
+    monkeypatch.setattr(
+        server,
+        "assert_approved_host_authority_available",
+        lambda: {
+            "healthy": True,
+            "service_epoch": "test-epoch",
+            "active_operation_id": None,
+        },
+    )
 
     status = server._approved_host_capability()
 
     assert status["enabled"] is True
     assert status["available"] is True
+    assert status["execution_route_available"] is True
     assert status["unit_tested"] is True
     assert status["live_verified"] is False
     assert status["windows_live_verified"] is False
-    assert status["verification_scope"] == "runtime_immutability_preflight_only"
+    assert status["verification_scope"] == "runtime_and_authority_preflight_only"
     assert status["runtime_preflight"]["status"] == "passed"
     assert status["runtime_preflight"]["digest"] == "a" * 64
+    assert status["authority_preflight"] == {
+        "status": "passed",
+        "healthy": True,
+        "service_epoch": "test-epoch",
+        "active_operation_id": None,
+    }
     runtime_property = status["properties"]["runtime_immutability"]
     assert runtime_property["status"] == (
         "verified" if os.name == "nt" else "unverified"
@@ -383,7 +399,15 @@ def test_approved_host_runtime_preflight_is_not_promoted_to_capability_live_veri
     assert runtime_property["verification_kind"] == (
         "windows_live_preflight" if os.name == "nt" else "non_windows_preflight"
     )
+    authority_property = status["properties"]["authority_service_boundary"]
+    assert authority_property["status"] == (
+        "verified" if os.name == "nt" else "unverified"
+    )
+    assert authority_property["unit_tested"] is True
     for property_name in (
+        "durable_recovery_state",
+        "requester_token_child",
+        "monitor_access_denial",
         "control_plane_tamper_detection",
         "approval_integrity",
         "job_descendant_handling",
