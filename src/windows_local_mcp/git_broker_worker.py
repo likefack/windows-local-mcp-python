@@ -21,6 +21,7 @@ from .paths import Workspace
 from .policy import CommandPolicy
 from .process_utils import capture_process_identity
 from .redaction import redact_text
+from .resources import _try_remove_disposable_artifact
 from .util import canonical_json, utc_now_iso
 
 
@@ -192,6 +193,11 @@ def run_operation(operation_id: str, settings: Settings) -> int:
     error_message: str | None = None
     exit_code: int | None = None
     broker_result: Any | None = None
+    stage_root = (
+        settings.sandbox_scratch_dir / "git-broker" / operation_id
+        if settings.sandbox_scratch_dir is not None
+        else None
+    )
     try:
         git_identity = dict(fresh.executable_identity or {})
         live_marker = require_git_broker_live_verification(settings, git_identity)
@@ -232,6 +238,9 @@ def run_operation(operation_id: str, settings: Settings) -> int:
         status = "failed"
         failure_class = "execution_failure"
         error_message = f"{type(error).__name__}: {error}"
+    finally:
+        if stage_root is not None:
+            _try_remove_disposable_artifact(stage_root)
 
     duration_ms = int((time.monotonic() - started) * 1000)
     stdout_bytes = stdout_path.read_bytes() if stdout_path.exists() else b""
