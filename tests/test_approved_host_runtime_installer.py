@@ -117,9 +117,20 @@ def test_runtime_installer_replace_gate_checks_recovery_state_without_service_de
         "if (Test-Path -LiteralPath $StagingRoot)", maxsplit=1
     )[0]
 
+    assert '$AuthorityStatusState = Join-Path $AuthorityStateRoot "active-status.json"' in script
     assert '$AuthorityRecoveryState = Join-Path $AuthorityStateRoot "recovery_required"' in script
     assert "Test-Path -LiteralPath $AuthorityActiveState -PathType Leaf" in replace_gate
+    assert "Test-Path -LiteralPath $AuthorityStatusState -PathType Leaf" in replace_gate
     assert "Test-Path -LiteralPath $AuthorityRecoveryState" in replace_gate
+    active_check = replace_gate.index("Test-Path -LiteralPath $AuthorityActiveState")
+    status_check = replace_gate.index("Test-Path -LiteralPath $AuthorityStatusState")
     recovery_check = replace_gate.index("Test-Path -LiteralPath $AuthorityRecoveryState")
     service_check = replace_gate.index("if ($null -ne $existingAuthorityService)")
-    assert recovery_check < service_check
+    assert active_check < status_check < recovery_check < service_check
+
+
+def test_runtime_installer_packages_all_approved_host_recovery_entrypoints() -> None:
+    script = _installer_text()
+
+    assert '"recover-approved-host-authority.ps1"' in script
+    assert '"recover-approved-host-postflight.ps1"' in script
