@@ -8,10 +8,16 @@ import time
 from pathlib import Path
 from typing import Any
 
+import psutil
+
 from .approved_host_authority import (
     ApprovedHostAuthorityClient,
     ApprovedHostRecoveryRequired,
     default_authority_state_root,
+)
+from .approved_host_process_census import (
+    capture_user_processes,
+    requester_username,
 )
 from .approved_host_service import _process_token_details
 from .approval import verify_approval_bundle
@@ -60,12 +66,46 @@ def _wait_worker_and_child(runtime: Any, operation_id: str, timeout: float = 20.
     raise TimeoutError("Approved Host worker/child did not start")
 
 
+def _new_ping_helpers(
+    *,
+    username: str,
+    baseline: set[tuple[int, float]],
+    expected_ping: Path,
+) -> list[dict[str, Any]]:
+    expected = os.path.normcase(str(expected_ping.resolve(strict=True)))
+    helpers: list[dict[str, Any]] = []
+    for pid, create_time in sorted(capture_user_processes(username) - baseline):
+        try:
+            process = psutil.Process(pid)
+            executable = os.path.normcase(str(Path(process.exe()).resolve(strict=True)))
+        except (
+            psutil.AccessDenied,
+            psutil.NoSuchProcess,
+            psutil.ZombieProcess,
+            OSError,
+        ):
+            continue
+        if executable != expected:
+            continue
+        helpers.append(
+            {
+                "pid": int(pid),
+                "create_time": float(create_time),
+                "executable": str(expected_ping.resolve(strict=True)),
+            }
+        )
+    return helpers
+
+
 def arm_abnormal(cwd: str, handoff: Path) -> dict[str, Any]:
     if os.name != "nt":
         raise RuntimeError("Approved Host abnormal verification requires native Windows")
     requester_sid, elevated = _process_token_details(os.getpid())
     if elevated:
         raise PermissionError("arm phase must run from the non-elevated runtime user")
+    requester_create_time = float(psutil.Process(os.getpid()).create_time())
+    username = requester_username(os.getpid(), requester_create_time)
+    user_process_baseline = capture_user_processes(username)
 
     from . import server
 
@@ -103,9 +143,23 @@ def arm_abnormal(cwd: str, handoff: Path) -> dict[str, Any]:
     _approve_and_launch(server.runtime, operation_id)
     operation = _wait_worker_and_child(server.runtime, operation_id)
 
-    # WMIC normally exits after the provider accepts Create(). Give WmiPrvSE enough time to
-    # create the job-external helper so the SYSTEM worker enters its postflight user census.
-    time.sleep(2.0)
+    # WMIC normally exits after WmiPrvSE accepts Create(). Confirm the requested ping helper
+    # actually exists under the original runtime user before fault-injecting the SYSTEM worker.
+    deadline = time.monotonic() + 8.0
+    helpers: list[dict[str, Any]] = []
+    while time.monotonic() < deadline:
+        helpers = _new_ping_helpers(
+            username=username,
+            baseline=user_process_baseline,
+            expected_ping=ping,
+        )
+        if helpers:
+            break
+        time.sleep(0.1)
+    if not helpers:
+        raise AssertionError(
+            "Win32_Process.Create did not produce an observable requester-user ping.exe helper"
+        )
     current = server.runtime.audit.get_operation(operation_id, include_events=False)
     if current["status"] in TERMINAL_STATUSES:
         raise AssertionError(
@@ -121,6 +175,8 @@ def arm_abnormal(cwd: str, handoff: Path) -> dict[str, Any]:
         "worker_executable": str(operation["worker_executable"]),
         "process_nonce": str(operation["process_nonce"]),
         "requester_sid": requester_sid,
+        "requester_username": username,
+        "wmi_job_external_helpers": helpers,
         "config": os.environ.get("LOCAL_MCP_CONFIG"),
         "authority_state_root": str(default_authority_state_root()),
     }
@@ -166,6 +222,10 @@ def check_abnormal(handoff: Path) -> dict[str, Any]:
     config = payload.get("config")
     if config:
         os.environ["LOCAL_MCP_CONFIG"] = str(config)
+
+    helpers = payload.get("wmi_job_external_helpers")
+    if not isinstance(helpers, list) or not helpers:
+        raise AssertionError("handoff contains no verified WMI job-external helper identity")
 
     probe = ApprovedHostAuthorityClient().probe()
     if bool(probe.get("healthy")):
@@ -224,6 +284,7 @@ def check_abnormal(handoff: Path) -> dict[str, Any]:
         "status": "passed",
         "operation_id": payload["operation_id"],
         "legacy_pending_approval_id": legacy_id,
+        "verified_wmi_job_external_helpers": helpers,
         "authority_healthy": False,
         "state_tamper_denied": True,
         "legacy_generation_blocked": True,
