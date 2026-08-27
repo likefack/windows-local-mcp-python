@@ -234,7 +234,10 @@ def test_hardlinked_relevant_input_remains_rejected(tmp_path: Path) -> None:
     except OSError as error:
         pytest.skip(f"hardlink creation is unavailable: {error}")
 
-    with pytest.raises(GitBrokerUnavailable, match="hard-linked Git input"):
+    with pytest.raises(
+        GitBrokerUnavailable,
+        match="hard-linked Git input|multiple hard links are denied",
+    ):
         stage_git_repository(
             settings,
             "hardlink",
