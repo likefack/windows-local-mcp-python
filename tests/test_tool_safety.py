@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from windows_local_mcp.config import Settings
+from windows_local_mcp.git_broker_sandbox import GitBrokerUnavailable
 from windows_local_mcp.tool_safety import (
     capture_executable_identity,
     hold_executable_identity,
@@ -28,18 +29,48 @@ def make_settings(tmp_path: Path, executable: Path, digest: str) -> Settings:
     return settings
 
 
-def test_automatic_git_broker_helper_is_disabled_with_valid_trust_anchor(
-    tmp_path: Path,
+def test_automatic_git_broker_helper_requires_verified_containment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     executable = tmp_path / "git.exe"
     executable.write_bytes(b"trusted-git")
     digest = sha256(executable.read_bytes()).hexdigest()
     settings = make_settings(tmp_path, executable, digest)
 
-    with pytest.raises(
-        PermissionError, match="automatic Git broker execution is disabled"
-    ):
+    from windows_local_mcp import git_broker_sandbox
+
+    monkeypatch.setattr(
+        git_broker_sandbox,
+        "require_git_broker_containment",
+        lambda _settings, _identity: (_ for _ in ()).throw(
+            GitBrokerUnavailable("live containment is missing")
+        ),
+    )
+    with pytest.raises(GitBrokerUnavailable, match="live containment is missing"):
         trusted_helper_identity(settings, "git")
+
+
+def test_automatic_git_broker_helper_accepts_pinned_git_after_containment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    executable = tmp_path / "git.exe"
+    executable.write_bytes(b"trusted-git")
+    digest = sha256(executable.read_bytes()).hexdigest()
+    settings = make_settings(tmp_path, executable, digest)
+
+    from windows_local_mcp import git_broker_sandbox
+
+    observed: dict[str, object] = {}
+
+    def verified(_settings: Settings, identity: dict[str, object]) -> None:
+        observed.update(identity)
+
+    monkeypatch.setattr(git_broker_sandbox, "require_git_broker_containment", verified)
+    identity = trusted_helper_identity(settings, "git")
+
+    assert identity["path"] == str(executable.resolve())
+    assert identity["sha256"] == digest
+    assert observed["sha256"] == digest
 
 
 def test_adb_broker_helper_requires_matching_explicit_hash(tmp_path: Path) -> None:
