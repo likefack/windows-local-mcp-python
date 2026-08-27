@@ -27,6 +27,20 @@ jobs:
       - name: Install Ruff
         run: python -m pip install 'ruff>=0.12,<1'
 
+      - name: Harden regex replacement handling
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('scripts/r2_001_finalize_patch.py')
+          text = path.read_text(encoding='utf-8')
+          old = 'updated, actual = re.subn(pattern, replacement, text, count=count, flags=re.DOTALL)'
+          new = 'updated, actual = re.subn(pattern, lambda _match: replacement, text, count=count, flags=re.DOTALL)'
+          if text.count(old) != 1:
+              raise SystemExit('finalize replacement helper changed unexpectedly')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8', newline='\n')
+          PY
+
       - name: Apply exact finalize patch
         run: python scripts/r2_001_finalize_patch.py
 
