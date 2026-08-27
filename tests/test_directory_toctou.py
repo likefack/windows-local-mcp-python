@@ -1,7 +1,6 @@
 import gc
 import os
 import sys
-from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
@@ -133,11 +132,12 @@ def test_safe_process_pins_cwd_before_subprocess_launch(
     assert moved.is_dir()
 
 
-def test_git_snapshot_pins_workspace_root_across_probe_and_batch(
+def test_git_snapshot_pins_workspace_root_across_sandbox_batch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     settings = make_settings(tmp_path, git_enabled=True)
     root = settings.workspace_root
+    (root / ".git").mkdir()
     moved = tmp_path / "moved-workspace"
     identity = {"path": str(Path(sys.executable).resolve(strict=True))}
     monkeypatch.setattr(
@@ -145,20 +145,6 @@ def test_git_snapshot_pins_workspace_root_across_probe_and_batch(
         "trusted_helper_identity",
         lambda _settings, _program_key: identity,
     )
-    monkeypatch.setattr(
-        git_snapshot_module,
-        "hold_executable_identity",
-        lambda _identity: nullcontext(),
-    )
-
-    def fake_probe(**_kwargs: object) -> SafeProcessResult:
-        return SafeProcessResult(
-            returncode=0,
-            stdout=str(root.resolve()).encode("utf-8"),
-            stderr=b"",
-            stdout_truncated=False,
-            stderr_truncated=False,
-        )
 
     def fake_batch(
         *, commands: list[list[str]], **_kwargs: object
@@ -176,8 +162,7 @@ def test_git_snapshot_pins_workspace_root_across_probe_and_batch(
             for _command in commands
         ]
 
-    monkeypatch.setattr(git_snapshot_module, "run_safe_process", fake_probe)
-    monkeypatch.setattr(git_snapshot_module, "run_safe_process_batch", fake_batch)
+    monkeypatch.setattr(git_snapshot_module, "run_git_broker_batch", fake_batch)
 
     snapshot = capture_git_snapshot(
         settings=settings,
