@@ -26,6 +26,14 @@ from .control_plane import verify_control_plane_generation
 from .policy import approved_request_hash
 
 
+_ABNORMAL_CHILD_START_TIMEOUT_SECONDS = 120.0
+_ABNORMAL_OPERATION_RUNTIME_SECONDS = 300
+# Windows ping sends the first packet immediately, so 601 loopback requests keep the WMI-created
+# helper alive for roughly 600 seconds. This must outlive the 300-second worker/postflight budget so
+# the verifier never depends on how quickly an operator can switch to an elevated PowerShell.
+_ABNORMAL_WMI_HELPER_PING_COUNT = 601
+
+
 def _approve_and_launch(runtime: Any, operation_id: str) -> None:
     operation = runtime.audit.get_operation(operation_id, include_events=False)
     request = operation["request"]
@@ -52,7 +60,11 @@ def _approve_and_launch(runtime: Any, operation_id: str) -> None:
     runtime.executor.launch(operation_id, 0)
 
 
-def _wait_worker_and_child(runtime: Any, operation_id: str, timeout: float = 20.0) -> dict[str, Any]:
+def _wait_worker_and_child(
+    runtime: Any,
+    operation_id: str,
+    timeout: float = _ABNORMAL_CHILD_START_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         operation = runtime.audit.get_operation(operation_id, include_events=False)
@@ -118,7 +130,9 @@ def arm_abnormal(cwd: str, handoff: Path) -> dict[str, Any]:
             "the mandatory Win32_Process.Create abnormal-path verification."
         )
     ping = system_root / "System32" / "ping.exe"
-    helper_command = f'"{ping}" 127.0.0.1 -n 30 -w 1000'
+    helper_command = (
+        f'"{ping}" 127.0.0.1 -n {_ABNORMAL_WMI_HELPER_PING_COUNT} -w 1000'
+    )
 
     victim = server.request_host_command(
         command=[str(wmic), "process", "call", "create", helper_command],
@@ -127,7 +141,7 @@ def arm_abnormal(cwd: str, handoff: Path) -> dict[str, Any]:
         network_required=False,
         risk_summary="Win32_Process.Create creates a same-user process outside the Host Job",
         workspace_write=True,
-        max_runtime_seconds=45,
+        max_runtime_seconds=_ABNORMAL_OPERATION_RUNTIME_SECONDS,
     )
     legacy = server.request_host_command(
         command=[str(system_root / "System32" / "whoami.exe"), "/user"],
@@ -179,6 +193,7 @@ def arm_abnormal(cwd: str, handoff: Path) -> dict[str, Any]:
         "wmi_job_external_helpers": helpers,
         "config": os.environ.get("LOCAL_MCP_CONFIG"),
         "authority_state_root": str(default_authority_state_root()),
+        "fault_injection_window_seconds": _ABNORMAL_OPERATION_RUNTIME_SECONDS,
     }
     handoff.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return payload
