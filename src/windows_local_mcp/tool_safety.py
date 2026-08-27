@@ -75,11 +75,11 @@ def capture_stable_file_identity(path: str | Path) -> dict[str, Any]:
     invalid = wintypes.HANDLE(-1).value
     handle = kernel32.CreateFileW(
         str(resolved),
-        0x80000000,  # GENERIC_READ
-        0x00000001 | 0x00000002 | 0x00000004,  # share read/write/delete for capture
+        0x80000000,
+        0x00000001 | 0x00000002 | 0x00000004,
         None,
-        3,  # OPEN_EXISTING
-        0x00000080,  # FILE_ATTRIBUTE_NORMAL
+        3,
+        0x00000080,
         None,
     )
     if handle in (None, invalid):
@@ -199,12 +199,9 @@ def trusted_helper_identity(settings: Any, program_key: str) -> dict[str, Any]:
         provenance="explicit-local-config",
     )
     if program_key == "git":
-        # Import lazily so the low-level identity helpers remain acyclic. Automatic Git is
-        # available only when the same Windows sandbox/WFP/Job boundary used at execution has
-        # current machine-bound live evidence; a valid git.exe hash alone is never sufficient.
-        from .git_broker_sandbox import require_git_broker_containment
+        from .git_broker_live_verify import require_git_broker_live_verification
 
-        require_git_broker_containment(settings, identity)
+        require_git_broker_live_verification(settings, identity)
     return identity
 
 
@@ -249,11 +246,11 @@ def hold_file_identity(expected: dict[str, Any]) -> Iterator[Path]:
         invalid = wintypes.HANDLE(-1).value
         handle = kernel32.CreateFileW(
             str(path),
-            0x80000000,  # GENERIC_READ
-            0x00000001,  # FILE_SHARE_READ only: deny writes, deletes, and replacement
+            0x80000000,
+            0x00000001,
             None,
-            3,  # OPEN_EXISTING
-            0x00000080,  # FILE_ATTRIBUTE_NORMAL
+            3,
+            0x00000080,
             None,
         )
         if handle in (None, invalid):
@@ -266,9 +263,6 @@ def hold_file_identity(expected: dict[str, Any]) -> Iterator[Path]:
     try:
         verified = verify_file_identity(expected)
         yield verified
-        # On Windows the still-open FILE_SHARE_READ-only handle has denied all writes and
-        # replacement for the whole interval. Other platforms recheck because their retained
-        # read handle is not an equivalent security boundary.
         if os.name != "nt":
             verify_file_identity(expected)
     finally:
