@@ -45,7 +45,7 @@ function Invoke-Sc {
     param([Parameter(Mandatory = $true)][string[]]$Arguments)
     & "$env:SystemRoot\System32\sc.exe" @Arguments | Out-Host
     if ($LASTEXITCODE -ne 0) {
-        throw "sc.exe failed with exit code $LASTEXITCODE: $($Arguments -join ' ')"
+        throw "sc.exe failed with exit code ${LASTEXITCODE}: $($Arguments -join ' ')"
     }
 }
 
