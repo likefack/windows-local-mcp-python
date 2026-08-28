@@ -193,6 +193,7 @@ jobs:
           tests/test_mcp_stdio_integration.py
           tests/test_mcp_policy_error_visibility.py
           tests/test_sandbox_scratch_retention.py
+          tests/test_integrated_capability_surface.py
 
       - name: Full pytest
         run: python -m pytest
