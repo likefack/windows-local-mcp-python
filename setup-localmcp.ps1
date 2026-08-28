@@ -428,8 +428,8 @@ function Save-Config {
     try {
         [IO.File]::WriteAllText($temporary, $Content, [Text.UTF8Encoding]::new($false))
         if (-not [string]::IsNullOrWhiteSpace($PythonPath)) {
-            # 置換前に新しい内容を実際の設定ローダーで検証します。失敗時は旧ファイルを触りません。
-            Test-Configuration -PythonPath $PythonPath -ConfigPath $temporary
+            # 一時ファイルでは副作用のない候補検証だけを行い、namespace marker を一時 path に結び付けません。
+            Test-ConfigurationCandidate -PythonPath $PythonPath -ConfigPath $temporary
         }
         if ($existing) {
             $stamp = Get-Date -Format "yyyyMMdd-HHmmssfff"
@@ -496,6 +496,21 @@ function Test-Configuration {
         }
     }
     Write-Ok "設定ファイルの検証が完了しました。"
+}
+
+function Test-ConfigurationCandidate {
+    param(
+        [Parameter(Mandatory = $true)][string]$PythonPath,
+        [Parameter(Mandatory = $true)][string]$ConfigPath
+    )
+
+    # 一時 config を load_settings() に渡すと namespace marker が一時 path に結び付くため、
+    # ここでは副作用のない TOML/Settings 検証だけを行います。実体の namespace と filesystem
+    # probe は、原子置換後の最終 config で Test-Configuration が確認します。
+    $probe = @(
+        "import pathlib, sys, tomllib; from windows_local_mcp.config import Settings, _is_reparse; config_path = pathlib.Path(sys.argv[1]).resolve(); payload = tomllib.loads(config_path.read_text(encoding='utf-8')); settings = Settings.model_validate(payload); workspace = settings.workspace_root.resolve(); data_dir = settings.data_dir.resolve(); scratch = settings.sandbox_scratch_dir.resolve(); assert workspace.exists() and workspace.is_dir() and not _is_reparse(workspace); assert workspace != pathlib.Path(workspace.anchor); assert not config_path.is_relative_to(workspace); assert all((not candidate.exists()) or (candidate.is_dir() and not _is_reparse(candidate)) for candidate in (data_dir, scratch)); print('candidate-ok')"
+    )
+    Invoke-Python -PythonPath $PythonPath -Arguments @("-I", "-B", "-c", $probe, $ConfigPath) | Out-Null
 }
 
 function Get-TunnelConfigContext {
