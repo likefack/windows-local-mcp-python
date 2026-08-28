@@ -121,16 +121,15 @@ mcp = MCPServer(
     version="0.6.0",
     instructions=(
         "Operate inside the configured workspace. Use broker primitives for bounded file, "
-        "artifact, and fixed ADB-read operations. Automatic Git Broker execution is "
-        "unavailable in current v1; Git process execution requires a separately "
-        "human-approved route. DOCX/XLSX/CSV/TSV/ZIP/image work "
-        "uses bounded structured processing or hash-bound container artifacts. Project code, "
-        "plugins, Flutter/Dart processing, test/build, and general commands use "
-        "request_sandbox_command; request_host_command "
-        "is the explicit last-resort host tier. Activity tools expose bounded "
-        "operation details; workspace rollback is always a locally approved operation. "
-        "request_host_command only stages "
-        "the request; local approval performs the dangerous execution once. Poll the result."
+        "artifact, fixed ADB-read, and metadata-only fixed Git-read operations. Automatic Git "
+        "requires current Git-specific live verification and otherwise fails closed. "
+        "Content-producing or open-ended Git, project code, plugins, Flutter/Dart processing, "
+        "test/build, and general commands use request_sandbox_command. DOCX/XLSX/CSV/TSV/ZIP/"
+        "image work uses bounded structured processing or hash-bound container artifacts. "
+        "request_host_command stages a separate one-shot Approved Host request through the "
+        "authority-separated Windows service and is never an automatic fallback. Activity tools "
+        "expose bounded operation details; workspace rollback is always a locally approved "
+        "operation. Poll approved execution for its durable result."
     ),
     log_level="INFO",
 )
@@ -493,6 +492,7 @@ def _broker_helper_capability(program_key: str, enabled: bool) -> dict[str, Any]
         "configured": configured,
         "enabled": enabled,
         "available": False,
+        "live_verified": False,
         "windows_live_verified": False,
     }
     if not enabled:
@@ -500,8 +500,14 @@ def _broker_helper_capability(program_key: str, enabled: bool) -> dict[str, Any]
         return result
     try:
         identity = trusted_helper_identity(runtime.settings, program_key)
+        git_live_verified = program_key == "git"
         result.update(
             available=True,
+            live_verified=git_live_verified,
+            windows_live_verified=git_live_verified,
+            verification_scope=(
+                "git-specific-live-marker" if git_live_verified else "executable-identity-only"
+            ),
             provenance=identity["provenance"],
             executable_sha256=identity["sha256"],
         )
@@ -581,9 +587,9 @@ def session_info() -> dict[str, Any]:
             "version": "broker-centered-sandboxed-processing-v1",
             "layers": {
                 "broker": (
-                    "closed-world file, artifact, fixed ADB-read, checkpoint, transaction, "
-                    "rollback, and audit primitives; automatic Git Broker execution is "
-                    "unavailable in current v1"
+                    "closed-world file, artifact, fixed ADB-read, metadata-only fixed Automatic "
+                    "Git, checkpoint, transaction, rollback, and audit primitives; Automatic Git "
+                    "requires current Git-specific live verification"
                 ),
                 "structured_processing": "bounded declarative WLMCP processing or hash-bound ChatGPT container artifacts",
                 "codex_sandbox": "open-ended execution, project-controlled code/plugins, Flutter/Dart processing, test/build, and general commands",
@@ -2273,7 +2279,7 @@ def execute_readonly(
     foreground_timeout_seconds: int | None = None,
     max_runtime_seconds: int | None = None,
 ) -> dict[str, Any]:
-    """Retain the fixed-grammar read surface; current v1 Git requests fail closed before execution."""
+    """Run fixed-grammar automatic reads; Git uses the verified metadata-only Broker route."""
     return _run_automatic_tool(
         tool_name="execute_readonly",
         expected_kind=SafeExecutionKind.READ_ONLY,
@@ -2326,7 +2332,7 @@ def adb_read(
 
 @mcp.tool(annotations=READ_ONLY)
 def git_info() -> dict[str, Any]:
-    """Retain the Git snapshot surface; current v1 fails closed before automatic Git execution."""
+    """Capture bounded Git state through the verified Automatic Git Broker route."""
     request: dict[str, Any] = {}
     operation_id: str | None = None
     try:
