@@ -8,6 +8,8 @@ $StateRoot = Join-Path $LocalAppData "WindowsLocalMCP"
 $DefaultConfigPath = Join-Path $StateRoot "config.toml"
 $SelectorPath = Join-Path $StateRoot "active-config.txt"
 $MinimumPython = [Version]::new(3, 11)
+$PythonWindowsDownloadUrl = "https://www.python.org/downloads/windows/"
+$CodexCliDocsUrl = "https://developers.openai.com/codex/cli/"
 
 try {
     [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
@@ -139,6 +141,26 @@ function Test-WlmcpImport {
     }
 }
 
+function Show-PythonInstallGuidance {
+    Write-Host ""
+    Write-Warn "Python 3.11 以上が見つかりません。"
+    Write-Host "Python の公式ダウンロードページ:" -ForegroundColor Yellow
+    Write-Host "  $PythonWindowsDownloadUrl" -ForegroundColor Cyan
+    Write-Host "Windows 用の Python 3.11 以上をインストールし、完了後に新しく PowerShell を開いてください。"
+    Write-Host "確認できたら、この画面を閉じて start-localmcp.bat をもう一度実行します。"
+    Write-Host "会社や学校の PC でインストールできない場合は、管理者または PC の管理担当者に相談してください。"
+}
+
+function Show-PythonRecoveryGuidance {
+    Write-Host ""
+    Write-Warn "Python の専用環境を準備できませんでした。"
+    Write-Host "ネットワーク接続と、Python 3.11 以上を実行できることを確認してから再実行してください。"
+    Write-Host "手動で試す場合は、配布フォルダーで次を実行します:" -ForegroundColor Yellow
+    Write-Host "  py -3.11 -m venv .venv" -ForegroundColor Gray
+    Write-Host "  .\.venv\Scripts\python.exe -m pip install -e ." -ForegroundColor Gray
+    Write-Host "Python の入手先: $PythonWindowsDownloadUrl" -ForegroundColor Cyan
+}
+
 function Ensure-PythonRuntime {
     Write-Info "Python 3.11 以上と Windows Local MCP の導入状態を確認しています。"
 
@@ -163,18 +185,24 @@ function Ensure-PythonRuntime {
     }
 
     if ($null -eq $basePython) {
-        throw "Python 3.11 以上が見つかりません。Python をインストールしてから再実行してください。"
+        Show-PythonInstallGuidance
+        throw "Python 3.11 以上を準備してから再実行してください。"
     }
     if (-not (Test-Path -LiteralPath (Join-Path $ScriptRoot "pyproject.toml") -PathType Leaf)) {
         throw "pyproject.toml が見つかりません。このバッチはリリースパッケージまたはリポジトリのルートから実行してください。"
     }
 
     if (-not (Test-Path -LiteralPath (Join-Path $venvPath "Scripts\python.exe") -PathType Leaf)) {
-        Write-Info "専用の .venv を作成しています。"
-        if ($basePython.Path -match "\\py(?:\.exe)?$") {
-            Invoke-Python -PythonPath $basePython.Path -Arguments @("-3.11", "-m", "venv", $venvPath) | Out-Host
-        } else {
-            Invoke-Python -PythonPath $basePython.Path -Arguments @("-m", "venv", $venvPath) | Out-Host
+        try {
+            Write-Info "専用の .venv を作成しています。"
+            if ($basePython.Path -match "\\py(?:\.exe)?$") {
+                Invoke-Python -PythonPath $basePython.Path -Arguments @("-3.11", "-m", "venv", $venvPath) | Out-Host
+            } else {
+                Invoke-Python -PythonPath $basePython.Path -Arguments @("-m", "venv", $venvPath) | Out-Host
+            }
+        } catch {
+            Show-PythonRecoveryGuidance
+            throw
         }
     }
 
@@ -183,10 +211,15 @@ function Ensure-PythonRuntime {
         throw ".venv の Python が作成されませんでした: $venvPythonPath"
     }
 
-    Write-Info "依存パッケージをインストールしています。ネットワーク接続が必要です。"
-    Invoke-Python -PythonPath $venvPythonPath -Arguments @("-I", "-B", "-m", "pip", "install", "-e", $ScriptRoot) | Out-Host
-    if (-not (Test-WlmcpImport -PythonPath $venvPythonPath)) {
-        throw "Windows Local MCP を import できません。依存パッケージの導入結果を確認してください。"
+    try {
+        Write-Info "依存パッケージをインストールしています。ネットワーク接続が必要です。"
+        Invoke-Python -PythonPath $venvPythonPath -Arguments @("-I", "-B", "-m", "pip", "install", "-e", $ScriptRoot) | Out-Host
+        if (-not (Test-WlmcpImport -PythonPath $venvPythonPath)) {
+            throw "Windows Local MCP を import できません。依存パッケージの導入結果を確認してください。"
+        }
+    } catch {
+        Show-PythonRecoveryGuidance
+        throw
     }
 
     $version = Get-PythonVersion -PythonPath $venvPythonPath
@@ -195,10 +228,16 @@ function Ensure-PythonRuntime {
 }
 
 function Read-WorkspacePath {
+    Write-Host ""
+    Write-Host "MCP から操作したいプロジェクトのフォルダーを指定します。" -ForegroundColor Cyan
+    Write-Host "場所の調べ方: エクスプローラーでそのフォルダーを開き、上のアドレスバーをクリックして Ctrl+C。"
+    Write-Host "この画面に戻って Ctrl+V で貼り付けます。フォルダー名までを指定し、ファイル名は入力しません。"
+    Write-Host "例: C:\Users\あなたの名前\Documents\my-project" -ForegroundColor Gray
+
     while ($true) {
-        $value = (Read-Host "workspace として使う既存フォルダーのパス").Trim().Trim('"')
+        $value = (Read-Host "操作対象フォルダーの場所").Trim().Trim('"')
         if ([string]::IsNullOrWhiteSpace($value)) {
-            Write-Warn "workspace のパスは必須です。"
+            Write-Warn "操作対象フォルダーの場所は必須です。"
             continue
         }
 
@@ -213,7 +252,7 @@ function Read-WorkspacePath {
             continue
         }
         if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-            Write-Warn "ショートカットや junction などの reparse point は workspace に使えません。"
+            Write-Warn "ショートカットや junction など、実体を別の場所へ見せるフォルダーは指定できません。"
             continue
         }
 
@@ -224,7 +263,7 @@ function Read-WorkspacePath {
             continue
         }
         if (Test-PathInside -Candidate $resolved -Parent $StateRoot) {
-            Write-Warn "$StateRoot の中は workspace に使えません。設定・監査領域と分離してください。"
+            Write-Warn "$StateRoot の中は操作対象にできません。設定・監査用の場所と分けてください。"
             continue
         }
         return $resolved
@@ -406,7 +445,7 @@ function Test-Configuration {
         [Parameter(Mandatory = $true)][string]$ConfigPath
     )
 
-    Write-Info "設定と workspace の境界を確認しています。"
+    Write-Info "設定と操作対象フォルダーの境界を確認しています。"
     $previousConfig = $env:LOCAL_MCP_CONFIG
     $previousRoot = $env:LOCAL_MCP_ROOT
     try {
@@ -436,6 +475,38 @@ function Test-Configuration {
     Write-Ok "設定ファイルの検証が完了しました。"
 }
 
+function Find-CodexCli {
+    $candidates = [System.Collections.Generic.List[string]]::new()
+    $command = Get-Command codex.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $command -and $command.Source) {
+        $null = $candidates.Add($command.Source)
+    }
+
+    $cacheRoot = Join-Path $LocalAppData "OpenAI\Codex\bin"
+    if (Test-Path -LiteralPath $cacheRoot -PathType Container) {
+        foreach ($versionDirectory in @(Get-ChildItem -LiteralPath $cacheRoot -Directory -Force -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending)) {
+            $null = $candidates.Add((Join-Path $versionDirectory.FullName "codex.exe"))
+        }
+    }
+    $null = $candidates.Add((Join-Path $LocalAppData "Programs\OpenAI\Codex\bin\codex.exe"))
+    if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+        $null = $candidates.Add((Join-Path $env:USERPROFILE ".codex\packages\standalone\current\bin\codex.exe"))
+        $null = $candidates.Add((Join-Path $env:USERPROFILE ".codex\packages\standalone\current\codex.exe"))
+    }
+
+    foreach ($candidate in @($candidates | Select-Object -Unique)) {
+        try {
+            $item = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop
+            if (-not $item.PSIsContainer -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
+                return (Resolve-Path -LiteralPath $candidate).Path
+            }
+        } catch {
+            # 候補がない、または検証できない場合は次の候補を確認します。
+        }
+    }
+    return $null
+}
+
 function Show-OptionalChecks {
     param([Parameter(Mandatory = $true)][string]$ConfigPath)
 
@@ -446,12 +517,16 @@ function Show-OptionalChecks {
         Write-Warn "Git runtime は自動設定していません。Automatic Git は明示的な path/hash と実機検証が必要です。"
     }
 
-    $codex = Get-Command codex.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+    $codex = Find-CodexCli
     if ($null -eq $codex) {
-        Write-Warn "Codex CLI は検出できませんでした。Sandbox 機能は別途導入・検証が必要です。"
+        Write-Warn "Codex CLI の実行ファイルが見つかりませんでした。"
+        Write-Host "ファイルの読み書きはこのまま利用できます。Python、テスト、ビルドなどの Sandbox 経路はまだ利用できません。" -ForegroundColor Yellow
+        Write-Host "導入案内（OpenAI 公式）: $CodexCliDocsUrl" -ForegroundColor Cyan
+        Write-Host "導入後に start-localmcp.bat を再実行してください。手動設定では approved_sandbox_codex_path に codex.exe の絶対パスを指定できます。"
     } else {
-        Write-Info "Codex CLI を検出しました: $($codex.Source)"
-        Write-Info "Sandbox の live verification は通常 operation から自動実行せず、必要時に明示します。"
+        Write-Info "Codex CLI の実行ファイル候補を検出しました: $codex"
+        Write-Info "実行時には署名・ハッシュ・実体の識別情報を再確認します。検出だけでは Sandbox 利用可能とは判定しません。"
+        Write-Info "Sandbox のライブ検証は通常の操作から自動実行せず、必要時に明示します。"
     }
 
     $adbRoots = @($env:ANDROID_HOME, $env:ANDROID_SDK_ROOT) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
@@ -464,6 +539,20 @@ function Show-OptionalChecks {
     Write-Info "設定ファイル: $ConfigPath"
 }
 
+function Show-ManualConfigGuidance {
+    param([Parameter(Mandatory = $true)][string]$ConfigPath)
+
+    Write-Host ""
+    Write-Host "設定を手動で変更する場合:" -ForegroundColor Cyan
+    Write-Host "1. 次の config.toml をメモ帳やエディターで開きます。"
+    Write-Host "   $ConfigPath" -ForegroundColor Gray
+    Write-Host "2. workspace_root は MCP から操作したいフォルダー、data_dir はその外側の保存場所です。"
+    Write-Host "3. 保存後、次のコマンドで設定を検証して起動します。"
+    Write-Host "   run-localmcp.bat -Config '$ConfigPath'" -ForegroundColor Gray
+    Write-Host "別の設定ファイルへ切り替える場合は、start-localmcp.bat の「既存の設定を使う」を選択します。"
+    Write-Host "active-config.txt はこのウィザードが管理するため、通常は直接編集しません。"
+}
+
 try {
     Write-Title "Windows Local MCP セットアップ"
     Write-Host "この画面では、設定ファイルを作成または既存設定を診断します。"
@@ -471,11 +560,11 @@ try {
 
     $existing = @(Find-ExistingConfig)
     Write-Host ""
-    Write-Host "1. 初心者向け（必要な環境を確認して新しい設定を作る）"
+    Write-Host "1. かんたんセットアップ（必要なものを確認して新しい設定を作る）"
     if ($existing.Count -gt 0) {
-        Write-Host "2. 環境設定済み（既存の設定を診断して使う）"
+        Write-Host "2. 既存の設定を使う（設定ファイルを確認して利用する）"
     } else {
-        Write-Host "2. 環境設定済み（既存 config.toml のパスを指定する）"
+        Write-Host "2. 既存の設定を使う（config.toml の場所を指定する）"
     }
     Write-Host "0. 終了"
     $mode = (Read-Host "番号").Trim()
@@ -506,6 +595,7 @@ try {
     }
 
     Write-Host ""
+    Show-ManualConfigGuidance -ConfigPath $configPath
     Write-Host "次回からは run-localmcp.bat を実行してください。" -ForegroundColor Cyan
     Write-Host "Secure MCP Tunnel には、引き続き次の明示的な起動引数を登録します:" -ForegroundColor Gray
     Write-Host "powershell.exe -NoProfile -File `"$ScriptRoot\run-server.ps1`" -Config `"$configPath`"" -ForegroundColor Gray

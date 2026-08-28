@@ -273,6 +273,8 @@ Public code and `config.example.toml` remain generic. Machine/private values bel
 
 `start-localmcp.bat` は対話型セットアップの入口であり、`%LOCALAPPDATA%\WindowsLocalMCP\active-config.txt` に次回起動で使う config の絶対 path を保存します。`run-localmcp.bat` は `run-localmcp.ps1` を経由して selector または明示された第 1 引数を UTF-8 で読み、既存の `run-server.ps1 -Config <path>` へ渡します。バッチは config の中身を解釈して security setting を上書きせず、server の既存の config binding／startup validation を経由させます。
 
+1つの config と1つの server process は、1つの `workspace_root` にだけバインドされます。複数フォルダーを同時に扱う場合は、パス識別子、承認、履歴、Git、Sandbox の各境界を定義する仕様変更が必要です。現行ランチャーでは、フォルダーごとに設定を分け、明示的な `-Config` またはセットアップ画面で切り替えます。
+
 通常の server は管理者権限で起動しません。Approved Host の immutable runtime／authority service の導入、Codex Sandbox の live verification、Automatic Git の marker 作成、ADB serial の許可は、検証結果を省略しない明示的な手順として扱います。Sandbox から Approved Host への自動 fallback は行いません。
 
 ## 9. data_dir protection

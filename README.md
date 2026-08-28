@@ -1,12 +1,62 @@
 # Windows Local MCP
 
+## 用語解説（最初に読む章）
+
+このプロジェクトでは、機能名や設定名に英語の名前が多く登場します。ここでは、その言葉をこの README でどのような意味で使うかを、できるだけ簡単に説明します。設定名、コマンド名、ツール名は動作に必要な名前なので、そのまま表記します。
+
+| 用語 | この README での意味 |
+| --- | --- |
+| MCP | ChatGPT などのアプリケーションから、別のプログラムの機能を呼び出すための共通の仕組みです |
+| MCP クライアント | MCP を使って WLMCP に接続するアプリケーションです。ここでは主に ChatGPT を指します |
+| ローカルサーバー | あなたの Windows パソコン上で動き、外部のサーバーへ作業ファイルを預けずに処理するプログラムです |
+| WLMCP Broker | ファイルの場所、容量、変更内容を確認してから、決められた範囲の処理を行う本体です |
+| 作業領域（workspace） | MCP に操作させるプロジェクトのフォルダーです。設定名は `workspace_root` です |
+| 保存領域（data directory） | 監査記録、バックアップ、処理の状態を保存するフォルダーです。設定名は `data_dir` です |
+| 実行経路 | ある処理をどの仕組みで実行するか、という区分です |
+| 承認 | 実行する内容を人が確認し、許可することです。許可されなかった処理は実行されません |
+| Codex Windows Sandbox | テストやビルドなどを、作業領域とは分けた一時的なコピーで実行する仕組みです |
+| Approved Host | Sandbox や Broker では実行できない処理を、別の承認を受けたうえで、通常の Windows ユーザー権限で実行する仕組みです |
+| operation | 1 回の処理単位です。読み取り、編集、コマンド実行など、それぞれに番号と記録が付きます |
+| capability | その設定と環境で利用できる機能です。有効にしただけで、必ず利用できるとは限りません |
+| helper | Git や ADB など、WLMCP から呼び出す外部の実行ファイルです |
+| runtime | プログラムを実際に動かすための実行環境や実行ファイルです |
+| SHA-256 | ファイルの内容から計算する指紋です。登録済みの実行ファイルが置き換えられていないか確認するために使います |
+| marker | 実機検証が完了した時点の環境情報を記録した証明データです。古くなった marker は使えません |
+| 実機検証（live verification） | 設定を読むだけでなく、この PC の Windows 上で実際に境界や動作を確かめる検証です |
+| sidecar 設定 | メイン設定とは別に置く、Context Read／Export 専用の設定ファイルです |
+| checkpoint | 変更前のファイルを記録して、後から戻せるようにする仕組みです |
+| rollback／Undo | checkpoint や変更記録を使って、ファイルの変更を取り消すことです |
+| artifact | 処理の途中で作る成果物を、検査してから保存するための一時データです |
+| transaction | 複数の変更を一まとまりとして確認し、問題があれば確定しない仕組みです |
+| Git | ソースコードの変更履歴を管理するソフトウェアです。ここでは許可した読み取りだけを自動化します |
+| ADB | Android 端末やエミュレーターを確認するためのコマンドです。ここでは固定された読み取りだけを許可します |
+| stdio | MCP クライアントとサーバーが、標準入出力で直接通信する方式です。現行版で利用できる方式です |
+| TOML／JSON | TOML は設定ファイル、JSON はデータの受け渡しに使う形式です |
+| ACL | Windows のアクセス権設定です |
+| fail closed | 確認できないときに処理を止め、安全側へ倒すことです。別の経路へ勝手に切り替える意味ではありません |
+| LocalSystem | Windows がサービス用に用意している特別なアカウントです。Approved Host の監視サービスが使います |
+| manifest | 実行や変更の対象にするファイルの一覧と、その確認情報です |
+| identity | パス名だけでなく、実体やハッシュなどを組み合わせた識別情報です |
+| WFP | Windows Filtering Platform の略で、Windows の通信を制限する仕組みです |
+| Job Object | Windows がプロセスと子プロセスを一つのまとまりとして管理し、数やメモリ、終了を制限する仕組みです |
+| UAC | 管理者権限が必要なときに Windows が表示する確認画面です |
+| WMI／CIM | Windows のプロセスやサービスを確認するための管理インターフェースです |
+| preflight／postflight | 実行前と実行後に行う確認です |
+| projection | Git などへ渡すために、必要なものだけを取り出した作業用コピーです |
+| pinned | 実行ファイルの場所やハッシュを固定して指定することです |
+| eligible | 必要な条件をすべて満たし、実行対象にできる状態です |
+| reparse point／junction／SUBST | Windows で別の場所を指す仕組みです。見かけのパスだけでは安全性を判断できないため検査します |
+| loopback／LAN | loopback は同じ PC 内、LAN は同じネットワーク内への通信です |
+
+以降では、最初にこの表の日本語の意味で説明し、その後に必要な場所だけ正式な英語名や設定名を併記します。
+
 ChatGPT から、指定した 1 つの Windows 作業領域を安全に読み書きするためのローカル MCP サーバーです。ファイル編集、構造化ファイル処理、監査、承認付きコマンド、変更履歴、Undo／rollback を提供します。
 
-通常起動は管理者権限で行わないでください。`workspace_root` はプロジェクト単位で指定し、ドライブ直下やユーザーフォルダー全体を指定しないでください。
+通常起動は管理者権限で行わないでください。`workspace_root` にはプロジェクト単位のフォルダーを指定し、ドライブ全体やユーザーフォルダー全体は指定しないでください。
 
 ## はじめに
 
-Windows Local MCP は、ChatGPT などの MCP クライアントから、指定した一つの Windows 作業フォルダーを扱うためのローカルサーバーです。読み取り、編集、構造化ファイルの処理、Git や ADB の限定的な確認、承認が必要なコマンドの実行、監査、変更の取り消しを、操作の種類ごとに分けて提供します。
+Windows Local MCP は、ChatGPT などの MCP クライアントから、指定した一つの Windows 作業フォルダーを扱うためのローカルサーバーです。読み取り、編集、文書や表計算ファイルの処理、Git や ADB の限定的な確認、承認が必要なコマンド、監査、変更の取り消しを、処理の種類ごとに分けて提供します。
 
 最初に覚えることは次の三つだけです。
 
@@ -18,9 +68,14 @@ Windows Local MCP は、ChatGPT などの MCP クライアントから、指定�
 
 ## かんたん導入
 
-開発環境に詳しくない場合は、まず配布パッケージを展開したフォルダーで `start-localmcp.bat` をダブルクリックしてください。表示された画面で「初心者向け」または「環境設定済み」を選択すると、ウィザードが必要な確認を順番に案内します。
+開発環境に詳しくなくても、まず配布パッケージを展開したフォルダーで `start-localmcp.bat` をダブルクリックしてください。表示された画面では、次のどちらかを選べます。
 
-初心者向けの場合は、MCP から操作したい既存のプロジェクトフォルダーを選びます。ウィザードは Python／依存パッケージ、workspace、Git の実 runtime、設定ファイルの分離を確認します。環境設定済みの場合は、既存設定をコピーせず、そのファイルを次回の active config として選択します。
+- `1. かんたんセットアップ`：必要なものを確認しながら、新しい設定を作ります。
+- `2. 既存の設定を使う`：手元の `config.toml` を確認し、次回使用する設定として選びます。
+
+操作対象のフォルダーを指定するときは、エクスプローラーで目的のフォルダーを開き、上のアドレスバーをクリックして `Ctrl+C`。この画面に戻って `Ctrl+V` で貼り付けます。フォルダー名までを指定し、ファイル名は入力しません。
+
+Python 3.11 以上が見つからない場合は、ウィザードに表示される [Python の Windows 向けダウンロードページ](https://www.python.org/downloads/windows/) から用意し、新しい PowerShell で `py --version` または `python --version` を確認してから `start-localmcp.bat` を再実行してください。
 
 設定は次の場所に保存されます。
 
@@ -29,24 +84,30 @@ Windows Local MCP は、ChatGPT などの MCP クライアントから、指定�
 %LOCALAPPDATA%\WindowsLocalMCP\active-config.txt
 ~~~
 
+設定を手動で変更する場合は、ウィザードが表示した `config.toml` をメモ帳やエディターで開きます。`workspace_root` は操作対象のフォルダー、`data_dir` はその外側の保存場所です。保存後は `run-localmcp.bat -Config C:\path\to\config.toml` で検証・起動できます。設定ファイルを切り替えるときは `start-localmcp.bat` の `2. 既存の設定を使う` を選び、`active-config.txt` は通常編集しません。
+
+Codex CLI が見つからない場合でもファイルの読み書きは利用できますが、Python・テスト・ビルドなどの Sandbox 経路は利用できません。導入は [OpenAI 公式の Codex CLI 案内](https://developers.openai.com/codex/cli/) を確認し、導入後に `start-localmcp.bat` を再実行してください。
+
 設定完了後の通常起動は `run-localmcp.bat` だけで行えます。設定ファイルを明示する場合は、`run-localmcp.bat C:\path\to\config.toml` または `run-localmcp.bat -Config C:\path\to\config.toml` と指定できます。設定が見つからない場合、バッチは勝手に推測せず、`start-localmcp.bat` の実行を案内します。
 
-通常のサーバーは管理者権限で起動しません。Approved Host の runtime や authority service の導入だけは、別の管理者手順で行います。ランチャーは既存の production runtime や service を勝手に置き換えません。
+通常のサーバーは管理者権限で起動しません。Approved Host の変更できない運用用実行環境や監視サービスの導入だけは、別の管理者手順で行います。ランチャーは既存の運用用実行環境やサービスを勝手に置き換えません。
 
-MCP クライアントの stdio 設定は、ランチャーのバッチではなく、後述の `run-server.ps1 -Config` を明示したコマンドと引数の組み合わせを使います。詳しい挙動は [docs/LOCAL_LAUNCHERS.md](docs/LOCAL_LAUNCHERS.md) を参照してください。
+MCP クライアントの標準入出力（stdio）設定は、ランチャーのバッチではなく、後述の `run-server.ps1 -Config` を明示したコマンドと引数の組み合わせを使います。詳しい挙動は [docs/LOCAL_LAUNCHERS.md](docs/LOCAL_LAUNCHERS.md) を参照してください。
 
 ## できることと、実行経路の違い
 
-| 目的 | 主な経路 | 承認 | 概要 |
-| --- | --- | --- | --- |
-| ファイルを読む、画像を見る、ファイルを編集する | WLMCP Broker | 通常不要 | 作業領域、容量、対象パスを WLMCP が管理します |
-| DOCX、XLSX、CSV／TSV、ZIP、画像を扱う | 構造化処理 | 操作による | 入出力を検査し、必要に応じて artifact と transaction で反映します |
-| テスト、ビルド、スクリプト、任意コードを動かす | Codex Windows Sandbox | ローカル承認が必要 | operation ごとの作業コピーと Windows の隔離境界を使います |
-| Broker や Sandbox では実行できない eligible command | Approved Host | 別の一回限りの承認が必要 | 通常の Windows ユーザー権限で実行します。管理者権限で実行する経路ではありません |
-| 設定した外部記憶から文脈を読む | Context Read | 設定による | 固定 URL から JSON を取得し、検索結果を外部の未信頼データとして扱います |
-| 作業結果の文脈を外部記憶へ送る | Context Export | 設定による | 固定 URL へ、モデルが明示した内容だけを送ります |
+処理の種類によって、操作できる範囲と確認方法が異なります。迷った場合は、ファイル操作は WLMCP Broker、テストやビルドは Codex Windows Sandbox、特別な Windows 権限が必要な処理は Approved Host を使います。
 
-Sandbox が使えないときに Approved Host へ自動的に切り替えることはありません。反対に、Approved Host を無効にしてセキュリティ上の問題を解消したことにすることもできません。Approved Host は、必要な承認と実行時検証を伴う中核の実行経路です。
+| やりたいこと | 使う仕組み | 人の確認 | 説明 |
+| --- | --- | --- | --- |
+| ファイルを読む、画像を見る、ファイルを編集する | WLMCP Broker | 基本不要 | 作業領域、容量、対象ファイルを確認して処理します |
+| DOCX、XLSX、CSV／TSV、ZIP、画像を扱う | 構造化ファイル処理 | 内容による | 入出力を確認し、問題がなければ変更を確定します |
+| テスト、ビルド、スクリプト、任意のプログラムを動かす | Codex Windows Sandbox | 必要 | 作業領域とは分けた一時コピーと Windows の隔離を使います |
+| Broker や Sandbox では実行できない処理 | Approved Host | 別途必要 | 承認後、通常の Windows ユーザー権限で実行します |
+| 設定した外部の記憶から文脈を読む | Context Read | 設定時 | 固定した URL から JSON を取得し、内容は外部から来た未確認の情報として扱います |
+| 作業結果の文脈を外部の記憶へ送る | Context Export | 設定時 | 固定した URL へ、明示された内容だけを送ります |
+
+Sandbox の検証に失敗したとき、Approved Host へ自動的に切り替えることはありません。検証できない処理は停止し、利用できない理由を表示します。Approved Host を無効にするだけで、セキュリティ上の問題が解決したことにもなりません。
 
 ## 利用前のチェックリスト
 
@@ -84,7 +145,7 @@ Set-Location C:\dev\windows-local-mcp-python
 py -3.11 --version
 ~~~
 
-`Python 3.11` 以上が表示されれば進めます。`py` が見つからない場合は、Python をインストールしてから再度実行してください。会社の PC などで Python のインストールが制限されている場合は、管理者または PC の管理担当者に確認してください。
+`Python 3.11` 以上が表示されれば進めます。`py` が見つからない場合は、[Python の公式 Windows ダウンロードページ](https://www.python.org/downloads/windows/) から Python 3.11 以上をインストールしてから再度実行してください。会社の PC などで Python のインストールが制限されている場合は、管理者または PC の管理担当者に確認してください。
 
 ### 2. 専用の仮想環境を作る
 
@@ -180,7 +241,18 @@ Secure MCP Tunnel などで JSON を直接入力する場合も、上記の `arg
 
 ## 実行構成
 
-処理は次の 4 種類に分かれます。安全性を安価に閉じられる処理まで Sandbox に送らず、作用範囲を閉じられない処理だけを隔離します。
+処理の種類に合わせて、4 つの仕組みを使い分けます。基本的には、ファイル操作は WLMCP Broker、文書や表計算ファイルの編集は構造化ファイル処理、テストやビルドは Codex Windows Sandbox、特別な Windows 権限が必要な処理は Approved Host を使います。
+
+### 先に知っておくこと
+
+- WLMCP Broker は、対象ファイルや変更内容を確認できる処理を担当します。
+- 構造化ファイル処理は、文書・表計算・CSV・ZIP・画像を、ファイル形式に合わせて扱います。
+- Codex Windows Sandbox は、作業領域とは分けたコピーでテストやビルドを実行します。
+- Approved Host は、別の承認を受けた処理を通常の Windows ユーザー権限で実行します。
+
+検証できない処理は停止します。Sandbox の失敗を理由に Approved Host へ自動的に切り替えることはありません。
+
+### 技術者向けの詳細
 
 1. **WLMCP Broker**
    - 対象パス、入出力、容量、副作用を WLMCP が限定できる処理です。
@@ -205,7 +277,7 @@ Secure MCP Tunnel などで JSON を直接入力する場合も、上記の `arg
 
 ## 開発者向け設定（詳細）
 
-Python 3.11 以上を使用します。repository checkout と `.venv` は通常 user が編集できる開発環境であり、Broker／Codex Sandbox の開発・テスト用です。Approved Host production execution は immutable Program Files runtime と LocalSystem authority service を必要とするため、editable checkout では `approved_host_enabled = false` を推奨します。
+Python 3.11 以上を使用します。このリポジトリと `.venv` は、WLMCP Broker と Codex Windows Sandbox を開発・テストするための環境です。Approved Host の運用環境は、このリポジトリとは別に用意します。開発中は `approved_host_enabled = false` を推奨します。
 
 ```powershell
 Set-Location C:\dev\windows-local-mcp-python
@@ -223,9 +295,9 @@ protect_data_dir_acl = true
 approved_host_enabled = false
 ```
 
-Broker が自動実行する ADB helper は `PATH` 上の同名ファイルを使用しません。workspace、`data_dir`、Sandbox scratch の外にある絶対 path と SHA-256 を対で設定してください。未設定時は capability が有効でも実行を拒否します。
+ADB を自動で使う場合、PATH から見つかった同名ファイルは使いません。作業領域、`data_dir`、Sandbox の一時領域の外にある実行ファイルを、絶対パスと SHA-256 の組み合わせで設定してください。設定がない場合は、機能を有効にしていても実行を拒否します。
 
-Automatic Git Broker も `PATH` discovery を trust source にせず、workspace／`data_dir`／Sandbox scratch の外にある実 Git runtime executable の絶対 path と SHA-256 を必要とします。Git for Windows の `cmd\git.exe` や install-root の `bin\git.exe` は wrapper／redirector になり得るため、Automatic Git の trust anchor には使用しません。典型的な 64-bit Git for Windows では `mingw64\bin\git.exe` を直接 pin します。path／hash を設定しただけでは execution availability にはなりません。まず generic Codex Sandbox live verification を成立させ、そのうえで同じ containment 内の pinned runtime を使う `verify-git-broker` を明示実行して Git-specific marker schema v1 を作成する必要があります。
+Automatic Git も PATH から実行ファイルを探して信用することはありません。作業領域、`data_dir`、Sandbox の一時領域の外にある実際の Git 実行ファイルを、絶対パスと SHA-256 の組み合わせで指定します。Git for Windows の `cmd\git.exe` やインストール先の `bin\git.exe` は別の実行ファイルへ渡すだけのものの場合があるため、確認対象には使いません。64 ビット版では通常 `mingw64\bin\git.exe` を指定します。パスとハッシュを設定しただけでは利用できず、先に Sandbox の実機検証、続けて `verify-git-broker` を明示的に実行する必要があります。
 
 ```powershell
 $gitPath = 'C:\Program Files\Git\mingw64\bin\git.exe'
@@ -243,47 +315,47 @@ $env:LOCAL_MCP_CONFIG = 'C:\path\to\config.local.toml'
 .\.venv\Scripts\python.exe -m windows_local_mcp.cli verify-git-broker
 ```
 
-`verify-git-broker` は通常 operation から自動実行されません。Git runtime identity、Sandbox backend、generic live evidence、workspace、scratch quota、Automatic Git containment-policy generation v6、command-policy generation v5、trusted process-cwd policy、exact projection ownership-trust policy、sanitized `core.autocrlf` semantics、required-builtin policy のいずれかが変わった場合は marker が stale になり、再検証するまで Automatic Git は `available=false` です。verifier は `status`／`diff`／`log`／`show`／`rev-parse`／`ls-files` が exact pinned runtime の builtin command であることも確認します。Git-specific route は general Sandbox で residual risk として許容する `protected_information_read`／LAN を継承せず、全 Sandbox security property が `verified` の場合だけ route eligible です。
+`verify-git-broker` は通常の処理から自動では呼び出しません。Git の実行ファイル、Sandbox の検証結果、作業領域、容量制限、実行ルールのいずれかが変わると、以前の検証結果は古いものとして無効になります。もう一度確認するまで Automatic Git は `available=false` です。確認対象の Git 操作は `status`、`diff`、`log`、`show`、`rev-parse`、`ls-files` に限られます。Git の自動経路では、一般 Sandbox で残る一部のリスクを引き継がず、必要な検証がすべて成功した場合だけ利用できます。
 
-開発 server は次のとおり起動します。設定が不正な場合は、workspace を操作する前に起動を拒否します。
+開発用サーバーは次のように起動します。設定が不正な場合は、作業領域を操作する前に起動を拒否します。
 
 ```powershell
 .\run-server.ps1 -Config .\config.local.toml
 ```
 
-Secure MCP Tunnel には、Shell 文字列ではなく次の argv を登録します。
+Secure MCP Tunnel には、コマンドを一つの Shell 文字列にせず、コマンド本体と引数を分けて登録します。
 
 ```text
 powershell.exe -NoProfile -File C:\dev\windows-local-mcp-python\run-server.ps1 -Config C:\path\to\config.local.toml
 ```
 
-複数 workspace は別々の `config`、`data_dir`、Sandbox scratch を使用してください。namespace marker が workspace、data_dir、実体識別子の混在を拒否します。Windows では handle から得た volume GUID 付きの物理 path も比較するため、junction／reparse point だけでなく SUBST 等の別名で同じ領域を指定した場合も起動を拒否します。
+現在の実装では、1つの `config` と1つの MCP サーバープロセスにつき、操作対象の `workspace_root` は1つだけです。複数の作業領域を使う場合は、それぞれに別の `config`、`data_dir`、Sandbox の一時領域を用意し、`run-localmcp.bat -Config C:\path\to\config.toml` またはセットアップ画面で切り替えます。同じプロセスから複数フォルダーを同時に操作する機能は、承認・履歴・Git・Sandbox の境界を含む仕様変更が必要です。作業領域、保存領域、実体の識別情報が混ざった設定は拒否します。Windows の別名、junction、reparse point、SUBST などを使って同じ場所を別の場所に見せる設定も利用できません。
 
 ## Approved Host の現行仕様
 
-Approved Host の production route は immutable runtime と LocalSystem authority service の両方を前提にします。`approved_host_enabled=true` や `request_host_command` surface、pending／approved row だけでは execution availability を意味しません。
+Approved Host を運用で使うには、変更できない運用用実行環境と、LocalSystem で動く監視サービスの両方が必要です。`approved_host_enabled=true` にしたり、`request_host_command` が表示されたりするだけでは、実行できる状態とは限りません。
 
-通常の導入順序は `install-approved-host-runtime.ps1` → non-elevated `verify-approved-host-runtime.ps1` → elevated `install-approved-host-authority.ps1` → non-elevated `verify-approved-host-authority.ps1` です。WLMCP-R2-001 の security boundary を変更する場合は `verify-approved-host-authority-abnormal.ps1` の Arm／KillAndRestart／Check、coordinated recovery、post-recovery normal path まで再検証します。
+導入は、運用用実行環境のインストール、通常権限での確認、監視サービスの管理者インストール、通常権限での確認、という順に行います。対応するスクリプトは `install-approved-host-runtime.ps1`、`verify-approved-host-runtime.ps1`、`install-approved-host-authority.ps1`、`verify-approved-host-authority.ps1` です。セキュリティ境界を変更した場合は、異常終了と復旧後の通常処理まで再確認します。
 
-`session_info()` の `available=true` は immutable runtime と authenticated authority service の current preflight が通ったことだけを意味します。Hosted CI や service health を full capability の `live_verified`／`windows_live_verified` へ自動昇格しません。WLMCP-R2-001 は 2026-08-28 に normal → SYSTEM worker loss／WMI Job 外 helper survival → service restart／`recovery_required` → stale execution rejection → coordinated recovery → post-recovery normal の実機 lifecycle を完了し、`fixed / live verified` です。
+`session_info` の `available=true` は、現在の実行環境と監視サービスの事前確認が通ったことを示すだけです。自動テストやサービスが動いているという情報だけで、Windows の実機検証済みとは扱いません。WLMCP-R2-001 については、2026-08-28 に通常処理、worker の停止、サービス再起動、復旧要求、復旧後の通常処理を含む実機確認を完了しています。
 
 詳細は `docs/APPROVED_HOST_RUNTIME.md` と `docs/APPROVED_HOST_PRODUCT_INVARIANT.md` を参照してください。
 
 ## 主な機能
 
-| 用途 | 経路 | 主な tool |
+| やりたいこと | 使う仕組み | 主なツール |
 | --- | --- | --- |
-| テキスト／バイナリの読み書き | Broker | `read_file`, `write_file`, artifact transfer |
-| 固定 Git metadata 読み取り | Automatic Git Broker | `git_info`, `execute_readonly` |
-| content-bearing／一般／変更系 Git、project-controlled 処理 | Codex Sandbox（適用可能な場合） | `request_sandbox_command` |
-| Emulator の限定読み取り | Broker | `adb_read`, `get_adb_screenshot` |
-| DOCX／XLSX／CSV／TSV／ZIP／画像 | 構造化処理 | `structured_file_inspect`, `structured_file_apply` 等 |
-| Python、PowerShell、Node、test、build、project script | Codex Sandbox | `request_sandbox_command` |
-| Sandbox 外の Windows 権限／network が必要な eligible 処理 | Approved Host | `request_host_command` → local approval → LocalSystem monitor／ordinary user child |
-| 状態確認、停止、監査 | Broker | `poll_job`, `stop_job`, `activity_get`, `audit_get` |
-| 変更取消 | Broker | selective Undo、point-in-time rollback |
+| テキストやバイナリを読む・書く | WLMCP Broker | `read_file`、`write_file`、ファイル転送 |
+| Git の状態や履歴を限定的に確認する | Automatic Git Broker | `git_info`、`execute_readonly` |
+| Git の内容を比較する、変更系の処理を行う | Codex Windows Sandbox | `request_sandbox_command` |
+| Android エミュレーターを限定的に確認する | WLMCP Broker | `adb_read`、`get_adb_screenshot` |
+| DOCX、XLSX、CSV／TSV、ZIP、画像を扱う | 構造化ファイル処理 | `structured_file_inspect`、`structured_file_apply` など |
+| Python、PowerShell、Node、テスト、ビルドを動かす | Codex Windows Sandbox | `request_sandbox_command` |
+| Broker や Sandbox でできない処理を通常権限で動かす | Approved Host | `request_host_command`、承認、監視サービス |
+| 状態を確認する、処理を止める、記録を見る | WLMCP Broker | `poll_job`、`stop_job`、`activity_get`、`audit_get` |
+| 変更を取り消す | WLMCP Broker | 選択的な Undo、指定時点への rollback |
 
-`execute_workspace_write` は互換用の公開面を残していますが、Dart／Flutter 等の project-controlled 処理は拒否され、`request_sandbox_command` を案内します。
+`execute_workspace_write` は互換性のため残していますが、Dart、Flutter などプロジェクト内のプログラムを実行する処理は拒否し、`request_sandbox_command` を案内します。
 
 `git_info` と `execute_readonly` の固定 Git grammar は、current Git-specific marker が成立した Windows PC では Automatic Git Broker として実行できます。Git child は live workspace を直接読まず、operation ごとの bounded／sanitized projection を処理します。Git process 自体の Windows process cwd は pinned runtime directory に固定し、repository selection は Broker が argv へ挿入する `git -C <sanitized projection cwd>` で行うため、project-controlled projection を current-directory DLL search surface にしません。repository ownership trust は command-scope `-c safe.directory=<exact operation projection>` に限定し、wildcard、source workspace、scratch parent、global persistent `safe.directory` は Automatic Git では使用しません。`.gitattributes`、hooks、object alternates、external／extended repository metadata、nested `.git`、reparse／hardlink／ADS 等は除外または拒否し、source `.git/config` は raw bytes を scratch へ保存せず Broker memory 上で解析して inert `core` settings だけを書き出します。config parsing は 1 MiB で fail closed します。
 
@@ -307,17 +379,17 @@ ADB helper は設定済み path、SHA-256、file identity を正規化時と wor
 
 変換中は workspace-wide lock を保持しません。commit 直前に source の raw bytes identity を再確認し、別処理による変更があれば conflict として拒否します。Office macro を含む bytes の転送・保存と、macro の実行は別の能力です。
 
-## 承認と実行時 binding
+## 承認と実行時の確認
 
-`request_sandbox_command` と `request_host_command` は要求を作るだけで、その呼び出し時にはコマンドを実行しません。`request_sandbox_command` はローカル承認 UI で承認された要求を 1 回だけ claim して Sandbox 実行へ進みます。`request_host_command` も separately human-approved one-shot request として current generation、immutable manifest、TTL、executable identity を検証し、authenticated LocalSystem authority service の SYSTEM worker から verified non-elevated requester token の child を起動します。Sandbox failure からの implicit fallback や model-facing `execute_approved` surface はありません。
+`request_sandbox_command` と `request_host_command` は、実行内容を登録して承認を求めるだけのツールです。呼び出した瞬間にコマンドを実行するものではありません。承認された要求は一度だけ使え、同じ要求を繰り返し使うことはできません。Sandbox の失敗を理由に、Host が自動で実行することもありません。
 
-承認には、argv、cwd、実行ファイルと入力の hash、checkpoint、workspace／data_dir の実体 identity、設定、WLMCP build と policy generation、Sandbox backend を結合します。更新や設定変更後の古い承認、二重 claim、replay は拒否します。
+承認の対象には、コマンドと引数、実行場所、実行ファイルと入力の指紋、変更前の記録、workspace／data_dir の実体、設定、WLMCP のバージョン、Sandbox の設定を結び付けます。設定や実行環境が変わった後の古い承認、二重使用、再利用は拒否します。
 
 承認後の Sandbox 実行ファイルも実行直前に path、SHA-256、device／inode、size、mtime を照合し、Windows では実行終了まで差し替えを拒否する handle を保持します。
 
 Approved Host は runtime immutability、LocalSystem-owned Job Object／monitor、requester-user WMI／CIM process census、control-plane preflight／postflight、SYSTEM-owned durable `active.json` latch と user-owned bound postflight latch を組み合わせます。normal verified completion の場合だけ latch を解除し、SYSTEM worker loss／service restart／postflight uncertainty は `recovery_required` のまま fail closed にし、elevated Administrator の reviewed coordinated recovery を要求します。
 
-## Codex Sandbox
+## Codex Windows Sandbox の詳細
 
 Live verification は各 property を `verified`、`failed`、`unverified` の三値で保存します。`failed` は実際の probe が境界脱出を観測した場合だけ、`unverified` は起動失敗、タイムアウト、listener または probe 環境の準備失敗、出力を測定できない場合に使います。current v1 の一般 Codex Sandbox route では workspace 内 `protected_information_read` と LAN access を受容済み残存 risk として分離します。これらの failure／unverified は隠さず保持しますが、それだけでは一般 route を unavailable にしません。Automatic Git はこの例外を継承しません。一般 source-workspace read/write、workspace 外 user/protected read、control-plane、Internet、loopback、termination、resource bound、WMI／CIM brokered process creation denial 等の必須境界は引き続き fail closed です。Approved Host へ自動移行しません。
 
@@ -365,7 +437,7 @@ $env:LOCAL_MCP_CONFIG = 'C:\path\to\config.local.toml'
 
 検証器は親・child・grandchild の filesystem／network 境界に加え、process 数上限と process-tree memory 上限の超過、違反時の全子孫停止、終了状態回収、brokered process creation denial まで実測します。独立 probe が例外になった場合、その probe を `unverified` として残し、安全に続行できる残りの probe を継続します。一般 source workspace read/write、workspace 外 read、control-plane、Internet、loopback、WMI/CIM process creation denial 等の mandatory check は fail closed します。一方、workspace 内 `protected_information_read` と対応する child／grandchild protected-information denial、LAN access は一般 Codex Sandbox route の受容済み残存 risk として `failed`／`unverified` を保持・表示したまま route 判定から分離します。Automatic Git は全 property の `verified` を要求します。その他の必須境界が成立する場合に限り一般 Sandbox 経路を利用でき、利用できない場合も Approved Host へ自動移行しません。
 
-## ファイルと制御領域の保護
+## ファイルと保護範囲
 
 - workspace path は canonical path、reparse point、hardlink、予約名、ADS、親／target identity を検査します。
 - optimistic concurrency には表示用文字列ではなく raw file bytes の SHA-256 を使います。CRLF も raw identity に含まれます。
@@ -374,13 +446,13 @@ $env:LOCAL_MCP_CONFIG = 'C:\path\to\config.local.toml'
 - `.env`、credential 等の保護対象は通常の Broker read、automatic helper／snapshot から返しません。Automatic Git Broker は live workspace を Git child に渡さず、sanitized projection から protected worktree file／behavior metadata を除外します。Git object database の historical blob は path validation だけで safe content とみなさず、Automatic Git の content-bearing diff/show を禁止します。audit、approval、Activity、argv、stdout／stderr preview は secret を伏せ字にします。一般 Codex Sandbox から workspace 内 protected information を direct read できる可能性は別途受容済み残存 risk として明示します。
 - 同時 job、pending approval、出力、artifact、data_dir、Sandbox scratch、structured element／pixel／archive 展開量に上限があります。
 
-## Activity、Undo、rollback
+## 活動履歴と変更の取り消し
 
-Live Activity と Timeline は Read／Edited／Running／Finished、実行境界、network policy、before／after、conflict、failure／recovery、bounded stdout／stderr preview、rollback 可否を記録します。詳細は `activity_get`／`audit_get` で確認します。
+活動履歴とタイムラインには、読み取り、編集、実行中、完了などの状態、実行経路、通信の制限、変更前後、競合、失敗、復旧、出力の要約、取り消しが可能かどうかを記録します。詳しくは `activity_get` と `audit_get` で確認できます。
 
-checkpoint が戻せるのは、manifest に含まれる通常の workspace file bytes です。`.git`、ACL、device、network、外部サービス、別 process の副作用は戻せません。selective Undo は独立した text 変更を保持できますが、binary／曖昧な競合では停止します。
+checkpoint で戻せるのは、記録対象になった通常の作業ファイルです。`.git`、Windows のアクセス権、端末、ネットワーク、外部サービス、別のプログラムが行った変更は戻せません。選択的な Undo は独立したテキスト変更に使えますが、バイナリファイルや判断できない競合では停止します。
 
-`write_file`、1 file の構造化編集、artifact commit、複数の既知 entry の ZIP 展開は、manifest に明示した対象 path だけを checkpoint／競合検査します。派生物では入力元と全出力先の path lock を同時に保持し、rollback 表示にも反映範囲を含めます。任意コード等で出力先が事前に閉じない処理は従来どおり full workspace checkpoint を使用します。
+`write_file`、1 ファイルの構造化編集、処理結果の確定、複数の ZIP 展開は、対象として明示したファイルだけを記録し、他の変更との競合を確認します。入力と出力が複数ある場合は、関係する場所をまとめて確認します。任意のプログラムがどこへ書き込むか事前に分からない場合は、作業領域全体を checkpoint の対象にします。
 
 ## Context Read と Context Export（任意の連携）
 

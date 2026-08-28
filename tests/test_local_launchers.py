@@ -75,3 +75,23 @@ def test_setup_wizard_preserves_security_relevant_setup_contract() -> None:
     assert "Test-Configuration" in script
     assert "Find-TrustedGit" in script
     assert "adb_allowed_serials = []" in script
+    assert "かんたんセットアップ" in script
+    assert "既存の設定を使う" in script
+    assert "初心者向け" not in script
+    assert "環境設定済み" not in script
+    assert "操作対象フォルダーの場所" in script
+    assert "PythonWindowsDownloadUrl" in script
+    assert "CodexCliDocsUrl" in script
+    assert "Find-CodexCli" in script
+    assert "Show-ManualConfigGuidance" in script
+
+
+def test_launcher_docs_explain_manual_setup_and_single_root_boundary() -> None:
+    docs = (_REPOSITORY_ROOT / "docs" / "LOCAL_LAUNCHERS.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "アドレスバー" in docs
+    assert "https://www.python.org/downloads/windows/" in docs
+    assert "https://developers.openai.com/codex/cli/" in docs
+    assert "同じプロセスから複数フォルダーを同時に操作する機能" in docs
