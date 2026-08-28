@@ -475,7 +475,7 @@ class ContextReadBroker:
         except json.JSONDecodeError:
             raise ValueError("context read response is not valid JSON") from None
         if not isinstance(payload, list):
-            raise ValueError("context read response must be a JSON array")
+            raise TypeError("context read response must be a JSON array")
         if len(payload) > self.settings.context_read_max_nodes:
             raise ValueError("context read response exceeds configured node count")
 
@@ -483,7 +483,7 @@ class ContextReadBroker:
         seen_ids: set[str] = set()
         for item in payload:
             if not isinstance(item, dict):
-                raise ValueError("context read response contains a non-object node")
+                raise TypeError("context read response contains a non-object node")
             node = DecisionDeckMemoryNode.model_validate(item)
             node_payload = canonical_json(node.model_dump(mode="json")).encode()
             if len(node_payload) > self.settings.context_read_max_node_bytes:
