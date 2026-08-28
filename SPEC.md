@@ -269,6 +269,12 @@ An explicit `LOCAL_MCP_CONFIG` must contain `workspace_root` and the selected co
 
 Public code and `config.example.toml` remain generic. Machine/private values belong in ignored `config.toml`, `config.local.toml`, `config.*.local.toml`, or `.local-mcp/`. Launchers keep explicit `-Config` selection; there is no private-project schema switch or private branch requirement.
 
+### ローカル起動ランチャー
+
+`start-localmcp.bat` は対話型セットアップの入口であり、`%LOCALAPPDATA%\WindowsLocalMCP\active-config.txt` に次回起動で使う config の絶対 path を保存します。`run-localmcp.bat` は `run-localmcp.ps1` を経由して selector または明示された第 1 引数を UTF-8 で読み、既存の `run-server.ps1 -Config <path>` へ渡します。バッチは config の中身を解釈して security setting を上書きせず、server の既存の config binding／startup validation を経由させます。
+
+通常の server は管理者権限で起動しません。Approved Host の immutable runtime／authority service の導入、Codex Sandbox の live verification、Automatic Git の marker 作成、ADB serial の許可は、検証結果を省略しない明示的な手順として扱います。Sandbox から Approved Host への自動 fallback は行いません。
+
 ## 9. data_dir protection
 
 `data_dir` and Sandbox scratch are resolved independently and must not lexically or effectively overlap workspace or each other. Roots must not be reparse points. On Windows, handle-resolved volume-GUID paths and stable file identities also reject aliases such as SUBST that identify the same or nested physical namespace. `protect_data_dir_acl=true` removes inherited ACLs and grants Full Control only to the current token SID and SYSTEM.
