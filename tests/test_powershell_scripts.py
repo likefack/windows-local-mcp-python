@@ -10,7 +10,12 @@ import pytest
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 _SCRIPTS = (
     "install-approved-host-runtime.ps1",
+    "install-approved-host-authority.ps1",
+    "recover-approved-host-authority.ps1",
+    "recover-approved-host-postflight.ps1",
     "verify-approved-host-runtime.ps1",
+    "verify-approved-host-authority.ps1",
+    "verify-approved-host-authority-abnormal.ps1",
     "run-server.ps1",
     "run-approvals.ps1",
 )
@@ -55,3 +60,28 @@ def test_approved_host_installer_requires_program_files_base_and_install_root() 
     assert '"*${runtimeSid}:(OI)(CI)RX"' in script
     assert '"*S-1-5-18:(OI)(CI)F"' in script
     assert '"*S-1-5-32-544:(OI)(CI)F"' in script
+
+
+def test_approved_host_recovery_quarantines_postflight_before_authority_latch_clear() -> None:
+    script = (_REPOSITORY_ROOT / "recover-approved-host-authority.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    quarantine = script.index('"quarantine",')
+    clear_active = script.index("Remove-Item -LiteralPath $ActiveState -Force")
+    assert quarantine < clear_active
+    assert "AcknowledgeMissingPostflightMarker" in script
+    assert "Independent control-plane tamper markers are never cleared" in script
+
+
+def test_legacy_split_recovery_requires_protected_archive_and_absent_authority_latch() -> None:
+    script = (_REPOSITORY_ROOT / "recover-approved-host-postflight.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert "AuthorityRecoveryArchive" in script
+    assert 'if (Test-Path -LiteralPath $ActiveState -PathType Leaf)' in script
+    assert "ApprovedHostAuthority\\completed" in script
+    assert 'priorRecovery.version -ne 1' in script
+    assert 'priorRecovery.status.state -cne "recovery_required"' in script
+    assert '"quarantine",' in script

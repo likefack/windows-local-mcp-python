@@ -23,6 +23,7 @@ from .approval import (
     prepare_approval_bundle,
     settings_digest,
 )
+from .approved_host_policy import assert_approved_host_authority_available
 from .audit import AuditStore
 from .command_traits import (
     SafeExecutionKind,
@@ -125,9 +126,10 @@ mcp = MCPServer(
         "Content-producing or open-ended Git, project code, plugins, Flutter/Dart processing, "
         "test/build, and general commands use request_sandbox_command. DOCX/XLSX/CSV/TSV/ZIP/"
         "image work uses bounded structured processing or hash-bound container artifacts. "
-        "request_host_command is compatibility approval staging only in current v1; Approved "
-        "Host execution is unavailable and is never an automatic fallback. Activity tools expose "
-        "bounded operation details; workspace rollback is always a locally approved operation."
+        "request_host_command stages a separate one-shot Approved Host request through the "
+        "authority-separated Windows service and is never an automatic fallback. Activity tools "
+        "expose bounded operation details; workspace rollback is always a locally approved "
+        "operation. Poll approved execution for its durable result."
     ),
     log_level="INFO",
 )
@@ -395,6 +397,10 @@ def _approved_host_capability() -> dict[str, Any]:
         name: {"status": "unverified", "unit_tested": True}
         for name in (
             "runtime_immutability",
+            "authority_service_boundary",
+            "durable_recovery_state",
+            "requester_token_child",
+            "monitor_access_denial",
             "control_plane_tamper_detection",
             "approval_integrity",
             "job_descendant_handling",
@@ -406,13 +412,15 @@ def _approved_host_capability() -> dict[str, Any]:
         "configured": runtime.settings.approved_host_enabled,
         "enabled": runtime.settings.approved_host_enabled,
         "available": False,
+        "execution_route_available": False,
         "unit_tested": True,
         "live_verified": False,
         "windows_live_verified": False,
-        "verification_scope": "runtime_immutability_preflight_only",
+        "verification_scope": "runtime_and_authority_preflight_only",
         "properties": properties,
         "execution_time_recheck": True,
         "runtime_preflight": {"status": "not_run"},
+        "authority_preflight": {"status": "not_run"},
     }
     if not runtime.settings.approved_host_enabled:
         status["unavailable_reason"] = "disabled by configuration"
@@ -431,7 +439,6 @@ def _approved_host_capability() -> dict[str, Any]:
         )
         return status
 
-    status["available"] = True
     properties["runtime_immutability"].update(
         status="verified" if os.name == "nt" else "unverified",
         verification_kind=(
@@ -448,6 +455,31 @@ def _approved_host_capability() -> dict[str, Any]:
         "ancestor_directory_count": evidence.get("ancestor_directory_count"),
         "digest": evidence.get("digest"),
     }
+    try:
+        authority = assert_approved_host_authority_available()
+    except Exception as error:  # noqa: BLE001 - capability display must remain available
+        message = redact_text(f"{type(error).__name__}: {error}")
+        status["unavailable_reason"] = message
+        status["authority_preflight"] = {"status": "failed", "error": message}
+        return status
+
+    status["available"] = True
+    status["execution_route_available"] = True
+    status["authority_preflight"] = {
+        "status": "passed",
+        "healthy": bool(authority.get("healthy")),
+        "service_epoch": authority.get("service_epoch"),
+        "active_operation_id": authority.get("active_operation_id"),
+    }
+    properties["authority_service_boundary"].update(
+        status="verified" if os.name == "nt" else "unverified",
+        verification_kind=(
+            "authenticated_service_preflight" if os.name == "nt" else "unsupported"
+        ),
+    )
+    # Full monitor-access denial, requester-token preservation, abnormal recovery, and WMI
+    # worker-loss behavior require the explicit Windows live verifiers. Availability never
+    # upgrades those release-verification properties to live-verified evidence.
     return status
 
 
@@ -561,7 +593,7 @@ def session_info() -> dict[str, Any]:
                 ),
                 "structured_processing": "bounded declarative WLMCP processing or hash-bound ChatGPT container artifacts",
                 "codex_sandbox": "open-ended execution, project-controlled code/plugins, Flutter/Dart processing, test/build, and general commands",
-                "approved_host": "compatibility/future explicit-host route; current v1 execution unavailable pending an authority-separated monitor boundary",
+                "approved_host": "separately approved operations requiring real Windows user authority",
             },
             "legacy_safe_tier": "obsolete; fixed operations are broker primitives",
         },
@@ -575,7 +607,7 @@ def session_info() -> dict[str, Any]:
         "execution_boundaries": {
             "broker": "closed-world validation; no general command surface",
             "codex_sandbox": "configured independently; live verification reported separately",
-            "approved_host": "compatibility approval staging only; current v1 execution unavailable; never an automatic fallback",
+            "approved_host": "separate approval; never an automatic fallback",
         },
         "configuration_selection": runtime.settings.selection_info(),
         "transport": {

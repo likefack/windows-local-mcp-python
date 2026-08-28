@@ -61,14 +61,19 @@ patch、`--check`、pathspec 付き暗黙 patch 等の content-bearing mode は 
 metadata-only diff/show、log metadata、rev-parse、ls-files、`git_info` snapshot は Automatic Git capability として維持します。
 
 同日、Approved Host の guarded interval について、same Windows user authority の child が worker／監視 process を
-停止して postflight を回避でき、再起動時の stale reconciliation だけでは永続 tamper latch が残らないことを
+停止して postflight を回避でき、restart 時の stale reconciliation だけでは永続 tamper latch が残らないことを
 WLMCP-R2-001 として valid と判定しました。same-desktop UAC elevation は Windows security boundary として受理せず、
-この問題を受容済み残存 risk に移しません。current v1 の Approved Host execution は capability reduction として
-fail closed に固定し、設定、surface、pending／approved state の存在から実行可能性を推測しません。既存の
-queued／approved operation も worker spawn 前の production gate で拒否します。Approved Host を再有効化する場合は、
-別 user／session、SYSTEM service その他 Microsoft が security boundary として扱う authority separation、または
-同等に実証された境界によって monitor／postflight owner と durable tamper state を untrusted same-user child から
-保護し、kill／bypass／restart 回帰を Windows 実機で通すことを先に要求します。
+この問題を受容済み残存 risk に移しません。同日 main に入った Approved Host 全面 fail-closed は temporary exploit
+containment／product regression の履歴であり、final remediation ではありません。
+
+最終 remediation は monitor／postflight worker を LocalSystem service へ分離し、実 command だけを verified requester の
+非昇格 Windows user token で起動します。service-owned ProgramData durable state、service epoch、normal-return completion
+proof、requester-user WMI／CIM process census を必須境界とし、runtime user／Approved Host child に service stop/change-config、
+monitor cancellation、SYSTEM worker の terminate／suspend／duplicate-handle／VM-write／token-manipulation authority を
+与えません。2026-08-28 に normal path、SYSTEM worker loss、WMI Job 外 helper survival、service restart、`recovery_required`、
+stale execution rejection、coordinated recovery、post-recovery normal path の Windows live verification を完了したため、
+WLMCP-R2-001 は `fixed / live verified` とします。ただし別 PC や runtime／service／policy 変更後の execution availability は、
+current immutable runtime と authenticated authority service の preflight を毎回満たす必要があります。
 
 ## 1. 適用範囲と信頼モデル
 
@@ -93,6 +98,7 @@ queued／approved operation も worker spawn 前の production gate で拒否し
   Automatic Git の primary `git.exe` も同じ identity binding を要求しますが、identity 単独を route authorization
   には使わず、Git-specific live verification と sanitized projection containment を追加で要求します。
 - provenance と必要な Windows live verification を通過した Codex Sandbox 実装
+- Approved Host の authenticated LocalSystem authority service と、その protection／recovery に依存する Windows service model
 - 明示承認を行う local user と trusted operator
 - Windows user authority が既に完全奪取されていないこと
 
@@ -133,14 +139,23 @@ Approved Host へ自動 fallback しません。
 
 ### 2.4 Approved Host
 
-`request_host_command` 等の surface と設定 schema は compatibility／将来拡張のため残り得ますが、current v1 の
-Approved Host execution route は WLMCP-R2-001 の capability reduction により unavailable です。新規 request を
-staging できる code path や upgrade 前の pending／approved state が残っていても、それらは execution capability を
-意味せず、production runtime gate は Approved Host worker を spawn する前に fail closed します。
+Approved Host は Codex Sandbox／Broker では満たせない eligible command を、separate one-shot human approval 後に通常の
+Windows user authority で実行する中核 route です。project-controlled code-loader と workspace executable は引き続き
+拒否し、Sandbox failure から Host への automatic fallback は行いません。
 
-Approved Host を再有効化するには、one-shot human approval に加えて、same-user child が monitor／postflight owner と
-durable tamper state を停止・変更・回避できない Windows security boundary を実証しなければなりません。
-same-desktop UAC elevation だけをこの boundary の根拠にしません。
+production execution は immutable Program Files runtime と authenticated LocalSystem authority service の両方を必要とします。
+monitor／postflight は LocalSystem worker が所有し、実 child は pipe requester の verified non-elevated token を
+`CreateProcessAsUserW` で使用します。same-desktop UAC elevation を security boundary としません。
+
+service-owned durable `active.json` は normal verified completion まで immutable とし、worker kill、service restart、channel
+loss、postflight mismatch、Job 外 helper 残存では解除しません。authority service が provision 済みである限り、user-owned
+configuration の `approved_host_enabled=false` は active／recovery latch の global health gate を無効化しません。active Approved Host
+monitor は runtime-user `stop_job` から停止できません。異常 state の解除は elevated Administrator による explicit reviewed
+coordinated recovery だけです。
+
+release-level WLMCP-R2-001 boundary は 2026-08-28 の normal／abnormal／recovery Windows live lifecycle で検証済みです。
+一方、`available=true` は current machine で immutable runtime と authority-service preflight が成立したことだけを意味し、
+過去の live evidence を別 machine／changed runtime の current availability として再利用しません。
 
 旧 Safe Tier／AppContainer は第五の policy tier として復活させません。固定文法の低 risk
 処理は Broker primitive として狭く実装し、open-ended execution は Codex Sandbox へ送ります。
@@ -253,19 +268,17 @@ guaranteed された根拠にはせず、general Sandbox の受容済み残存 r
 
 ### E. Approved Host boundary
 
-current v1 では Approved Host execution capability 自体を fail closed にします。したがって以下は current route の
-実行保証ではなく、将来再有効化する場合に先に満たすべき最低条件です。
-
 - Codex Sandbox とは別の one-shot human approval を必要とする。
 - project-controlled code-loader と workspace 内 executable は Approved Host で受理せず、Codex Sandbox の snapshot-only route を要求する。
-- monitor／postflight owner と durable tamper state は untrusted Approved Host child と同じ有効 authority に置かず、child から terminate／suspend／rewrite／delete／reset できない Windows security boundary で保護する。
+- monitor／postflight owner は LocalSystem service 配下とし、実 command は元 requester の non-elevated Windows user token で起動する。
+- runtime user／Approved Host child から monitor／worker／service の terminate、suspend、thread control、duplicate handle、VM write、token manipulation、security descriptor rewrite、SCM stop/change-config を許さない。
 - same-desktop UAC elevation だけを authority separation の根拠にしない。
-- child／worker／monitor の異常終了、channel loss、timeout、postflight 未完了、control-plane mismatch、検証不能を restart 後にも残る fail-closed state へ結合し、単なる stale operation の `interrupted` 化だけで解除しない。
-- Windows Job Object の全 descendant と、Job 外 process creation の双方を閉じる。process identity を列挙できない、または期限内に終了しない場合も postflight を成功扱いしない。
+- durable pending／recovery／epoch state は LocalSystem-owned protected ProgramData namespace に置き、normal verified completion まで immutable active latch を残す。
+- child／worker／monitor の異常終了、channel loss、timeout、postflight 未完了、control-plane mismatch、service restart、旧 epoch proof を restart 後にも残る fail-closed state へ結合する。
+- Windows Job Object の全 descendant と、WMI／CIM 等の Job 外 requester-user process creation の双方を閉じる。process identity を列挙できない、または期限内に終了しない場合も postflight を成功扱いしない。
 - Host の device、network、external service、process side effect を workspace rollback 可能とは表示しない。
-
-current v1 では設定が `approved_host_enabled=true` でもこの future-condition を満たした意味にはせず、worker spawn 前に
-fail closed します。upgrade 前の pending／approved operation も同じ execution-time gate を迂回できません。
+- Hosted CI の unit/integration evidence を Windows service/process authority の live verification と表示しない。
+- 2026-08-28 に確認した normal／abnormal／recovery lifecycle を release-level evidence として保持しつつ、current machine の runtime／service preflight を省略しない。
 
 ### F. Approval integrity
 
@@ -343,7 +356,7 @@ fail closed します。upgrade 前の pending／approved operation も同じ ex
 - staging exclusion、argv／environment／stdout／stderr preview／error／audit field の redaction は防御を
   多層化する補助策であり、workspace 外 protected-information read denial の代替にしません。
 - argv、environment、stdout／stderr preview、error、audit field は semantic redaction と容量制限を通します。
-- Approved Host は current v1 では execution unavailable です。将来再有効化した場合、人間が明示的に secret access を承認する operation についてまで絶対に読めないことは保証しません。
+- Approved Host は separate human approval 後の通常 Windows user command であるため、人間が明示的に secret access を承認した operation についてまで絶対に読めないことは保証しません。
 
 ### L. Resource safety／practicality
 
@@ -413,12 +426,13 @@ Git-specific live marker schema v1 が current identity、scratch quota、comman
 capability に含まれることは意味しません。
 
 Approved Host も capability truthfulness の対象です。`approved_host_enabled=true`、`request_host_command` surface、
-または既存 pending／approved row の存在を execution availability と同一視しません。WLMCP-R2-001 の capability
-reduction が有効な current v1 では `available=false`／`live_verified=false`／`windows_live_verified=false` を維持し、
-worker を spawn しません。
+または pending／approved row の存在を execution availability と同一視しません。`available=true` は immutable runtime と
+authenticated LocalSystem authority service の current preflight が両方成功した場合だけです。source／unit evidence や service
+health だけを full capability の `live_verified`／`windows_live_verified` へ昇格しません。release-level R2-001 Windows live
+evidence と、current-machine execution preflight を別の状態として扱います。
 
 過去の結果、mock、static test、direct ADB、stdio integration を、現在の commit に対する Windows live、
-Automatic Git E2E、MCP ADB E2E、Tunnel、deployment の代替にしません。
+Automatic Git E2E、Approved Host authority E2E、MCP ADB E2E、Tunnel、deployment の代替にしません。
 
 ## 4. 原則対象内
 
@@ -434,7 +448,7 @@ Automatic Git E2E、MCP ADB E2E、Tunnel、deployment の代替にしません�
 - Broker helper の PATH shadowing、差し替え、stale executable identity
 - Automatic Git Broker の repository metadata confinement、object-content provenance、sanitized projection、Git-specific live-marker binding、dedicated-worker routing、capability 表示の不一致
 - Codex Sandbox の一般 source workspace read／write、workspace 外 protected information direct read、workspace 外 read／write、Internet／loopback／control-plane／必須 descendant boundary 不足。ただし Section 5 の general Sandbox workspace 内 protected-information direct read は除く
-- Approved Host を再有効化する場合の monitor／postflight kill・bypass・restart persistence と capability 表示の不一致
+- Approved Host の LocalSystem authority separation、monitor／postflight kill・bypass・restart persistence、requester-token preservation、recovery、capability 表示の不一致
 - ordinary non-admin Windows user 権限で成立する現実的な攻撃
 - common project layout で起こる機能破綻、通常操作での重大 UX 破綻
 - 容易に trigger できる resource exhaustion、過剰 copy／scan／hash／lock／approval
@@ -463,7 +477,8 @@ Automatic Git E2E、MCP ADB E2E、Tunnel、deployment の代替にしません�
   不釣り合いな極端な攻撃
 
 Approved Host の same-principal monitor termination／postflight bypass はこの受容済み残存 risk に含めません。
-current v1 は当該 capability を停止して解消し、将来再有効化する場合は Section E の boundary を先に要求します。
+current v1 は Section E の LocalSystem authority boundary と durable recovery state で対処し、この境界または current
+preflight が成立しない場合は Approved Host execution を fail closed します。
 
 ## 6. 既知問題と契約の対応
 
@@ -509,8 +524,10 @@ release candidate と判断するには、少なくとも次を満たします�
    対象内 blocker を発見しない。
 3. full pytest、Ruff、compileall、`git diff --check` と、該当する security／structured-file／race／approval／
    recovery／transfer／resource／Activity／Undo の回帰を現在の commit に対して実行する。
-4. 実行可能な Windows live test、Automatic Git `verify-git-broker`、ADB emulator integration、Secure MCP Tunnel／ChatGPT E2E を
-   実行し、実行不能なものは未検証として理由を記録する。Sandbox は property ごとの実測結果と、それが必須境界か
-   general-route 受容済み残存 risk かを残す。Automatic Git は全 required property と Git-specific marker の成功を別に残す。
+4. 実行可能な Windows live test、Automatic Git `verify-git-broker`、Approved Host normal／abnormal／recovery authority verification、
+   ADB emulator integration、Secure MCP Tunnel／ChatGPT E2E を実行し、実行不能なものは未検証として理由を記録する。
+   Sandbox は property ごとの実測結果と、それが必須境界か general-route 受容済み残存 risk かを残す。Automatic Git は全
+   required property と Git-specific marker の成功を別に残し、Approved Host は release-level live evidence と current-machine
+   runtime／authority preflight を区別する。
 5. README、`SPEC.md`、`VERIFICATION.md` と関連文書を現行実装へ合わせ、過去の architecture や過去の
    検証結果を現在の保証として再利用しない。

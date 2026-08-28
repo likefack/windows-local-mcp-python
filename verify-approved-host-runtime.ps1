@@ -22,4 +22,5 @@ if ($LASTEXITCODE -ne 0) {
     throw "Approved Host runtime immutability verification failed."
 }
 
-Write-Output "Approved Host runtime immutability verification passed. Approved Host execution remains unavailable in current v1."
+Write-Output "Approved Host immutable-runtime verification PASSED."
+Write-Output "This check covers only Program Files/runtime immutability. Approved Host execution additionally requires the authenticated LocalSystem authority service and both normal/abnormal Windows live verification before WLMCP-R2-001 can be claimed fixed."

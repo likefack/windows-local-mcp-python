@@ -7,6 +7,10 @@ from pathlib import Path
 
 import pytest
 
+from windows_local_mcp.approved_host_recovery import (
+    inspect_postflight_recovery,
+    quarantine_postflight_recovery,
+)
 from windows_local_mcp.audit import AuditStore
 from windows_local_mcp.config import Settings
 from windows_local_mcp.control_plane import control_plane_generation
@@ -147,7 +151,7 @@ def test_completed_approved_host_guard_clears_pending_recovery_state(
     assert_control_plane_healthy(settings)
 
 
-def test_lost_approved_host_postflight_remains_fail_closed_after_restart(
+def test_lost_approved_host_postflight_stays_closed_until_explicit_recovery(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     settings = _settings(tmp_path, monkeypatch)
@@ -193,3 +197,15 @@ def test_lost_approved_host_postflight_remains_fail_closed_after_restart(
     assert pending.is_file()
     with pytest.raises(RuntimeError, match="postflight|recovery|tamper"):
         assert_control_plane_healthy(settings)
+
+    # Recovery is an explicit trusted-operator action after review; restart/reconciliation alone
+    # never performs it. The reviewed marker digest and operation binding are both required.
+    evidence = inspect_postflight_recovery(settings, operation_id)
+    recovered = quarantine_postflight_recovery(
+        settings,
+        operation_id,
+        expected_sha256=str(evidence["marker_identity"]["sha256"]),
+    )
+    assert recovered["quarantined"] is True
+    assert not pending.exists()
+    assert_control_plane_healthy(settings)

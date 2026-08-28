@@ -57,6 +57,31 @@ jobs:
       - name: Compile all
         run: python -m compileall -q src tests
 
+      - name: Parse PowerShell scripts
+        shell: pwsh
+        run: |
+          $files = @(
+            'install-approved-host-runtime.ps1',
+            'install-approved-host-authority.ps1',
+            'recover-approved-host-authority.ps1',
+            'verify-approved-host-runtime.ps1',
+            'verify-approved-host-authority.ps1',
+            'verify-approved-host-authority-abnormal.ps1'
+          )
+          foreach ($file in $files) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path -LiteralPath $file).Path,
+              [ref]$tokens,
+              [ref]$errors
+            ) | Out-Null
+            if ($errors.Count -ne 0) {
+              $errors | ForEach-Object { Write-Error "${file}: $($_.Message)" }
+              throw "PowerShell parse failed: $file"
+            }
+          }
+
   whitespace:
     name: Diff whitespace
     runs-on: windows-latest
@@ -132,6 +157,21 @@ jobs:
           tests/test_server_operations.py
           tests/test_timeline_and_rollback.py
 
+      - name: Focused WLMCP-R2-001 authority regressions
+        run: >-
+          python -m pytest -q
+          tests/test_approved_host_authority_state.py
+          tests/test_approved_host_hardened_state.py
+          tests/test_approved_host_fail_closed.py
+          tests/test_approved_host_policy.py
+          tests/test_approved_host_process_census.py
+          tests/test_approved_host_stop_boundary.py
+          tests/test_approved_host_service_entry.py
+          tests/test_approved_host_crash_recovery.py
+          tests/test_approved_host_audit_integrity.py
+          tests/test_approval_execution_integration.py
+          tests/test_runtime_immutability.py::test_executor_blocks_approved_host_before_worker_spawn
+
       - name: Focused Automatic Git Broker regression
         run: >-
           python -m pytest -q
@@ -153,6 +193,7 @@ jobs:
           tests/test_mcp_stdio_integration.py
           tests/test_mcp_policy_error_visibility.py
           tests/test_sandbox_scratch_retention.py
+          tests/test_integrated_capability_surface.py
 
       - name: Full pytest
         run: python -m pytest
