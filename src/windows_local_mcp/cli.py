@@ -60,18 +60,20 @@ def main() -> None:
         return
 
     if args.command == "server":
-        # Context Export has its own optional sidecar because the core Settings model intentionally
-        # rejects unknown keys. Capture the sidecar before server Runtime initialization sanitizes
-        # LOCAL_MCP_* environment values, then bind it to the already validated production runtime.
+        # Context bridge sidecars are captured before server Runtime initialization sanitizes
+        # LOCAL_MCP_* environment values, then bound to the validated production runtime.
         from .context_export import load_context_export_config
         from .context_export_protocol import register_context_export_tools
+        from .context_read import load_context_read_config, register_context_read_tools
 
         context_export_config = load_context_export_config()
+        context_read_config = load_context_read_config()
 
         from .mcp_stdio import run_stdio_server
         from .server import mcp, runtime
 
         register_context_export_tools(mcp, context_export_config, runtime)
+        register_context_read_tools(mcp, context_read_config, runtime)
         run_stdio_server(mcp)
         return
 
