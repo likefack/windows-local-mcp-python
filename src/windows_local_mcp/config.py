@@ -372,9 +372,12 @@ class Settings(BaseModel):
             directory.mkdir(parents=True, exist_ok=True)
             if _is_reparse(directory):
                 raise ValueError(f"workspace-history child must not be a reparse point: {directory}")
-        _ensure_control_plane_namespace(self)
+        namespace_created = _ensure_control_plane_namespace(self)
         if self.protect_data_dir_acl and os.name == "nt":
-            _protect_windows_acl(self.data_dir)
+            _protect_windows_acl(
+                self.data_dir,
+                allow_initial_provision=namespace_created,
+            )
         _probe_filesystem_semantics(self.data_dir)
         _probe_filesystem_semantics(self.sandbox_scratch_dir)
         if self.filesystem_enabled:
@@ -465,7 +468,7 @@ def _probe_filesystem_semantics(directory: Path) -> None:
         second.unlink(missing_ok=True)
 
 
-def _ensure_control_plane_namespace(settings: Settings) -> None:
+def _ensure_control_plane_namespace(settings: Settings) -> bool:
     details = settings.workspace_root.stat()
     data = settings.data_dir.stat()
     assert settings.sandbox_scratch_dir is not None
@@ -495,6 +498,7 @@ def _ensure_control_plane_namespace(settings: Settings) -> None:
             output.write(payload)
             output.flush()
             os.fsync(output.fileno())
+        return True
     except FileExistsError:
         try:
             current = json.loads(marker.read_text(encoding="utf-8"))
@@ -520,14 +524,15 @@ def _ensure_control_plane_namespace(settings: Settings) -> None:
             temporary = marker.with_suffix(".upgrade.tmp")
             temporary.write_text(payload, encoding="utf-8")
             os.replace(temporary, marker)
-            return
+            return False
         if current != expected:
             raise PermissionError(
                 "data_dir belongs to a different workspace or configuration profile"
             )
+        return False
 
 
-def _protect_windows_acl(path: Path) -> None:
+def _protect_windows_acl(path: Path, *, allow_initial_provision: bool) -> None:
     identity = subprocess.run(
         [windows_system_executable("whoami.exe"), "/user", "/fo", "csv", "/nh"],
         capture_output=True,
@@ -573,9 +578,18 @@ def _protect_windows_acl(path: Path) -> None:
             or expected_marker.get("root_acl_sha256") != current_digest
         ):
             raise PermissionError(
-                "data_dir ACL changed after provisioning; run explicit ACL provisioning"
+                "data_dir ACL changed after provisioning; automatic repair is disabled. "
+                "Do not delete .acl-policy.json. Preserve data_dir and its marker, inspect "
+                "the ACL difference, then use a new config/data_dir or explicitly "
+                "reprovision the reviewed ACL before retrying"
             )
         return
+    if not allow_initial_provision:
+        raise PermissionError(
+            "data_dir ACL policy marker is missing after provisioning; automatic repair "
+            "and marker deletion recovery are disabled. Preserve data_dir and inspect the "
+            "ACL state before explicit reprovisioning"
+        )
     reset = subprocess.run(
         [windows_system_executable("icacls.exe"), str(path), "/reset", "/T", "/C"],
         capture_output=True,
@@ -715,6 +729,80 @@ def _load_file_backed_config(
     return selector, config_path, identity, payload
 
 
+def _normalize_file_config_payload(payload: dict[str, object]) -> None:
+    """Apply the same compatibility checks to active and staged config payloads."""
+    if "safe_network_readable_paths" in payload:
+        if "sandbox_dependency_readable_paths" in payload:
+            raise ValueError(
+                "use only sandbox_dependency_readable_paths; the legacy key is ambiguous"
+            )
+        payload["sandbox_dependency_readable_paths"] = payload.pop(
+            "safe_network_readable_paths"
+        )
+    obsolete = {
+        "safe_network_isolation_mode",
+        "safe_network_profile_prefix",
+    }.intersection(payload)
+    if obsolete:
+        raise ValueError(
+            "obsolete Safe Tier/AppContainer settings must be removed: "
+            + ", ".join(sorted(obsolete))
+        )
+
+
+def _populate_file_config_defaults(
+    payload: dict[str, object], *, config_path: Path
+) -> None:
+    if "workspace_root" not in payload or not str(payload["workspace_root"]).strip():
+        raise ValueError("explicit config must define workspace_root")
+    data_dir = str(payload.get("data_dir", "")).strip()
+    if not data_dir:
+        configured_root = Path(str(payload["workspace_root"])).expanduser().resolve(strict=True)
+        payload["data_dir"] = str(_default_data_dir(configured_root, config_path))
+    if not str(payload.get("sandbox_scratch_dir", "")).strip():
+        configured_data = Path(str(payload["data_dir"])).expanduser().resolve()
+        payload["sandbox_scratch_dir"] = str(
+            configured_data.parent / f"{configured_data.name}-sandbox-scratch"
+        )
+
+
+def validate_configuration_candidate(
+    candidate_path: str | Path, *, final_config_path: str | Path
+) -> Settings:
+    """Validate staged config content without provisioning directories or marker state."""
+    _, _, _, payload = _load_file_backed_config(str(candidate_path))
+    _normalize_file_config_payload(payload)
+    final_path = Path(final_config_path).expanduser().absolute().resolve()
+    _populate_file_config_defaults(payload, config_path=final_path)
+    for name in ("workspace_root", "data_dir", "sandbox_scratch_dir"):
+        lexical_root = Path(
+            os.path.expandvars(os.path.expanduser(str(payload[name])))
+        ).absolute()
+        if lexical_root.exists() and _is_reparse(lexical_root):
+            raise ValueError(f"{name} must not be a symbolic link or reparse point")
+        resolved_root = lexical_root.resolve()
+        if resolved_root == Path(resolved_root.anchor):
+            raise ValueError(f"{name} cannot be a drive root")
+    settings = Settings.model_validate(payload)
+    if _is_relative_to(final_path, settings.workspace_root):
+        raise ValueError("the active config path must be outside workspace_root")
+
+    roots = {
+        "workspace_root": settings.workspace_root.resolve(),
+        "data_dir": settings.data_dir.resolve(),
+        "sandbox_scratch_dir": settings.sandbox_scratch_dir.resolve(),
+    }
+    for name, path in roots.items():
+        if name == "workspace_root":
+            if not path.exists() or not path.is_dir():
+                raise ValueError("workspace_root must be an existing directory")
+        elif path.exists() and not path.is_dir():
+            raise ValueError(f"{name} must be a directory when it already exists")
+        if path.exists() and _is_reparse(path):
+            raise ValueError(f"{name} must not be a symbolic link or reparse point")
+    return settings
+
+
 def _default_data_dir(workspace_root: Path, config_path: Path | None) -> Path:
     local_app_data = os.environ.get("LOCALAPPDATA")
     if local_app_data:
@@ -753,23 +841,7 @@ def load_settings() -> Settings:
             config_file_identity,
             payload,
         ) = _load_file_backed_config(config_path_value)
-        if "safe_network_readable_paths" in payload:
-            if "sandbox_dependency_readable_paths" in payload:
-                raise ValueError(
-                    "use only sandbox_dependency_readable_paths; the legacy key is ambiguous"
-                )
-            payload["sandbox_dependency_readable_paths"] = payload.pop(
-                "safe_network_readable_paths"
-            )
-        obsolete = {
-            "safe_network_isolation_mode",
-            "safe_network_profile_prefix",
-        }.intersection(payload)
-        if obsolete:
-            raise ValueError(
-                "obsolete Safe Tier/AppContainer settings must be removed: "
-                + ", ".join(sorted(obsolete))
-            )
+        _normalize_file_config_payload(payload)
 
     env_root = os.environ.get("LOCAL_MCP_ROOT", "").strip()
     if config_path is not None and env_root:
@@ -789,15 +861,20 @@ def load_settings() -> Settings:
             "workspace_root must be explicitly set in LOCAL_MCP_CONFIG or LOCAL_MCP_ROOT"
         )
 
-    data_dir = str(payload.get("data_dir", "")).strip()
-    if not data_dir:
-        configured_root = Path(str(payload["workspace_root"])).expanduser().resolve(strict=True)
-        payload["data_dir"] = str(_default_data_dir(configured_root, config_path))
-    if not str(payload.get("sandbox_scratch_dir", "")).strip():
-        configured_data = Path(str(payload["data_dir"])).expanduser().resolve()
-        payload["sandbox_scratch_dir"] = str(
-            configured_data.parent / f"{configured_data.name}-sandbox-scratch"
-        )
+    if config_path is not None:
+        _populate_file_config_defaults(payload, config_path=config_path)
+    else:
+        data_dir = str(payload.get("data_dir", "")).strip()
+        if not data_dir:
+            configured_root = Path(str(payload["workspace_root"])).expanduser().resolve(
+                strict=True
+            )
+            payload["data_dir"] = str(_default_data_dir(configured_root, config_path))
+        if not str(payload.get("sandbox_scratch_dir", "")).strip():
+            configured_data = Path(str(payload["data_dir"])).expanduser().resolve()
+            payload["sandbox_scratch_dir"] = str(
+                configured_data.parent / f"{configured_data.name}-sandbox-scratch"
+            )
 
     settings = Settings.model_validate(payload)
     if config_path is not None and _is_relative_to(config_path, settings.workspace_root):

@@ -236,7 +236,7 @@ Set-Location C:\dev\windows-local-mcp-python
 .\run-server.ps1 -Config C:\path\to\config.local.toml
 ~~~
 
-サーバーは MCP クライアントから接続されるまで、そのウィンドウで待機します。終了するときは、その PowerShell で `Ctrl+C` を押します。
+サーバーの初期化に成功すると、起動成功、ChatGPT からの接続待機中であること、ウィンドウを閉じないこと、`Ctrl+C` で終了できることを表示します。この案内は MCP protocol の標準出力を壊さないよう標準エラーへ出します。サーバーは MCP クライアントから接続されるまで、そのウィンドウで待機します。
 
 ### 7. MCP クライアントへ登録する
 

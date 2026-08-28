@@ -101,13 +101,13 @@ try {{
 
 
 @pytest.mark.skipif(os.name != "nt", reason="PowerShell helper is Windows-only")
-def test_profile_generation_and_secret_redaction_with_spaces() -> None:
+def test_profile_generation_normalizes_drive_space_and_japanese_paths() -> None:
     command = f"""
 $ErrorActionPreference = 'Stop'
 . {_ps_literal(_HELPER)}
     $marker = 'zzsecret-' + [Guid]::NewGuid().ToString('N')
 $server = 'C:\\Program Files\\Windows Local MCP\\run-server.ps1'
-$config = 'C:\\Users\\Public\\Local MCP\\config.toml'
+$config = 'C:\\Users\\Public\\日本語 Local MCP\\config.toml'
 $pidFile = 'C:\\Users\\22905\\AppData\\Local\\WindowsLocalMCP\\tunnel-state\\space.pid'
 $healthFile = 'C:\\Users\\22905\\AppData\\Local\\WindowsLocalMCP\\tunnel-state\\space.health-url'
 $profile = New-TunnelProfileContent -TunnelId 'tunnel_0123456789abcdef0123456789abcdef' -ServerScript $server -ConfigPath $config -PidFile $pidFile -HealthUrlFile $healthFile
@@ -115,6 +115,9 @@ if ($profile -match [regex]::Escape($marker)) {{ throw 'marker leaked into profi
 if ($profile -notmatch 'api_key: env:WLMCP_TUNNEL_RUNTIME_API_KEY') {{ throw 'safe API key reference missing' }}
 if ($profile -notmatch 'channel: main') {{ throw 'main channel missing' }}
 if ($profile -notmatch 'powershell.exe -NoProfile -File') {{ throw 'canonical command missing' }}
+if ($profile -notmatch 'C:/Program Files/Windows Local MCP/run-server.ps1') {{ throw 'drive path was not normalized' }}
+if ($profile -notmatch 'C:/Users/Public/日本語 Local MCP/config.toml') {{ throw 'space or Japanese config path was not preserved' }}
+if ($profile -match 'command:.*C:\\\\') {{ throw 'raw backslash remained in MCP command' }}
 $secure = ConvertTo-SecureString -String $marker -AsPlainText -Force
 $prepared = New-TunnelProcessStartInfo -ClientPath $env:ComSpec -Arguments @('run', '--profile-file', 'C:\\Program Files\\Windows Local MCP\\profile.yaml') -Credential $secure
 if ($prepared.StartInfo.Arguments -match [regex]::Escape($marker)) {{ throw 'secret leaked into argv' }}

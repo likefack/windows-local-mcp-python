@@ -5,7 +5,88 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from windows_local_mcp.config import Settings, load_settings
+from windows_local_mcp.config import (
+    Settings,
+    load_settings,
+    validate_configuration_candidate,
+)
+
+
+def test_configuration_candidate_uses_final_path_defaults_without_side_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "日本語 workspace"
+    workspace.mkdir()
+    local_app_data = tmp_path / "local app data"
+    monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
+    candidate = tmp_path / "config.toml.tmp-candidate"
+    final_config = tmp_path / "settings" / "config.toml"
+    candidate.write_text(
+        f'workspace_root = "{workspace.as_posix()}"\n',
+        encoding="utf-8",
+    )
+
+    settings = validate_configuration_candidate(
+        candidate, final_config_path=final_config
+    )
+
+    assert str(settings.data_dir).startswith(str(local_app_data))
+    assert settings.sandbox_scratch_dir is not None
+    assert not settings.data_dir.exists()
+    assert not settings.sandbox_scratch_dir.exists()
+    assert not list(tmp_path.rglob("namespace.json"))
+    assert not list(tmp_path.rglob(".acl-policy.json"))
+
+
+def test_configuration_candidate_rejects_roots_and_invalid_existing_paths(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    final_config = tmp_path / "settings" / "config.toml"
+    root_candidate = tmp_path / "root.toml"
+    root_candidate.write_text(
+        f'workspace_root = "{Path(tmp_path.anchor).as_posix()}"\n'
+        f'data_dir = "{(tmp_path / "data").as_posix()}"\n'
+        "protect_data_dir_acl = false\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="drive root"):
+        validate_configuration_candidate(root_candidate, final_config_path=final_config)
+
+    invalid_data = tmp_path / "not-a-directory"
+    invalid_data.write_text("file", encoding="utf-8")
+    invalid_candidate = tmp_path / "invalid.toml"
+    invalid_candidate.write_text(
+        f'workspace_root = "{workspace.as_posix()}"\n'
+        f'data_dir = "{invalid_data.as_posix()}"\n'
+        "protect_data_dir_acl = false\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="must be a directory"):
+        validate_configuration_candidate(invalid_candidate, final_config_path=final_config)
+
+
+def test_configuration_candidate_rejects_reparse_workspace(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    workspace_link = tmp_path / "workspace-link"
+    try:
+        workspace_link.symlink_to(workspace, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"directory symlink is unavailable: {error}")
+    candidate = tmp_path / "reparse.toml"
+    candidate.write_text(
+        f'workspace_root = "{workspace_link.as_posix()}"\n'
+        f'data_dir = "{(tmp_path / "data").as_posix()}"\n'
+        "protect_data_dir_acl = false\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="reparse point"):
+        validate_configuration_candidate(
+            candidate, final_config_path=tmp_path / "settings" / "config.toml"
+        )
 
 
 def test_rejects_data_dir_inside_workspace(tmp_path: Path) -> None:
@@ -238,7 +319,34 @@ def test_data_dir_acl_grants_current_principal_and_system(tmp_path: Path) -> Non
         # The marker path avoids a recursive ACL reset on ordinary startup while still
         # checking that the protected namespace remains usable by the bound principal.
         settings.ensure_directories()
+        acl_marker = data / ".acl-policy.json"
+        marker_bytes = acl_marker.read_bytes()
+        acl_marker.unlink()
+        with pytest.raises(PermissionError, match="marker is missing"):
+            settings.ensure_directories()
+        acl_marker.write_bytes(marker_bytes)
+
+        tamper = subprocess.run(
+            ["icacls.exe", str(data), "/grant", "*S-1-1-0:(RX)"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+            shell=False,
+        )
+        assert tamper.returncode == 0, tamper.stderr or tamper.stdout
+        with pytest.raises(PermissionError, match="ACL changed after provisioning"):
+            settings.ensure_directories()
     finally:
+        subprocess.run(
+            ["icacls.exe", str(data), "/remove:g", "*S-1-1-0", "/C"],
+            capture_output=True,
+            timeout=30,
+            check=False,
+            shell=False,
+        )
         subprocess.run(
             ["icacls.exe", str(data), "/inheritance:e", "/T", "/C"],
             capture_output=True,

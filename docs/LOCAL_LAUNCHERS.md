@@ -57,12 +57,15 @@ Tunnel ID は OpenAI の Tunnels 管理画面で確認または作成する識�
 - Tunnel ID の変更
 - Runtime API Key の再入力・ローテーション
 - Tunnel integration の無効化
+- 保持済み profile／Tunnel ID／Runtime API Key を再作成しない再有効化
 - 保存済み API Key の削除
 - 既存 profile と client の診断
 
-設定確認・変更モードでは、最初に workspace、active config、Tunnel の有効状態、Tunnel ID、Runtime API Key の登録状態（secret 本体は非表示）、tunnel-client の検出状態を表示します。workspace の変更は新しい config を検証してから原子的に反映し、Runtime API Key の更新は新しい key の `doctor` 成功後に credential だけを切り替えます。失敗時は旧設定を維持します。
+設定確認・変更モードでは、最初に workspace、active config、Tunnel の有効状態、Tunnel ID、Runtime API Key の登録状態（secret 本体は非表示）、tunnel-client の検出状態を表示します。workspace の変更は、副作用のない候補検証を行ってから config を原子的に置換し、最終 config path で通常検証を完了した場合だけ確定します。候補検証では一時 config path に namespace／ACL marker やディレクトリを作りません。置換後の検証に失敗した場合は旧 config を復元します。Runtime API Key の更新は新しい key の `doctor` 成功後に credential だけを切り替え、失敗時は旧 key を維持します。
 
 Tunnel client が見つからない場合は、[公式 Tunnels 管理画面](https://platform.openai.com/settings/organization/tunnels) または [公式リリース](https://github.com/openai/tunnel-client/releases/latest) の案内を確認し、workspace・`data_dir`・リポジトリの外へ配置してから再実行します。ChatGPT 側で接続やツールが表示されない場合は、Tunnel／connector の tool refresh や再接続が必要になることがあります。
+
+managed profile の MCP command に含める Windows path は、tunnel-client v0.0.10 でも drive path を安全に解釈できる `C:/...` 形式へ正規化します。空白や日本語を含む path は引用符内にそのまま保持します。
 
 ## 手動で設定を変更する場合
 
@@ -86,11 +89,15 @@ run-localmcp.bat -Config C:\path\to\config.toml
 
 `run-localmcp.bat` は `run-localmcp.ps1` を呼び出します。PowerShell 側で UTF-8 の active config を読み、Tunnel integration が有効なら profile／client／Credential Manager／ready 状態を確認して Tunnel 経由で `run-server.ps1 -Config` を一度だけ起動します。無効または未設定なら、従来の `run-server.ps1 -Config` へ直接渡します。
 
+stdio server の初期化に成功すると、`起動に成功しました`、`ChatGPT からの接続を待っています`、`このウィンドウを閉じないでください`、`Ctrl+C` で終了できることを標準エラーへ表示します。MCP protocol が使用する標準出力には人向け案内を出しません。
+
 そのため、設定ファイルのパスに日本語が含まれていても、コマンドプロンプトの文字コードに依存しません。設定がない場合は自動的に設定を推測せず、`configure-localmcp.bat` の実行を案内します。
 
 通常のサーバーは管理者権限で起動しません。管理者権限が必要な Approved Host の runtime／authority service の導入は、通常起動とは別の明示的な手順です。この初版のウィザードは既存の production runtime／service を勝手に置き換えません。
 
 Tunnel の設定不整合、client の変更、API Key の取得失敗、認証失敗、LocalMCP server の起動失敗、ready 応答未確認は、それぞれ別の案内を表示して起動を停止します。Tunnel を設定済みの状態で問題がある場合に、Tunnel を迂回して LocalMCP を直接公開する自動 fallback は行いません。二重起動を避けるため、起動中のプロセスを確認できない場合も停止します。
+
+`data_dir ACL changed after provisioning` が出た場合は実際の ACL 変更として fail closed にし、`.acl-policy.json` の削除による通常起動への復帰や自動 ACL 再設定は行いません。`data_dir` と marker を保全して ACL 差分を確認し、既存 state を引き継がない新しい config／`data_dir` を作るか、確認済み ACL を明示的に再設定してから再検証します。
 
 ## 自動設定しないもの
 

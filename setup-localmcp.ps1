@@ -1,5 +1,8 @@
 ﻿[CmdletBinding()]
-param()
+param(
+    # 回帰テストでは対話 UI を起動せず、設定関数だけを読み込みます。
+    [switch]$FunctionsOnly
+)
 
 $ErrorActionPreference = "Stop"
 $ScriptRoot = (Resolve-Path -LiteralPath $PSScriptRoot).Path
@@ -17,6 +20,7 @@ if (-not (Test-Path -LiteralPath $TunnelHelperPath -PathType Leaf)) {
 . $TunnelHelperPath
 
 try {
+    [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
     [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 } catch {
     # コンソールのエンコーディングを変更できない環境でも導入処理は続けます。
@@ -425,21 +429,46 @@ function Save-Config {
         throw "既存の設定を置き換えるには、設定画面で明示的に確認してください。"
     }
     $temporary = "$Path.tmp-$PID-$([Guid]::NewGuid().ToString('N'))"
+    $backup = $null
     try {
         [IO.File]::WriteAllText($temporary, $Content, [Text.UTF8Encoding]::new($false))
         if (-not [string]::IsNullOrWhiteSpace($PythonPath)) {
             # 一時ファイルでは副作用のない候補検証だけを行い、namespace marker を一時 path に結び付けません。
-            Test-ConfigurationCandidate -PythonPath $PythonPath -ConfigPath $temporary
+            Test-ConfigurationCandidate -PythonPath $PythonPath -ConfigPath $temporary -FinalConfigPath $Path
         }
         if ($existing) {
             $stamp = Get-Date -Format "yyyyMMdd-HHmmssfff"
             $backup = "$Path.backup-$stamp-$([Guid]::NewGuid().ToString('N'))"
             [IO.File]::Replace($temporary, $Path, $backup, $true)
-            Write-Info "既存設定をバックアップしました: $backup"
         } else {
             Move-Item -LiteralPath $temporary -Destination $Path -Force
         }
         $temporary = $null
+
+        if (-not [string]::IsNullOrWhiteSpace($PythonPath)) {
+            try {
+                # 永続 state、ACL、filesystem probe は最終 config path にだけ結び付けます。
+                Test-Configuration -PythonPath $PythonPath -ConfigPath $Path
+            } catch {
+                $validationError = $_.Exception
+                try {
+                    if ($existing) {
+                        $failed = "$Path.rollback-$PID-$([Guid]::NewGuid().ToString('N'))"
+                        [IO.File]::Replace($backup, $Path, $failed, $true)
+                        $backup = $null
+                        Remove-Item -LiteralPath $failed -Force -ErrorAction SilentlyContinue
+                    } elseif (Test-Path -LiteralPath $Path -PathType Leaf) {
+                        Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+                    }
+                } catch {
+                    throw "最終設定の検証に失敗し、旧 config の自動復元も完了できませんでした。config と backup を保全して診断してください。"
+                }
+                throw $validationError
+            }
+        }
+        if ($existing) {
+            Write-Info "既存設定をバックアップしました: $backup"
+        }
     } finally {
         if (-not [string]::IsNullOrWhiteSpace($temporary) -and (Test-Path -LiteralPath $temporary)) {
             Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
@@ -501,16 +530,20 @@ function Test-Configuration {
 function Test-ConfigurationCandidate {
     param(
         [Parameter(Mandatory = $true)][string]$PythonPath,
-        [Parameter(Mandatory = $true)][string]$ConfigPath
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [Parameter(Mandatory = $true)][string]$FinalConfigPath
     )
 
     # 一時 config を load_settings() に渡すと namespace marker が一時 path に結び付くため、
     # ここでは副作用のない TOML/Settings 検証だけを行います。実体の namespace と filesystem
     # probe は、原子置換後の最終 config で Test-Configuration が確認します。
     $probe = @(
-        "import pathlib, sys, tomllib; from windows_local_mcp.config import Settings, _is_reparse; config_path = pathlib.Path(sys.argv[1]).resolve(); payload = tomllib.loads(config_path.read_text(encoding='utf-8')); settings = Settings.model_validate(payload); workspace = settings.workspace_root.resolve(); data_dir = settings.data_dir.resolve(); scratch = settings.sandbox_scratch_dir.resolve(); assert workspace.exists() and workspace.is_dir() and not _is_reparse(workspace); assert workspace != pathlib.Path(workspace.anchor); assert not config_path.is_relative_to(workspace); assert all((not candidate.exists()) or (candidate.is_dir() and not _is_reparse(candidate)) for candidate in (data_dir, scratch)); print('candidate-ok')"
-    )
-    Invoke-Python -PythonPath $PythonPath -Arguments @("-I", "-B", "-c", $probe, $ConfigPath) | Out-Null
+        "import sys",
+        "from windows_local_mcp.config import validate_configuration_candidate",
+        "validate_configuration_candidate(sys.argv[1], final_config_path=sys.argv[2])",
+        "print('candidate-ok')"
+    ) -join "; "
+    Invoke-Python -PythonPath $PythonPath -Arguments @("-I", "-B", "-c", $probe, $ConfigPath, $FinalConfigPath) | Out-Null
 }
 
 function Get-TunnelConfigContext {
@@ -1280,6 +1313,53 @@ function Disable-TunnelIntegrationForSetup {
     return $copy
 }
 
+function Enable-TunnelIntegrationForSetup {
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [Parameter(Mandatory = $true)][object]$Context,
+        [Parameter(Mandatory = $true)][object]$State
+    )
+
+    Assert-TunnelNotRunning -State $State
+    $binding = Test-TunnelProfileBinding `
+        -State $State `
+        -ConfigPath $ConfigPath `
+        -ServerScript (Join-Path $ScriptRoot "run-server.ps1") `
+        -ProfileRoot (Join-Path $StateRoot "tunnel-profiles") `
+        -StateRoot $StateRoot `
+        -ForbiddenRoots @(Get-TunnelForbiddenRoots -Context $Context)
+    if (-not $binding.Valid) {
+        Show-TunnelFailureGuide -FailureClass (Get-TunnelFailureClassForSetup -ReasonCode $binding.ReasonCode)
+        Write-Warn "保持済み Tunnel 設定を安全に再利用できないため、有効化していません。"
+        return $false
+    }
+
+    $credential = $null
+    try {
+        if ([string]$State.credential_mode -eq "credential_manager") {
+            $credential = Get-TunnelCredentialSecure -Target (Get-TunnelCredentialTarget -ConfigPath $ConfigPath)
+            if ($null -eq $credential) {
+                Show-TunnelFailureGuide -FailureClass "auth_failed"
+                Write-Warn "保存済み Runtime API Key がないため、有効化していません。"
+                return $false
+            }
+        }
+        $doctor = Invoke-TunnelClientDoctor -ClientPath $binding.ClientPath -ProfilePath $binding.ProfilePath -Credential $credential
+        if (-not $doctor.Succeeded) {
+            Show-TunnelFailureGuide -FailureClass $doctor.FailureClass
+            Write-Warn "保持済み Tunnel 設定の検証に失敗したため、有効化していません。"
+            return $false
+        }
+        $copy = Copy-TunnelStateForSetup -State $State
+        $copy.enabled = $true
+        $null = Save-TunnelStateAtomic -State $copy -StatePath (Get-TunnelStatePath -StateRoot $StateRoot -ConfigPath $ConfigPath)
+        Write-Ok "保持済み Tunnel profile、Tunnel ID、Runtime API Key を変更せず再び有効にしました。"
+        return $true
+    } finally {
+        if ($null -ne $credential) { $credential.Dispose() }
+    }
+}
+
 function Remove-TunnelSavedCredentialForSetup {
     param(
         [Parameter(Mandatory = $true)][string]$ConfigPath,
@@ -1568,6 +1648,8 @@ function Invoke-SettingsMenu {
                     $state = Get-TunnelStateForConfig -ConfigPath $ConfigPath
                     if ($null -ne $state -and [bool]$state.enabled -eq $true) {
                         Disable-TunnelIntegrationForSetup -ConfigPath $ConfigPath -State $state | Out-Null
+                    } elseif ($null -ne $state) {
+                        $null = Enable-TunnelIntegrationForSetup -ConfigPath $ConfigPath -Context $context -State $state
                     } else {
                         $null = Configure-NewTunnelIntegration -ConfigPath $ConfigPath -Context $context -PreviousState $state
                     }
@@ -1743,6 +1825,10 @@ function Show-ManualConfigGuidance {
         Write-Host "Secure MCP Tunnel はスキップまたは未設定です。run-localmcp.bat は従来どおり LocalMCP 単体を起動します。"
         Write-Host "後から設定・診断する場合は、configure-localmcp.bat の「現在の設定を確認・変更する」を選んでください。"
     }
+}
+
+if ($FunctionsOnly) {
+    return
 }
 
 try {

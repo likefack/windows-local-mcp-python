@@ -528,7 +528,10 @@ function ConvertTo-TunnelCommandArgument {
     if ($Value -match '[\r\n]') {
         throw "Tunnel profile の path に改行は使用できません。"
     }
-    return '"' + $Value.Replace('"', '\"') + '"'
+    # tunnel-client v0.0.10 の MCP command parser は drive path の backslash を
+    # 安全に保持しないため、PowerShell でも等価な forward slash へ正規化します。
+    $normalized = $Value.Replace('\', '/')
+    return '"' + $normalized.Replace('"', '\"') + '"'
 }
 
 function ConvertFrom-TunnelYamlScalar {

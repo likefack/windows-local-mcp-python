@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 
 from .approval_ui import run_approval_ui
 from .audit import AuditStore
@@ -85,6 +86,17 @@ def main() -> None:
 
         register_context_export_tools(mcp, context_export_config, runtime)
         register_context_read_tools(mcp, context_read_config, runtime)
+        # stdout は MCP frame 専用なので、人向けの起動案内は stderr にだけ出します。
+        print(
+            "Windows Local MCP の起動に成功しました。ChatGPT からの接続を待っています。",
+            file=sys.stderr,
+            flush=True,
+        )
+        print(
+            "このウィンドウを閉じないでください。終了するには Ctrl+C を押します。",
+            file=sys.stderr,
+            flush=True,
+        )
         run_stdio_server(mcp)
         return
 
