@@ -1,4 +1,4 @@
-[CmdletBinding(DefaultParameterSetName = "Config")]
+﻿[CmdletBinding(DefaultParameterSetName = "Config")]
 param(
     [Parameter(Mandatory = $true, ParameterSetName = "Root")]
     [string]$Root = "",

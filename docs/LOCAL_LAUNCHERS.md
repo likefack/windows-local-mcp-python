@@ -89,6 +89,8 @@ run-localmcp.bat -Config C:\path\to\config.toml
 
 `run-localmcp.bat` は `run-localmcp.ps1` を呼び出します。PowerShell 側で UTF-8 の active config を読み、Tunnel integration が有効なら profile／client／Credential Manager／ready 状態を確認して Tunnel 経由で `run-server.ps1 -Config` を一度だけ起動します。無効または未設定なら、従来の `run-server.ps1 -Config` へ直接渡します。
 
+Windows PowerShell 5.1 を正式サポートする配布対象の `.ps1`（setup、run、server、approvals、Tunnel helper）は、ソース内の日本語を正しく解釈できるよう UTF-8 BOM 付きで保存します。PowerShell 7 だけでなく、実際の Windows PowerShell 5.1 parser でも配布対象全体を検証します。
+
 stdio server の初期化に成功すると、`起動に成功しました`、`ChatGPT からの接続を待っています`、`このウィンドウを閉じないでください`、`Ctrl+C` で終了できることを標準エラーへ表示します。MCP protocol が使用する標準出力には人向け案内を出しません。
 
 そのため、設定ファイルのパスに日本語が含まれていても、コマンドプロンプトの文字コードに依存しません。設定がない場合は自動的に設定を推測せず、`configure-localmcp.bat` の実行を案内します。

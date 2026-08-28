@@ -9,18 +9,43 @@ from pathlib import Path
 import pytest
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+_WINDOWS_POWERSHELL_51_LAUNCHERS = (
+    "setup-localmcp.ps1",
+    "run-localmcp.ps1",
+    "run-server.ps1",
+    "run-approvals.ps1",
+    "secure-mcp-tunnel.ps1",
+)
 
 
 def _ps_literal(value: str | Path) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
+def _windows_powershell_51() -> Path:
+    system_root = os.environ.get("SystemRoot")
+    if not system_root:
+        pytest.skip("SystemRoot is unavailable")
+    shell = (
+        Path(system_root)
+        / "System32"
+        / "WindowsPowerShell"
+        / "v1.0"
+        / "powershell.exe"
+    )
+    if not shell.is_file():
+        pytest.skip("Windows PowerShell 5.1 is unavailable")
+    return shell
+
+
 def _assert_powershell_script_parses(path: Path) -> None:
-    shell = shutil.which("pwsh.exe") or shutil.which("powershell.exe")
-    if shell is None:
-        pytest.skip("PowerShell executable is unavailable")
+    # PowerShell 7 accepts BOM-less UTF-8, so it cannot detect the Windows
+    # PowerShell 5.1 source-decoding regression covered by this test.
+    shell = _windows_powershell_51()
     command = (
         "$tokens=$null; $errors=$null; "
+        "if ($PSVersionTable.PSVersion.Major -ne 5 -or "
+        "$PSVersionTable.PSVersion.Minor -ne 1) { exit 3 }; "
         f"[System.Management.Automation.Language.Parser]::ParseFile({str(path)!r}, "
         "[ref]$tokens, [ref]$errors) | Out-Null; "
         "if ($errors.Count -gt 0) { "
@@ -40,18 +65,23 @@ def _assert_powershell_script_parses(path: Path) -> None:
 
 
 @pytest.mark.skipif(os.name != "nt", reason="PowerShell launcher validation is Windows-only")
-def test_setup_localmcp_powershell_script_parses() -> None:
-    _assert_powershell_script_parses(_REPOSITORY_ROOT / "setup-localmcp.ps1")
+@pytest.mark.parametrize("script_name", _WINDOWS_POWERSHELL_51_LAUNCHERS)
+def test_launcher_parses_with_windows_powershell_51(script_name: str) -> None:
+    _assert_powershell_script_parses(_REPOSITORY_ROOT / script_name)
 
 
-@pytest.mark.skipif(os.name != "nt", reason="PowerShell launcher validation is Windows-only")
-def test_run_localmcp_powershell_script_parses() -> None:
-    _assert_powershell_script_parses(_REPOSITORY_ROOT / "run-localmcp.ps1")
+def test_windows_powershell_51_launchers_use_utf8_bom_and_keep_japanese() -> None:
+    for script_name in _WINDOWS_POWERSHELL_51_LAUNCHERS:
+        payload = (_REPOSITORY_ROOT / script_name).read_bytes()
+        assert payload.startswith(b"\xef\xbb\xbf"), script_name
+        payload.decode("utf-8-sig", errors="strict")
 
-
-@pytest.mark.skipif(os.name != "nt", reason="PowerShell launcher validation is Windows-only")
-def test_secure_mcp_tunnel_helper_powershell_script_parses() -> None:
-    _assert_powershell_script_parses(_REPOSITORY_ROOT / "secure-mcp-tunnel.ps1")
+    assert "設定ファイルが見つかりません" in (
+        _REPOSITORY_ROOT / "run-localmcp.ps1"
+    ).read_text(encoding="utf-8-sig")
+    assert "Tunnel client の SHA-256 を確認できません" in (
+        _REPOSITORY_ROOT / "secure-mcp-tunnel.ps1"
+    ).read_text(encoding="utf-8-sig")
 
 
 def test_start_launcher_delegates_to_setup_script() -> None:

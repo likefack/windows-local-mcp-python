@@ -1,4 +1,4 @@
-# Secure MCP Tunnel integration helpers.
+﻿# Secure MCP Tunnel integration helpers.
 #
 # This file is dot-sourced by the setup and normal-startup launchers.  It keeps
 # Runtime API keys in the current user's Windows Credential Manager and never
