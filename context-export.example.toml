@@ -1,0 +1,30 @@
+# Optional Context Export Broker configuration.
+#
+# Production selection:
+# 1. Set LOCAL_MCP_CONTEXT_EXPORT_CONFIG to this file's private local copy, or
+# 2. Place a file named `context-export.toml` beside the active LOCAL_MCP_CONFIG file.
+#
+# Keep this file outside workspace_root, data_dir, and sandbox_scratch_dir. The real local
+# config may contain a Bearer token and must not be committed to a public repository.
+
+# Disabled by default. When disabled, export_context fails closed.
+context_export_enabled = false
+
+# Trusted-operator-selected fixed destination. The MCP tool cannot override this URL.
+# HTTPS may target any host. Loopback HTTP is allowed for local development.
+# Non-loopback plain HTTP additionally requires context_export_allow_insecure_http = true.
+context_export_endpoint = "https://example.invalid/api/context-import"
+
+# Optional fixed Bearer credential sent only as `Authorization: Bearer ...`.
+# It is never returned by context_export_info or stored in WLMCP audit records.
+context_export_bearer_token = ""
+
+# Final bound for the complete canonical JSON request body, not only the content field.
+context_export_max_bytes = 262144
+
+# Outbound request timeout. Allowed range: 1..60 seconds.
+context_export_timeout_seconds = 10
+
+# Explicit confidentiality downgrade for a trusted non-loopback HTTP receiver.
+# Keep false unless the configured network path is intentionally plaintext.
+context_export_allow_insecure_http = false
