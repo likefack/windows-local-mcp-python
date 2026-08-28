@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-import windows_local_mcp.context_export as context_export
+from windows_local_mcp import context_export
 from windows_local_mcp.context_export import (
     ContextExportBroker,
     ContextExportSettings,
