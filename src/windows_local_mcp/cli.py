@@ -63,7 +63,8 @@ def main() -> None:
         # Context Export has its own optional sidecar because the core Settings model intentionally
         # rejects unknown keys. Capture the sidecar before server Runtime initialization sanitizes
         # LOCAL_MCP_* environment values, then bind it to the already validated production runtime.
-        from .context_export import load_context_export_config, register_context_export_tools
+        from .context_export import load_context_export_config
+        from .context_export_protocol import register_context_export_tools
 
         context_export_config = load_context_export_config()
 
