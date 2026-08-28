@@ -2,11 +2,12 @@
 
 ## 目的
 
-Windows Local MCP の初回設定と通常起動を、長い README を読まずに進めるための入口です。
+Windows Local MCP の初回設定、設定確認・変更、通常起動を、長い README を読まずに進めるための入口です。
 
-- `start-localmcp.bat`: 初回設定・既存設定の診断
+- `configure-localmcp.bat`: 設定を管理する正式な入口（初回セットアップと設定確認・変更）
+- `start-localmcp.bat`: 旧名称から正式入口へ転送する互換ラッパー（非推奨）
 - `run-localmcp.bat`: 2 回目以降の通常起動
-- `setup-localmcp.ps1`: `start-localmcp.bat` から呼び出す対話型セットアップ
+- `setup-localmcp.ps1`: `configure-localmcp.bat` から呼び出す対話型設定管理
 - `run-localmcp.ps1`: active config の読み取り、Tunnel の検証・起動、または既存サーバー起動スクリプトへの委譲
 - `secure-mcp-tunnel.ps1`: Tunnel profile、Credential Manager、client／ready 検証を共有する内部ヘルパー
 
@@ -14,8 +15,8 @@ Windows Local MCP の初回設定と通常起動を、長い README を読まず
 
 ## 初回設定
 
-1. `start-localmcp.bat` を実行します。
-2. `1. かんたんセットアップ` または `2. 既存の設定を使う` を選びます。
+1. `configure-localmcp.bat` を実行します。
+2. `1. かんたんセットアップ` または `2. 現在の設定を確認・変更する` を選びます。
 3. `かんたんセットアップ` では、MCP から操作したい既存のプロジェクトフォルダーを指定します。
 4. フォルダーの場所が分からない場合は、エクスプローラーで目的のフォルダーを開き、上のアドレスバーをクリックして `Ctrl+C`。この画面に戻って `Ctrl+V` で貼り付けます。
 5. Python 3.11 以上があり、パッケージを import できない場合は、専用の `.venv` を作成してこのパッケージを editable install します。
@@ -44,19 +45,22 @@ Tunnel ID は OpenAI の Tunnels 管理画面で確認または作成する識�
 設定完了後の基本操作は次のとおりです。
 
 ```text
-初回:   start-localmcp.bat → workspace 指定 → Tunnel 設定 → 完了
-2回目以降: run-localmcp.bat
+初回:       configure-localmcp.bat → かんたんセットアップ → workspace → Tunnel → 完了 → 今すぐ起動
+通常:       run-localmcp.bat
+設定変更:   configure-localmcp.bat → 現在の設定を確認・変更する
 ```
 
 設定済みの場合、`run-localmcp.bat` が `tunnel-client doctor` 相当の事前確認を行い、Tunnel client から現在の `run-server.ps1 -Config <absolute config>` を一度だけ起動します。Tunnel 未設定またはスキップ済みの場合は、従来どおり `run-server.ps1` を直接起動します。通常の LocalMCP server は管理者権限で起動しません。
 
-既存の profile／runtime 設定が検出された場合は、再利用、managed profile の新規設定、スキップを選べます。既存 profile の内容を無断で上書き・削除・再生成しません。`start-localmcp.bat` の `3. Secure MCP Tunnel の設定・診断だけを行う` から、LocalMCP 全体を初期化せずに次の操作ができます。
+既存の profile／runtime 設定が検出された場合は、再利用、managed profile の新規設定、スキップを選べます。既存 profile の内容を無断で上書き・削除・再生成しません。`configure-localmcp.bat` の `2. 現在の設定を確認・変更する` から、LocalMCP 全体を初期化せずに次の操作ができます。
 
 - Tunnel ID の変更
 - Runtime API Key の再入力・ローテーション
 - Tunnel integration の無効化
 - 保存済み API Key の削除
 - 既存 profile と client の診断
+
+設定確認・変更モードでは、最初に workspace、active config、Tunnel の有効状態、Tunnel ID、Runtime API Key の登録状態（secret 本体は非表示）、tunnel-client の検出状態を表示します。workspace の変更は新しい config を検証してから原子的に反映し、Runtime API Key の更新は新しい key の `doctor` 成功後に credential だけを切り替えます。失敗時は旧設定を維持します。
 
 Tunnel client が見つからない場合は、[公式 Tunnels 管理画面](https://platform.openai.com/settings/organization/tunnels) または [公式リリース](https://github.com/openai/tunnel-client/releases/latest) の案内を確認し、workspace・`data_dir`・リポジトリの外へ配置してから再実行します。ChatGPT 側で接続やツールが表示されない場合は、Tunnel／connector の tool refresh や再接続が必要になることがあります。
 
@@ -68,7 +72,7 @@ Tunnel client が見つからない場合は、[公式 Tunnels 管理画面](htt
 run-localmcp.bat -Config C:\path\to\config.toml
 ```
 
-別の設定ファイルへ切り替える場合は、`start-localmcp.bat` の `2. 既存の設定を使う` を選びます。`active-config.txt` はウィザードが管理するため、通常は直接編集しません。
+別の設定ファイルへ切り替える場合は、`configure-localmcp.bat` の `2. 現在の設定を確認・変更する` から `active config を変更する` を選びます。`active-config.txt` はウィザードが管理するため、通常は直接編集しません。
 
 ## 通常起動
 
@@ -82,7 +86,7 @@ run-localmcp.bat -Config C:\path\to\config.toml
 
 `run-localmcp.bat` は `run-localmcp.ps1` を呼び出します。PowerShell 側で UTF-8 の active config を読み、Tunnel integration が有効なら profile／client／Credential Manager／ready 状態を確認して Tunnel 経由で `run-server.ps1 -Config` を一度だけ起動します。無効または未設定なら、従来の `run-server.ps1 -Config` へ直接渡します。
 
-そのため、設定ファイルのパスに日本語が含まれていても、コマンドプロンプトの文字コードに依存しません。設定がない場合は自動的に設定を推測せず、`start-localmcp.bat` の実行を案内します。
+そのため、設定ファイルのパスに日本語が含まれていても、コマンドプロンプトの文字コードに依存しません。設定がない場合は自動的に設定を推測せず、`configure-localmcp.bat` の実行を案内します。
 
 通常のサーバーは管理者権限で起動しません。管理者権限が必要な Approved Host の runtime／authority service の導入は、通常起動とは別の明示的な手順です。この初版のウィザードは既存の production runtime／service を勝手に置き換えません。
 
@@ -92,7 +96,7 @@ Tunnel の設定不整合、client の変更、API Key の取得失敗、認証�
 
 - Automatic Git は `Git\mingw64\bin\git.exe` のような実 runtime だけを候補にし、検出時に SHA-256 を設定します。`verify-git-broker` の live verification は明示的に実行する必要があります。
 - ADB は SDK を検出しても、許可する emulator serial を利用者が確認していないため自動有効化しません。
-- Codex Sandbox は設定を有効にしたまま、Codex CLI の存在と live verification の状態を別々に表示します。Codex CLI が見つからなくてもファイルの読み書きは利用できますが、Python・テスト・ビルドなどの Sandbox 経路は利用できません。導入は [OpenAI 公式の Codex CLI 案内](https://developers.openai.com/codex/cli/) を確認し、導入後に `start-localmcp.bat` を再実行します。検出だけでは Sandbox 利用可能とは判定せず、署名・ハッシュ・実体の識別情報と、この PC でのライブ検証を別途確認します。
+- Codex Sandbox は、設定の有効化、backend の安全な解決、Windows の live verification を別々に表示します。セットアップの「利用可能」は native `codex.exe`、必要な helper、Authenticode、SHA-256、安定ファイル識別、version を同じ production resolver で確認できたことを意味し、live verification の完了を意味しません。Windows の公式 npm global install では PATH 上の `codex.ps1`、`codex.cmd`、`codex` を locator としてだけ使い、公式 `@openai/codex` package manifest が示す対象 architecture の native `codex.exe` と同梱 `codex-code-mode-host.exe` を解決します。shim 自体を Sandbox の trusted executable として実行することはありません。Codex が見つからない、package 配置が不正、署名または helper 閉包を確認できない場合は、ファイルの読み書きだけを残して Sandbox 経路を fail closed にします。導入は [OpenAI 公式の Codex CLI 案内](https://developers.openai.com/codex/cli/) を確認し、導入後に `configure-localmcp.bat` を再実行します。
 - Sandbox の失敗を理由に Approved Host へ自動 fallback しません。
 
 ## 複数のフォルダー

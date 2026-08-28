@@ -132,6 +132,55 @@ $secure.Dispose()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="PowerShell helper is Windows-only")
+def test_secret_does_not_enter_config_state_logs_audit_or_temporary_files() -> None:
+    with tempfile.TemporaryDirectory(prefix="wlmcp-secret-regression-") as temporary_root:
+        root = Path(temporary_root) / "local mcp data"
+        command = f"""
+$ErrorActionPreference = 'Stop'
+. {_ps_literal(_HELPER)}
+$root = {_ps_literal(root)}
+$marker = 'file-secret-' + [Guid]::NewGuid().ToString('N')
+$profileRoot = Join-Path $root 'profile'
+$stateRoot = Join-Path $root 'state'
+New-Item -ItemType Directory -Path $profileRoot, $stateRoot, (Join-Path $root 'logs'), (Join-Path $root 'audit') -Force | Out-Null
+$configPath = Join-Path $root 'config.toml'
+$profilePath = Join-Path $profileRoot 'localmcp.yaml'
+$statePath = Join-Path $stateRoot 'state.json'
+$pidFile = Join-Path $stateRoot 'tunnel.pid'
+$healthFile = Join-Path $stateRoot 'tunnel.health-url'
+$serverPath = {_ps_literal(_REPOSITORY_ROOT / 'run-server.ps1')}
+$clientPath = $env:ComSpec
+[IO.File]::WriteAllText($configPath, 'workspace_root = "C:\\Users\\Public\\workspace"', [Text.UTF8Encoding]::new($false))
+$profile = New-TunnelProfileContent -TunnelId 'tunnel_0123456789abcdef0123456789abcdef' -ServerScript $serverPath -ConfigPath $configPath -PidFile $pidFile -HealthUrlFile $healthFile
+[IO.File]::WriteAllText($profilePath, $profile, [Text.UTF8Encoding]::new($false))
+$state = [PSCustomObject][ordered]@{{
+    version = 1; enabled = $true; config_path = [IO.Path]::GetFullPath($configPath)
+    profile_path = [IO.Path]::GetFullPath($profilePath); profile_sha256 = Get-TunnelSha256 -Path $profilePath
+    profile_scope = 'managed'; tunnel_id = 'tunnel_0123456789abcdef0123456789abcdef'
+    tunnel_client_path = [IO.Path]::GetFullPath($clientPath); tunnel_client_sha256 = Get-TunnelSha256 -Path $clientPath
+    pid_file = [IO.Path]::GetFullPath($pidFile); health_url_file = [IO.Path]::GetFullPath($healthFile)
+    credential_mode = 'credential_manager'; credential_target = Get-TunnelCredentialTarget -ConfigPath $configPath
+}}
+$null = Save-TunnelStateAtomic -State $state -StatePath $statePath
+$secure = ConvertTo-SecureString -String $marker -AsPlainText -Force
+$prepared = New-TunnelProcessStartInfo -ClientPath $clientPath -Arguments @('run', '--profile-file', $profilePath) -Credential $secure
+if ($prepared.StartInfo.Arguments -match [regex]::Escape($marker)) {{ throw 'secret leaked into command line' }}
+if ($prepared.StartInfo.EnvironmentVariables['WLMCP_TUNNEL_RUNTIME_API_KEY'] -ne $marker) {{ throw 'child environment contract missing' }}
+foreach ($file in @(Get-ChildItem -LiteralPath $root -File -Recurse -Force)) {{
+    $text = [IO.File]::ReadAllText($file.FullName, [Text.UTF8Encoding]::new($false, $true))
+    if ($text.IndexOf($marker, [StringComparison]::Ordinal) -ge 0) {{ throw 'secret leaked into file: ' + $file.FullName }}
+}}
+$secure.Dispose()
+'secret-file-regression-ok'
+"""
+        completed = _run_powershell(command)
+        output = completed.stdout + completed.stderr
+        assert completed.returncode == 0, output
+        assert "secret-file-regression-ok" in output
+        assert "file-secret-" not in output
+
+
+@pytest.mark.skipif(os.name != "nt", reason="PowerShell helper is Windows-only")
 def test_tunnel_id_validation_and_profile_binding_fail_closed() -> None:
     with tempfile.TemporaryDirectory(prefix="wlmcp-tunnel-state-") as temporary_root:
         root = Path(temporary_root) / "tunnel state with spaces"

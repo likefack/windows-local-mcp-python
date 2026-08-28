@@ -52,7 +52,7 @@ try {
     }
 
     if (-not (Test-Path -LiteralPath $Config -PathType Leaf)) {
-        Write-Error "設定ファイルが見つかりません。先に start-localmcp.bat を実行してください。" -ErrorAction Continue
+        Write-Error "設定ファイルが見つかりません。先に configure-localmcp.bat を実行してください。" -ErrorAction Continue
         exit 2
     }
     if (-not (Test-Path -LiteralPath $ServerScript -PathType Leaf)) {

@@ -15,13 +15,17 @@ from windows_local_mcp.sandbox_backend import (
 
 def _settings(tmp_path: Path) -> Settings:
     workspace = tmp_path / "workspace"
-    workspace.mkdir()
+    workspace.mkdir(parents=True)
     settings = Settings(
         workspace_root=workspace,
         data_dir=tmp_path / "data",
         protect_data_dir_acl=False,
     )
-    settings.ensure_directories()
+    # This test exercises executable resolution only. Avoid the repository-wide filesystem
+    # semantics probe so a shared Windows temp ACL cannot obscure that result.
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    assert settings.sandbox_scratch_dir is not None
+    settings.sandbox_scratch_dir.mkdir(parents=True, exist_ok=True)
     return settings
 
 
@@ -160,6 +164,55 @@ def test_workspace_controlled_npm_wrapper_and_package_are_not_adopted(
 
     with pytest.raises(ApprovedSandboxUnavailable, match="not found or was not accessible"):
         resolve_codex_sandbox_backend(settings)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Codex Sandbox backend is Windows-only")
+def test_existing_desktop_install_resolution_keeps_its_helper_closure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    install_dir = tmp_path / "localappdata" / "OpenAI" / "Codex" / "bin" / "0.150.0"
+    native_path = install_dir / "codex.exe"
+    _write(native_path, b"desktop codex")
+    _write(install_dir / "codex-command-runner.exe", b"desktop runner")
+    _write(install_dir / "codex-windows-sandbox-setup.exe", b"desktop setup")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "localappdata"))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path / "userprofile"))
+    monkeypatch.setenv("HOME", str(tmp_path / "userprofile"))
+    monkeypatch.setenv("PATH", "")
+    _patch_native_verification(monkeypatch)
+
+    backend = resolve_codex_sandbox_backend(settings)
+
+    assert backend.provenance == "openai-codex-desktop-install-root"
+    assert [helper.name for helper in backend.helpers] == [
+        "codex-command-runner.exe",
+        "codex-windows-sandbox-setup.exe",
+    ]
+    assert backend.executable == str(native_path.resolve())
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Codex Sandbox backend is Windows-only")
+def test_existing_standalone_install_resolution_is_preserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    userprofile = tmp_path / "userprofile"
+    install_dir = userprofile / ".codex" / "packages" / "standalone" / "current" / "bin"
+    native_path = install_dir / "codex.exe"
+    _write(native_path, b"standalone codex")
+    _write(install_dir / "codex-command-runner.exe", b"standalone runner")
+    _write(install_dir / "codex-windows-sandbox-setup.exe", b"standalone setup")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "localappdata"))
+    monkeypatch.setenv("USERPROFILE", str(userprofile))
+    monkeypatch.setenv("HOME", str(userprofile))
+    monkeypatch.setenv("PATH", "")
+    _patch_native_verification(monkeypatch)
+
+    backend = resolve_codex_sandbox_backend(settings)
+
+    assert backend.provenance == "codex-managed-standalone-root"
+    assert backend.executable == str(native_path.resolve())
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Codex Sandbox backend is Windows-only")

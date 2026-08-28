@@ -5,6 +5,10 @@ workspace_root = "C:\\path\\to\\your-project"
 # Empty uses %LOCALAPPDATA%\WindowsLocalMCP. It must not overlap workspace_root.
 data_dir = ""
 
+# Secure MCP Tunnel の ID/profile/state はこの LocalMCP config とは分離して管理します。
+# Runtime API Key の secret 本体は config、profile、workspace、ログへ書かず、
+# 設定用ランチャーが Windows の現在ユーザーの Credential Manager に保存します。
+
 # Capability switches. false blocks both automatic execution and direct request_host_command use.
 filesystem_enabled = true
 git_enabled = true
@@ -29,7 +33,9 @@ adb_executable_sha256 = ""
 # fail closed and never fall back to the Windows user token.
 approved_sandbox_enabled = true
 approved_sandbox_backend = "codex_cli"
-# Optional absolute path to an installed Codex CLI. Empty enables trusted-path discovery.
+# Optional absolute path to a trusted native Codex CLI. Empty enables the resolver for
+# Desktop/standalone installs and the official Windows npm global package. npm wrappers
+# are locators only; they are never used as the trusted Sandbox executable.
 approved_sandbox_codex_path = ""
 # This release intentionally supports only the stronger elevated Windows sandbox and the
 # workspace permission profile. Initial Codex sandbox setup may require Administrator/UAC.

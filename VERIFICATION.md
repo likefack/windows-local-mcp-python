@@ -13,7 +13,7 @@
 
 ### 今回の回帰検証
 
-- Tunnel／launcher focused pytest: `27 passed in 12.46s`。
+- Tunnel／launcher focused pytest: `30 passed in 13.60s`。
 - focused Ruff: pass（`tests/test_tunnel_integration.py`、`tests/test_local_launchers.py`、`tests/test_powershell_scripts.py`）。
 - PowerShell parser: pass（`secure-mcp-tunnel.ps1`、`setup-localmcp.ps1`、`run-localmcp.ps1`、既存の主要 launcher）。
 - Credential Manager の保存・読み出し・rotation・削除: Windows API を使った実行確認 pass。テスト出力への secret 混入なし。
@@ -22,14 +22,14 @@
 
 ### リポジトリ全体検証の制限
 
-- 全体 pytest: `649 passed, 7 skipped, 3 failed`。失敗3件は今回の Tunnel 変更対象外の並行作業差分に含まれる `src/windows_local_mcp/sandbox_backend.py` の未定義 `_NPM_*` 定数による2件と、`test_snapshot_execution_succeeds_when_bound_workspace_is_unchanged` が `running` のまま終了した1件。今回の focused suite は成功しているが、リポジトリ全体の合格状態とは扱わない。
-- 全体 Ruff: 今回の変更対象外の `src/windows_local_mcp/sandbox_backend.py` にある未定義 `_NPM_*` 定数と、既存テストの `PLR0402` により未通過。対象ファイルの focused Ruff は通過している。
+- 全体 pytest（安定スナップショット）: `660 passed, 7 skipped, 1 failed`。失敗は今回の Tunnel 変更対象外の Approved Host 統合テスト `test_approved_host_terminates_descendants_at_runtime_limit` で、期待値 `timed_out` に対して `failed` が返ったもの。Tunnel focused suite は成功しているが、リポジトリ全体の合格状態とは扱わない。
+- 全体 Ruff: pass。並行作業を含む現在の全体で確認した。
 
 ### Windows／外部サービス検証の境界
 
 - Windows API レベルの Credential Manager 検証は実施した。
 - この環境では `tunnel-client.exe`／`tunnel-client` を検出できなかったため、実 client の doctor／run、OpenAI control plane、ChatGPT 側の Tunnel 表示・tool refresh を通した本番相当 E2E は未実施。ローカル focused test の成功を Secure MCP Tunnel／ChatGPT の接続成功とはみなさない。
-- 実機で残る確認は、公式 client の安全な配置後に、通常の Windows user 権限で `setup-localmcp.bat` の初回設定、`run-localmcp.bat` の ready 応答、ChatGPT 側の Tunnel／tool refresh、key rotation／無効化／再設定を一続きで確認することである。
+- 実機で残る確認は、公式 client の安全な配置後に、通常の Windows user 権限で `configure-localmcp.bat`（旧 `start-localmcp.bat` からも到達可能）の初回設定、`run-localmcp.bat` の ready 応答、ChatGPT 側の Tunnel／tool refresh、key rotation／無効化／再設定を一続きで確認することである。
 
 ## 2026-08-28 Security Scan Round 2 post-merge targeted review
 

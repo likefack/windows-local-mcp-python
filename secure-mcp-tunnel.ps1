@@ -770,7 +770,7 @@ function Read-TunnelState {
         return $state
     } catch {
         if ($_.Exception.Message -like "Tunnel state*") { throw }
-        throw "Secure MCP Tunnel の state を読み取れません。start-localmcp.bat から診断してください。"
+        throw "Secure MCP Tunnel の state を読み取れません。configure-localmcp.bat から診断してください。"
     }
 }
 
@@ -1188,7 +1188,7 @@ function Show-TunnelClientInstallGuide {
     Write-Host "tunnel-client は LocalMCP と OpenAI Tunnel の間を接続するために必要です。"
     Write-Host "公式 Tunnels 管理画面のダウンロード案内: https://platform.openai.com/settings/organization/tunnels" -ForegroundColor Cyan
     Write-Host "公式リリース一覧: https://github.com/openai/tunnel-client/releases/latest" -ForegroundColor Cyan
-    Write-Host "公式配布物を workspace の外へインストールし、絶対 path を指定してから start-localmcp.bat を再実行してください。"
+    Write-Host "公式配布物を workspace の外へインストールし、絶対 path を指定してから configure-localmcp.bat を再実行してください。"
 }
 
 function Show-TunnelFailureGuide {
@@ -1204,7 +1204,7 @@ function Show-TunnelFailureGuide {
             Write-Host "Tunnel ID が存在しないか形式が正しくありません。Platform の Tunnels 管理画面から対象 ID を再確認してください。" -ForegroundColor Yellow
         }
         "profile_invalid" {
-            Write-Host "Tunnel profile が不正または変更されています。start-localmcp.bat の Tunnel 設定変更を選び、検証済み profile を再生成してください。" -ForegroundColor Yellow
+            Write-Host "Tunnel profile が不正または変更されています。configure-localmcp.bat の Tunnel 設定変更を選び、検証済み profile を再生成してください。" -ForegroundColor Yellow
         }
         "server_start_failed" {
             Write-Host "Tunnel から LocalMCP server を起動できません。config.toml、run-server.ps1、専用 Python 環境を確認してください。" -ForegroundColor Yellow
@@ -1213,7 +1213,7 @@ function Show-TunnelFailureGuide {
             Write-Host "tunnel-client を起動または実行できません。実行ファイルの path、権限、公式配布物を確認してください。" -ForegroundColor Yellow
         }
         default {
-            Write-Host "Tunnel の検証に失敗しました。tunnel-client doctor --profile-file を再実行できるよう、start-localmcp.bat から診断・再設定してください。" -ForegroundColor Yellow
+            Write-Host "Tunnel の検証に失敗しました。tunnel-client doctor --profile-file を再実行できるよう、configure-localmcp.bat から診断・再設定してください。" -ForegroundColor Yellow
         }
     }
 }
