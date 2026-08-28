@@ -4,14 +4,17 @@
 # 1. Set LOCAL_MCP_CONTEXT_EXPORT_CONFIG to this file's private local copy, or
 # 2. Place a file named `context-export.toml` beside the active LOCAL_MCP_CONFIG file.
 #
-# Keep this file outside workspace_root, data_dir, and sandbox_scratch_dir. The real local
-# config may contain a Bearer token and must not be committed to a public repository.
+# Keep the real sidecar outside workspace_root, data_dir, and sandbox_scratch_dir.
+# Symlink/junction/reparse sidecars are rejected. The active file identity is pinned at startup
+# and rechecked before each export; edit/replace it only when you intend to restart WLMCP.
+# A real local file may contain a Bearer token and must not be committed to a public repository.
 
 # Disabled by default. When disabled, export_context fails closed.
 context_export_enabled = false
 
 # Trusted-operator-selected fixed destination. The MCP tool cannot override this URL.
-# HTTPS may target any host. Loopback HTTP is allowed for local development.
+# HTTPS may target any host. Use an ASCII URL; percent-encode non-ASCII path data.
+# Loopback HTTP is allowed for local development.
 # Non-loopback plain HTTP additionally requires context_export_allow_insecure_http = true.
 context_export_endpoint = "https://example.invalid/api/context-import"
 

@@ -2,20 +2,25 @@ from __future__ import annotations
 
 import json
 import threading
+from collections.abc import Iterator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Iterator
+from typing import Any
 
 import pytest
 from pydantic import ValidationError
 
+import windows_local_mcp.context_export as context_export
 from windows_local_mcp.context_export import (
     ContextExportBroker,
     ContextExportSettings,
     LoadedContextExportConfig,
+    _assert_export_boundary,
     _audit_request_summary,
+    _finish_audit_success,
+    _verify_active_config,
     load_context_export_config,
     validate_context_export_config_location,
 )
@@ -32,7 +37,7 @@ def _receiver(
     requests: list[dict[str, Any]] = []
 
     class Handler(BaseHTTPRequestHandler):
-        def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
+        def do_POST(self) -> None:
             length = int(self.headers.get("Content-Length", "0"))
             payload = self.rfile.read(length)
             requests.append(
@@ -48,9 +53,12 @@ def _receiver(
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
-        def log_message(self, format: str, *args: object) -> None:
+        def log_message(self, _format: str, *_args: object) -> None:
             return
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -73,6 +81,20 @@ def _settings(endpoint: str, **overrides: object) -> ContextExportSettings:
     )
 
 
+def _runtime_roots(tmp_path: Path) -> SimpleNamespace:
+    workspace = tmp_path / "workspace"
+    data = tmp_path / "data"
+    scratch = tmp_path / "scratch"
+    workspace.mkdir(exist_ok=True)
+    data.mkdir(exist_ok=True)
+    scratch.mkdir(exist_ok=True)
+    return SimpleNamespace(
+        workspace_root=workspace,
+        data_dir=data,
+        sandbox_scratch_dir=scratch,
+    )
+
+
 def test_remote_plain_http_requires_explicit_downgrade() -> None:
     with pytest.raises(ValidationError, match="allow_insecure_http"):
         _settings("http://example.com/import")
@@ -91,6 +113,7 @@ def test_remote_plain_http_requires_explicit_downgrade() -> None:
         "https://user:password@example.com/import",
         "https://example.com/import#fragment",
         "https://example.com\\@127.0.0.1/import",
+        "https://example.com/日本語",
     ],
 )
 def test_endpoint_rejects_unsafe_forms(endpoint: str) -> None:
@@ -98,7 +121,17 @@ def test_endpoint_rejects_unsafe_forms(endpoint: str) -> None:
         _settings(endpoint)
 
 
-def test_https_destination_is_operator_customizable() -> None:
+def test_bearer_validation_does_not_echo_secret() -> None:
+    secret = "very-secret bearer token"
+    with pytest.raises(ValidationError) as raised:
+        _settings(
+            "https://receiver.example/import",
+            context_export_bearer_token=secret,
+        )
+    assert secret not in str(raised.value)
+
+
+def test_https_destination_is_operator_customizable_without_exposing_path() -> None:
     settings = _settings("https://context.example.test:8443/custom/import?profile=personal")
     capability = ContextExportBroker(settings).capability()
 
@@ -106,7 +139,9 @@ def test_https_destination_is_operator_customizable() -> None:
     assert capability["fixed_destination"] is True
     assert capability["endpoint"]["host"] == "context.example.test"
     assert capability["endpoint"]["port"] == 8443
-    assert "custom/import" not in canonical_json(capability)
+    serialized = canonical_json(capability)
+    assert "custom/import" not in serialized
+    assert "profile=personal" not in serialized
 
 
 def test_export_posts_bounded_payload_with_fixed_headers_and_ignores_proxy(
@@ -132,7 +167,7 @@ def test_export_posts_bounded_payload_with_fixed_headers_and_ignores_proxy(
 
     assert len(requests) == 1
     request = requests[0]
-    payload = json.loads(request["body"].decode("utf-8"))
+    payload = json.loads(request["body"].decode())
     headers = {key.casefold(): value for key, value in request["headers"].items()}
 
     assert request["path"] == "/v1/context?profile=personal"
@@ -153,21 +188,23 @@ def test_export_posts_bounded_payload_with_fixed_headers_and_ignores_proxy(
 
 
 def test_redirect_is_not_followed() -> None:
-    with _receiver() as (target_origin, target_requests):
-        with _receiver(status=302, location=f"{target_origin}/redirect-target") as (
+    with (
+        _receiver() as (target_origin, target_requests),
+        _receiver(status=302, location=f"{target_origin}/redirect-target") as (
             redirect_origin,
             redirect_requests,
-        ):
-            broker = ContextExportBroker(_settings(f"{redirect_origin}/start"))
-            with pytest.raises(RuntimeError, match="HTTP 302"):
-                broker.export(
-                    content="context",
-                    kind="context",
-                    title=None,
-                    tags=None,
-                    metadata=None,
-                    idempotency_key="redirect-test",
-                )
+        ),
+    ):
+        broker = ContextExportBroker(_settings(f"{redirect_origin}/start"))
+        with pytest.raises(RuntimeError, match="HTTP 302"):
+            broker.export(
+                content="context",
+                kind="context",
+                title=None,
+                tags=None,
+                metadata=None,
+                idempotency_key="redirect-test",
+            )
 
     assert len(redirect_requests) == 1
     assert target_requests == []
@@ -265,7 +302,7 @@ def test_generated_idempotency_key_is_ascii_and_returned() -> None:
     key.encode("ascii")
 
 
-def test_audit_summary_never_contains_exported_content() -> None:
+def test_audit_summary_never_contains_exported_context() -> None:
     summary = _audit_request_summary(
         content="highly-sensitive-context",
         kind="memory",
@@ -280,7 +317,46 @@ def test_audit_summary_never_contains_exported_content() -> None:
     assert "private title" not in serialized
     assert '"private":"metadata"' not in serialized
     assert "retry-key" not in serialized
-    assert summary["content"]["bytes"] == len("highly-sensitive-context".encode("utf-8"))
+    assert summary["content"]["bytes"] == len(b"highly-sensitive-context")
+
+
+def test_success_audit_hashes_idempotency_key() -> None:
+    class FakeAudit:
+        def __init__(self) -> None:
+            self.result_json = ""
+            self.events: list[dict[str, Any]] = []
+
+        def update_operation(self, _operation_id: str, **fields: Any) -> None:
+            self.result_json = str(fields["result_json"])
+
+        def add_event(
+            self,
+            _operation_id: str,
+            _event_type: str,
+            payload: dict[str, Any],
+        ) -> None:
+            self.events.append(payload)
+
+    audit = FakeAudit()
+    runtime = SimpleNamespace(audit=audit)
+    receipt = {
+        "export_id": "export-id",
+        "idempotency_key": "sensitive-retry-key",
+        "schema_version": 1,
+        "http_status": 200,
+        "payload_bytes": 100,
+        "content_bytes": 10,
+        "content_sha256": "0" * 64,
+    }
+    _finish_audit_success(
+        runtime,
+        "operation-id",
+        receipt=receipt,
+        audit_details={"endpoint": {"host": "receiver.example"}},
+    )
+
+    assert "sensitive-retry-key" not in audit.result_json
+    assert "sensitive-retry-key" not in canonical_json(audit.events)
 
 
 def test_sidecar_beside_main_config_is_loaded(
@@ -291,14 +367,9 @@ def test_sidecar_beside_main_config_is_loaded(
     main.write_text("workspace_root = 'placeholder'\n", encoding="utf-8")
     sidecar = tmp_path / "context-export.toml"
     sidecar.write_text(
-        "\n".join(
-            (
-                "context_export_enabled = true",
-                "context_export_endpoint = 'https://receiver.example/import'",
-                "context_export_max_bytes = 65536",
-                "",
-            )
-        ),
+        "context_export_enabled = true\n"
+        "context_export_endpoint = 'https://receiver.example/import'\n"
+        "context_export_max_bytes = 65536\n",
         encoding="utf-8",
     )
     monkeypatch.delenv("LOCAL_MCP_CONTEXT_EXPORT_CONFIG", raising=False)
@@ -319,19 +390,11 @@ def test_explicit_sidecar_selection_takes_precedence(
     main = tmp_path / "config.toml"
     main.write_text("workspace_root = 'placeholder'\n", encoding="utf-8")
     automatic = tmp_path / "context-export.toml"
-    automatic.write_text(
-        "context_export_enabled = false\n",
-        encoding="utf-8",
-    )
+    automatic.write_text("context_export_enabled = false\n", encoding="utf-8")
     explicit = tmp_path / "custom-export.toml"
     explicit.write_text(
-        "\n".join(
-            (
-                "context_export_enabled = true",
-                "context_export_endpoint = 'https://explicit.example/import'",
-                "",
-            )
-        ),
+        "context_export_enabled = true\n"
+        "context_export_endpoint = 'https://explicit.example/import'\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("LOCAL_MCP_CONFIG", str(main))
@@ -344,31 +407,77 @@ def test_explicit_sidecar_selection_takes_precedence(
     assert loaded.selection_source == "LOCAL_MCP_CONTEXT_EXPORT_CONFIG"
 
 
+def test_active_sidecar_change_fails_closed_until_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = tmp_path / "context-export.toml"
+    config.write_text(
+        "context_export_enabled = true\n"
+        "context_export_endpoint = 'https://receiver.example/import'\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LOCAL_MCP_CONTEXT_EXPORT_CONFIG", str(config))
+    loaded = load_context_export_config()
+    _verify_active_config(loaded)
+
+    config.write_text(
+        "context_export_enabled = true\n"
+        "context_export_endpoint = 'https://changed.example/import'\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PermissionError, match="restart is required"):
+        _verify_active_config(loaded)
+
+
 @pytest.mark.parametrize("root_name", ["workspace", "data", "scratch"])
 def test_context_export_config_is_rejected_inside_runtime_writable_roots(
     tmp_path: Path,
     root_name: str,
 ) -> None:
-    roots = {
-        "workspace": tmp_path / "workspace",
-        "data": tmp_path / "data",
-        "scratch": tmp_path / "scratch",
-    }
-    for root in roots.values():
-        root.mkdir()
-    config_path = roots[root_name] / "context-export.toml"
+    roots = _runtime_roots(tmp_path)
+    selected_root = {
+        "workspace": roots.workspace_root,
+        "data": roots.data_dir,
+        "scratch": roots.sandbox_scratch_dir,
+    }[root_name]
+    config_path = selected_root / "context-export.toml"
     config_path.write_text("context_export_enabled = false\n", encoding="utf-8")
     loaded = LoadedContextExportConfig(
         settings=ContextExportSettings(),
         selection_source="test",
+        config_selector_path=config_path.resolve(),
         config_path=config_path.resolve(),
         config_identity=None,
     )
-    runtime_settings = SimpleNamespace(
-        workspace_root=roots["workspace"],
-        data_dir=roots["data"],
-        sandbox_scratch_dir=roots["scratch"],
-    )
 
     with pytest.raises(ValueError, match="must be outside"):
-        validate_context_export_config_location(loaded, runtime_settings)
+        validate_context_export_config_location(loaded, roots)
+
+
+def test_control_plane_failure_blocks_export_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = _runtime_roots(tmp_path)
+    loaded = LoadedContextExportConfig(
+        settings=ContextExportSettings(),
+        selection_source="test",
+        config_selector_path=None,
+        config_path=None,
+        config_identity=None,
+    )
+    runtime = SimpleNamespace(settings=roots)
+
+    def reject_control_plane(_settings: object) -> None:
+        raise RuntimeError("tampered")
+
+    monkeypatch.setattr(
+        context_export,
+        "assert_control_plane_healthy",
+        reject_control_plane,
+    )
+
+    with pytest.raises(PermissionError, match="security preflight"):
+        _assert_export_boundary(loaded, runtime)

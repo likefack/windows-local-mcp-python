@@ -1,13 +1,12 @@
 from __future__ import annotations
 
+import http.client
 import ipaddress
 import math
 import os
-import socket
 import ssl
+import stat
 import tomllib
-import urllib.error
-import urllib.request
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,8 +17,9 @@ from mcp.server import MCPServer
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
+from .control_plane_guard import assert_control_plane_healthy
 from .redaction import redact_text
-from .tool_safety import capture_file_identity, hold_file_identity
+from .tool_safety import capture_file_identity, hold_file_identity, verify_file_identity
 from .util import canonical_json, sha256_bytes, sha256_text, utc_now_iso
 
 _CONTEXT_EXPORT_CONFIG_ENV = "LOCAL_MCP_CONTEXT_EXPORT_CONFIG"
@@ -52,9 +52,9 @@ EXTERNAL_WRITE = ToolAnnotations(
 
 
 class ContextExportSettings(BaseModel):
-    """Fail-closed settings for the optional context-export sidecar."""
+    """Fail-closed settings for the optional Context Export sidecar."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     context_export_enabled: bool = False
     context_export_endpoint: str | None = None
@@ -77,16 +77,12 @@ class ContextExportSettings(BaseModel):
             raise ValueError("context_export_endpoint must not have surrounding whitespace")
         return endpoint
 
-    @field_validator("context_export_bearer_token", mode="before")
+    @field_validator("context_export_bearer_token")
     @classmethod
-    def normalize_bearer_token(cls, value: object) -> object:
-        if value is None:
+    def validate_bearer_token(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is None or not value.get_secret_value():
             return None
-        if isinstance(value, SecretStr):
-            return value
-        if not str(value):
-            return None
-        token = str(value)
+        token = value.get_secret_value()
         if len(token) > _MAX_BEARER_TOKEN_CHARACTERS:
             raise ValueError("context export bearer token is too long")
         try:
@@ -100,7 +96,7 @@ class ContextExportSettings(BaseModel):
             raise ValueError(
                 "context export bearer token contains unsafe whitespace/control characters"
             )
-        return token
+        return value
 
     @model_validator(mode="after")
     def validate_export_policy(self) -> ContextExportSettings:
@@ -121,6 +117,7 @@ class ContextExportSettings(BaseModel):
 class LoadedContextExportConfig:
     settings: ContextExportSettings
     selection_source: str
+    config_selector_path: Path | None
     config_path: Path | None
     config_identity: dict[str, Any] | None
 
@@ -132,6 +129,10 @@ class ValidatedEndpoint:
     host: str
     port: int | None
 
+    @property
+    def request_target(self) -> str:
+        return urlunsplit(("", "", self.parts.path or "/", self.parts.query, ""))
+
     def audit_summary(self) -> dict[str, Any]:
         return {
             "scheme": self.parts.scheme,
@@ -139,19 +140,6 @@ class ValidatedEndpoint:
             "port": self.port,
             "endpoint_sha256": sha256_text(self.url),
         }
-
-
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    def redirect_request(
-        self,
-        req: urllib.request.Request,
-        fp: Any,
-        code: int,
-        msg: str,
-        headers: Any,
-        newurl: str,
-    ) -> None:
-        return None
 
 
 def _contains_control(value: str) -> bool:
@@ -171,6 +159,12 @@ def _validated_endpoint(value: str, *, allow_insecure_http: bool) -> ValidatedEn
     if not value or value != value.strip() or _contains_control(value) or "\\" in value:
         raise ValueError("context export endpoint contains unsafe characters")
     try:
+        value.encode("ascii")
+    except UnicodeEncodeError as error:
+        raise ValueError(
+            "context export endpoint must be ASCII; percent-encode non-ASCII path data"
+        ) from error
+    try:
         parts = urlsplit(value)
         port = parts.port
     except ValueError as error:
@@ -188,20 +182,13 @@ def _validated_endpoint(value: str, *, allow_insecure_http: bool) -> ValidatedEn
     if port is not None and not 1 <= port <= 65535:
         raise ValueError("context export endpoint port is out of range")
 
-    try:
-        host = parts.hostname.encode("idna").decode("ascii").casefold()
-    except UnicodeError as error:
-        raise ValueError("context export endpoint host is invalid") from error
-
+    host = parts.hostname.casefold()
     if scheme == "http" and not _is_loopback_host(host) and not allow_insecure_http:
         raise ValueError(
             "non-loopback plain HTTP requires context_export_allow_insecure_http=true"
         )
 
-    if ":" in host:
-        netloc = f"[{host}]"
-    else:
-        netloc = host
+    netloc = f"[{host}]" if ":" in host else host
     if port is not None:
         netloc = f"{netloc}:{port}"
     normalized = urlunsplit((scheme, netloc, parts.path or "/", parts.query, ""))
@@ -213,6 +200,14 @@ def _validated_endpoint(value: str, *, allow_insecure_http: bool) -> ValidatedEn
     )
 
 
+def _is_reparse(path: Path) -> bool:
+    details = path.lstat()
+    attributes = int(getattr(details, "st_file_attributes", 0))
+    return path.is_symlink() or bool(
+        attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    )
+
+
 def _explicit_or_sidecar_config_path() -> tuple[Path | None, str]:
     explicit = os.environ.get(_CONTEXT_EXPORT_CONFIG_ENV, "").strip()
     if explicit:
@@ -221,9 +216,8 @@ def _explicit_or_sidecar_config_path() -> tuple[Path | None, str]:
     main_config = os.environ.get("LOCAL_MCP_CONFIG", "").strip()
     if not main_config:
         return None, "not_configured"
-    selector = Path(main_config).expanduser().absolute()
-    candidate = selector.parent / _CONTEXT_EXPORT_SIDECAR
-    if candidate.is_file():
+    candidate = Path(main_config).expanduser().absolute().parent / _CONTEXT_EXPORT_SIDECAR
+    if candidate.exists():
         return candidate, f"{_CONTEXT_EXPORT_SIDECAR}_beside_LOCAL_MCP_CONFIG"
     return None, "not_configured"
 
@@ -234,29 +228,35 @@ def load_context_export_config() -> LoadedContextExportConfig:
         return LoadedContextExportConfig(
             settings=ContextExportSettings(),
             selection_source=selection_source,
+            config_selector_path=None,
             config_path=None,
             config_identity=None,
         )
+    if _is_reparse(selector):
+        raise ValueError("context export config must not be a symlink or reparse point")
 
     resolved = selector.resolve(strict=True)
+    if not resolved.is_file():
+        raise ValueError("context export config must be a regular file")
     identity = capture_file_identity(resolved, provenance="context-export-config")
     if int(identity.get("size", 0)) > _CONTEXT_EXPORT_CONFIG_MAX_BYTES:
         raise ValueError("context export config file exceeds 64 KiB")
+
     with hold_file_identity(identity) as held_path:
-        try:
-            selected = selector.resolve(strict=True)
-        except OSError as error:
-            raise RuntimeError("context export config selector changed during load") from error
-        if selected != held_path:
+        if selector.resolve(strict=True) != held_path:
             raise RuntimeError("context export config selector changed during load")
-        with held_path.open("rb") as source:
-            payload = tomllib.load(source)
+        try:
+            with held_path.open("rb") as source:
+                payload = tomllib.load(source)
+        except tomllib.TOMLDecodeError:
+            raise ValueError("context export config TOML is invalid") from None
         if selector.resolve(strict=True) != held_path:
             raise RuntimeError("context export config selector changed during load")
 
     return LoadedContextExportConfig(
         settings=ContextExportSettings.model_validate(payload),
         selection_source=selection_source,
+        config_selector_path=selector,
         config_path=resolved,
         config_identity=identity,
     )
@@ -284,6 +284,31 @@ def validate_context_export_config_location(
     for label, root in protected:
         if root is not None and _is_inside(loaded.config_path, root):
             raise ValueError(f"context export config must be outside {label}")
+
+
+def _verify_active_config(loaded: LoadedContextExportConfig) -> None:
+    if loaded.config_identity is None:
+        return
+    selector = loaded.config_selector_path
+    expected_path = loaded.config_path
+    if selector is None or expected_path is None:
+        raise PermissionError("context export configuration binding is incomplete")
+    try:
+        if _is_reparse(selector) or selector.resolve(strict=True) != expected_path:
+            raise PermissionError("context export configuration changed")
+        verify_file_identity(loaded.config_identity)
+    except (OSError, RuntimeError, ValueError):
+        raise PermissionError(
+            "context export configuration changed after startup; restart is required"
+        ) from None
+
+
+def _assert_export_boundary(loaded: LoadedContextExportConfig, runtime: Any) -> None:
+    try:
+        assert_control_plane_healthy(runtime.settings)
+        _verify_active_config(loaded)
+    except (OSError, RuntimeError, ValueError):
+        raise PermissionError("context export security preflight failed") from None
 
 
 def _normalize_short_text(
@@ -458,7 +483,7 @@ class ContextExportBroker:
             raise PermissionError("context export endpoint is not configured")
         if not isinstance(content, str) or not content.strip():
             raise ValueError("context export content must be non-empty text")
-        if len(content.encode("utf-8")) > self.settings.context_export_max_bytes:
+        if len(content.encode()) > self.settings.context_export_max_bytes:
             raise ValueError("context export content exceeds configured byte limit")
 
         endpoint = _validated_endpoint(
@@ -498,7 +523,7 @@ class ContextExportBroker:
                 "metadata": normalized_metadata,
             },
         }
-        body = canonical_json(payload).encode("utf-8")
+        body = canonical_json(payload).encode()
         if len(body) > self.settings.context_export_max_bytes:
             raise ValueError("serialized context export payload exceeds configured byte limit")
 
@@ -513,39 +538,14 @@ class ContextExportBroker:
         if token is not None:
             headers["Authorization"] = f"Bearer {token.get_secret_value()}"
 
-        request = urllib.request.Request(
-            endpoint.url,
-            data=body,
-            headers=headers,
-            method="POST",
-        )
-        opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({}),
-            _NoRedirectHandler(),
-            urllib.request.HTTPSHandler(context=ssl.create_default_context()),
-        )
-        try:
-            with opener.open(
-                request,
-                timeout=self.settings.context_export_timeout_seconds,
-            ) as response:
-                status = int(response.status)
-                if not 200 <= status < 300:
-                    raise RuntimeError(f"context export receiver returned HTTP {status}")
-        except urllib.error.HTTPError as error:
-            raise RuntimeError(
-                f"context export receiver returned HTTP {int(error.code)}"
-            ) from None
-        except (urllib.error.URLError, TimeoutError, socket.timeout, OSError) as error:
-            raise RuntimeError("context export transport failed") from error
-
+        status = self._post(endpoint, body, headers)
         receipt = {
             "export_id": export_id,
             "idempotency_key": normalized_idempotency_key,
             "schema_version": _CONTEXT_EXPORT_SCHEMA_VERSION,
             "http_status": status,
             "payload_bytes": len(body),
-            "content_bytes": len(content.encode("utf-8")),
+            "content_bytes": len(content.encode()),
             "content_sha256": sha256_text(content),
         }
         audit_details = {
@@ -560,6 +560,43 @@ class ContextExportBroker:
         }
         return receipt, audit_details
 
+    def _post(
+        self,
+        endpoint: ValidatedEndpoint,
+        body: bytes,
+        headers: dict[str, str],
+    ) -> int:
+        connection_class = (
+            http.client.HTTPSConnection
+            if endpoint.parts.scheme == "https"
+            else http.client.HTTPConnection
+        )
+        kwargs: dict[str, Any] = {
+            "host": endpoint.host,
+            "port": endpoint.port,
+            "timeout": self.settings.context_export_timeout_seconds,
+        }
+        if connection_class is http.client.HTTPSConnection:
+            kwargs["context"] = ssl.create_default_context()
+        connection = connection_class(**kwargs)
+        try:
+            connection.request(
+                "POST",
+                endpoint.request_target,
+                body=body,
+                headers=headers,
+            )
+            response = connection.getresponse()
+            status = int(response.status)
+        except (OSError, http.client.HTTPException):
+            raise RuntimeError("context export transport failed") from None
+        finally:
+            connection.close()
+
+        if not 200 <= status < 300:
+            raise RuntimeError(f"context export receiver returned HTTP {status}")
+        return status
+
 
 def _audit_request_summary(
     *,
@@ -573,15 +610,12 @@ def _audit_request_summary(
     return {
         "kind": redact_text(kind)[:_MAX_KIND_CHARACTERS],
         "title": (
-            {
-                "characters": len(title),
-                "sha256": sha256_text(title),
-            }
+            {"characters": len(title), "sha256": sha256_text(title)}
             if title is not None
             else None
         ),
         "content": {
-            "bytes": len(content.encode("utf-8", errors="replace")),
+            "bytes": len(content.encode(errors="replace")),
             "sha256": sha256_text(content),
         },
         "tags": {
@@ -591,9 +625,10 @@ def _audit_request_summary(
         "metadata": {
             "sha256": sha256_text(canonical_json(metadata or {})),
         },
-        "idempotency_key": (
-            sha256_text(idempotency_key) if idempotency_key else "<generated>"
+        "idempotency_key_sha256": (
+            sha256_text(idempotency_key) if idempotency_key else None
         ),
+        "idempotency_key_generated": not bool(idempotency_key),
     }
 
 
@@ -614,10 +649,15 @@ def _finish_audit_success(
     receipt: dict[str, Any],
     audit_details: dict[str, Any],
 ) -> None:
-    result = {
-        "receipt": receipt,
-        **audit_details,
+    audit_receipt = {
+        key: value
+        for key, value in receipt.items()
+        if key != "idempotency_key"
     }
+    audit_receipt["idempotency_key_sha256"] = sha256_text(
+        str(receipt["idempotency_key"])
+    )
+    result = {"receipt": audit_receipt, **audit_details}
     runtime.audit.update_operation(
         operation_id,
         status="succeeded",
@@ -628,16 +668,17 @@ def _finish_audit_success(
 
 
 def _finish_audit_failure(runtime: Any, operation_id: str, error: Exception) -> None:
-    message = redact_text(f"{type(error).__name__}: {error}")[:1000]
+    rejected = isinstance(error, (PermissionError, ValueError, TypeError))
+    status = "rejected" if rejected else "failed"
     runtime.audit.update_operation(
         operation_id,
-        status="rejected",
-        error=message,
+        status=status,
+        error=redact_text(f"{type(error).__name__}: {error}")[:1000],
         finished_at=utc_now_iso(),
     )
     runtime.audit.add_event(
         operation_id,
-        "rejected",
+        status,
         {"error_type": type(error).__name__},
     )
 
@@ -647,10 +688,8 @@ def register_context_export_tools(
     loaded: LoadedContextExportConfig,
     runtime: Any,
 ) -> None:
-    """Register the optional export surface on the production MCP server."""
+    """Register the optional Context Export surface on the production MCP server."""
 
-    if getattr(mcp, "_wlmcp_context_export_registered", False):
-        return
     validate_context_export_config_location(loaded, runtime.settings)
     broker = ContextExportBroker(loaded.settings)
 
@@ -664,6 +703,14 @@ def register_context_export_tools(
             if loaded.config_identity is not None
             else None
         )
+        try:
+            _assert_export_boundary(loaded, runtime)
+        except PermissionError:
+            result["available"] = False
+            result["security_preflight"] = "failed"
+        else:
+            result["security_preflight"] = "verified"
+
         operation_id = runtime.audit.create_operation(
             tool_name="context_export_info",
             tier="read",
@@ -700,6 +747,7 @@ def register_context_export_tools(
         )
         operation_id = _start_audit(runtime, request)
         try:
+            _assert_export_boundary(loaded, runtime)
             receipt, audit_details = broker.export(
                 content=content,
                 kind=kind,
@@ -719,5 +767,3 @@ def register_context_export_tools(
         )
         receipt["operation_id"] = operation_id
         return receipt
-
-    setattr(mcp, "_wlmcp_context_export_registered", True)
