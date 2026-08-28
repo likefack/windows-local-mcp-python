@@ -18,9 +18,12 @@ Context Export Broker は、ChatGPT を含む MCP client が現在利用でき�
 
 - `content`: 必須の本文。
 - `kind`: bounded な分類文字列。固定 enum に閉じない。
+- `scope`: optional。`global`、`project:decision-deck` 等、receiver が適用範囲を判断するための bounded な model-supplied scope。
 - `title`: 任意の短いタイトル。
+- `content_format`: `plain_text` または `markdown`。既定 `plain_text`。
 - `tags`: 任意の bounded tag list。
 - `metadata`: 任意の bounded JSON-compatible object。
+- `observed_at`: optional。元情報が観測・成立した時刻を表す timezone 付き ISO 8601 timestamp。送信時刻 `created_at` とは区別する。
 - `idempotency_key`: retry 用の任意 key。未指定時は WLMCP が生成する。
 
 tool argument に URL、host、port、path、HTTP header、proxy、Bearer token を含めません。送信先と認証は trusted operator の設定だけから決まります。
@@ -81,11 +84,11 @@ trusted operator は `context_export_endpoint` へ任意の受信先を設定で
 
 送信は Python `http.client` から configured host へ直接行い、method は `POST` 固定です。HTTPS は default trust store による通常の certificate verification を維持します。
 
-## 5. Payload schema v1
+## 5. Payload schema v2
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "export_id": "uuid",
   "idempotency_key": "caller-or-generated-key",
   "created_at": "RFC3339 UTC",
@@ -95,7 +98,10 @@ trusted operator は `context_export_endpoint` へ任意の受信先を設定で
   },
   "context": {
     "kind": "conversation_summary",
+    "scope": "project:decision-deck",
     "title": "optional title",
+    "content_format": "markdown",
+    "observed_at": "2026-08-28T11:30:00+09:00",
     "content": "text supplied by MCP client",
     "tags": ["optional"],
     "metadata": {}
@@ -113,7 +119,10 @@ caller が `metadata` 内で provenance を申告しても、それだけを根�
 
 - canonical JSON request body: 既定 256 KiB、設定可能範囲 4 KiB..4 MiB。
 - `kind`: 1..64 characters。
+- `scope`: optional、最大 256 characters。値は model-supplied hint であり authorization / trust boundary に使用しない。
 - `title`: optional、最大 512 characters。
+- `content_format`: `plain_text` / `markdown` のみ。
+- `observed_at`: optional、最大 64 characters、明示 timezone offset を含む ISO 8601 timestamp。model-supplied timestamp として扱い、WLMCP-generated `created_at` と同等の trusted clock evidence に昇格しない。
 - `tags`: 最大 32 個、各最大 128 characters。
 - `metadata`: 最大 depth 4、最大 64 entries、string 最大 4096 characters、64-bit integer、finite float のみ。
 - `idempotency_key`: optional、visible ASCII 1..128 characters。
@@ -143,6 +152,8 @@ audit へ平文保存しないもの:
 
 - exported `content`。
 - `title` の本文。
+- `scope` の本文。
+- `observed_at` の平文。
 - `tags` の本文。
 - `metadata` の本文。
 - Bearer token / Authorization header。
@@ -154,7 +165,8 @@ audit 可能なもの:
 
 - operation/export ID。
 - `kind`。
-- content/title/tags/metadata/idempotency の size/hash。
+- bounded enum である `content_format`。
+- content/title/scope/observed_at/tags/metadata/idempotency の size/hash。
 - payload byte count / SHA-256。
 - endpoint の scheme/host/port と endpoint SHA-256。
 - HTTP status または bounded error class。
@@ -186,7 +198,7 @@ Context Export Broker は次を追加しません。
 
 Decision Deck の receiver は今回の WLMCP repository では実装しません。将来 Decision Deck 側で次を実装する前提です。
 
-1. Context Export payload v1 専用 endpoint。
+1. Context Export payload v2 専用 endpoint。
 2. Bearer 等の receiver authentication。
 3. `Idempotency-Key` / payload `idempotency_key` による retry deduplication。
 4. 同一 idempotency key + 同一 payload は重複保存しない。
@@ -212,7 +224,7 @@ Decision Deck の receiver は今回の WLMCP repository では実装しませ�
 - Bearer header の固定注入と secret 非露出。
 - response body 非利用。
 - payload/field/metadata limits。
-- payload schema v1。
+- payload schema v2 と `scope` / `content_format` / `observed_at` validation。
 - idempotency key generation / preservation。
 - 2xx success / non-2xx failure。
 - exported context と idempotency key が audit に平文で残らないこと。
@@ -231,6 +243,7 @@ Context Export は既存 command execution boundary を変更しないため、�
 - ChatGPT Web の Playwright 操作。
 - ChatGPT Memory の直接列挙・dump。
 - Decision Deck Memory 正本への直接 mutation。
+- Decision Deck Memory の検索・読み取り・取得。これは将来の read-only Context/Memory connector または Decision Deck MCP の責務とする。
 - receiver discovery。
 - model 指定 URL への送信。
 - generic webhook / arbitrary HTTP client。
