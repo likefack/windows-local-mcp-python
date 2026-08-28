@@ -1,5 +1,36 @@
 # 検証記録
 
+## 2026-08-29 Secure MCP Tunnel onboarding／LocalMCP ランチャー統合
+
+### 対象と仕様変更
+
+- 対象 baseline: `09730fcb837d98532dc96ccc283a240f48de85f0`（`09730fc ランチャーのUXを改善`）。
+- 初回セットアップで ChatGPT Secure MCP Tunnel の利用を任意に設定でき、設定後は `run-localmcp.bat` が Tunnel client と LocalMCP を一つの起動経路として扱うようにした。未設定・スキップ・無効化時は、従来どおり `run-server.ps1 -Config` による LocalMCP 単体起動を維持する。
+- Tunnel ID は厳密な形式で検証し、profile は LocalMCP の専用 stdio command と完全一致する場合だけ採用する。既存 profile は内容を変更せず、安全に検証できるものだけ再利用する。
+- runtime API key は Windows のユーザー資格情報領域（Credential Manager）へ保存し、profile、state、argv、launcher の標準出力・標準エラーへ平文を出さない。プロファイル・state・client の場所、hash、config binding、process identity を起動ごとに再検証し、不一致時は fail closed とする。
+- managed profile／state の保存は staging、doctor、atomic replace、旧ファイル退避、credential/profile/state のロールバックを行う。Tunnel の起動失敗から LocalMCP 単体へ自動フォールバックしない。
+- `SECURITY_CONTRACT.md`、Approved Host、Codex Sandbox、Automatic Git の境界は変更していない。
+
+### 今回の回帰検証
+
+- Tunnel／launcher focused pytest: `27 passed in 12.46s`。
+- focused Ruff: pass（`tests/test_tunnel_integration.py`、`tests/test_local_launchers.py`、`tests/test_powershell_scripts.py`）。
+- PowerShell parser: pass（`secure-mcp-tunnel.ps1`、`setup-localmcp.ps1`、`run-localmcp.ps1`、既存の主要 launcher）。
+- Credential Manager の保存・読み出し・rotation・削除: Windows API を使った実行確認 pass。テスト出力への secret 混入なし。
+- profile 生成、`channel: main`、canonical LocalMCP command、argv と child environment の secret 分離、state/profile binding、改変時 fail closed、既存 profile の安全な候補検出: pass。
+- Python `compileall`: pass。`git diff --check`: whitespace errorなし（既存の改行コード変換 warningのみ）。
+
+### リポジトリ全体検証の制限
+
+- 全体 pytest: `649 passed, 7 skipped, 3 failed`。失敗3件は今回の Tunnel 変更対象外の並行作業差分に含まれる `src/windows_local_mcp/sandbox_backend.py` の未定義 `_NPM_*` 定数による2件と、`test_snapshot_execution_succeeds_when_bound_workspace_is_unchanged` が `running` のまま終了した1件。今回の focused suite は成功しているが、リポジトリ全体の合格状態とは扱わない。
+- 全体 Ruff: 今回の変更対象外の `src/windows_local_mcp/sandbox_backend.py` にある未定義 `_NPM_*` 定数と、既存テストの `PLR0402` により未通過。対象ファイルの focused Ruff は通過している。
+
+### Windows／外部サービス検証の境界
+
+- Windows API レベルの Credential Manager 検証は実施した。
+- この環境では `tunnel-client.exe`／`tunnel-client` を検出できなかったため、実 client の doctor／run、OpenAI control plane、ChatGPT 側の Tunnel 表示・tool refresh を通した本番相当 E2E は未実施。ローカル focused test の成功を Secure MCP Tunnel／ChatGPT の接続成功とはみなさない。
+- 実機で残る確認は、公式 client の安全な配置後に、通常の Windows user 権限で `setup-localmcp.bat` の初回設定、`run-localmcp.bat` の ready 応答、ChatGPT 側の Tunnel／tool refresh、key rotation／無効化／再設定を一続きで確認することである。
+
 ## 2026-08-28 Security Scan Round 2 post-merge targeted review
 
 ### 対象と判定

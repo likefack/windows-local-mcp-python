@@ -18,6 +18,7 @@ _SCRIPTS = (
     "verify-approved-host-authority-abnormal.ps1",
     "run-server.ps1",
     "run-approvals.ps1",
+    "secure-mcp-tunnel.ps1",
 )
 
 

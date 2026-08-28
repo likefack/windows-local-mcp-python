@@ -271,11 +271,15 @@ Public code and `config.example.toml` remain generic. Machine/private values bel
 
 ### ローカル起動ランチャー
 
-`start-localmcp.bat` は対話型セットアップの入口であり、`%LOCALAPPDATA%\WindowsLocalMCP\active-config.txt` に次回起動で使う config の絶対 path を保存します。`run-localmcp.bat` は `run-localmcp.ps1` を経由して selector または明示された第 1 引数を UTF-8 で読み、既存の `run-server.ps1 -Config <path>` へ渡します。バッチは config の中身を解釈して security setting を上書きせず、server の既存の config binding／startup validation を経由させます。
+`start-localmcp.bat` は対話型セットアップの入口であり、`%LOCALAPPDATA%\WindowsLocalMCP\active-config.txt` に次回起動で使う config の絶対 path を保存します。セットアップは任意で Secure MCP Tunnel の profile と client を検証し、config ごとの state/profile を同じ state root に保存します。`run-localmcp.bat` は `run-localmcp.ps1` を経由して selector または明示された第 1 引数を UTF-8 で読みます。Tunnel が有効な場合は、Credential Manager から Runtime API Key を実行時だけ child environment へ渡し、検証済み `tunnel-client run --profile-file <profile>` が正規の `powershell.exe -NoProfile -File <repo>\run-server.ps1 -Config <absolute config>` を一度だけ起動します。Tunnel が未設定・無効なら従来の `run-server.ps1 -Config <path>` へ直接渡します。バッチは config の中身を解釈して security setting を上書きせず、server の既存の config binding／startup validation を経由させます。
 
 1つの config と1つの server process は、1つの `workspace_root` にだけバインドされます。複数フォルダーを同時に扱う場合は、パス識別子、承認、履歴、Git、Sandbox の各境界を定義する仕様変更が必要です。現行ランチャーでは、フォルダーごとに設定を分け、明示的な `-Config` またはセットアップ画面で切り替えます。
 
 通常の server は管理者権限で起動しません。Approved Host の immutable runtime／authority service の導入、Codex Sandbox の live verification、Automatic Git の marker 作成、ADB serial の許可は、検証結果を省略しない明示的な手順として扱います。Sandbox から Approved Host への自動 fallback は行いません。
+
+Secure MCP Tunnel の導入は optional です。Tunnel ID は `tunnel_` + 32 桁の小文字 hexadecimal として入力検証し、Runtime API Key は非表示入力で受け取ります。Key 本体は config、profile、workspace、`data_dir`、Git、ログ、監査、argv、永続環境変数へ保存せず、current Windows user の Credential Manager に config path 由来の target で保存します。起動時にその credential を読み取れない場合は Tunnel 経由の起動を fail closed します。profile は `api_key: env:WLMCP_TUNNEL_RUNTIME_API_KEY` という参照だけを持ち、Tunnel の実行終了後に親プロセスの環境へ key を残しません。
+
+既存の profile/runtime 設定は、workspace、`data_dir`、リポジトリ内の executable を自動採用せず、profile の MCP command、Tunnel ID、client の実体・SHA-256 を検証したうえで非破壊に再利用できます。既存 profile を変更しない再利用では、既存の安全な `env:`／`file:`／ambient reference` をそのまま使います。新しい managed profile、Tunnel ID 変更、Key rotation、無効化、credential 削除は設定用メニューから行い、profile/state の更新は staging、doctor、atomic replacement、既存 backup、credential rollback を組み合わせます。Tunnel が設定済みで不整合な場合、Tunnel を迂回する direct-server fallback は行いません。client の path は PATH や profile の文字列だけで信用せず、実体が workspace／`data_dir`／リポジトリの外にあり、reparse point でなく、実行時 SHA-256 が state と一致する場合だけ受理します。
 
 ## 9. data_dir protection
 

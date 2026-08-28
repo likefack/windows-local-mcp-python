@@ -28,6 +28,10 @@ def main() -> None:
     timeline_parser.add_argument("--operation", default=None)
 
     subparsers.add_parser(
+        "resolve-codex-sandbox",
+        help="この Windows PC で実行可能な Codex Sandbox backend を解決",
+    )
+    subparsers.add_parser(
         "verify-codex-sandbox",
         help="この Windows PC 上で Codex Sandbox の境界を実機検証",
     )
@@ -37,6 +41,13 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+
+    if args.command == "resolve-codex-sandbox":
+        from .sandbox_backend import resolve_codex_sandbox_backend
+
+        backend = resolve_codex_sandbox_backend(load_settings())
+        print(json.dumps(backend.as_dict(), ensure_ascii=False, indent=2))
+        return
 
     if args.command == "verify-codex-sandbox":
         from .sandbox_backend import sandbox_live_verification_route_eligible

@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 
-
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -45,9 +44,18 @@ def test_run_localmcp_powershell_script_parses() -> None:
     _assert_powershell_script_parses(_REPOSITORY_ROOT / "run-localmcp.ps1")
 
 
+@pytest.mark.skipif(os.name != "nt", reason="PowerShell launcher validation is Windows-only")
+def test_secure_mcp_tunnel_helper_powershell_script_parses() -> None:
+    _assert_powershell_script_parses(_REPOSITORY_ROOT / "secure-mcp-tunnel.ps1")
+
+
 def test_start_launcher_delegates_to_setup_script() -> None:
     script = (_REPOSITORY_ROOT / "start-localmcp.bat").read_text(encoding="utf-8")
 
+    # A compatibility wrapper may delegate to the newer settings entry point;
+    # the effective entry point must still reach the same setup PowerShell.
+    if "configure-localmcp.bat" in script:
+        script = (_REPOSITORY_ROOT / "configure-localmcp.bat").read_text(encoding="utf-8")
     assert "setup-localmcp.ps1" in script
     assert "powershell.exe -NoLogo -NoProfile" in script
     assert "-ExecutionPolicy Bypass" in script
@@ -82,8 +90,30 @@ def test_setup_wizard_preserves_security_relevant_setup_contract() -> None:
     assert "操作対象フォルダーの場所" in script
     assert "PythonWindowsDownloadUrl" in script
     assert "CodexCliDocsUrl" in script
-    assert "Find-CodexCli" in script
+    assert "Resolve-CodexSandboxBackend" in script
+    assert "resolve-codex-sandbox" in script
+    assert "Set-CodexSandboxPath" in script
+    assert "approved_sandbox_codex_path" in script
+    assert "Get-Command codex.exe" not in script
+    assert "Find-CodexCli" not in script
     assert "Show-ManualConfigGuidance" in script
+    assert "secure-mcp-tunnel.ps1" in script
+    assert "Configure-TunnelIntegration" in script
+    assert "Read-TunnelRuntimeApiKeyForSetup" in script
+    assert "Save-TunnelManagedIntegration" in script
+    assert "Remove-TunnelSavedCredentialForSetup" in script
+
+
+def test_run_launcher_preserves_tunnel_fail_closed_and_direct_compatibility() -> None:
+    script = (_REPOSITORY_ROOT / "run-localmcp.ps1").read_text(encoding="utf-8-sig")
+
+    assert "Get-TunnelStatePath" in script
+    assert "Test-TunnelLocalMcpConfiguration" in script
+    assert "Test-TunnelProfileBinding" in script
+    assert "Invoke-TunnelClientDoctor" in script
+    assert "Start-TunnelClientProcess" in script
+    assert "二重起動を避けるため停止します" in script
+    assert "Tunnel を迂回" not in script
 
 
 def test_launcher_docs_explain_manual_setup_and_single_root_boundary() -> None:
@@ -95,3 +125,8 @@ def test_launcher_docs_explain_manual_setup_and_single_root_boundary() -> None:
     assert "https://www.python.org/downloads/windows/" in docs
     assert "https://developers.openai.com/codex/cli/" in docs
     assert "同じプロセスから複数フォルダーを同時に操作する機能" in docs
+    assert "Credential Manager" in docs
+    assert "start-localmcp.bat → workspace 指定 → Tunnel 設定 → 完了" in docs
+    assert "2回目以降: run-localmcp.bat" in docs
+    assert "platform.openai.com/settings/organization/tunnels" in docs
+    assert "platform.openai.com/settings/organization/api-keys" in docs

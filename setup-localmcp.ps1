@@ -10,6 +10,11 @@ $SelectorPath = Join-Path $StateRoot "active-config.txt"
 $MinimumPython = [Version]::new(3, 11)
 $PythonWindowsDownloadUrl = "https://www.python.org/downloads/windows/"
 $CodexCliDocsUrl = "https://developers.openai.com/codex/cli/"
+$TunnelHelperPath = Join-Path $ScriptRoot "secure-mcp-tunnel.ps1"
+if (-not (Test-Path -LiteralPath $TunnelHelperPath -PathType Leaf)) {
+    throw "secure-mcp-tunnel.ps1 が見つかりません。配布パッケージ全体を展開し直してください。"
+}
+. $TunnelHelperPath
 
 try {
     [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
@@ -147,7 +152,7 @@ function Show-PythonInstallGuidance {
     Write-Host "Python の公式ダウンロードページ:" -ForegroundColor Yellow
     Write-Host "  $PythonWindowsDownloadUrl" -ForegroundColor Cyan
     Write-Host "Windows 用の Python 3.11 以上をインストールし、完了後に新しく PowerShell を開いてください。"
-    Write-Host "確認できたら、この画面を閉じて start-localmcp.bat をもう一度実行します。"
+    Write-Host "確認できたら、この画面を閉じて configure-localmcp.bat をもう一度実行します。"
     Write-Host "会社や学校の PC でインストールできない場合は、管理者または PC の管理担当者に相談してください。"
 }
 
@@ -228,6 +233,8 @@ function Ensure-PythonRuntime {
 }
 
 function Read-WorkspacePath {
+    param([string]$CurrentPath = "")
+
     Write-Host ""
     Write-Host "MCP から操作したいプロジェクトのフォルダーを指定します。" -ForegroundColor Cyan
     Write-Host "場所の調べ方: エクスプローラーでそのフォルダーを開き、上のアドレスバーをクリックして Ctrl+C。"
@@ -235,8 +242,11 @@ function Read-WorkspacePath {
     Write-Host "例: C:\Users\あなたの名前\Documents\my-project" -ForegroundColor Gray
 
     while ($true) {
-        $value = (Read-Host "操作対象フォルダーの場所").Trim().Trim('"')
+        $value = (Read-Host "操作対象フォルダーの場所（空欄で現在の場所を維持）").Trim().Trim('"')
         if ([string]::IsNullOrWhiteSpace($value)) {
+            if (-not [string]::IsNullOrWhiteSpace($CurrentPath)) {
+                return [IO.Path]::GetFullPath($CurrentPath)
+            }
             Write-Warn "操作対象フォルダーの場所は必須です。"
             continue
         }
@@ -381,6 +391,7 @@ function New-ConfigContent {
     $lines.Add("powershell_enabled = false")
     $lines.Add("approved_sandbox_enabled = true")
     $lines.Add('approved_sandbox_backend = "codex_cli"')
+    $lines.Add('approved_sandbox_codex_path = ""')
     $lines.Add('approved_sandbox_windows_mode = "elevated"')
     $lines.Add('approved_sandbox_permission_profile = ":workspace"')
     $lines.Add("approved_sandbox_require_live_verification = true")
@@ -403,22 +414,34 @@ function New-ConfigContent {
 function Save-Config {
     param(
         [Parameter(Mandatory = $true)][string]$Content,
-        [Parameter(Mandatory = $true)][string]$Path
+        [Parameter(Mandatory = $true)][string]$Path,
+        [string]$PythonPath = "",
+        [switch]$AllowExistingReplacement
     )
 
     New-Item -ItemType Directory -Path (Split-Path -Parent $Path) -Force | Out-Null
-    if (Test-Path -LiteralPath $Path -PathType Leaf) {
-        $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-        $backup = "$Path.backup-$stamp"
-        Copy-Item -LiteralPath $Path -Destination $backup -ErrorAction Stop
-        Write-Info "既存設定をバックアップしました: $backup"
+    $existing = Test-Path -LiteralPath $Path -PathType Leaf
+    if ($existing -and -not $AllowExistingReplacement) {
+        throw "既存の設定を置き換えるには、設定画面で明示的に確認してください。"
     }
     $temporary = "$Path.tmp-$PID-$([Guid]::NewGuid().ToString('N'))"
     try {
         [IO.File]::WriteAllText($temporary, $Content, [Text.UTF8Encoding]::new($false))
-        Move-Item -LiteralPath $temporary -Destination $Path -Force
+        if (-not [string]::IsNullOrWhiteSpace($PythonPath)) {
+            # 置換前に新しい内容を実際の設定ローダーで検証します。失敗時は旧ファイルを触りません。
+            Test-Configuration -PythonPath $PythonPath -ConfigPath $temporary
+        }
+        if ($existing) {
+            $stamp = Get-Date -Format "yyyyMMdd-HHmmssfff"
+            $backup = "$Path.backup-$stamp-$([Guid]::NewGuid().ToString('N'))"
+            [IO.File]::Replace($temporary, $Path, $backup, $true)
+            Write-Info "既存設定をバックアップしました: $backup"
+        } else {
+            Move-Item -LiteralPath $temporary -Destination $Path -Force
+        }
+        $temporary = $null
     } finally {
-        if (Test-Path -LiteralPath $temporary) {
+        if (-not [string]::IsNullOrWhiteSpace($temporary) -and (Test-Path -LiteralPath $temporary)) {
             Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
         }
     }
@@ -475,40 +498,695 @@ function Test-Configuration {
     Write-Ok "設定ファイルの検証が完了しました。"
 }
 
-function Find-CodexCli {
-    $candidates = [System.Collections.Generic.List[string]]::new()
-    $command = Get-Command codex.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -ne $command -and $command.Source) {
-        $null = $candidates.Add($command.Source)
-    }
+function Get-TunnelConfigContext {
+    param(
+        [Parameter(Mandatory = $true)][string]$PythonPath,
+        [Parameter(Mandatory = $true)][string]$ConfigPath
+    )
 
-    $cacheRoot = Join-Path $LocalAppData "OpenAI\Codex\bin"
-    if (Test-Path -LiteralPath $cacheRoot -PathType Container) {
-        foreach ($versionDirectory in @(Get-ChildItem -LiteralPath $cacheRoot -Directory -Force -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending)) {
-            $null = $candidates.Add((Join-Path $versionDirectory.FullName "codex.exe"))
+    $context = Test-TunnelLocalMcpConfiguration -PythonPath $PythonPath -ConfigPath $ConfigPath
+    if (-not $context.Valid) {
+        throw "LocalMCP の設定を Tunnel 用に検証できません。"
+    }
+    return $context
+}
+
+function Get-TunnelForbiddenRoots {
+    param([Parameter(Mandatory = $true)][object]$Context)
+
+    return @(
+        $ScriptRoot,
+        $Context.WorkspaceRoot,
+        $Context.DataDir
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -Unique
+}
+
+function Get-TunnelStateForConfig {
+    param([Parameter(Mandatory = $true)][string]$ConfigPath)
+
+    $statePath = Get-TunnelStatePath -StateRoot $StateRoot -ConfigPath $ConfigPath
+    if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
+        return $null
+    }
+    try {
+        $state = Read-TunnelState -StatePath $statePath
+        if ($null -ne $state -and -not [string]::IsNullOrWhiteSpace([string]$state.config_path) -and
+            [IO.Path]::GetFullPath([string]$state.config_path).Equals([IO.Path]::GetFullPath($ConfigPath), [StringComparison]::OrdinalIgnoreCase)) {
+            return $state
         }
+        return $null
+    } catch {
+        Write-Warn "この config に対応する Tunnel state を安全に読み取れません。既存 state は変更しません。"
+        return $null
     }
-    $null = $candidates.Add((Join-Path $LocalAppData "Programs\OpenAI\Codex\bin\codex.exe"))
-    if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
-        $null = $candidates.Add((Join-Path $env:USERPROFILE ".codex\packages\standalone\current\bin\codex.exe"))
-        $null = $candidates.Add((Join-Path $env:USERPROFILE ".codex\packages\standalone\current\codex.exe"))
+}
+
+function Get-TunnelCurrentProcessStatus {
+    param([Parameter(Mandatory = $true)][object]$State)
+
+    try {
+        return Get-TunnelProcessStatus -PidFile ([string]$State.pid_file) -ClientPath ([string]$State.tunnel_client_path) -ProfilePath ([string]$State.profile_path)
+    } catch {
+        return [PSCustomObject]@{ Status = "indeterminate"; ProcessId = $null }
+    }
+}
+
+function Assert-TunnelNotRunning {
+    param([object]$State)
+
+    if ($null -eq $State -or [bool]$State.enabled -ne $true) {
+        return
+    }
+    $status = Get-TunnelCurrentProcessStatus -State $State
+    if ($status.Status -eq "running") {
+        throw "Tunnel が起動中です。現在の起動ウィンドウで Ctrl+C を押してから設定を変更してください。"
+    }
+    if ($status.Status -eq "indeterminate") {
+        throw "Tunnel の起動状態を安全に確認できないため、設定を変更しません。PID/profile の状態を確認してください。"
+    }
+}
+
+function Select-TunnelClient {
+    param(
+        [object]$State,
+        [Parameter(Mandatory = $true)][string[]]$ForbiddenRoots
+    )
+
+    $preferred = if ($null -ne $State) { [string]$State.tunnel_client_path } else { $null }
+    $candidates = @(Get-TunnelClientCandidates -PreferredPath $preferred -StateRoot $StateRoot -ForbiddenRoots $ForbiddenRoots)
+    if ($candidates.Count -gt 0) {
+        Write-Host "検出した tunnel-client:" -ForegroundColor Cyan
+        for ($index = 0; $index -lt $candidates.Count; $index++) {
+            Write-Host ("  {0}. {1}" -f ($index + 1), $candidates[$index].Path)
+        }
+        Write-Host "実行ファイルは workspace、data_dir、リポジトリの中から自動採用しません。" -ForegroundColor Gray
+    } else {
+        Show-TunnelClientInstallGuide
     }
 
-    foreach ($candidate in @($candidates | Select-Object -Unique)) {
+    while ($true) {
+        $prompt = if ($candidates.Count -gt 0) {
+            "使う番号、または tunnel-client.exe の絶対 path（空欄で 1 番、0 でキャンセル）"
+        } else {
+            "tunnel-client.exe の絶対 path（空欄でキャンセル）"
+        }
+        $selection = (Read-Host $prompt).Trim().Trim('"')
+        if ([string]::IsNullOrWhiteSpace($selection)) {
+            if ($candidates.Count -gt 0) { return $candidates[0] }
+            return $null
+        }
+        if ($selection -eq "0") { return $null }
+        if ($selection -match '^\d+$' -and [int]$selection -ge 1 -and [int]$selection -le $candidates.Count) {
+            return $candidates[[int]$selection - 1]
+        }
+        if (-not [IO.Path]::IsPathRooted($selection)) {
+            Write-Warn "絶対 path を指定してください。"
+            continue
+        }
         try {
-            $item = Get-Item -LiteralPath $candidate -Force -ErrorAction Stop
-            if (-not $item.PSIsContainer -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
-                return (Resolve-Path -LiteralPath $candidate).Path
-            }
+            $resolved = Resolve-TunnelExecutable -Path $selection -ForbiddenRoots $ForbiddenRoots
+            return [PSCustomObject]@{ Path = $resolved; Hash = Get-TunnelSha256 -Path $resolved }
         } catch {
-            # 候補がない、または検証できない場合は次の候補を確認します。
+            Write-Warn "指定した tunnel-client を安全に確認できません。公式配布物の path を指定してください。"
         }
     }
-    return $null
+}
+
+function Read-TunnelIdForSetup {
+    param([string]$CurrentTunnelId)
+
+    Show-TunnelOnboardingGuide
+    while ($true) {
+        $suffix = if (Test-TunnelId -TunnelId $CurrentTunnelId) { "（空欄で現在の ID を再利用）" } else { "" }
+        $value = (Read-Host "Tunnel ID $suffix").Trim()
+        if ([string]::IsNullOrWhiteSpace($value) -and (Test-TunnelId -TunnelId $CurrentTunnelId)) {
+            return $CurrentTunnelId
+        }
+        if (Test-TunnelId -TunnelId $value) {
+            return $value
+        }
+        Write-Warn "Tunnel ID は tunnel_ に続く 32 桁の小文字 hexadecimal で指定してください。"
+    }
+}
+
+function Read-TunnelRuntimeApiKeyForSetup {
+    while ($true) {
+        $secret = Read-Host "Runtime API Key（入力内容は表示されません）" -AsSecureString
+        if ($null -ne $secret -and $secret.Length -ge 8 -and $secret.Length -le 256) {
+            return $secret
+        }
+        if ($null -ne $secret) { $secret.Dispose() }
+        Write-Warn "Runtime API Key は 8～256 文字で入力してください。値そのものは表示・保存しません。"
+    }
+}
+
+function Get-TunnelSavedCredential {
+    param([Parameter(Mandatory = $true)][string]$ConfigPath)
+
+    try {
+        return Get-TunnelCredentialSecure -Target (Get-TunnelCredentialTarget -ConfigPath $ConfigPath)
+    } catch {
+        Write-Warn "保存済み Runtime API Key を安全に読み取れません。再入力が必要です。"
+        return $null
+    }
+}
+
+function Get-TunnelCredentialForSetup {
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [object]$State
+    )
+
+    $saved = $null
+    if ($null -ne $State -and [string]$State.credential_mode -eq "credential_manager") {
+        $saved = Get-TunnelSavedCredential -ConfigPath $ConfigPath
+    }
+    if ($null -ne $saved -and (Read-YesNo -Prompt "保存済みの Runtime API Key を再利用しますか" -Default $true)) {
+        return $saved
+    }
+    if ($null -ne $saved) { $saved.Dispose() }
+    return Read-TunnelRuntimeApiKeyForSetup
+}
+
+function Get-TunnelFailureClassForSetup {
+    param([Parameter(Mandatory = $true)][string]$ReasonCode)
+
+    switch ($ReasonCode) {
+        "credential_missing" { return "auth_failed" }
+        "credential_binding" { return "auth_failed" }
+        "state_incomplete" { return "profile_invalid" }
+        "state_location" { return "profile_invalid" }
+        "profile_scope" { return "profile_invalid" }
+        "profile_location" { return "profile_invalid" }
+        "profile_changed" { return "profile_invalid" }
+        "client_changed" { return "tunnel_client_unavailable" }
+        "tunnel_id_invalid" { return "tunnel_id_invalid" }
+        "config_mismatch" { return "profile_invalid" }
+        default { return "profile_invalid" }
+    }
+}
+
+function Test-TunnelIntegrationForSetup {
+    param(
+        [Parameter(Mandatory = $true)][string]$PythonPath,
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [Parameter(Mandatory = $true)][object]$Context,
+        [Parameter(Mandatory = $true)][object]$State
+    )
+
+    Assert-TunnelNotRunning -State $State
+    $forbiddenRoots = @(Get-TunnelForbiddenRoots -Context $Context)
+    $binding = Test-TunnelProfileBinding `
+        -State $State `
+        -ConfigPath $ConfigPath `
+        -ServerScript (Join-Path $ScriptRoot "run-server.ps1") `
+        -ProfileRoot (Join-Path $StateRoot "tunnel-profiles") `
+        -StateRoot $StateRoot `
+        -ForbiddenRoots $forbiddenRoots
+    if (-not $binding.Valid) {
+        Show-TunnelFailureGuide -FailureClass (Get-TunnelFailureClassForSetup -ReasonCode $binding.ReasonCode)
+        return $false
+    }
+
+    $credential = $null
+    try {
+        if ([string]$State.credential_mode -eq "credential_manager") {
+            $credential = Get-TunnelSavedCredential -ConfigPath $ConfigPath
+            if ($null -eq $credential) {
+                Show-TunnelFailureGuide -FailureClass "auth_failed"
+                return $false
+            }
+        }
+        $doctor = Invoke-TunnelClientDoctor -ClientPath $binding.ClientPath -ProfilePath $binding.ProfilePath -Credential $credential
+        if (-not $doctor.Succeeded) {
+            Show-TunnelFailureGuide -FailureClass $doctor.FailureClass
+            return $false
+        }
+        Write-Ok "既存の Tunnel profile、tunnel-client、認証参照を検証しました。"
+        return $true
+    } finally {
+        if ($null -ne $credential) { $credential.Dispose() }
+    }
+}
+
+function New-TunnelManagedState {
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [Parameter(Mandatory = $true)][string]$ProfilePath,
+        [Parameter(Mandatory = $true)][string]$ClientPath,
+        [Parameter(Mandatory = $true)][string]$TunnelId,
+        [Parameter(Mandatory = $true)][string]$PidFile,
+        [Parameter(Mandatory = $true)][string]$HealthUrlFile,
+        [Parameter(Mandatory = $true)][string]$CredentialMode,
+        [string]$CredentialTarget = "",
+        [string]$ProfileScope = "managed"
+    )
+
+    return [PSCustomObject][ordered]@{
+        version = 1
+        enabled = $true
+        config_path = [IO.Path]::GetFullPath($ConfigPath)
+        profile_path = [IO.Path]::GetFullPath($ProfilePath)
+        profile_sha256 = (Get-TunnelSha256 -Path $ProfilePath)
+        profile_scope = $ProfileScope
+        tunnel_id = $TunnelId
+        tunnel_client_path = [IO.Path]::GetFullPath($ClientPath)
+        tunnel_client_sha256 = (Get-TunnelSha256 -Path $ClientPath)
+        pid_file = [IO.Path]::GetFullPath($PidFile)
+        health_url_file = [IO.Path]::GetFullPath($HealthUrlFile)
+        credential_mode = $CredentialMode
+        credential_target = $CredentialTarget
+    }
+}
+
+function Save-TunnelManagedIntegration {
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [Parameter(Mandatory = $true)][string]$ClientPath,
+        [Parameter(Mandatory = $true)][string]$TunnelId,
+        [Parameter(Mandatory = $true)][Security.SecureString]$Credential,
+        [Parameter(Mandatory = $true)][AllowNull()][object]$PreviousState
+    )
+
+    Assert-TunnelNotRunning -State $PreviousState
+    $mutex = [Threading.Mutex]::new($false, (Get-TunnelMutexName -ConfigPath $ConfigPath))
+    $hasMutex = $false
+    $stagingPath = $null
+    $profileInstall = $null
+    $stateSave = $null
+    $oldCredential = $null
+    $credentialChanged = $false
+    try {
+        try { $hasMutex = $mutex.WaitOne(0) } catch { $hasMutex = $false }
+        if (-not $hasMutex) {
+            throw "Tunnel が別の起動処理で使用中です。現在の処理が終わってから再実行してください。"
+        }
+
+        $resolvedConfig = [IO.Path]::GetFullPath($ConfigPath)
+        $serverScript = (Resolve-Path -LiteralPath (Join-Path $ScriptRoot "run-server.ps1") -ErrorAction Stop).Path
+        $profilePath = Get-TunnelProfilePath -StateRoot $StateRoot -ConfigPath $resolvedConfig
+        $fingerprint = (Get-TunnelCredentialTarget -ConfigPath $resolvedConfig).Split('/')[-1]
+        $pidFile = Join-Path $StateRoot "tunnel-state\$fingerprint.pid"
+        $healthUrlFile = Join-Path $StateRoot "tunnel-state\$fingerprint.health-url"
+        $profileContent = New-TunnelProfileContent `
+            -TunnelId $TunnelId `
+            -ServerScript $serverScript `
+            -ConfigPath $resolvedConfig `
+            -PidFile ([IO.Path]::GetFullPath($pidFile)) `
+            -HealthUrlFile ([IO.Path]::GetFullPath($healthUrlFile))
+        $stagingPath = Write-TunnelProfileStaging -Content $profileContent -DestinationPath $profilePath
+
+        $doctor = Invoke-TunnelClientDoctor -ClientPath $ClientPath -ProfilePath $stagingPath -Credential $Credential
+        if (-not $doctor.Succeeded) {
+            Remove-TunnelStagingFile -Path $stagingPath
+            Show-TunnelFailureGuide -FailureClass $doctor.FailureClass
+            return $false
+        }
+
+        try {
+            $oldCredential = Get-TunnelCredentialSecure -Target (Get-TunnelCredentialTarget -ConfigPath $resolvedConfig)
+        } catch {
+            throw "保存済み Runtime API Key を安全に読み取れないため、既存設定を変更しません。"
+        }
+
+        $profileInstall = Install-TunnelProfileStaging -StagingPath $stagingPath -DestinationPath $profilePath
+        $stagingPath = $null
+        $credentialChanged = $true
+        Set-TunnelCredential -Target (Get-TunnelCredentialTarget -ConfigPath $resolvedConfig) -Secret $Credential
+        $state = New-TunnelManagedState `
+            -ConfigPath $resolvedConfig `
+            -ProfilePath $profilePath `
+            -ClientPath $ClientPath `
+            -TunnelId $TunnelId `
+            -PidFile $pidFile `
+            -HealthUrlFile $healthUrlFile `
+            -CredentialMode "credential_manager" `
+            -CredentialTarget (Get-TunnelCredentialTarget -ConfigPath $resolvedConfig)
+        $stateSave = Save-TunnelStateAtomic -State $state -StatePath (Get-TunnelStatePath -StateRoot $StateRoot -ConfigPath $resolvedConfig)
+        Write-Ok "Tunnel profile と設定を保存しました。API Key は Windows のユーザー資格情報領域に保存しています。"
+        return $true
+    } catch {
+        $rollbackFailed = $false
+        try {
+            if ($null -ne $stateSave) {
+                Restore-TunnelFileBackup -DestinationPath $stateSave.StatePath -BackupPath $stateSave.BackupPath
+            }
+        } catch { $rollbackFailed = $true }
+        try {
+            if ($null -ne $profileInstall) {
+                Restore-TunnelFileBackup -DestinationPath $profileInstall.DestinationPath -BackupPath $profileInstall.BackupPath
+            }
+        } catch { $rollbackFailed = $true }
+        if ($credentialChanged) {
+            try {
+                $target = Get-TunnelCredentialTarget -ConfigPath $ConfigPath
+                if ($null -ne $oldCredential) {
+                    Set-TunnelCredential -Target $target -Secret $oldCredential
+                } else {
+                    $null = Remove-TunnelCredential -Target $target
+                }
+            } catch { $rollbackFailed = $true }
+        }
+        if ($rollbackFailed) {
+            Write-Warn "自動復元の一部を確認できません。既存設定を使用せず、Tunnel の state/profile と資格情報を診断してください。"
+        }
+        throw "新しい Tunnel 設定を保存できませんでした。既存設定は可能な範囲で復元しました。"
+    } finally {
+        Remove-TunnelStagingFile -Path $stagingPath
+        if ($null -ne $oldCredential) { $oldCredential.Dispose() }
+        if ($hasMutex) { try { $mutex.ReleaseMutex() } catch { } }
+        $mutex.Dispose()
+    }
+}
+
+function Save-TunnelExternalIntegration {
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [Parameter(Mandatory = $true)][object]$Candidate,
+        [Parameter(Mandatory = $true)][string]$ClientPath,
+        [Parameter(Mandatory = $true)][AllowNull()][object]$PreviousState
+    )
+
+    Assert-TunnelNotRunning -State $PreviousState
+    $mutex = [Threading.Mutex]::new($false, (Get-TunnelMutexName -ConfigPath $ConfigPath))
+    $hasMutex = $false
+    $credential = $null
+    try {
+        try { $hasMutex = $mutex.WaitOne(0) } catch { $hasMutex = $false }
+        if (-not $hasMutex) {
+            throw "Tunnel が別の起動処理で使用中です。現在の処理が終わってから再実行してください。"
+        }
+
+        $credentialMode = "profile_reference"
+        $credentialTarget = ""
+        if ([string]$Candidate.ApiKeyReference -ieq "env:WLMCP_TUNNEL_RUNTIME_API_KEY") {
+            $credential = Get-TunnelSavedCredential -ConfigPath $ConfigPath
+            if ($null -eq $credential) {
+                Write-Info "既存 profile はこのセットアップの Credential Manager 参照を使用します。"
+                $credential = Read-TunnelRuntimeApiKeyForSetup
+            }
+            $credentialMode = "credential_manager"
+            $credentialTarget = Get-TunnelCredentialTarget -ConfigPath $ConfigPath
+        }
+
+        $doctor = Invoke-TunnelClientDoctor -ClientPath $ClientPath -ProfilePath $Candidate.Path -Credential $credential
+        if (-not $doctor.Succeeded) {
+            Show-TunnelFailureGuide -FailureClass $doctor.FailureClass
+            return $false
+        }
+
+        $fingerprint = (Get-TunnelCredentialTarget -ConfigPath $ConfigPath).Split('/')[-1]
+        $pidFile = Join-Path $StateRoot "tunnel-state\$fingerprint.pid"
+        $healthUrlFile = Join-Path $StateRoot "tunnel-state\$fingerprint.health-url"
+        $state = New-TunnelManagedState `
+            -ConfigPath $ConfigPath `
+            -ProfilePath $Candidate.Path `
+            -ClientPath $ClientPath `
+            -TunnelId ([string]$Candidate.TunnelId) `
+            -PidFile $pidFile `
+            -HealthUrlFile $healthUrlFile `
+            -CredentialMode $credentialMode `
+            -CredentialTarget $credentialTarget `
+            -ProfileScope "external"
+        $null = Save-TunnelStateAtomic -State $state -StatePath (Get-TunnelStatePath -StateRoot $StateRoot -ConfigPath $ConfigPath)
+        Write-Ok "既存 Tunnel profile を変更せず、通常起動から再利用する設定を保存しました。"
+        return $true
+    } finally {
+        if ($null -ne $credential) { $credential.Dispose() }
+        if ($hasMutex) { try { $mutex.ReleaseMutex() } catch { } }
+        $mutex.Dispose()
+    }
+}
+
+function Copy-TunnelStateForSetup {
+    param([Parameter(Mandatory = $true)][object]$State)
+    return ($State | ConvertTo-Json -Depth 8 -Compress | ConvertFrom-Json -ErrorAction Stop)
+}
+
+function Disable-TunnelIntegrationForSetup {
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [Parameter(Mandatory = $true)][object]$State
+    )
+
+    Assert-TunnelNotRunning -State $State
+    $copy = Copy-TunnelStateForSetup -State $State
+    $copy.enabled = $false
+    $null = Save-TunnelStateAtomic -State $copy -StatePath (Get-TunnelStatePath -StateRoot $StateRoot -ConfigPath $ConfigPath)
+    Write-Ok "Tunnel integration を無効にしました。profile と保存済み key は削除していません。"
+    Write-Host "次回の run-localmcp.bat は LocalMCP 単体を起動します。" -ForegroundColor Gray
+    return $copy
+}
+
+function Remove-TunnelSavedCredentialForSetup {
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [object]$State
+    )
+
+    if ($null -ne $State -and [bool]$State.enabled -eq $true) {
+        $State = Disable-TunnelIntegrationForSetup -ConfigPath $ConfigPath -State $State
+    }
+    $target = Get-TunnelCredentialTarget -ConfigPath $ConfigPath
+    try {
+        $removed = Remove-TunnelCredential -Target $target
+    } catch {
+        throw "保存済み Runtime API Key を削除できませんでした。"
+    }
+    if ($null -ne $State) {
+        $copy = Copy-TunnelStateForSetup -State $State
+        $copy.enabled = $false
+        $copy.credential_mode = "none"
+        $copy.credential_target = ""
+        $null = Save-TunnelStateAtomic -State $copy -StatePath (Get-TunnelStatePath -StateRoot $StateRoot -ConfigPath $ConfigPath)
+    }
+    if ($removed) {
+        Write-Ok "保存済み Runtime API Key を削除しました。profile は残しています。"
+    } else {
+        Write-Info "削除対象の Runtime API Key は見つかりませんでした。"
+    }
+}
+
+function Configure-NewTunnelIntegration {
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [Parameter(Mandatory = $true)][object]$Context,
+        [AllowNull()][object]$PreviousState
+    )
+
+    $forbiddenRoots = @(Get-TunnelForbiddenRoots -Context $Context)
+    $client = Select-TunnelClient -State $PreviousState -ForbiddenRoots $forbiddenRoots
+    if ($null -eq $client) {
+        Write-Info "Tunnel 設定は変更していません。LocalMCP 単体の起動は引き続き利用できます。"
+        return $false
+    }
+    $currentTunnelId = if ($null -ne $PreviousState) { [string]$PreviousState.tunnel_id } else { "" }
+    $tunnelId = Read-TunnelIdForSetup -CurrentTunnelId $currentTunnelId
+    $credential = $null
+    try {
+        $credential = Get-TunnelCredentialForSetup -ConfigPath $ConfigPath -State $PreviousState
+        return Save-TunnelManagedIntegration `
+            -ConfigPath $ConfigPath `
+            -ClientPath $client.Path `
+            -TunnelId $tunnelId `
+            -Credential $credential `
+            -PreviousState $PreviousState
+    } finally {
+        if ($null -ne $credential) { $credential.Dispose() }
+    }
+}
+
+function Configure-ExistingTunnelProfile {
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [Parameter(Mandatory = $true)][object]$Context,
+        [Parameter(Mandatory = $true)][object]$Candidate,
+        [AllowNull()][object]$PreviousState
+    )
+
+    $forbiddenRoots = @(Get-TunnelForbiddenRoots -Context $Context)
+    $client = Select-TunnelClient -State $PreviousState -ForbiddenRoots $forbiddenRoots
+    if ($null -eq $client) {
+        Write-Info "既存 profile は変更せず、Tunnel の利用設定も変更していません。"
+        return $false
+    }
+    return Save-TunnelExternalIntegration `
+        -ConfigPath $ConfigPath `
+        -Candidate $Candidate `
+        -ClientPath $client.Path `
+        -PreviousState $PreviousState
+}
+
+function Configure-TunnelIntegration {
+    param(
+        [Parameter(Mandatory = $true)][string]$PythonPath,
+        [Parameter(Mandatory = $true)][string]$ConfigPath
+    )
+
+    $context = Get-TunnelConfigContext -PythonPath $PythonPath -ConfigPath $ConfigPath
+    $state = Get-TunnelStateForConfig -ConfigPath $ConfigPath
+    $forbiddenRoots = @(Get-TunnelForbiddenRoots -Context $context)
+    Write-Title "ChatGPT Secure MCP Tunnel"
+    Write-Host "Tunnel を設定すると、以後は run-localmcp.bat から tunnel-client と LocalMCP をまとめて起動できます。"
+    Write-Host "Tunnel を使わない場合は、いつでもスキップできます。"
+
+    if ($null -ne $state -and [bool]$state.enabled -eq $true) {
+        Write-Host "現在の Tunnel 設定: $([string]$state.tunnel_id)" -ForegroundColor Cyan
+        Write-Host "profile: $([string]$state.profile_path)" -ForegroundColor Gray
+        Write-Host "1. 既存設定を検証して使用する"
+        Write-Host "2. 設定を変更する（Tunnel ID / Runtime API Key / client）"
+        Write-Host "3. 今回はスキップする"
+        Write-Host "4. Tunnel integration を無効化する"
+        Write-Host "5. 保存済み Runtime API Key を削除する"
+        Write-Host "0. 戻る"
+        $choice = (Read-Host "番号").Trim()
+        switch ($choice) {
+            "1" { return Test-TunnelIntegrationForSetup -PythonPath $PythonPath -ConfigPath $ConfigPath -Context $context -State $state }
+            "2" { return Configure-NewTunnelIntegration -ConfigPath $ConfigPath -Context $context -PreviousState $state }
+            "3" { return $true }
+            "4" { Disable-TunnelIntegrationForSetup -ConfigPath $ConfigPath -State $state | Out-Null; return $false }
+            "5" { Remove-TunnelSavedCredentialForSetup -ConfigPath $ConfigPath -State $state; return $false }
+            "0" { return $true }
+            default { throw "Tunnel 設定メニューの番号が正しくありません。" }
+        }
+    }
+
+    if ($null -ne $state -and [bool]$state.enabled -ne $true) {
+        Write-Host "Tunnel integration は現在無効です。保存済み profile は削除していません。" -ForegroundColor Gray
+        Write-Host "1. Tunnel を有効化または設定変更する"
+        Write-Host "2. 保存済み Runtime API Key を削除する"
+        Write-Host "3. 今回はスキップする"
+        Write-Host "0. 戻る"
+        $choice = (Read-Host "番号").Trim()
+        switch ($choice) {
+            "1" { return Configure-NewTunnelIntegration -ConfigPath $ConfigPath -Context $context -PreviousState $state }
+            "2" { Remove-TunnelSavedCredentialForSetup -ConfigPath $ConfigPath -State $state; return $false }
+            "3" { return $false }
+            "0" { return $false }
+            default { throw "Tunnel 設定メニューの番号が正しくありません。" }
+        }
+    }
+
+    $profiles = @(Find-TunnelProfileCandidates `
+        -StateRoot $StateRoot `
+        -ServerScript (Join-Path $ScriptRoot "run-server.ps1") `
+        -ConfigPath $ConfigPath `
+        -ForbiddenRoots $forbiddenRoots)
+    if ($profiles.Count -gt 0) {
+        Write-Host "この config と一致する既存 Tunnel profile を検出しました:" -ForegroundColor Cyan
+        for ($index = 0; $index -lt $profiles.Count; $index++) {
+            Write-Host ("  {0}. {1}  ({2})" -f ($index + 1), $profiles[$index].Path, $profiles[$index].TunnelId)
+        }
+        Write-Host "1. 既存 profile を使用する（profile 自体は変更しません）"
+        Write-Host "2. 新しい managed profile を設定する"
+        Write-Host "3. 今回はスキップする"
+        $choice = (Read-Host "番号（空欄で 1）").Trim()
+        if ([string]::IsNullOrWhiteSpace($choice)) { $choice = "1" }
+        if ($choice -eq "1") {
+            $profileIndex = 1
+            if ($profiles.Count -gt 1) {
+                $profileChoice = (Read-Host "使用する profile の番号（空欄で 1）").Trim()
+                if (-not [string]::IsNullOrWhiteSpace($profileChoice)) { $profileIndex = [int]$profileChoice }
+            }
+            if ($profileIndex -lt 1 -or $profileIndex -gt $profiles.Count) {
+                throw "profile の番号が正しくありません。"
+            }
+            return Configure-ExistingTunnelProfile `
+                -ConfigPath $ConfigPath `
+                -Context $context `
+                -Candidate $profiles[$profileIndex - 1] `
+                -PreviousState $state
+        }
+        if ($choice -eq "3") { return $false }
+        if ($choice -ne "2") { throw "Tunnel 設定メニューの番号が正しくありません。" }
+    } elseif (-not (Read-YesNo -Prompt "ChatGPT Secure MCP Tunnel を設定しますか" -Default $true)) {
+        Write-Info "Tunnel 設定をスキップしました。run-localmcp.bat は LocalMCP 単体を起動します。"
+        return $false
+    }
+
+    return Configure-NewTunnelIntegration -ConfigPath $ConfigPath -Context $context -PreviousState $state
+}
+
+function Resolve-CodexSandboxBackend {
+    param(
+        [Parameter(Mandatory = $true)][string]$PythonPath,
+        [Parameter(Mandatory = $true)][string]$ConfigPath
+    )
+
+    # セットアップは runtime と別の探索ロジックを持たず、同じ production resolver の
+    # identity、署名、helper、version 検証結果だけを表示・保存します。wrapper は Python 側で
+    # locator としてのみ扱い、実行ファイルとして返されることはありません。
+    $previousConfig = $env:LOCAL_MCP_CONFIG
+    $previousRoot = $env:LOCAL_MCP_ROOT
+    try {
+        $env:LOCAL_MCP_CONFIG = $ConfigPath
+        Remove-Item Env:LOCAL_MCP_ROOT -ErrorAction SilentlyContinue
+        $output = @(& $PythonPath -I -B -m windows_local_mcp.cli resolve-codex-sandbox 2>&1)
+        $exitCode = $LASTEXITCODE
+        if ($exitCode -ne 0) {
+            return $null
+        }
+        $jsonText = ($output | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine
+        $backend = $jsonText | ConvertFrom-Json -ErrorAction Stop
+        if ($null -eq $backend -or [string]::IsNullOrWhiteSpace([string]$backend.executable)) {
+            return $null
+        }
+        if ([string]$backend.signature_status -ne "Valid" -or
+            [string]$backend.signer_subject -notmatch "OpenAI OpCo, LLC" -or
+            @($backend.helper_dependencies).Count -eq 0) {
+            return $null
+        }
+        return $backend
+    } catch {
+        return $null
+    } finally {
+        if ($null -eq $previousConfig) {
+            Remove-Item Env:LOCAL_MCP_CONFIG -ErrorAction SilentlyContinue
+        } else {
+            $env:LOCAL_MCP_CONFIG = $previousConfig
+        }
+        if ($null -eq $previousRoot) {
+            Remove-Item Env:LOCAL_MCP_ROOT -ErrorAction SilentlyContinue
+        } else {
+            $env:LOCAL_MCP_ROOT = $previousRoot
+        }
+    }
+}
+
+function Set-CodexSandboxPath {
+    param(
+        [Parameter(Mandatory = $true)][string]$PythonPath,
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [Parameter(Mandatory = $true)][string]$NativePath
+    )
+
+    if (-not [IO.Path]::IsPathRooted($NativePath)) {
+        throw "Codex Sandbox backend の path が絶対 path ではありません。"
+    }
+    $tomlValue = ConvertTo-TomlString -Value $NativePath
+    $lines = [System.Collections.Generic.List[string]]::new()
+    [IO.File]::ReadAllLines($ConfigPath, [Text.UTF8Encoding]::new($false, $true)) |
+        ForEach-Object { $lines.Add($_) }
+    $updated = $false
+    for ($index = 0; $index -lt $lines.Count; $index++) {
+        if ($lines[$index] -match '^\s*approved_sandbox_codex_path\s*=') {
+            $lines[$index] = "approved_sandbox_codex_path = $tomlValue"
+            $updated = $true
+            break
+        }
+    }
+    if (-not $updated) {
+        $lines.Add("approved_sandbox_codex_path = $tomlValue")
+    }
+    $content = ($lines -join [Environment]::NewLine) + [Environment]::NewLine
+    Save-Config -Content $content -Path $ConfigPath -PythonPath $PythonPath -AllowExistingReplacement
 }
 
 function Show-OptionalChecks {
-    param([Parameter(Mandatory = $true)][string]$ConfigPath)
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [object]$CodexBackend
+    )
 
     $git = Find-TrustedGit
     if ($null -ne $git) {
@@ -517,15 +1195,15 @@ function Show-OptionalChecks {
         Write-Warn "Git runtime は自動設定していません。Automatic Git は明示的な path/hash と実機検証が必要です。"
     }
 
-    $codex = Find-CodexCli
-    if ($null -eq $codex) {
-        Write-Warn "Codex CLI の実行ファイルが見つかりませんでした。"
+    if ($null -eq $CodexBackend) {
+        Write-Warn "利用可能な Codex Sandbox backend を安全に解決できませんでした。"
         Write-Host "ファイルの読み書きはこのまま利用できます。Python、テスト、ビルドなどの Sandbox 経路はまだ利用できません。" -ForegroundColor Yellow
         Write-Host "導入案内（OpenAI 公式）: $CodexCliDocsUrl" -ForegroundColor Cyan
-        Write-Host "導入後に start-localmcp.bat を再実行してください。手動設定では approved_sandbox_codex_path に codex.exe の絶対パスを指定できます。"
+        Write-Host "導入後に start-localmcp.bat を再実行してください。手動設定では信頼できる native codex.exe の絶対パスを approved_sandbox_codex_path に指定できます。"
     } else {
-        Write-Info "Codex CLI の実行ファイル候補を検出しました: $codex"
-        Write-Info "実行時には署名・ハッシュ・実体の識別情報を再確認します。検出だけでは Sandbox 利用可能とは判定しません。"
+        Write-Ok "Codex Sandbox backend を検出しました: $($CodexBackend.executable)"
+        Write-Info "version: $($CodexBackend.version)。native executable と helper の署名・ハッシュ・実体の識別情報を実行時にも再確認します。"
+        Write-Info "npm wrapper は trusted executable として使用しません。"
         Write-Info "Sandbox のライブ検証は通常の操作から自動実行せず、必要時に明示します。"
     }
 
@@ -540,7 +1218,10 @@ function Show-OptionalChecks {
 }
 
 function Show-ManualConfigGuidance {
-    param([Parameter(Mandatory = $true)][string]$ConfigPath)
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [bool]$TunnelEnabled = $false
+    )
 
     Write-Host ""
     Write-Host "設定を手動で変更する場合:" -ForegroundColor Cyan
@@ -551,6 +1232,16 @@ function Show-ManualConfigGuidance {
     Write-Host "   run-localmcp.bat -Config '$ConfigPath'" -ForegroundColor Gray
     Write-Host "別の設定ファイルへ切り替える場合は、start-localmcp.bat の「既存の設定を使う」を選択します。"
     Write-Host "active-config.txt はこのウィザードが管理するため、通常は直接編集しません。"
+    $currentState = Get-TunnelStateForConfig -ConfigPath $ConfigPath
+    if ($TunnelEnabled -or ($null -ne $currentState -and [bool]$currentState.enabled -eq $true)) {
+        Write-Host ""
+        Write-Host "Secure MCP Tunnel は設定済みです。次回からは run-localmcp.bat だけで tunnel-client と LocalMCP を起動します。" -ForegroundColor Cyan
+        Write-Host "ChatGPT 側で接続が表示されない場合は、Tunnel/connector の tool refresh を行ってください。"
+    } else {
+        Write-Host ""
+        Write-Host "Secure MCP Tunnel はスキップまたは未設定です。run-localmcp.bat は従来どおり LocalMCP 単体を起動します。"
+        Write-Host "後から設定・診断する場合は、start-localmcp.bat の Tunnel 設定メニューを選んでください。"
+    }
 }
 
 try {
@@ -566,6 +1257,7 @@ try {
     } else {
         Write-Host "2. 既存の設定を使う（config.toml の場所を指定する）"
     }
+    Write-Host "3. Secure MCP Tunnel の設定・診断だけを行う（LocalMCP 設定は初期化しない）"
     Write-Host "0. 終了"
     $mode = (Read-Host "番号").Trim()
 
@@ -578,7 +1270,10 @@ try {
         $python = Ensure-PythonRuntime
         Test-Configuration -PythonPath $python.Path -ConfigPath $configPath
         Set-ActiveConfig -ConfigPath $configPath
+        $codexBackend = Resolve-CodexSandboxBackend -PythonPath $python.Path -ConfigPath $configPath
+        Show-OptionalChecks -ConfigPath $configPath -CodexBackend $codexBackend
         Write-Ok "既存設定を通常起動の対象にしました。"
+        $tunnelEnabled = Configure-TunnelIntegration -PythonPath $python.Path -ConfigPath $configPath
     } elseif ($mode -eq "1") {
         $workspacePath = Read-WorkspacePath
         $python = Ensure-PythonRuntime
@@ -588,17 +1283,29 @@ try {
         Test-Configuration -PythonPath $python.Path -ConfigPath $DefaultConfigPath
         Set-ActiveConfig -ConfigPath $DefaultConfigPath
         $configPath = $DefaultConfigPath
-        Show-OptionalChecks -ConfigPath $configPath
+        $codexBackend = Resolve-CodexSandboxBackend -PythonPath $python.Path -ConfigPath $configPath
+        if ($null -ne $codexBackend) {
+            Set-CodexSandboxPath -ConfigPath $configPath -NativePath ([string]$codexBackend.executable)
+            Test-Configuration -PythonPath $python.Path -ConfigPath $configPath
+            # 保存後の明示 path でも同じ resolver が成功することを確認してから成功表示します。
+            $codexBackend = Resolve-CodexSandboxBackend -PythonPath $python.Path -ConfigPath $configPath
+        }
+        Show-OptionalChecks -ConfigPath $configPath -CodexBackend $codexBackend
         Write-Ok "初回設定が完了しました。"
+        $tunnelEnabled = Configure-TunnelIntegration -PythonPath $python.Path -ConfigPath $configPath
+    } elseif ($mode -eq "3") {
+        $configPath = Select-ExistingConfig
+        $python = Ensure-PythonRuntime
+        Test-Configuration -PythonPath $python.Path -ConfigPath $configPath
+        Set-ActiveConfig -ConfigPath $configPath
+        $tunnelEnabled = Configure-TunnelIntegration -PythonPath $python.Path -ConfigPath $configPath
     } else {
         throw "メニューの番号が正しくありません。"
     }
 
     Write-Host ""
-    Show-ManualConfigGuidance -ConfigPath $configPath
+    Show-ManualConfigGuidance -ConfigPath $configPath -TunnelEnabled ([bool]$tunnelEnabled)
     Write-Host "次回からは run-localmcp.bat を実行してください。" -ForegroundColor Cyan
-    Write-Host "Secure MCP Tunnel には、引き続き次の明示的な起動引数を登録します:" -ForegroundColor Gray
-    Write-Host "powershell.exe -NoProfile -File `"$ScriptRoot\run-server.ps1`" -Config `"$configPath`"" -ForegroundColor Gray
     Write-Host ""
     if (Read-YesNo -Prompt "今すぐサーバーを起動しますか" -Default $true) {
         $runBatch = Join-Path $ScriptRoot "run-localmcp.bat"

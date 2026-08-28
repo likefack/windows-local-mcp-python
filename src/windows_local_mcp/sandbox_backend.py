@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -41,6 +42,22 @@ _SANDBOX_HELPERS = (
     "codex-command-runner.exe",
     "codex-windows-sandbox-setup.exe",
 )
+_NPM_SANDBOX_HELPERS = ("codex-code-mode-host.exe",)
+_NPM_CODEX_PACKAGE_NAME = "@openai/codex"
+_NPM_CODEX_WRAPPER_NAMES = ("codex.cmd", "codex.ps1", "codex")
+_NPM_WINDOWS_TARGETS = {
+    "x64": (
+        "@openai/codex-win32-x64",
+        "x86_64-pc-windows-msvc",
+        "x64",
+    ),
+    "arm64": (
+        "@openai/codex-win32-arm64",
+        "aarch64-pc-windows-msvc",
+        "arm64",
+    ),
+}
+_NPM_PACKAGE_MANIFEST_MAX_BYTES = 1024 * 1024
 _WLMCP_ISOLATION_POLICY_VERSION = 3
 _SANDBOX_STATE_POLICY_VERSION = 2
 _SANDBOX_STATE_GLOB_SCAN_MAX_DEPTH = 64
@@ -160,23 +177,285 @@ class CodexSandboxBackend:
         }
 
 
+def _path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _discovery_path_is_allowed(path: Path, settings: Settings) -> bool:
+    """Reject discovery locators and package roots controlled by MCP input roots."""
+    if not path.is_absolute():
+        return False
+    try:
+        lexical = Path(os.path.abspath(str(path)))
+        resolved = lexical.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+    roots = [settings.workspace_root, settings.data_dir]
+    if settings.sandbox_scratch_dir is not None:
+        roots.append(settings.sandbox_scratch_dir)
+    try:
+        protected_roots = [Path(root).resolve(strict=False) for root in roots]
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return not any(
+        _path_is_within(candidate, root)
+        for root in protected_roots
+        for candidate in (lexical, resolved)
+    )
+
+
+def _is_regular_non_reparse_file(path: Path) -> bool:
+    try:
+        if not path.is_file() or path.is_symlink():
+            return False
+        attributes = int(getattr(path.stat(), "st_file_attributes", 0))
+    except OSError:
+        return False
+    # FILE_ATTRIBUTE_REPARSE_POINT. The final executable is checked again by
+    # ensure_external_tool_executable and the identity capture functions.
+    return not attributes & 0x400
+
+
+def _read_npm_package_manifest(path: Path) -> dict[str, Any] | None:
+    try:
+        if not _is_regular_non_reparse_file(path):
+            return None
+        if path.stat().st_size > _NPM_PACKAGE_MANIFEST_MAX_BYTES:
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _npm_windows_target() -> tuple[str, str, str]:
+    values = (
+        os.environ.get("PROCESSOR_ARCHITEW6432"),
+        os.environ.get("PROCESSOR_ARCHITECTURE"),
+        platform.machine(),
+    )
+    for value in values:
+        if not value:
+            continue
+        normalized = re.sub(r"[^a-z0-9]", "", value.casefold())
+        if normalized in {"amd64", "x64", "x8664"}:
+            return _NPM_WINDOWS_TARGETS["x64"]
+        if normalized in {"arm64", "aarch64"}:
+            return _NPM_WINDOWS_TARGETS["arm64"]
+    raise ApprovedSandboxUnavailable("Windows native architecture is not supported by Codex npm")
+
+
+def _manifest_has_value(manifest: dict[str, Any], key: str, expected: str) -> bool:
+    values = manifest.get(key)
+    return isinstance(values, list) and expected in {str(value) for value in values}
+
+
+def _manifest_declares_codex_wrapper(manifest: dict[str, Any]) -> bool:
+    entry = manifest.get("bin")
+    if isinstance(entry, str):
+        return entry.replace("\\", "/") == "bin/codex.js"
+    return (
+        isinstance(entry, dict)
+        and str(entry.get("codex") or "").replace("\\", "/") == "bin/codex.js"
+    )
+
+
+def _validate_npm_codex_package_root(
+    package_root: Path, settings: Settings
+) -> Path | None:
+    """Resolve only the exact native path described by the official npm layout."""
+    if package_root.name.casefold() != "codex":
+        return None
+    if not _discovery_path_is_allowed(package_root, settings):
+        return None
+    manifest = _read_npm_package_manifest(package_root / "package.json")
+    if manifest is None or manifest.get("name") != _NPM_CODEX_PACKAGE_NAME:
+        return None
+    if not _manifest_declares_codex_wrapper(manifest):
+        return None
+    if not _is_regular_non_reparse_file(package_root / "bin" / "codex.js"):
+        return None
+
+    optional_dependencies = manifest.get("optionalDependencies")
+    if not isinstance(optional_dependencies, dict):
+        return None
+    try:
+        target_package, target_triple, target_cpu = _npm_windows_target()
+    except ApprovedSandboxUnavailable:
+        return None
+    if target_package not in optional_dependencies:
+        return None
+    target_package_directory = target_package.rsplit("/", 1)[-1]
+
+    target_roots = (
+        package_root / "node_modules" / "@openai" / target_package_directory,
+        package_root.parent / target_package_directory,
+    )
+    for target_root in target_roots:
+        if not _discovery_path_is_allowed(target_root, settings):
+            continue
+        target_manifest = _read_npm_package_manifest(target_root / "package.json")
+        if target_manifest is None:
+            continue
+        if target_manifest.get("name") not in {
+            _NPM_CODEX_PACKAGE_NAME,
+            target_package,
+        }:
+            continue
+        if not _manifest_has_value(target_manifest, "os", "win32"):
+            continue
+        if not _manifest_has_value(target_manifest, "cpu", target_cpu):
+            continue
+        native = target_root / "vendor" / target_triple / "bin" / "codex.exe"
+        helper = target_root / "vendor" / target_triple / "bin" / _NPM_SANDBOX_HELPERS[0]
+        if not _is_regular_non_reparse_file(native):
+            continue
+        if not _is_regular_non_reparse_file(helper):
+            continue
+        try:
+            return native.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+    return None
+
+
+def _npm_wrapper_locator_paths(settings: Settings) -> Iterator[Path]:
+    """Find npm shims as locators only; no shim is ever executed or trusted."""
+    roots: list[Path] = []
+    for raw in os.environ.get("PATH", "").split(os.pathsep):
+        value = raw.strip().strip('"')
+        if value:
+            roots.append(Path(value))
+    for name in ("APPDATA", "LOCALAPPDATA"):
+        value = os.environ.get(name)
+        if value:
+            roots.append(Path(value) / "npm")
+    user_profile = os.environ.get("USERPROFILE")
+    if user_profile:
+        roots.append(Path(user_profile) / "AppData" / "Roaming" / "npm")
+    for name in ("PROGRAMW6432", "PROGRAMFILES", "PROGRAMFILES(X86)"):
+        value = os.environ.get(name)
+        if value:
+            roots.append(Path(value) / "nodejs")
+    try:
+        roots.append(Path.home() / "AppData" / "Roaming" / "npm")
+    except (OSError, RuntimeError):
+        pass
+
+    seen: set[str] = set()
+    for root in roots:
+        if not root.is_absolute():
+            continue
+        for name in _NPM_CODEX_WRAPPER_NAMES:
+            wrapper = root / name
+            if not _is_regular_non_reparse_file(wrapper):
+                continue
+            if not _discovery_path_is_allowed(wrapper, settings):
+                continue
+            try:
+                key = os.path.normcase(str(wrapper.resolve(strict=True)))
+            except (OSError, RuntimeError):
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            yield wrapper
+
+
+def _npm_package_root_for_wrapper(wrapper: Path, settings: Settings) -> Path | None:
+    if wrapper.name.casefold() not in {name.casefold() for name in _NPM_CODEX_WRAPPER_NAMES}:
+        return None
+    if not _discovery_path_is_allowed(wrapper, settings):
+        return None
+    prefix = wrapper.parent
+    if prefix.name.casefold() == "bin":
+        prefix = prefix.parent
+    package_root = prefix / "node_modules" / "@openai" / "codex"
+    return package_root if _discovery_path_is_allowed(package_root, settings) else None
+
+
+def _iter_npm_codex_candidates(
+    settings: Settings,
+) -> Iterator[tuple[Path, str, tuple[str, ...], bool]]:
+    for wrapper in _npm_wrapper_locator_paths(settings):
+        package_root = _npm_package_root_for_wrapper(wrapper, settings)
+        if package_root is None:
+            continue
+        native = _validate_npm_codex_package_root(package_root, settings)
+        if native is None:
+            continue
+        yield native, "npm-global-codex-package", _NPM_SANDBOX_HELPERS, True
+
+
+def _looks_like_npm_codex_native_path(path: Path) -> bool:
+    try:
+        target_root = path.parent.parent.parent.parent
+    except (AttributeError, IndexError):
+        return False
+    return (
+        path.name.casefold() == "codex.exe"
+        and path.parent.name.casefold() == "bin"
+        and target_root.name.casefold().startswith("codex-win32-")
+    )
+
+
+def _validated_npm_native_path(path: Path, settings: Settings) -> Path | None:
+    if not _looks_like_npm_codex_native_path(path):
+        return None
+    target_root = path.parent.parent.parent.parent
+    possible_roots = (
+        target_root.parent / "codex",
+        target_root.parent.parent.parent,
+    )
+    seen: set[str] = set()
+    for package_root in possible_roots:
+        try:
+            key = os.path.normcase(str(package_root.resolve(strict=False)))
+        except (OSError, RuntimeError):
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        native = _validate_npm_codex_package_root(package_root, settings)
+        if native is not None and os.path.normcase(str(native)) == os.path.normcase(str(path)):
+            return native
+    return None
+
+
 def resolve_codex_sandbox_backend(settings: Settings) -> CodexSandboxBackend:
     if not settings.approved_sandbox_enabled:
         raise ApprovedSandboxUnavailable("Approved Sandbox is disabled by local policy")
     if os.name != "nt":
         raise ApprovedSandboxUnavailable("Approved Sandbox requires native Windows")
 
-    candidates: list[tuple[Path, str]] = []
+    candidates: list[tuple[Path, str, tuple[str, ...], bool]] = []
     if settings.approved_sandbox_codex_path is not None:
+        explicit_path = settings.approved_sandbox_codex_path
+        explicit_is_npm = _looks_like_npm_codex_native_path(explicit_path)
         candidates.append(
-            (settings.approved_sandbox_codex_path, "explicit-trusted-local-config")
+            (
+                explicit_path,
+                "explicit-trusted-local-config",
+                _NPM_SANDBOX_HELPERS if explicit_is_npm else _SANDBOX_HELPERS,
+                explicit_is_npm,
+            )
         )
     local_app_data = os.environ.get("LOCALAPPDATA")
     if local_app_data:
         cache_root = Path(local_app_data) / "OpenAI" / "Codex" / "bin"
         if cache_root.is_dir():
             candidates.extend(
-                (item, "openai-codex-desktop-install-root")
+                (
+                    item,
+                    "openai-codex-desktop-install-root",
+                    _SANDBOX_HELPERS,
+                    False,
+                )
                 for item in sorted(
                     cache_root.glob("*/codex.exe"),
                     key=lambda item: item.stat().st_mtime_ns,
@@ -192,6 +471,8 @@ def resolve_codex_sandbox_backend(settings: Settings) -> CodexSandboxBackend:
                 / "bin"
                 / "codex.exe",
                 "openai-codex-program-install-root",
+                _SANDBOX_HELPERS,
+                False,
             )
         )
     candidates.extend(
@@ -205,6 +486,8 @@ def resolve_codex_sandbox_backend(settings: Settings) -> CodexSandboxBackend:
                 / "bin"
                 / "codex.exe",
                 "codex-managed-standalone-root",
+                _SANDBOX_HELPERS,
+                False,
             ),
             (
                 Path.home()
@@ -214,18 +497,29 @@ def resolve_codex_sandbox_backend(settings: Settings) -> CodexSandboxBackend:
                 / "current"
                 / "codex.exe",
                 "codex-managed-standalone-root",
+                _SANDBOX_HELPERS,
+                False,
             ),
         ]
     )
+    candidates.extend(_iter_npm_codex_candidates(settings))
 
     errors: list[str] = []
     seen: set[str] = set()
-    for candidate, provenance in candidates:
+    for candidate, provenance, helper_names, requires_npm_package in candidates:
         folded = os.path.normcase(str(candidate))
         if folded in seen:
             continue
         seen.add(folded)
         try:
+            if requires_npm_package:
+                npm_native = _validated_npm_native_path(candidate, settings)
+                if npm_native is None or os.path.normcase(str(npm_native)) != os.path.normcase(
+                    str(candidate)
+                ):
+                    raise ApprovedSandboxUnavailable(
+                        "Codex npm package metadata or native target is invalid"
+                    )
             executable = Path(
                 ensure_external_tool_executable(
                     str(candidate),
@@ -240,8 +534,7 @@ def resolve_codex_sandbox_backend(settings: Settings) -> CodexSandboxBackend:
                 provenance=provenance,
             )
             helpers = tuple(
-                _resolve_codex_helper(settings, executable, name)
-                for name in _SANDBOX_HELPERS
+                _resolve_codex_helper(settings, executable, name) for name in helper_names
             )
             backend = CodexSandboxBackend(
                 executable=str(executable),

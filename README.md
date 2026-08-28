@@ -94,6 +94,25 @@ Codex CLI が見つからない場合でもファイルの読み書きは利用�
 
 MCP クライアントの標準入出力（stdio）設定は、ランチャーのバッチではなく、後述の `run-server.ps1 -Config` を明示したコマンドと引数の組み合わせを使います。詳しい挙動は [docs/LOCAL_LAUNCHERS.md](docs/LOCAL_LAUNCHERS.md) を参照してください。
 
+### Secure MCP Tunnel を使う場合
+
+初心者向けの流れは次のとおりです。
+
+```text
+初回:       start-localmcp.bat → workspace 指定 → Tunnel 設定 → 完了
+2回目以降:  run-localmcp.bat
+```
+
+初回セットアップの最後に「ChatGPT Secure MCP Tunnel を設定しますか」と表示されます。Tunnel を使わない場合はスキップでき、従来どおり LocalMCP 単体を起動できます。既存の profile／runtime が見つかった場合は、既存設定の再利用、managed profile の新規設定、スキップから選べます。正常な既存 profile を無断で上書き・削除・再生成することはありません。
+
+Tunnel ID は [OpenAI Platform の Tunnels 管理画面](https://platform.openai.com/settings/organization/tunnels) で確認または作成します。既存 Tunnel の ID をそのまま再利用でき、形式は `tunnel_` に続く 32 桁の小文字 hexadecimal です。Runtime API Key は [API Keys 画面](https://platform.openai.com/settings/organization/api-keys) で作成し、Tunnel の `Read` + `Use` だけを持つ Restricted key を選びます。キー全文は作成時にしか表示されず、後から再表示できないため、紛失時は新しいキーを作成してください。API Key を他人へ送信しないでください。
+
+入力した Runtime API Key は Windows の現在のユーザーに紐付く Credential Manager へ保存します。`config.toml`、Tunnel profile、workspace、`data_dir`、`.env`、Git、ログ、監査記録、コマンドライン、永続環境変数には保存しません。`run-localmcp.bat` の起動時だけ、検証済み `tunnel-client` の child process 環境へ渡します。
+
+Tunnel 設定後は、`run-localmcp.bat` が profile、tunnel-client の実体と SHA-256、Credential Manager、LocalMCP config、起動中プロセスを確認し、Tunnel client から現在の `run-server.ps1 -Config <absolute config>` を一度だけ起動します。Tunnel が設定済みで確認できない場合に、Tunnel を迂回して直接 server を起動する自動 fallback は行いません。ChatGPT 側で接続やツールが表示されない場合は、Tunnel／connector の tool refresh や再接続が必要になることがあります。
+
+後から変更する場合は `start-localmcp.bat` の `3. Secure MCP Tunnel の設定・診断だけを行う` を選びます。LocalMCP の workspace 設定を初期化せずに、Tunnel ID の変更、API Key の再入力・ローテーション、Tunnel の無効化、保存済み key の削除、既存 profile の診断を行えます。
+
 ## できることと、実行経路の違い
 
 処理の種類によって、操作できる範囲と確認方法が異なります。迷った場合は、ファイル操作は WLMCP Broker、テストやビルドは Codex Windows Sandbox、特別な Windows 権限が必要な処理は Approved Host を使います。
@@ -223,7 +242,7 @@ args:
   C:\path\to\config.local.toml
 ~~~
 
-Secure MCP Tunnel などで JSON を直接入力する場合も、上記の `args` を配列として指定してください。`config.local.toml` のパスは、実際に作成した絶対パスへ置き換えます。
+手動で Secure MCP Tunnel の profile を作る場合も、MCP command は上記の `powershell.exe` と引数を使い、`config.local.toml` のパスは実際に作成した絶対パスへ置き換えます。通常は `start-localmcp.bat` の Tunnel 設定を使えば profile の長いコマンドを毎回入力する必要はありません。
 
 接続後は最初に `session_info` を呼び出し、`workspace_root`、`data_dir`、transport、利用可能な capability を確認します。画面に入力欄が見えているだけでは接続確認になりません。
 
@@ -323,7 +342,7 @@ $env:LOCAL_MCP_CONFIG = 'C:\path\to\config.local.toml'
 .\run-server.ps1 -Config .\config.local.toml
 ```
 
-Secure MCP Tunnel には、コマンドを一つの Shell 文字列にせず、コマンド本体と引数を分けて登録します。
+Secure MCP Tunnel の手動 profile には、コマンドを一つの Shell 文字列にせず、コマンド本体と引数を分けて登録します。セットアップが生成する profile も、workspace を重複保存せず、この正規の `run-server.ps1 -Config` command を使用します。
 
 ```text
 powershell.exe -NoProfile -File C:\dev\windows-local-mcp-python\run-server.ps1 -Config C:\path\to\config.local.toml
@@ -628,6 +647,12 @@ Approved Host の導入・復旧は、通常の editable checkout を起動す�
 | Approved Host が unavailable または recovery required | service、immutable runtime、承認世代、postflight、durable authority state を確認し、必要な場合だけ管理者の recovery 手順を実行します |
 | ADB が拒否される | `adb.exe` の絶対 path と SHA-256、`-s SERIAL`、`adb_allowed_serials`、emulator-only 条件、固定 read grammar を確認します |
 | 承認要求が処理されない | `run-approvals.ps1` が同じ設定を使って起動しているか、要求の TTL が切れていないか、理由と manifest が表示されているかを確認します |
+| Tunnel client が見つからない | [公式 Tunnels 管理画面](https://platform.openai.com/settings/organization/tunnels) または [公式リリース](https://github.com/openai/tunnel-client/releases/latest) から用意し、workspace、`data_dir`、リポジトリの外へ置いてから `start-localmcp.bat` を再実行します |
+| Tunnel ID がない・形式エラーになる | Tunnels 管理画面で既存 Tunnel を確認または作成し、`tunnel_` + 32 桁の小文字 hexadecimal を入力します。新規作成は必須ではありません |
+| Runtime API Key がない・取得できない | API Keys 画面で Restricted key の Tunnels `Read` + `Use` を確認します。全文を紛失した既存キーは再表示できないため、新しいキーを作成して Tunnel 設定メニューでローテーションします |
+| Tunnel 認証に失敗する | key の権限、Tunnel の組織・workspace 関連付け、対象 Tunnel ID を確認します。設定済み Tunnel の問題を direct-server 起動で迂回することはありません |
+| Tunnel は起動したが ready にならない | `run-localmcp.bat` の表示、tunnel-client の公式 `doctor`、LocalMCP config、client の起動状態を確認します。ready 未確認は接続成功とは扱いません |
+| ChatGPT に Tunnel／ツールが表示されない | ChatGPT 側の workspace、Tunnel の `Read` + `Use`、connector の接続状態を確認し、必要なら tool refresh または再接続を行います |
 | Context が無効になる | sidecar のファイル名・環境変数、固定 endpoint、認証情報、サイズ上限を確認します。sidecar を変更した後はサーバーを再起動します |
 | 変更を戻せない | checkpoint の対象外である `.git`、ACL、外部サービス、ネットワーク、別プロセス、デバイスの副作用でないか、または競合が発生していないかを確認します |
 
