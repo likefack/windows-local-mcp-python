@@ -10,7 +10,8 @@
 - Final disposition: `fixed / live verified`。
 - Security code candidate: `bb66eb30a6b7a8cf3f174d576f8eaed0687eb14c`。
 - この verdict 後の commit は documentation-only sync であり、下記実機 security evidence の対象 code は上記 candidate である。
-- PR #27 は documentation sync／review のため Draft のまま保持し、explicit merge decision なしに merge しない。
+- PR #27 は 2026-08-28 に merge / closed。main merge commit は `63e3e75b4bf9fb1cf9ce8cef9c4eb1380b3e264a`。
+- 後続の PR #26 Automatic Git integration は Approved Host authority separation を保持したまま main へ統合され、最終 main merge commit は `a466f86e46a635e9390569971d6d1ee160d77dbf`。Automatic Git の実機 E2E を Approved Host の新しい release-level live verification として扱わない。
 
 pre-closure の詳細な検証履歴、過去の capability-reduction checkpoint、Security Scan Round 2 の当時判定、Codex Sandbox／WFP／その他の historical evidence は `VERIFICATION_HISTORY_PRE_R2_001_CLOSURE.md` に byte-identical blob として保存する。historical section 内の `pending`／`unresolved`／`BLOCKED` は各時点の記録であり、この current verdict を上書きしない。
 

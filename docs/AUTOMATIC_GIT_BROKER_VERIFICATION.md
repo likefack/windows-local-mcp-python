@@ -9,20 +9,24 @@ Final integrated source/test commit verified on the target Windows machine:
 - PR #26 integrated head: `926fc24a46f2d2afe0d2ddc05f32fb9c6d55dad0`
 - parent 1: prior PR #26 head `16f64b7c96093dcaa47462acc83e9b2b6231a282`
 - parent 2: current `main` at integration time `63e3e75b4bf9fb1cf9ce8cef9c4eb1380b3e264a`
-- integrated tree: `c3ccdebbbdcbea47c72cb953d337fb1315edb13c`
+- integrated source/test tree: `c3ccdebbbdcbea47c72cb953d337fb1315edb13c`
+- final PR #26 documentation-only head: `d7953aed01fcb664ce6f68db11a7c8c2e69149ec`
+- PR #26 final tree / merged main tree: `ce021bf7a468db5083632471ba92bc2954f7d62c`
+- final main merge commit: `a466f86e46a635e9390569971d6d1ee160d77dbf`
+- PR #26 state: merged / closed on 2026-08-28
 - Git-specific live marker schema: v1
 - Automatic Git command-policy generation: v5
 - Automatic Git containment-policy generation: v6
 - ordinary-operation auto verification/repair: prohibited
 - formal PR-head Windows CI run #428: PASS
+- final documentation-only PR-head Windows CI run #429: PASS after rerun; no source change between attempts
 - target-machine generic `verify-codex-sandbox`: PASS
 - target-machine `verify-git-broker`: PASS
 - target-machine MCP stdio / `session_info` / `git_info` / `execute_readonly` E2E: PASS
 - MCP protocol: `2026-07-28`
 - final E2E result: `e2e_passed=true`
-- PR state: draft / unmerged; verification completion does not authorize merge
 
-The documentation commit written after this evidence is documentation-only. The live evidence is bound to the integrated source/test tree above, not promoted to any later source change.
+The live evidence is bound to the integrated source/test tree `c3ccdebbbdcbea47c72cb953d337fb1315edb13c`. The later PR documentation-only head and final main merge commit preserve that verified source/test content while adding closure documentation.
 
 ## Problem and remediation scope
 
@@ -245,7 +249,7 @@ Final result: `e2e_passed=true`.
 
 ## Approved Host integration boundary
 
-This Automatic Git E2E does not claim to be a new Approved Host release-level live verification. Approved Host authority separation remains the separate capability introduced and verified through PR #27.
+This Automatic Git E2E does not claim to be a new Approved Host release-level live verification. Approved Host authority separation remains the separate capability introduced and verified through PR #27, which was subsequently merged to `main` as `63e3e75b4bf9fb1cf9ce8cef9c4eb1380b3e264a` before the final PR #26 integration.
 
 What PR #26 integration establishes is narrower and explicit:
 
@@ -280,7 +284,7 @@ No security-boundary weakening was introduced to recover Automatic Git availabil
 
 ## Finalization record
 
-Automatic Git remediation and current-main source integration are now verified at all required levels:
+Automatic Git remediation and current-main source integration are verified at all required levels:
 
 - source/security review: PASS
 - focused regression: PASS
@@ -289,7 +293,9 @@ Automatic Git remediation and current-main source integration are now verified a
 - final integrated-head generic Sandbox verification: PASS
 - final integrated-head Git-specific verification: PASS
 - final integrated-head model-facing Automatic Git E2E: PASS
+- PR #26 final documentation-only CI: PASS
+- PR #26 merged to `main`: PASS
 
-The live-verified integrated source/test commit is `926fc24a46f2d2afe0d2ddc05f32fb9c6d55dad0` with integrated tree `c3ccdebbbdcbea47c72cb953d337fb1315edb13c`.
+The live-verified integrated source/test commit is `926fc24a46f2d2afe0d2ddc05f32fb9c6d55dad0` with integrated source/test tree `c3ccdebbbdcbea47c72cb953d337fb1315edb13c`.
 
-PR #26 remains draft / unmerged solely because verification completion is not merge authorization. There is no remaining Automatic Git integration verification blocker recorded by this document.
+PR #26 was merged and closed on 2026-08-28. The final merge commit is `a466f86e46a635e9390569971d6d1ee160d77dbf`, and its tree `ce021bf7a468db5083632471ba92bc2954f7d62c` is identical to the final PR documentation-only head tree. There is no remaining Automatic Git integration verification or merge blocker recorded by this document.
