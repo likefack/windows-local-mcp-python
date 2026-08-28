@@ -454,6 +454,44 @@ Automatic Git E2E、Approved Host authority E2E、MCP ADB E2E、Tunnel、deploym
 - 容易に trigger できる resource exhaustion、過剰 copy／scan／hash／lock／approval
 - Sandbox から Host への automatic fallback、capability と UI 表示の不一致
 
+### 4.1 脅威の現実性と修正優先度
+
+Section 4 の対象内に入ること、または security finding が技術的に `valid` であることだけでは、その finding が
+current product で直ちに `must-fix` であることを意味しません。finding の成立判定と remediation priority は分離し、
+個人利用・single-user・local MCP という実際の脅威モデルに対して、得られる risk reduction と対策コストを比較します。
+
+各 finding では少なくとも次を評価します。
+
+- 攻撃成立前に必要な権限、principal、local code execution、Administrator 権限、trusted runtime compromise 等の前提
+- 攻撃後に新たに得られる authority、filesystem／secret access、別 principal への越境、network／device／external service 作用、永続性
+- model の誤判断、prompt injection、悪意ある workspace、一般入力、通常の user operation から attack path が到達可能か
+- timing／race window、worker kill、複数 process の協調、特殊な OS state、再起動等の前提数と再現容易性
+- confidentiality、integrity、availability への実害と、通常利用で自然発生する可能性
+- localhost／single-user product としての exposure、想定利用頻度、攻撃者がその機会を得る現実性
+- remediation に伴うコード量、状態遷移、Trusted Computing Base、privileged service／principal、依存 component の増加
+- remediation が生む性能低下、false positive、恒常的 fail-closed、UX 回帰、保守性低下、新しい故障・race・recovery mode
+- より単純な mitigation、scope reduction、検出・監査、文書化された residual risk で十分か
+
+「理論上成立する」「特殊な操作を組み合わせれば成立する」ことだけを修正根拠にせず、severity と remediation priority を
+同一視しません。特に、攻撃成立前に攻撃後と同等以上の authority を security boundary 外ですでに完全取得している必要があり、
+その exploit により privilege expansion、別 principal への越境、新しい protected-information access、未承認外部作用等が
+増えない場合は、原則として修正優先度を下げます。ただし project code、一般入力、prompt injection 等からその前提 authority
+自体を新たに獲得できる経路はこの扱いに含めません。
+
+availability／DoS finding では、攻撃者の既存権限と trigger 容易性だけでなく、対策が正常利用へ与える false positive、
+fail-closed、性能・運用停止のコストも比較します。hardening の複雑化により Trusted Computing Base や状態遷移が増え、
+元の脅威より大きい現実的な故障面を作る場合、その対策を自動的に安全側とは扱いません。
+
+remediation decision は少なくとも `must-fix`、`proportionate-fix`、`accepted-residual-risk`、`out-of-scope`、`invalid` を区別し、
+finding の技術的 validity、severity、攻撃前提、実害、remediation decision とその理由を別々に記録します。
+`accepted-residual-risk` とする場合は、成立条件、想定実害、受容理由、再評価条件を残し、継続的な product policy とする場合は
+Section 5 または関連する正本文書へ明示します。
+
+ただし Section 3 で既に必須保証として固定している境界の実証済み violation、または current route eligibility に明示的に
+必須とされている property を、費用対効果だけを理由に自動で `accepted-residual-risk` へ変更してはなりません。その保証を
+弱める必要がある場合は、現行契約、変更案、攻撃現実性、修正コスト、product complexity／availability への影響を提示し、
+trusted operator が明示的に受容した場合だけ本契約を更新します。
+
 ## 5. 対象外または受容する残存 risk
 
 次は v1 の Trusted Computing Base、明示的対象外、または trusted operator が明示的に受容した残存 risk です。
@@ -517,9 +555,10 @@ preflight が成立しない場合は Approved Host execution を fail closed �
 
 release candidate と判断するには、少なくとも次を満たします。
 
-1. 対象内の既知または新規 Security Contract violation と release-blocking な実用性回帰が残っていない。
-   Section 5 で general Sandbox に明示的に受容した workspace 内 protected-information read と LAN access は、それ自体では blocker
-   としないが、実測結果と残存 risk を隠してはならない。Automatic Git にはこの例外を適用しない。
+1. Section 3 の明示的な必須保証 violation が残っておらず、Section 4.1 の評価で `must-fix` とされた未解決 finding と
+   release-blocking な実用性回帰が残っていない。`proportionate-fix` は合意した軽減策を実装または文書化し、残存 risk と
+   再評価条件を記録する。Section 5 で general Sandbox に明示的に受容した workspace 内 protected-information read と LAN access は、
+   それ自体では blocker としないが、実測結果と残存 risk を隠してはならない。Automatic Git にはこの例外を適用しない。
 2. 修正後に security、practicality／performance、regression の独立 pass を繰り返し、2 回連続で新しい
    対象内 blocker を発見しない。
 3. full pytest、Ruff、compileall、`git diff --check` と、該当する security／structured-file／race／approval／
