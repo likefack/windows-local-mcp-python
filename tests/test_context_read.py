@@ -206,15 +206,19 @@ def test_redirect_is_not_followed() -> None:
 
 
 def test_compressed_response_is_rejected() -> None:
-    with _source(payload=[_node("node-1")], content_encoding="gzip") as (origin, _):
-        with pytest.raises(ValueError, match="compressed"):
-            ContextReadBroker(_settings(f"{origin}/api/v1/memory")).fetch()
+    with (
+        _source(payload=[_node("node-1")], content_encoding="gzip") as (origin, _),
+        pytest.raises(ValueError, match="compressed"),
+    ):
+        ContextReadBroker(_settings(f"{origin}/api/v1/memory")).fetch()
 
 
 def test_duplicate_node_ids_are_rejected() -> None:
-    with _source(payload=[_node("same"), _node("same")]) as (origin, _):
-        with pytest.raises(ValueError, match="duplicate"):
-            ContextReadBroker(_settings(f"{origin}/api/v1/memory")).fetch()
+    with (
+        _source(payload=[_node("same"), _node("same")]) as (origin, _),
+        pytest.raises(ValueError, match="duplicate"),
+    ):
+        ContextReadBroker(_settings(f"{origin}/api/v1/memory")).fetch()
 
 
 def test_response_byte_limit_is_fail_closed() -> None:
