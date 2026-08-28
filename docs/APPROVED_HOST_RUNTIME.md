@@ -4,9 +4,9 @@ Approved Host は、Codex Sandbox／Broker では満たせない処理を truste
 
 WLMCP-R2-001 は、旧 architecture で Approved Host child と worker／postflight monitor が同一 Windows user authority にあり、child が監視側を停止して postflight を回避できることを示しました。2026-08-27 に main へ入った total fail-closed は exploit containment としては有効でしたが、Approved Host の intended function を失う temporary capability reduction／product regression であり、最終 remediation ではありません。
 
-この branch の remediation candidate は monitor／postflight owner を LocalSystem service 配下へ移し、実 command だけを元の非昇格 runtime-user token で起動します。same-desktop UAC elevation は security boundary として使いません。
+現行 remediation は monitor／postflight owner を LocalSystem service 配下へ移し、実 command だけを元の非昇格 runtime-user token で起動します。same-desktop UAC elevation は security boundary として使いません。
 
-重要: source／CI 上で architecture を実装しただけでは WLMCP-R2-001 を fixed／closed としません。通常 Windows user と実際の LocalSystem service／SCM／ProgramData ACL を使った normal-path、abnormal-path、explicit recovery、recovery 後の normal-path がすべて成功するまで status は `valid / remediation implemented / Windows live verification incomplete` です。
+重要: source／CI 上で architecture を実装しただけでは WLMCP-R2-001 を fixed／closed としません。現行実装は通常 Windows user と実際の LocalSystem service／SCM／ProgramData ACL を使った normal-path、abnormal-path、explicit recovery、recovery 後の normal-pathを完了し、`fixed / live verified` と判定済みです。別環境またはsecurity boundary変更後は、その環境で再検証します。
 
 ## Production layout
 
@@ -193,6 +193,6 @@ LocalSystem authority、requester-token launch、durable state、restart recover
 
 その後、旧 authority-only recovery を実行すると SYSTEM `active.json` は正常に archive／clear された一方、user-owned `approved-host-postflight-pending.json` が残り、post-recovery normal operation が `assert_control_plane_healthy()` で拒否される lifecycle gap を実機で検出しました。これは security latch が失敗したのではなく、explicit recovery が二つの durable latch を一体で解除できず intended Approved Host availability を回復できない product/recovery defect でした。
 
-現在の candidate は coordinated recovery、digest／stable-identity-bound postflight quarantine、interruption resume、historical split-recovery compatibility を追加しています。この新 recovery implementation について CI と実 Windows の compatibility recovery、再度の abnormal → coordinated recovery → post-recovery normal path が成功するまでは WLMCP-R2-001 を `fixed / closed` としません。
+現行実装は coordinated recovery、digest／stable-identity-bound postflight quarantine、interruption resume、historical split-recovery compatibility を追加しています。CIに加えて、実Windowsの fresh abnormal → coordinated recovery → post-recovery normal pathが成功済みです。現行判定と検証範囲は `VERIFICATION.md` を正本とします。
 
 R2-001 専用 live verifier は別 finding WLMCP-R3-002 の `workspace_write=false` materialization 経路に依存しないよう、non-project-controlled command を `workspace_write=true` で実行します。

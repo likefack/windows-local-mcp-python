@@ -131,19 +131,15 @@ Target host evidence:
 - build 26200, UBR 9168, amd64
 - Codex Sandbox backend `0.150.0-alpha.8`
 - sandbox account `CodexSandboxOffline`
-- sandbox SID `S-1-5-21-1787218830-4025776409-3138769905-1004`
-- pinned Git runtime `C:\Program Files\Git\mingw64\bin\git.exe`
-- Git SHA-256 `fe0e064c8283dc50b1ce11a8b90d2ec1b68b5dc714ff0b8a8534bb9c43d1d02e`
+- sandbox SID は検証時の専用Sandbox accountと完全一致（生値は保存しない）
+- pinned Git runtimeのstable executable identityとSHA-256を取得・保持（機械固有のpathと生値は保存しない）
 
 ## Final integrated-head generic Sandbox verification
 
 `verify-codex-sandbox` generated current schema-v5 evidence at:
 
 - `verified_at`: `2026-08-28T00:57:12.754146+00:00`
-- backend digest: `0611a127ce15997800d7098caac9d50e38593247c61acb443d8a45e6988f55eb`
-- isolation context digest: `055385cfc8d7880fa9e10c47d022b210d2ef9bbaf0d28009ca035de37431485f`
-- guard implementation digest: `f6a5485c0a8d00af8ea58f1154ff5fabf0ccd30de393c5c017255680e91af0fd`
-- WFP guard binding digest: `cdefcbe60c0508a6bae550c1b6c4b4846a3c0cbdfeebf49308a18ad4b399f71a`
+- backend、isolation context、guard implementation、WFP guard bindingの各digestを取得し相互bindingを検証（生値は保存しない）
 - `passed=true`
 - `route_eligible=true`
 
@@ -175,13 +171,10 @@ This preserves the mandatory Job-external process-creation denial used by the Sa
 - `verified_at`: `2026-08-28T00:58:13.594831+00:00`
 - command-policy generation: v5
 - containment-policy generation: v6
-- exact Git runtime: `C:\Program Files\Git\mingw64\bin\git.exe`
-- Git SHA-256: `fe0e064c8283dc50b1ce11a8b90d2ec1b68b5dc714ff0b8a8534bb9c43d1d02e`
+- exact Git runtime: configured executableのstable identityとSHA-256にbinding（機械固有のpathと生値は保存しない）
 - Git process cwd policy: `trusted-executable-directory-before-fixed--C`
 - required subcommands: builtins
-- containment policy digest: `dcf380f9819a042338dd1793db43471fb58cf9c9cf3b97f51d9ceb22a344788d`
-- generic Sandbox live-evidence digest: `2316878cd74716dd3e1c057830921a2df606b466e0c9d6d2717e19fcaacdfdd9`
-- Git verification context digest: `bba7526a774efeef606320cbe4155af3102ac5633a0a874aef610b4c39904a2c`
+- containment policy、generic Sandbox live evidence、Git verification contextの各digestを取得し相互bindingを検証（生値は保存しない）
 - source workspace access: `deny`
 - execution input: `sanitized-disposable-repository-snapshot`
 - network: `deny`
@@ -205,16 +198,16 @@ A real MCP stdio client/server pair negotiated protocol `2026-07-28` against the
 - windows_live_verified: `true`
 - verification scope: `git-specific-live-marker`
 - provenance: `explicit-local-config`
-- Git SHA-256: `fe0e064c8283dc50b1ce11a8b90d2ec1b68b5dc714ff0b8a8534bb9c43d1d02e`
+- Git executable identity: live markerと実行時のstable identity／SHA-256が一致
 
 `git_info` succeeded:
 
-- operation id: `f46e373e-62a2-4e33-b0cf-621125b52831`
+- operation id: 監査記録へ保存済み（生値は保存しない）
 - snapshot bytes: `15540`
 
 `execute_readonly git status --short` succeeded:
 
-- operation id: `6673b80f-71fa-407f-a9ad-3d2bd5021a73`
+- operation id: 監査記録へ保存済み（生値は保存しない）
 - status: `succeeded`
 - exit code: `0`
 - stdout: empty
@@ -222,20 +215,18 @@ A real MCP stdio client/server pair negotiated protocol `2026-07-28` against the
 - Git Broker sandbox: `git-live-verified-codex-windows-sandbox`
 - source workspace access: `deny`
 - host fallback performed: `false`
-- containment policy digest: `dcf380f9819a042338dd1793db43471fb58cf9c9cf3b97f51d9ceb22a344788d`
-- repository snapshot digest: `ccab0a994f2247388ec7450d04b533dc887b5d11f61c930a38610c81ced59457`
+- containment policyとrepository snapshotのdigest bindingを検証（生値は保存しない）
 
 `execute_readonly git diff --stat` succeeded with the same containment and repository snapshot binding:
 
-- operation id: `4c25552f-7640-429d-8fa5-bad25bfdb60a`
+- operation id: 監査記録へ保存済み（生値は保存しない）
 - status: `succeeded`
 - exit code: `0`
 - stdout: empty
 - execution tier: `broker`
 - source workspace access: `deny`
 - host fallback performed: `false`
-- containment policy digest: `dcf380f9819a042338dd1793db43471fb58cf9c9cf3b97f51d9ceb22a344788d`
-- repository snapshot digest: `ccab0a994f2247388ec7450d04b533dc887b5d11f61c930a38610c81ced59457`
+- containment policyとrepository snapshotのdigest bindingを検証（生値は保存しない）
 
 The empty status/diff-stat output confirms that the sanitized projection did not reintroduce false EOL dirtiness on this target machine.
 

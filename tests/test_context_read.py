@@ -5,12 +5,24 @@ import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from pydantic import ValidationError
 
-from windows_local_mcp.context_read import ContextReadBroker, ContextReadSettings
+from windows_local_mcp.context_read import (
+    ContextReadBroker,
+    ContextReadSettings,
+    DecisionDeckMemoryNode,
+    LoadedContextReadConfig,
+    _assert_read_boundary,
+    _finish_audit_failure,
+    _verify_active_config,
+    load_context_read_config,
+    validate_context_read_config_location,
+)
 from windows_local_mcp.util import canonical_json
 
 
@@ -96,6 +108,17 @@ def _settings(endpoint: str, **overrides: object) -> ContextReadSettings:
         context_read_enabled=True,
         context_read_endpoint=endpoint,
         **overrides,
+    )
+
+
+def _runtime_roots(tmp_path: Path) -> SimpleNamespace:
+    roots = {name: tmp_path / name for name in ("workspace", "data", "scratch")}
+    for path in roots.values():
+        path.mkdir()
+    return SimpleNamespace(
+        workspace_root=roots["workspace"],
+        data_dir=roots["data"],
+        sandbox_scratch_dir=roots["scratch"],
     )
 
 
@@ -239,3 +262,117 @@ def test_disabled_read_fails_closed() -> None:
     broker = ContextReadBroker(ContextReadSettings())
     with pytest.raises(PermissionError, match="disabled"):
         broker.fetch()
+
+
+def test_sidecar_is_bound_and_change_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    main = tmp_path / "config.toml"
+    main.write_text("workspace_root = 'placeholder'\n", encoding="utf-8")
+    sidecar = tmp_path / "context-read.toml"
+    sidecar.write_text(
+        "context_read_enabled = true\n"
+        "context_read_endpoint = 'https://memory.example/api/v1/memory'\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("LOCAL_MCP_CONTEXT_READ_CONFIG", raising=False)
+    monkeypatch.setenv("LOCAL_MCP_CONFIG", str(main))
+
+    loaded = load_context_read_config()
+    assert loaded.config_path == sidecar.resolve()
+    _verify_active_config(loaded)
+
+    sidecar.write_text("context_read_enabled = false\n", encoding="utf-8")
+    with pytest.raises(PermissionError, match="restart is required"):
+        _verify_active_config(loaded)
+
+
+@pytest.mark.parametrize("root_name", ["workspace", "data", "scratch"])
+def test_context_read_config_is_rejected_inside_runtime_writable_roots(
+    tmp_path: Path,
+    root_name: str,
+) -> None:
+    roots = _runtime_roots(tmp_path)
+    selected = {
+        "workspace": roots.workspace_root,
+        "data": roots.data_dir,
+        "scratch": roots.sandbox_scratch_dir,
+    }[root_name]
+    config = selected / "context-read.toml"
+    config.write_text("context_read_enabled = false\n", encoding="utf-8")
+    loaded = LoadedContextReadConfig(
+        settings=ContextReadSettings(),
+        selection_source="test",
+        config_selector_path=config.resolve(),
+        config_path=config.resolve(),
+        config_identity=None,
+    )
+
+    with pytest.raises(ValueError, match="must be outside"):
+        validate_context_read_config_location(loaded, roots)
+
+
+def test_control_plane_failure_blocks_context_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from windows_local_mcp import context_read
+
+    roots = _runtime_roots(tmp_path)
+    loaded = LoadedContextReadConfig(
+        settings=ContextReadSettings(),
+        selection_source="test",
+        config_selector_path=None,
+        config_path=None,
+        config_identity=None,
+    )
+
+    def reject_control_plane(_settings: object) -> None:
+        raise RuntimeError("tampered")
+
+    monkeypatch.setattr(context_read, "assert_control_plane_healthy", reject_control_plane)
+    with pytest.raises(PermissionError, match="security preflight"):
+        _assert_read_boundary(loaded, SimpleNamespace(settings=roots))
+
+
+def test_rejected_node_does_not_echo_private_fields() -> None:
+    private_title = "private-memory-title-" * 20
+    payload = _node("node-private", title=private_title)
+
+    with pytest.raises(ValidationError) as raised:
+        DecisionDeckMemoryNode.model_validate(payload)
+
+    assert private_title not in str(raised.value)
+    assert "input_value=" not in str(raised.value)
+
+
+def test_failure_audit_stores_only_error_class() -> None:
+    private_value = "private-memory-title"
+
+    class FakeAudit:
+        def __init__(self) -> None:
+            self.error = ""
+            self.events: list[dict[str, Any]] = []
+
+        def update_operation(self, _operation_id: str, **fields: Any) -> None:
+            self.error = str(fields["error"])
+
+        def add_event(
+            self,
+            _operation_id: str,
+            _event_type: str,
+            payload: dict[str, Any],
+        ) -> None:
+            self.events.append(payload)
+
+    audit = FakeAudit()
+    runtime = type("Runtime", (), {"audit": audit})()
+    _finish_audit_failure(
+        runtime,
+        "operation-id",
+        ValueError(f"invalid remote node: {private_value}"),
+    )
+
+    assert audit.error == "ValueError"
+    assert private_value not in canonical_json(audit.events)

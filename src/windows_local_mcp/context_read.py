@@ -132,7 +132,9 @@ FolderName = Annotated[str, Field(min_length=1, max_length=120)]
 class DecisionDeckMemoryNode(BaseModel):
     """Bounded subset of the Decision Deck MemoryNodeRead response contract."""
 
-    model_config = ConfigDict(extra="ignore")
+    # The source body may contain durable private context. Validation errors must never
+    # echo rejected field values into MCP errors or the durable audit trail.
+    model_config = ConfigDict(extra="ignore", hide_input_in_errors=True)
 
     node_id: ShortId | None = None
     path: str = Field(min_length=1, max_length=500, pattern=r"^[a-z0-9][a-z0-9/_-]*$")
@@ -576,7 +578,9 @@ def _finish_audit_failure(runtime: Any, operation_id: str, error: Exception) -> 
     runtime.audit.update_operation(
         operation_id,
         status=status,
-        error=redact_text(f"{type(error).__name__}: {error}")[:1000],
+        # Validator and transport messages may contain untrusted Memory fragments.
+        # The bounded exception class is sufficient for durable failure triage.
+        error=redact_text(type(error).__name__)[:1000],
         finished_at=utc_now_iso(),
     )
     runtime.audit.add_event(operation_id, status, {"error_type": type(error).__name__})

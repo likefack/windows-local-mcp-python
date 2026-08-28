@@ -35,9 +35,9 @@ trusted operator はこの対処を product concept に反するとして拒否�
 - abnormal state は explicit reviewed recovery まで fail closed に残し、recovery 後は正常 Approved Host operation が再び成立することまで検証対象とします。
 - 将来の agent は旧全面停止状態を precedent として別 finding に capability reduction を適用してはなりません。
 
-## Current root-remediation candidate
+## Current root remediation
 
-この branch では上記 operator decision に従い、Approved Host を停止するのではなく authority boundary を変更しています。
+現行 main は上記 operator decision に従い、Approved Host を停止するのではなく authority boundary を変更しています。
 
 - monitor／postflight worker は LocalSystem service `WindowsLocalMCPApprovedHost` 配下で実行する。
 - 実 Approved Host command は、verified named-pipe requester の元の非昇格 Windows user token を `CreateProcessAsUserW` で使用する。child を SYSTEM に昇格しない。
@@ -53,9 +53,9 @@ trusted operator はこの対処を product concept に反するとして拒否�
 - recovery ordering は postflight marker quarantine を `active.json` 削除より先に行い、SYSTEM `active.json` を最後に消す。marker mismatch／missing／race では authority latch を残して fail closed にする。
 - recovery が postflight quarantine 後に中断しても digest-bound quarantine から再開可能とし、recovery failure で authority service を停止したまま残さない。
 
-この architecture は source／tests 上で実装されていても、実 Windows の SCM DACL、ProgramData DACL、process/thread/token access、requester-token child authority、WMI job-external helper、worker kill、service restart、coordinated recovery、recovery 後の normal operation を live verification するまでは受容済み root fix ではありません。
+この architecture は source／tests 上の実装だけでは受容せず、実 Windows の SCM DACL、ProgramData DACL、process/thread/token access、requester-token child authority、WMI job-external helper、worker kill、service restart、coordinated recovery、recovery 後の normal operation まで live verification しました。
 
-Current status は `valid / remediation implemented / Windows recovery lifecycle re-verification pending` とします。全 lifecycle 成功前に `fixed`／`closed` と記録したり main へ merge したりしません。
+Current status は `fixed / live verified` です。実証済み環境と証拠の範囲、別環境・security boundary変更時の再検証条件は `VERIFICATION.md` を正本とします。
 
 ## セキュリティ修正時の判断手順
 
@@ -109,7 +109,7 @@ GitHub Hosted Windows の unit/integration test はこの OS-level live evidence
 
 その後、旧 `recover-approved-host-authority.ps1` で SYSTEM latch だけを explicit recovery すると、`active.json`／`active-status.json` と service state は正常に回復した一方、user-owned `approved-host-postflight-pending.json` が残りました。post-recovery normal verification は `assert_control_plane_healthy()` により正しく fail closed し、Approved Host availability は復元しませんでした。
 
-この結果を隠したり marker を手動削除したりせず、recovery workflow 自体の defect として修正しています。新 candidate は standard recovery を coordinated dual-latch recovery に変更し、旧 recovery 済み state 専用の protected version-1 archive-bound compatibility path を追加しています。この新 lifecycle の実機再検証が終わるまでは finding を close しません。
+この結果を隠したり marker を手動削除したりせず、recovery workflow 自体の defect として修正しました。standard recovery を coordinated dual-latch recovery に変更し、旧 recovery 済み state 専用の protected version-1 archive-bound compatibility path を追加しました。その後、fresh abnormal path、coordinated recovery、post-recovery normal pathを同一実 Windows環境で完了したため、WLMCP-R2-001は `fixed / live verified` です。
 
 ## ドキュメントの優先関係
 
