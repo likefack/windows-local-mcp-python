@@ -20,6 +20,19 @@
 - `SECURITY_CONTRACT.md`、`SPEC.md`、`VERIFICATION.md` その他の文書を、実装上の都合だけで capability reduction を正当化する方向へ書き換えない。中核 capability の削除・停止・意味的縮小を契約へ反映するには、その変更自体について trusted operator の明示承認が必要である。
 - 2026-08-27 に WLMCP-R2-001 対応として行われた「Approved Host execution を current v1 で全面停止して finding を close する」方針は trusted operator により拒否された。この方針を precedent として再利用しない。詳細は `docs/APPROVED_HOST_PRODUCT_INVARIANT.md` を必ず読む。
 
+## セキュリティ finding の現実性と修正優先度
+
+- security finding の「技術的に成立するか」と「current product で修正必須か」は別々に判定する。`valid` であることだけを理由に自動的に実装へ進まない。
+- finding を修正する前に、少なくとも攻撃者の事前権限、攻撃後に新たに得る権限または能力、model／prompt injection／悪意ある workspace からの到達可能性、必要な timing／race／複数 process 等の前提、再現容易性、機密性・完全性・可用性への実害、single-user local product としての実際の露出を評価する。
+- あわせて、修正に必要なコード量と設計複雑性、Trusted Computing Base の拡大、新しい privileged component／service／principal の追加、性能低下、通常操作の false positive／fail-closed、保守性低下、新しい状態遷移や故障モードを生む可能性を評価する。security hardening 自体が可用性や安全性を悪化させ得ることを明示的に考慮する。
+- 「理論上成立する」「特殊な操作を組み合わせれば起こせる」ことだけでは `must-fix` の根拠にしない。severity と remediation priority も同一視しない。
+- 攻撃成立前に、攻撃後と同等以上の authority を security boundary 外ですでに完全取得している必要があり、攻撃によって privilege expansion、別 principal への越境、protected information の新規取得、未承認外部作用等が増えない場合は、原則として修正優先度を下げ、残存 risk としての受容を検討する。ただし通常の project code、一般入力、prompt injection 等からその前提権限を新たに獲得できる経路はこの扱いに含めない。
+- 多数の特殊条件、非常に狭い race window、worker kill と別 process の協調、既に侵害された trusted runtime 等を必要とする finding は、その前提を severity から隠さず、現実的な attack path と分離して報告する。
+- availability／DoS finding についても、trigger の容易さ、攻撃者が既に持つ権限、通常利用での誤発火可能性、対策による false positive と運用停止のコストを比較する。より強い fail-closed が元の脅威より大きな実害を通常利用者へ与える場合、その対策を自動採用しない。
+- 判定は少なくとも `must-fix`、`proportionate-fix`、`accepted-residual-risk`、`out-of-scope`、`invalid` を区別し、finding の validity と remediation decision を別 field／別記述で残す。`accepted-residual-risk` とする場合は前提条件、実害、受容理由、再評価条件を記録する。
+- ただし `SECURITY_CONTRACT.md` が既に必須保証として固定している境界の実証済み violation は、費用対効果だけを理由に Codex が独断で `accepted-residual-risk` へ変更してはならない。契約を弱める必要がある場合は、変更案と trade-off を提示して trusted operator の明示承認を得る。
+- security scan、再検証、triage の依頼では、finding 数や理論上の hardening 最大化ではなく、現実的な attack surface に対する risk reduction と product complexity／availability／maintainability の釣り合いを最適化する。
+
 ## ドキュメントと実装仕様の整合性
 
 - 実装作業を行う場合は、変更対象に関係する仕様書・設計資料・運用資料などのドキュメントを確認し、依頼された仕様および現行実装との整合性を確認する。
