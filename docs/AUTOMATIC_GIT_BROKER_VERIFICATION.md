@@ -1,0 +1,295 @@
+# Automatic Git Broker verification
+
+## Status
+
+Automatic Git Broker の availability remediation、security boundary、current-main integration、Windows real-machine verification を分離して記録します。
+
+Final integrated source/test commit verified on the target Windows machine:
+
+- PR #26 integrated head: `926fc24a46f2d2afe0d2ddc05f32fb9c6d55dad0`
+- parent 1: prior PR #26 head `16f64b7c96093dcaa47462acc83e9b2b6231a282`
+- parent 2: current `main` at integration time `63e3e75b4bf9fb1cf9ce8cef9c4eb1380b3e264a`
+- integrated tree: `c3ccdebbbdcbea47c72cb953d337fb1315edb13c`
+- Git-specific live marker schema: v1
+- Automatic Git command-policy generation: v5
+- Automatic Git containment-policy generation: v6
+- ordinary-operation auto verification/repair: prohibited
+- formal PR-head Windows CI run #428: PASS
+- target-machine generic `verify-codex-sandbox`: PASS
+- target-machine `verify-git-broker`: PASS
+- target-machine MCP stdio / `session_info` / `git_info` / `execute_readonly` E2E: PASS
+- MCP protocol: `2026-07-28`
+- final E2E result: `e2e_passed=true`
+- PR state: draft / unmerged; verification completion does not authorize merge
+
+The documentation commit written after this evidence is documentation-only. The live evidence is bound to the integrated source/test tree above, not promoted to any later source change.
+
+## Problem and remediation scope
+
+The original availability failure was not one defect. Automatic Git repository staging/preflight treated several workspace or host conditions as if they were semantically required Git inputs, and the sanitized Git child also lost host Git semantics needed for a faithful read-only projection.
+
+Observed root causes included:
+
+- stale or inaccessible pytest temporary trees
+- benign source `Zone.Identifier` ADS
+- large ignored `.dev-tmp` / `.venv` trees
+- unrelated deep loose-ref namespaces
+- disposable-projection ownership mismatch causing Git dubious-ownership rejection
+- sanitized child losing effective trusted `core.autocrlf` semantics and reporting false modifications
+- readonly projection cleanup interfering with MCP startup lifecycle
+- fixed `git_info` batch sharing a single-command timeout budget
+- MCP SDK v2 masking normal `PermissionError` text that carried Sandbox reroute guidance
+- required Git snapshot telemetry leaking into unrelated generic worker execution
+
+The remediation does not delete or mutate irrelevant source artifacts merely to make Automatic Git available. It instead narrows repository projection to command-observable inputs, validates those inputs conservatively, and preserves required trusted Git semantics without exposing raw host configuration.
+
+## Source-level security properties
+
+The integrated implementation requires the following before a model-facing Automatic Git child can run:
+
+1. `git_enabled=true` and an operator-pinned absolute Git executable path/SHA-256 outside workspace, `data_dir`, and Sandbox scratch.
+2. Known Git-for-Windows wrapper/redirector entry points are not accepted as the trust anchor; the real runtime executable is pinned directly.
+3. Current generic Codex Windows Sandbox live evidence must match the exact backend/isolation context.
+4. Automatic Git applies stricter all-property Sandbox gating, including protected-information, LAN, loopback, descendant, resource, and brokered-process denial properties.
+5. Git-specific marker schema v1 binds the pinned Git identity, Sandbox evidence, workspace, scratch quota, command-policy generation, containment-policy digest, process-cwd policy, required-builtin policy, projection ownership policy, and sanitized EOL semantics.
+6. The Git-specific marker is revalidated immediately before ordinary Git child launch. Only the explicit verifier may bootstrap the marker it is creating.
+7. Automatic Git `broker` operations route only to the dedicated Git Broker worker and do not fall through to the normal worker or Approved Host.
+8. The Git child receives a bounded sanitized disposable repository projection, not the source workspace as its repository filesystem.
+9. The Git child process cwd is the trusted runtime directory and the Broker fixes repository selection with `-C <sanitized projection>`.
+10. Ownership remediation is command-scope `-c safe.directory=<exact operation projection>` only. No wildcard, source-workspace, scratch-parent, global, or persistent Automatic Git trust is used.
+11. Hooks, attributes, external alternates, extended/worktree metadata, nested `.git`, reparse points, and security-relevant hardlinks are removed or rejected as Automatic Git behavior inputs.
+12. Source named ADS are not copied to newly materialized projection files; the completed projection is still checked fail closed for named ADS.
+13. Source `.git/config` is parsed only in Broker memory, capped at 1 MiB, requires repository format v0, and emits only inert sanitized configuration.
+14. Raw system/global Git configuration remains unavailable to the child.
+15. Only the normalized trusted `core.autocrlf` scalar (`true`, `false`, or `input`) may be reconstructed. include/includeIf, invalid values, unsafe config locations, or unknown layout fail closed.
+16. A direct repository-local `core.autocrlf` scalar preserves normal precedence.
+17. Automatic `diff` / `show` are metadata-only. Patch, binary patch, `--check`, and implicit content-bearing output are rejected and directed to `request_sandbox_command`.
+18. Automatic Git remains available for status, metadata-only diff/show, log metadata, rev-parse, ls-files, and `git_info`; the hardening does not disable the capability globally.
+19. `verify-git-broker` requires all Automatic Git subcommands to be builtins of the exact pinned runtime.
+20. Child Git environment disables maintenance/gc, fsmonitor, untracked cache, external diff/textconv, credentials, optional locks, protocols, raw system/global config, and system attributes as applicable.
+21. Source workspace and `data_dir` remain denied to the Git child; Internet, LAN, and loopback remain denied.
+22. Job Object descendant/termination/resource limits and brokered `Win32_Process.Create` denial remain mandatory.
+23. Git executable, Codex backend, and WFP Guard implementation identities are held against replacement during the relevant batch.
+24. Repository projection bytes and entry count are bounded during materialization as well as later scanning.
+25. Ignored/generated root pruning requires command non-observability, conservative root `.gitignore` semantics, and a pinned ordinary index proof that no tracked descendant exists.
+26. Loose-ref projection is command-observability driven. HEAD-only batches do not need unrelated deep loose-ref namespaces; commands that observe broader refs retain the required namespace and remain fail closed if it is unsafe.
+27. Destination-only Windows path overflow is classified explicitly as `GitBrokerUnavailable`; extended-length execution is not silently enabled.
+28. Generic worker before/after Git snapshots are optional telemetry, while direct `git_info` remains required.
+29. Only fixed `SandboxRouteRequiredError` policy guidance is model-visible; unexpected permission/runtime failures remain masked.
+30. No Automatic Git failure falls back to Approved Host or unrestricted host Git.
+
+## Regression and hosted Windows CI
+
+The pre-integration Automatic Git source/test head `bca06c6f40767e857820342536208f5edeb21f89` passed Windows CI run #414:
+
+- focused process identity: 17 passed
+- focused race/recovery/transaction: 38 passed
+- focused Automatic Git Broker: 121 passed
+- full pytest: 525 passed
+- Python 3.13 wheel-install MCP stdio negotiation: passed
+- Ruff / compileall / diff whitespace: passed
+
+After `main` advanced through PR #27 with the WLMCP-R2-001 Approved Host authority separation, overlapping `executor.py`, `server.py`, workflow, README, Security Contract, and specification changes were conflict-resolved together on an isolated integration branch. Neither side was accepted wholesale.
+
+Synthetic integration CI run #426 and documentation-only run #427 both passed before the verified tree was placed onto formal PR #26.
+
+Formal PR-head Windows CI run #428 on the integrated tree completed successfully:
+
+- focused process-identity security regression: 17 passed
+- focused race/recovery/transaction regression: 38 passed
+- focused WLMCP-R2-001 Approved Host authority regression: 49 passed
+- focused Automatic Git Broker regression, including integrated capability-surface coverage: 122 passed
+- full pytest: 595 passed
+- Python 3.13 wheel-install real MCP stdio negotiation: passed
+- Ruff: passed
+- compileall: passed
+- PowerShell parser: passed
+- diff whitespace: passed
+
+The integrated capability regression simultaneously locks:
+
+- Git helper `verification_scope=git-specific-live-marker`
+- Approved Host `verification_scope=runtime_and_authority_preflight_only`
+- Approved Host preflight is not misreported as release-level live verification
+- Automatic Git containment failure does not route to Approved Host
+
+The temporary integration PR #28 was closed unmerged after the exact verified tree was transferred to PR #26.
+
+## Target Windows verification environment
+
+On 2026-08-28 JST the operator fast-forwarded the local `fix/automatic-git-broker-sandbox` branch to exact integrated head `926fc24a46f2d2afe0d2ddc05f32fb9c6d55dad0` and installed that package non-editably into the external production-shaped runtime under `%LOCALAPPDATA%`.
+
+The package was therefore imported from external `site-packages`, not from the target workspace.
+
+Target host evidence:
+
+- Windows 10 Home 25H2
+- build 26200, UBR 9168, amd64
+- Codex Sandbox backend `0.150.0-alpha.8`
+- sandbox account `CodexSandboxOffline`
+- sandbox SID `S-1-5-21-1787218830-4025776409-3138769905-1004`
+- pinned Git runtime `C:\Program Files\Git\mingw64\bin\git.exe`
+- Git SHA-256 `fe0e064c8283dc50b1ce11a8b90d2ec1b68b5dc714ff0b8a8534bb9c43d1d02e`
+
+## Final integrated-head generic Sandbox verification
+
+`verify-codex-sandbox` generated current schema-v5 evidence at:
+
+- `verified_at`: `2026-08-28T00:57:12.754146+00:00`
+- backend digest: `0611a127ce15997800d7098caac9d50e38593247c61acb443d8a45e6988f55eb`
+- isolation context digest: `055385cfc8d7880fa9e10c47d022b210d2ef9bbaf0d28009ca035de37431485f`
+- guard implementation digest: `f6a5485c0a8d00af8ea58f1154ff5fabf0ccd30de393c5c017255680e91af0fd`
+- WFP guard binding digest: `cdefcbe60c0508a6bae550c1b6c4b4846a3c0cbdfeebf49308a18ad4b399f71a`
+- `passed=true`
+- `route_eligible=true`
+
+All required checks were true, including:
+
+- source workspace read/write denial
+- outside-user read/write denial
+- protected-information denial
+- control-plane read/write denial
+- Internet/LAN/loopback denial
+- child and grandchild inheritance of those boundaries
+- timeout termination and descendant drain
+- filesystem byte and entry limits
+- process count limit
+- process-tree memory limit
+- brokered process creation denial
+
+The brokered-process probe returned:
+
+- `WLMCP_WMI_STATUS=-2147217405`
+- `WLMCP_BROKERED_PROCESS=DENIED`
+
+This preserves the mandatory Job-external process-creation denial used by the Sandbox route.
+
+## Final integrated-head Git-specific verification
+
+`verify-git-broker` generated current schema-v1 evidence at:
+
+- `verified_at`: `2026-08-28T00:58:13.594831+00:00`
+- command-policy generation: v5
+- containment-policy generation: v6
+- exact Git runtime: `C:\Program Files\Git\mingw64\bin\git.exe`
+- Git SHA-256: `fe0e064c8283dc50b1ce11a8b90d2ec1b68b5dc714ff0b8a8534bb9c43d1d02e`
+- Git process cwd policy: `trusted-executable-directory-before-fixed--C`
+- required subcommands: builtins
+- containment policy digest: `dcf380f9819a042338dd1793db43471fb58cf9c9cf3b97f51d9ceb22a344788d`
+- generic Sandbox live-evidence digest: `2316878cd74716dd3e1c057830921a2df606b466e0c9d6d2717e19fcaacdfdd9`
+- Git verification context digest: `bba7526a774efeef606320cbe4155af3102ac5633a0a874aef610b4c39904a2c`
+- source workspace access: `deny`
+- execution input: `sanitized-disposable-repository-snapshot`
+- network: `deny`
+- host fallback: `false`
+- `git_inside_worktree=true`
+- `git_projection_snapshot_bound=true`
+- `git_status_readonly=true`
+- `git_allowed_commands_builtin=true`
+- `route_eligible=true`
+
+## Final integrated-head model-facing MCP E2E
+
+A real MCP stdio client/server pair negotiated protocol `2026-07-28` against the external runtime installed from exact integrated head `926fc24a46f2d2afe0d2ddc05f32fb9c6d55dad0`.
+
+`session_info()` reported the Automatic Git helper:
+
+- configured: `true`
+- enabled: `true`
+- available: `true`
+- live_verified: `true`
+- windows_live_verified: `true`
+- verification scope: `git-specific-live-marker`
+- provenance: `explicit-local-config`
+- Git SHA-256: `fe0e064c8283dc50b1ce11a8b90d2ec1b68b5dc714ff0b8a8534bb9c43d1d02e`
+
+`git_info` succeeded:
+
+- operation id: `f46e373e-62a2-4e33-b0cf-621125b52831`
+- snapshot bytes: `15540`
+
+`execute_readonly git status --short` succeeded:
+
+- operation id: `6673b80f-71fa-407f-a9ad-3d2bd5021a73`
+- status: `succeeded`
+- exit code: `0`
+- stdout: empty
+- execution tier: `broker`
+- Git Broker sandbox: `git-live-verified-codex-windows-sandbox`
+- source workspace access: `deny`
+- host fallback performed: `false`
+- containment policy digest: `dcf380f9819a042338dd1793db43471fb58cf9c9cf3b97f51d9ceb22a344788d`
+- repository snapshot digest: `ccab0a994f2247388ec7450d04b533dc887b5d11f61c930a38610c81ced59457`
+
+`execute_readonly git diff --stat` succeeded with the same containment and repository snapshot binding:
+
+- operation id: `4c25552f-7640-429d-8fa5-bad25bfdb60a`
+- status: `succeeded`
+- exit code: `0`
+- stdout: empty
+- execution tier: `broker`
+- source workspace access: `deny`
+- host fallback performed: `false`
+- containment policy digest: `dcf380f9819a042338dd1793db43471fb58cf9c9cf3b97f51d9ceb22a344788d`
+- repository snapshot digest: `ccab0a994f2247388ec7450d04b533dc887b5d11f61c930a38610c81ced59457`
+
+The empty status/diff-stat output confirms that the sanitized projection did not reintroduce false EOL dirtiness on this target machine.
+
+Content-bearing requests were rejected before Automatic Git execution with model-visible fixed reroute guidance:
+
+- `git show --patch` -> rejected; `use request_sandbox_command`
+- `git diff --patch` -> rejected; `use request_sandbox_command`
+- `git diff --check` -> rejected; `use request_sandbox_command`
+
+Final result: `e2e_passed=true`.
+
+## Approved Host integration boundary
+
+This Automatic Git E2E does not claim to be a new Approved Host release-level live verification. Approved Host authority separation remains the separate capability introduced and verified through PR #27.
+
+What PR #26 integration establishes is narrower and explicit:
+
+- shared `executor.py` still routes only `approved_host` operations to the authenticated LocalSystem authority service
+- Automatic Git remains a separate dedicated Broker route
+- Automatic Git containment failure cannot escalate to Approved Host
+- model-facing capability scopes for Git and Approved Host coexist correctly under integration regression
+- formal PR-head CI #428 reran the 49 focused Approved Host authority regressions together with the 122 focused Automatic Git regressions and the full 595-test suite
+
+Therefore the current evidence is sufficient to close the concurrent-main integration blocker for PR #26 without falsely reclassifying an Automatic Git E2E as Approved Host live evidence.
+
+## Final security review
+
+After final integrated-head target-machine E2E, the following invariants remain satisfied:
+
+- no `safe.directory=*`
+- no source-workspace or scratch-parent `safe.directory`
+- no persistent/global Automatic Git `safe.directory` mutation
+- raw system/global Git config unavailable to the Git child
+- only normalized trusted `core.autocrlf` scalar semantics reconstructed
+- source workspace and `data_dir` denied to the Git child
+- Internet/LAN/loopback denial mandatory
+- descendant termination/resource bounds mandatory
+- brokered WMI process creation denial mandatory
+- no Approved Host or unrestricted host-Git fallback
+- irrelevant `.venv`, `.dev-tmp`, stale pytest artifacts, unrelated refs, and benign source ADS are not deleted or modified to manufacture availability
+- content-bearing Git remains outside Automatic Git and is directed to normal Sandbox approval
+- unexpected internal permission/runtime failures remain masked
+- marker identity drift remains fail closed and requires explicit verifier execution
+
+No security-boundary weakening was introduced to recover Automatic Git availability.
+
+## Finalization record
+
+Automatic Git remediation and current-main source integration are now verified at all required levels:
+
+- source/security review: PASS
+- focused regression: PASS
+- full hosted Windows regression: PASS
+- production-shaped MCP stdio: PASS
+- final integrated-head generic Sandbox verification: PASS
+- final integrated-head Git-specific verification: PASS
+- final integrated-head model-facing Automatic Git E2E: PASS
+
+The live-verified integrated source/test commit is `926fc24a46f2d2afe0d2ddc05f32fb9c6d55dad0` with integrated tree `c3ccdebbbdcbea47c72cb953d337fb1315edb13c`.
+
+PR #26 remains draft / unmerged solely because verification completion is not merge authorization. There is no remaining Automatic Git integration verification blocker recorded by this document.

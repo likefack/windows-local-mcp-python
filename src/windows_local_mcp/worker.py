@@ -273,7 +273,12 @@ def run_operation(operation_id: str, settings: Settings) -> int:
         and request["approval_manifest_summary"].get("mode") == "staged-workspace-write"
     )
     pre_git = (
-        capture_git_snapshot(settings=settings, operation_id=operation_id, stage="before")
+        capture_git_snapshot(
+            settings=settings,
+            operation_id=operation_id,
+            stage="before",
+            required=False,
+        )
         if tracks_workspace and not staged_sandbox_commit
         else None
     )
@@ -915,7 +920,12 @@ def run_operation(operation_id: str, settings: Settings) -> int:
 
     postflight_error: str | None = None
     post_git = (
-        capture_git_snapshot(settings=settings, operation_id=operation_id, stage="after")
+        capture_git_snapshot(
+            settings=settings,
+            operation_id=operation_id,
+            stage="after",
+            required=False,
+        )
         if tracks_workspace and not staged_sandbox_commit
         else None
     )

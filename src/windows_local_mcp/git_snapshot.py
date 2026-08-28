@@ -3,11 +3,26 @@ from __future__ import annotations
 from pathlib import Path
 
 from .config import Settings
+from .git_broker_sandbox import run_git_broker_batch
+from .git_metadata import GIT_STRUCTURAL_COMMIT_FORMAT
 from .paths import hold_verified_path, release_verified_hold
 from .redaction import redact_text
 from .resources import enforce_data_quota
-from .safe_process import run_safe_process, run_safe_process_batch
-from .tool_safety import hold_executable_identity, trusted_helper_identity
+from .tool_safety import trusted_helper_identity
+
+_GIT_SNAPSHOT_BUDGET_PER_COMMAND_SECONDS = 60.0
+_GIT_SNAPSHOT_MAX_BATCH_BUDGET_SECONDS = 10 * 60.0
+
+
+def _git_snapshot_batch_timeout(command_count: int) -> float:
+    """Bound the shared batch deadline without charging later commands for a 1-command budget."""
+
+    if command_count < 1:
+        raise ValueError("Git snapshot requires at least one command")
+    return min(
+        _GIT_SNAPSHOT_MAX_BATCH_BUDGET_SECONDS,
+        _GIT_SNAPSHOT_BUDGET_PER_COMMAND_SECONDS * command_count,
+    )
 
 
 def capture_git_snapshot(
@@ -15,13 +30,20 @@ def capture_git_snapshot(
     settings: Settings,
     operation_id: str,
     stage: str,
+    required: bool = True,
 ) -> str | None:
+    """Capture Git state, preserving the root cause for required model-facing snapshots."""
+
     if not settings.git_enabled:
+        if required:
+            raise PermissionError("git capability is disabled")
         return None
     try:
         identity = trusted_helper_identity(settings, "git")
         git = str(identity["path"])
-    except (FileNotFoundError, PermissionError):
+    except (FileNotFoundError, PermissionError, RuntimeError):
+        if required:
+            raise
         return None
 
     root = settings.workspace_root.resolve(strict=True)
@@ -32,6 +54,8 @@ def capture_git_snapshot(
     )
     try:
         if not root_hold.is_dir():
+            if required:
+                raise RuntimeError("workspace root is not a directory")
             return None
         root = Path(str(root_hold))
         git_base = [
@@ -43,6 +67,10 @@ def capture_git_snapshot(
             "-c",
             "core.untrackedCache=false",
             "-c",
+            "maintenance.auto=false",
+            "-c",
+            "gc.auto=0",
+            "-c",
             "diff.autoRefreshIndex=false",
             "-c",
             "diff.external=",
@@ -50,14 +78,12 @@ def capture_git_snapshot(
             "credential.helper=",
         ]
         commands = [
-            ("branch", [*git_base, "-C", str(root), "symbolic-ref", "--short", "HEAD"]),
-            ("head", [*git_base, "-C", str(root), "rev-parse", "HEAD"]),
+            ("branch", [*git_base, "symbolic-ref", "--short", "HEAD"]),
+            ("head", [*git_base, "rev-parse", "HEAD"]),
             (
                 "status",
                 [
                     *git_base,
-                    "-C",
-                    str(root),
                     "status",
                     "--porcelain=v1",
                     "--branch",
@@ -68,8 +94,6 @@ def capture_git_snapshot(
                 "diff",
                 [
                     *git_base,
-                    "-C",
-                    str(root),
                     "diff",
                     "--stat",
                     "--name-status",
@@ -81,8 +105,6 @@ def capture_git_snapshot(
                 "staged",
                 [
                     *git_base,
-                    "-C",
-                    str(root),
                     "diff",
                     "--cached",
                     "--stat",
@@ -95,12 +117,9 @@ def capture_git_snapshot(
                 "recent",
                 [
                     *git_base,
-                    "-C",
-                    str(root),
                     "log",
                     "-10",
-                    "--oneline",
-                    "--decorate",
+                    GIT_STRUCTURAL_COMMIT_FORMAT,
                     "--no-ext-diff",
                     "--no-textconv",
                 ],
@@ -109,8 +128,6 @@ def capture_git_snapshot(
                 "changed-files",
                 [
                     *git_base,
-                    "-C",
-                    str(root),
                     "diff",
                     "--name-status",
                     "--no-ext-diff",
@@ -120,40 +137,28 @@ def capture_git_snapshot(
             ),
         ]
         per_stream_limit = max(4096, settings.max_diff_bytes // len(commands) // 2)
-        parts: list[str] = []
-        with hold_executable_identity(identity):
-            probe = run_safe_process(
+        # run_git_broker_batch uses one shared deadline for the entire fixed command set.  A
+        # one-command 60 s budget therefore cannot be reused unchanged for seven sequential
+        # sandbox launches: normal launch/guard overhead would consume later commands' budget.
+        # Scale the total allowance with this trusted, fixed command count while retaining a hard
+        # upper bound.  Individual Git processes remain inside the same Sandbox/Job/resource
+        # boundary, and the batch still has a finite overall deadline.
+        batch_timeout = _git_snapshot_batch_timeout(len(commands))
+        try:
+            results = run_git_broker_batch(
                 settings=settings,
-                program_key="git",
-                command=[*git_base, "-C", str(root), "rev-parse", "--show-toplevel"],
-                cwd=str(root),
-                timeout=15,
-                output_limit=4096,
-                executable_identity=identity,
-                executable_already_held=True,
-            )
-            if probe.returncode != 0:
-                return None
-            try:
-                discovered_root = Path(
-                    probe.stdout.decode("utf-8", errors="replace").strip()
-                ).resolve(strict=True)
-            except (FileNotFoundError, OSError):
-                return None
-            if discovered_root != root:
-                # Do not let a workspace nested inside a larger repository expose
-                # parent-repository state through automatic snapshots or git_info.
-                return None
-            results = run_safe_process_batch(
-                settings=settings,
-                program_key="git",
+                git_identity=identity,
                 commands=[command for _name, command in commands],
                 cwd=str(root),
-                timeout=30,
+                timeout=batch_timeout,
                 output_limit=per_stream_limit,
-                executable_identity=identity,
-                executable_already_held=True,
+                token=f"snapshot-{operation_id}-{stage}",
             )
+        except (OSError, PermissionError, RuntimeError, TimeoutError):
+            if required:
+                raise
+            return None
+        parts: list[str] = []
         for (name, _command), result in zip(commands, results, strict=True):
             parts.append(
                 f"===== {name} exit={result.returncode} =====\n"

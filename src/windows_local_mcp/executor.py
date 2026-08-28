@@ -14,6 +14,7 @@ from .audit import TERMINAL_STATUSES, AuditStore
 from .child_env import build_worker_environment
 from .config import Settings
 from .control_plane import create_worker_context, isolated_worker_argv
+from .git_broker_worker import isolated_git_broker_worker_argv
 from .process_utils import (
     ProcessIdentity,
     capture_process_identity,
@@ -85,6 +86,14 @@ class Executor:
         )
         context_path, context_sha256 = create_worker_context(self.settings, operation_id)
 
+        request = operation.get("request")
+        normalized = request.get("normalized_command") if isinstance(request, dict) else None
+        git_broker_worker = bool(
+            tier in {"broker", "safe_command", "safe_sandbox"}
+            and isinstance(normalized, dict)
+            and normalized.get("program_key") == "git"
+        )
+
         if tier == "approved_host":
             requester_pid = os.getpid()
             requester_create_time = float(psutil.Process(requester_pid).create_time())
@@ -105,14 +114,25 @@ class Executor:
             )
             spawned_pid = launched.worker.pid
             identity_role = "system_authority_worker"
+            worker_route = "approved_host_authority"
         else:
-            process = subprocess.Popen(
-                isolated_worker_argv(
+            worker_argv = (
+                isolated_git_broker_worker_argv(
                     self.settings,
                     operation_id=operation_id,
                     context_path=context_path,
                     context_sha256=context_sha256,
-                ),
+                )
+                if git_broker_worker
+                else isolated_worker_argv(
+                    self.settings,
+                    operation_id=operation_id,
+                    context_path=context_path,
+                    context_sha256=context_sha256,
+                )
+            )
+            process = subprocess.Popen(
+                worker_argv,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -124,6 +144,7 @@ class Executor:
             identity = capture_process_identity(process.pid, nonce)
             spawned_pid = process.pid
             identity_role = "bootstrap_launcher"
+            worker_route = "git_broker_sandbox" if git_broker_worker else "standard_worker"
 
         bootstrap_identity_recorded = self.audit.transition_operation(
             operation_id,
@@ -148,6 +169,7 @@ class Executor:
                 "immutable_context_sha256": context_sha256,
                 "isolated_import_mode": True,
                 "authority_separated": tier == "approved_host",
+                "worker_route": worker_route,
             },
         )
 

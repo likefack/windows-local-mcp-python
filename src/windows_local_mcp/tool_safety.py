@@ -75,11 +75,11 @@ def capture_stable_file_identity(path: str | Path) -> dict[str, Any]:
     invalid = wintypes.HANDLE(-1).value
     handle = kernel32.CreateFileW(
         str(resolved),
-        0x80000000,  # GENERIC_READ
-        0x00000001 | 0x00000002 | 0x00000004,  # share read/write/delete for capture
+        0x80000000,
+        0x00000001 | 0x00000002 | 0x00000004,
         None,
-        3,  # OPEN_EXISTING
-        0x00000080,  # FILE_ATTRIBUTE_NORMAL
+        3,
+        0x00000080,
         None,
     )
     if handle in (None, invalid):
@@ -176,8 +176,35 @@ def capture_executable_identity(
     )
 
 
-def trusted_helper_identity(settings: Any, program_key: str) -> dict[str, Any]:
-    """Resolve a broker helper only from an explicit path and SHA-256 trust anchor."""
+def _git_for_windows_runtime_candidate(executable: Path) -> Path | None:
+    """Return the real Git for Windows runtime when a known wrapper/redirector was pinned."""
+
+    if executable.name.casefold() != "git.exe":
+        return None
+    parent = executable.parent
+    parent_name = parent.name.casefold()
+    parent_parent_name = parent.parent.name.casefold()
+    root: Path | None = None
+    if parent_name == "cmd" or (
+        parent_name == "bin"
+        and parent_parent_name not in {"mingw64", "mingw32", "clangarm64"}
+    ):
+        root = parent.parent
+    if root is None:
+        return None
+    for runtime_root in ("mingw64", "clangarm64", "mingw32"):
+        candidate = root / runtime_root / "bin" / "git.exe"
+        try:
+            if candidate.is_file() and not candidate.is_symlink():
+                return candidate.resolve(strict=True)
+        except OSError:
+            continue
+    return None
+
+
+def pinned_helper_identity(settings: Any, program_key: str) -> dict[str, Any]:
+    """Resolve an operator-pinned Broker helper without consulting route availability."""
+
     if program_key not in {"git", "adb"}:
         raise ValueError(f"no broker helper trust policy exists for {program_key}")
     configured_path = getattr(settings, f"{program_key}_executable_path")
@@ -187,23 +214,38 @@ def trusted_helper_identity(settings: Any, program_key: str) -> dict[str, Any]:
             f"{program_key} is enabled but unavailable: configure both "
             f"{program_key}_executable_path and {program_key}_executable_sha256"
         )
-    if program_key == "git":
-        raise PermissionError(
-            "automatic Git broker execution is disabled because workspace-controlled "
-            "repository metadata cannot be safely confined to workspace_root; "
-            "use an explicitly human-approved execution route"
+    executable = Path(
+        ensure_external_tool_executable(
+            configured_path,
+            workspace_root=settings.workspace_root,
+            data_dir=settings.data_dir,
+            sandbox_scratch_dir=settings.sandbox_scratch_dir,
         )
-    executable = ensure_external_tool_executable(
-        configured_path,
-        workspace_root=settings.workspace_root,
-        data_dir=settings.data_dir,
-        sandbox_scratch_dir=settings.sandbox_scratch_dir,
-    )
+    ).resolve(strict=True)
+    if program_key == "git":
+        runtime = _git_for_windows_runtime_candidate(executable)
+        if runtime is not None and runtime != executable:
+            raise PermissionError(
+                "Automatic Git requires the real Git for Windows runtime executable, not "
+                "cmd/bin wrapper or redirector; configure git_executable_path="
+                f"{runtime} and pin that file's SHA-256"
+            )
     return capture_executable_identity(
         executable,
         expected_sha256=configured_sha256,
         provenance="explicit-local-config",
     )
+
+
+def trusted_helper_identity(settings: Any, program_key: str) -> dict[str, Any]:
+    """Resolve a Broker helper from a pinned identity and its required containment."""
+
+    identity = pinned_helper_identity(settings, program_key)
+    if program_key == "git":
+        from .git_broker_live_verify import require_git_broker_live_verification
+
+        require_git_broker_live_verification(settings, identity)
+    return identity
 
 
 def verify_file_identity(expected: dict[str, Any]) -> Path:
@@ -247,11 +289,11 @@ def hold_file_identity(expected: dict[str, Any]) -> Iterator[Path]:
         invalid = wintypes.HANDLE(-1).value
         handle = kernel32.CreateFileW(
             str(path),
-            0x80000000,  # GENERIC_READ
-            0x00000001,  # FILE_SHARE_READ only: deny writes, deletes, and replacement
+            0x80000000,
+            0x00000001,
             None,
-            3,  # OPEN_EXISTING
-            0x00000080,  # FILE_ATTRIBUTE_NORMAL
+            3,
+            0x00000080,
             None,
         )
         if handle in (None, invalid):
@@ -264,9 +306,6 @@ def hold_file_identity(expected: dict[str, Any]) -> Iterator[Path]:
     try:
         verified = verify_file_identity(expected)
         yield verified
-        # On Windows the still-open FILE_SHARE_READ-only handle has denied all writes and
-        # replacement for the whole interval. Other platforms recheck because their retained
-        # read handle is not an equivalent security boundary.
         if os.name != "nt":
             verify_file_identity(expected)
     finally:

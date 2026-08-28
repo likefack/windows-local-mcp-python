@@ -31,6 +31,10 @@ def main() -> None:
         "verify-codex-sandbox",
         help="この Windows PC 上で Codex Sandbox の境界を実機検証",
     )
+    subparsers.add_parser(
+        "verify-git-broker",
+        help="pinned Git を Automatic Git Broker 境界内で実機検証し live marker を更新",
+    )
 
     args = parser.parse_args()
 
@@ -46,10 +50,20 @@ def main() -> None:
             raise SystemExit(1)
         return
 
-    if args.command == "server":
-        from .server import main as server_main
+    if args.command == "verify-git-broker":
+        from .git_broker_live_verify import verify_git_broker_live
 
-        server_main()
+        result = verify_git_broker_live(load_settings())
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        if result.get("route_eligible") is not True:
+            raise SystemExit(1)
+        return
+
+    if args.command == "server":
+        from .mcp_stdio import run_stdio_server
+        from .server import mcp
+
+        run_stdio_server(mcp)
         return
 
     if args.command == "approvals":

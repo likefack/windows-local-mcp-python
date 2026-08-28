@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import threading
 import time
 from collections import deque
@@ -118,7 +119,9 @@ class NamedControlPlaneLock:
     """Cross-process lock for one trusted-store lifecycle, with same-thread nesting."""
 
     def __init__(self, settings: Settings, name: str, timeout: float = 30.0) -> None:
-        if not name or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789-" for character in name):
+        if not name or any(
+            character not in "abcdefghijklmnopqrstuvwxyz0123456789-" for character in name
+        ):
             raise ValueError("invalid control-plane lock name")
         self.path = settings.data_dir / "locks" / f"control-{name}.lock"
         self.timeout = timeout
@@ -280,7 +283,9 @@ class BoundedStreamCapture:
 def directory_size(path: Path, *, stop_after: int | None = None) -> int:
     total = 0
     for root, directories, files in os.walk(path, followlinks=False):
-        directories[:] = [name for name in directories if not (Path(root) / name).is_symlink()]
+        directories[:] = [
+            name for name in directories if not (Path(root) / name).is_symlink()
+        ]
         for name in files:
             candidate = Path(root) / name
             try:
@@ -353,7 +358,9 @@ def scan_directory_bounded(
                     pending.append(candidate)
                     continue
                 if not entry.is_file(follow_symlinks=False):
-                    raise RuntimeError(f"runtime tree contains a non-regular entry: {candidate}")
+                    raise RuntimeError(
+                        f"runtime tree contains a non-regular entry: {candidate}"
+                    )
                 total_bytes += info.st_size
                 if collect_files:
                     files.append(candidate)
@@ -370,7 +377,10 @@ def _has_named_data_stream(path: Path) -> bool:
     from ctypes import wintypes
 
     class Win32FindStreamData(ctypes.Structure):
-        _fields_ = [("stream_size", ctypes.c_longlong), ("stream_name", wintypes.WCHAR * 296)]
+        _fields_ = [
+            ("stream_size", ctypes.c_longlong),
+            ("stream_name", wintypes.WCHAR * 296),
+        ]
 
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     find_first = kernel32.FindFirstStreamW
@@ -391,7 +401,7 @@ def _has_named_data_stream(path: Path) -> bool:
     invalid_handle = ctypes.c_void_p(-1).value
     if handle == invalid_handle:
         error = ctypes.get_last_error()
-        if error in {2, 38, 50, 87}:  # missing/no streams/unsupported filesystem
+        if error in {2, 38, 50, 87}:
             return False
         raise OSError(error, f"FindFirstStreamW failed for {path}")
     try:
@@ -401,7 +411,7 @@ def _has_named_data_stream(path: Path) -> bool:
             if find_next(handle, ctypes.byref(data)):
                 continue
             error = ctypes.get_last_error()
-            if error == 38:  # ERROR_HANDLE_EOF
+            if error == 38:
                 return False
             raise OSError(error, f"FindNextStreamW failed for {path}")
     finally:
@@ -449,7 +459,9 @@ def prune_artifacts(settings: Settings, *, protected_ids: set[str] | None = None
         for candidate in root.iterdir():
             if candidate.is_symlink():
                 continue
-            if any(candidate.name.startswith(operation_id) for operation_id in protected_ids):
+            if any(
+                candidate.name.startswith(operation_id) for operation_id in protected_ids
+            ):
                 continue
             try:
                 modified = datetime.fromtimestamp(candidate.stat().st_mtime, UTC)
@@ -465,7 +477,9 @@ def prune_artifacts(settings: Settings, *, protected_ids: set[str] | None = None
     for _, candidate in sorted(candidates):
         if used <= settings.max_data_dir_bytes:
             break
-        size = directory_size(candidate) if candidate.is_dir() else candidate.stat().st_size
+        size = (
+            directory_size(candidate) if candidate.is_dir() else candidate.stat().st_size
+        )
         _remove_artifact(candidate)
         used -= size
         removed += 1
@@ -475,32 +489,51 @@ def prune_artifacts(settings: Settings, *, protected_ids: set[str] | None = None
             settings.sandbox_scratch_dir / "approval-inputs",
             settings.sandbox_scratch_dir / "runs",
             settings.sandbox_scratch_dir / "live-verification",
+            settings.sandbox_scratch_dir / "git-broker",
         ):
-            if not root.exists() or root.is_symlink():
-                continue
-            for candidate in root.iterdir():
-                if candidate.is_symlink() or candidate.name in protected_ids:
+            try:
+                if not root.exists() or root.is_symlink():
                     continue
+                entries = list(root.iterdir())
+            except OSError:
+                continue
+            for candidate in entries:
                 try:
+                    if candidate.is_symlink() or candidate.name in protected_ids:
+                        continue
                     modified = datetime.fromtimestamp(candidate.stat().st_mtime, UTC)
                 except FileNotFoundError:
                     continue
+                except OSError:
+                    continue
                 if modified < cutoff:
-                    _remove_artifact(candidate)
-                    removed += 1
+                    if _try_remove_disposable_artifact(candidate):
+                        removed += 1
+                    else:
+                        scratch_candidates.append((modified.timestamp(), candidate))
                 else:
                     scratch_candidates.append((modified.timestamp(), candidate))
-        scratch_used = directory_size(
-            settings.sandbox_scratch_dir,
-            stop_after=settings.max_sandbox_scratch_bytes,
-        )
+        try:
+            scratch_used = directory_size(
+                settings.sandbox_scratch_dir,
+                stop_after=settings.max_sandbox_scratch_bytes,
+            )
+        except OSError:
+            scratch_used = settings.max_sandbox_scratch_bytes + 1
         for _, candidate in sorted(scratch_candidates):
             if scratch_used <= settings.max_sandbox_scratch_bytes:
                 break
-            size = directory_size(candidate) if candidate.is_dir() else candidate.stat().st_size
-            _remove_artifact(candidate)
-            scratch_used -= size
-            removed += 1
+            try:
+                size = (
+                    directory_size(candidate)
+                    if candidate.is_dir()
+                    else candidate.stat().st_size
+                )
+            except OSError:
+                size = 0
+            if _try_remove_disposable_artifact(candidate):
+                scratch_used = max(0, scratch_used - size)
+                removed += 1
     return removed
 
 
@@ -526,7 +559,9 @@ def _prune_workspace_history(settings: Settings, protected_ids: set[str]) -> int
             _remove_artifact(candidate)
             removed += 1
     remaining = [item for item in candidates if item[1].exists()]
-    for _, candidate in sorted(remaining)[: max(0, len(remaining) - settings.retention_max_operations)]:
+    for _, candidate in sorted(remaining)[
+        : max(0, len(remaining) - settings.retention_max_operations)
+    ]:
         _remove_artifact(candidate)
         removed += 1
     removed += _garbage_collect_workspace_blobs(operations, blobs)
@@ -545,7 +580,6 @@ def _garbage_collect_workspace_blobs(operations: Path, blobs: Path) -> int:
                 if isinstance(blob, str) and len(blob) == 64:
                     referenced.add(blob)
         except (OSError, ValueError, TypeError):
-            # Fail closed for retention: an unreadable manifest must not cause blob deletion.
             return 0
     removed = 0
     for blob in blobs.glob("*.blob"):
@@ -555,8 +589,38 @@ def _garbage_collect_workspace_blobs(operations: Path, blobs: Path) -> int:
     return removed
 
 
+def _retry_windows_readonly_delete(
+    function: Any,
+    path: str,
+    exc_info: tuple[type[BaseException], BaseException, Any],
+) -> None:
+    error = exc_info[1]
+    if os.name == "nt" and isinstance(error, PermissionError):
+        try:
+            os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
+            function(path)
+            return
+        except OSError:
+            pass
+    raise error
+
+
 def _remove_artifact(path: Path) -> None:
     if path.is_dir():
-        shutil.rmtree(path)
-    else:
+        shutil.rmtree(path, onerror=_retry_windows_readonly_delete)
+        return
+    try:
         path.unlink(missing_ok=True)
+    except PermissionError:
+        if os.name != "nt":
+            raise
+        os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
+        path.unlink(missing_ok=True)
+
+
+def _try_remove_disposable_artifact(path: Path) -> bool:
+    try:
+        _remove_artifact(path)
+    except OSError:
+        return False
+    return True

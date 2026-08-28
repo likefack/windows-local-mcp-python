@@ -6,12 +6,18 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import ClassVar
 
+from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import BaseModel, PrivateAttr
 
 from .config import Settings
+from .git_metadata import force_structural_commit_output
 from .paths import Workspace
 from .tool_safety import capture_executable_identity, trusted_helper_identity
 from .util import canonical_json, sha256_text
+
+
+class SandboxRouteRequiredError(PermissionError, ToolError):
+    """Policy rejection that is intentionally safe to surface to the MCP model."""
 
 
 class NormalizedCommand(BaseModel):
@@ -108,7 +114,7 @@ class CommandPolicy:
             return self._result(identity, normalized_args, cwd_path, "git")
 
         if key in {"flutter", "dart"}:
-            raise PermissionError(
+            raise SandboxRouteRequiredError(
                 f"{key} processing may load project-controlled code or plugins; "
                 "use request_sandbox_command"
             )
@@ -119,8 +125,8 @@ class CommandPolicy:
             identity = self._resolve_safe_executable("adb")
             return self._result(identity, normalized_args, cwd_path, "adb")
 
-        raise PermissionError(
-            f"{program} is not eligible for automatic execution; use request_sandbox_command"
+        raise SandboxRouteRequiredError(
+            "program is not eligible for automatic execution; use request_sandbox_command"
         )
 
     def normalize_host(
@@ -187,7 +193,9 @@ class CommandPolicy:
     def _normalize_git(self, args: list[str]) -> list[str]:
         subcommand = args[0].casefold()
         if subcommand not in self.GIT_SUBCOMMANDS:
-            raise PermissionError(f"git {args[0]} requires human approval")
+            raise SandboxRouteRequiredError(
+                "Git subcommand is not eligible for Automatic Git; use request_sandbox_command"
+            )
         tail = list(args[1:])
 
         if subcommand == "status":
@@ -205,27 +213,34 @@ class CommandPolicy:
             normalized = self._flags_and_pathspec(tail, allowed)
         elif subcommand == "diff":
             has_paths = "--" in tail and bool(tail[tail.index("--") + 1 :])
-            explicit_content = any(value in {"--patch", "-p", "--binary"} for value in tail)
+            if any(value in {"--patch", "-p", "--binary", "--check"} for value in tail):
+                raise SandboxRouteRequiredError(
+                    "content-bearing Git diff output is not eligible for Automatic Git; "
+                    "use request_sandbox_command"
+                )
             metadata_only = any(
-                value in {"--stat", "--name-only", "--name-status", "--check", "--quiet"}
+                value in {"--stat", "--name-only", "--name-status", "--quiet", "--no-patch"}
                 for value in tail
             )
-            content_output = has_paths and (explicit_content or not metadata_only)
+            if has_paths and not metadata_only:
+                raise SandboxRouteRequiredError(
+                    "Automatic Git diff with a pathspec requires an explicit metadata-only "
+                    "output mode; use request_sandbox_command for patch content"
+                )
             allowed = self.GIT_COMMON_FLAGS | {
                 "--cached",
                 "--staged",
-                "--check",
                 "--quiet",
                 "--exit-code",
                 "--no-renames",
             }
-            if has_paths:
-                allowed |= {"--patch", "-p", "--binary"}
             normalized = self._git_revisions_flags_paths(
-                tail, allowed, files_only=content_output
+                tail,
+                allowed,
+                require_commitish=True,
             )
-            if not has_paths and not any(
-                value in {"--stat", "--name-only", "--name-status", "--check", "--quiet"}
+            if not any(
+                value in {"--stat", "--name-only", "--name-status", "--quiet", "--no-patch"}
                 for value in normalized
             ):
                 normalized.insert(0, "--stat")
@@ -233,24 +248,36 @@ class CommandPolicy:
         elif subcommand == "log":
             allowed = self.GIT_COMMON_FLAGS | {"--all", "--branches", "--tags"}
             normalized = self._git_revisions_flags_paths(tail, allowed, allow_count=True)
+            normalized = force_structural_commit_output(normalized)
             normalized = ["--no-ext-diff", "--no-textconv", *normalized]
         elif subcommand == "show":
             has_paths = "--" in tail and bool(tail[tail.index("--") + 1 :])
-            explicit_content = any(value in {"--patch", "-p"} for value in tail)
+            if any(value in {"--patch", "-p"} for value in tail):
+                raise SandboxRouteRequiredError(
+                    "content-bearing Git show output is not eligible for Automatic Git; "
+                    "use request_sandbox_command"
+                )
             metadata_only = any(
                 value in {"--stat", "--name-only", "--name-status", "--no-patch"}
                 for value in tail
             )
-            content_output = has_paths and (explicit_content or not metadata_only)
-            allowed = self.GIT_COMMON_FLAGS | ({"--patch", "-p"} if has_paths else set())
+            if has_paths and not metadata_only:
+                raise SandboxRouteRequiredError(
+                    "Automatic Git show with a pathspec requires an explicit metadata-only "
+                    "output mode; use request_sandbox_command for patch content"
+                )
             normalized = self._git_revisions_flags_paths(
-                tail, allowed, files_only=content_output
+                tail,
+                self.GIT_COMMON_FLAGS,
+                require_commitish=True,
+                default_revision="HEAD",
             )
             if not has_paths and not any(
                 value in {"--stat", "--name-only", "--name-status", "--no-patch"}
                 for value in normalized
             ):
                 normalized.insert(0, "--no-patch")
+            normalized = force_structural_commit_output(normalized)
             normalized = ["--no-ext-diff", "--no-textconv", *normalized]
         elif subcommand == "rev-parse":
             permitted = {
@@ -282,6 +309,10 @@ class CommandPolicy:
             "-c",
             "core.untrackedCache=false",
             "-c",
+            "maintenance.auto=false",
+            "-c",
+            "gc.auto=0",
+            "-c",
             "diff.autoRefreshIndex=false",
             "-c",
             "diff.external=",
@@ -303,6 +334,24 @@ class CommandPolicy:
             return [*flags, "--", *self._normalize_read_paths(paths)]
         return flags
 
+    @classmethod
+    def _commit_bound_revision(cls, value: str) -> str:
+        for separator in ("...", ".."):
+            if separator not in value:
+                continue
+            if value.count(separator) != 1:
+                raise PermissionError("Git revision range is not in the safe grammar")
+            left, right = value.split(separator, 1)
+            if (
+                not left
+                or not right
+                or not cls.SAFE_REVISION.fullmatch(left)
+                or not cls.SAFE_REVISION.fullmatch(right)
+            ):
+                raise PermissionError("Git revision range is not in the safe grammar")
+            return f"{left}^{{commit}}{separator}{right}^{{commit}}"
+        return f"{value}^{{commit}}"
+
     def _git_revisions_flags_paths(
         self,
         values: list[str],
@@ -310,6 +359,8 @@ class CommandPolicy:
         *,
         allow_count: bool = False,
         files_only: bool = False,
+        require_commitish: bool = False,
+        default_revision: str | None = None,
     ) -> list[str]:
         if "--" in values:
             split = values.index("--")
@@ -317,16 +368,19 @@ class CommandPolicy:
         else:
             head, paths = values, []
         normalized_head: list[str] = []
+        revision_count = 0
         for value in head:
-            if (
-                value in allowed
-                or (allow_count and self.SAFE_LOG_COUNT.fullmatch(value))
-                or self.SAFE_REVISION.fullmatch(value)
-                and not value.startswith("-")
-            ):
+            if value in allowed or (allow_count and self.SAFE_LOG_COUNT.fullmatch(value)):
                 normalized_head.append(value)
+            elif self.SAFE_REVISION.fullmatch(value) and not value.startswith("-"):
+                revision_count += 1
+                normalized_head.append(
+                    self._commit_bound_revision(value) if require_commitish else value
+                )
             else:
                 raise PermissionError("Git revision or option is not in the safe grammar")
+        if require_commitish and revision_count == 0 and default_revision is not None:
+            normalized_head.append(self._commit_bound_revision(default_revision))
         if paths:
             return [
                 *normalized_head,

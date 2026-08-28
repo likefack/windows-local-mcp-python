@@ -97,6 +97,32 @@ jobs:
         shell: bash
         run: git diff --check HEAD^ HEAD
 
+  stdio-python313:
+    name: MCP stdio / Python 3.13 wheel
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout tested revision
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install wheel-shaped production package and test dependency
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install . "pytest>=8,<9"
+          python -m pip check
+          python --version
+          python -I -B -c "import windows_local_mcp; print(windows_local_mcp.__file__)"
+
+      - name: Real Windows stdio negotiation
+        run: python -m pytest -q tests/test_mcp_stdio_transport.py
+
   tests:
     name: Pytest
     runs-on: windows-latest
@@ -145,6 +171,29 @@ jobs:
           tests/test_approved_host_audit_integrity.py
           tests/test_approval_execution_integration.py
           tests/test_runtime_immutability.py::test_executor_blocks_approved_host_before_worker_spawn
+
+      - name: Focused Automatic Git Broker regression
+        run: >-
+          python -m pytest -q
+          tests/test_git_environment.py
+          tests/test_git_semantics.py
+          tests/test_git_broker_launch_gate.py
+          tests/test_git_broker_live_verify.py
+          tests/test_git_broker_cleanup_lifecycle.py
+          tests/test_git_broker_projection_boundary.py
+          tests/test_git_ref_projection.py
+          tests/test_git_broker_resource_limits.py
+          tests/test_git_object_access.py
+          tests/test_git_snapshot_diagnostics.py
+          tests/test_git_worker_routing.py
+          tests/test_security_regressions_git_staging.py
+          tests/test_tool_safety.py
+          tests/test_directory_toctou.py
+          tests/test_mcp_stdio_transport.py
+          tests/test_mcp_stdio_integration.py
+          tests/test_mcp_policy_error_visibility.py
+          tests/test_sandbox_scratch_retention.py
+          tests/test_integrated_capability_surface.py
 
       - name: Full pytest
         run: python -m pytest
