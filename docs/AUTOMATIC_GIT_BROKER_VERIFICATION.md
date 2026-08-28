@@ -228,4 +228,35 @@ No security-boundary weakening was introduced to recover availability.
 
 Source/tests validated by Windows CI and final target-machine E2E are at `bca06c6f40767e857820342536208f5edeb21f89`. Windows CI run #414 completed successfully with 121 focused Automatic Git tests and 525 full-suite tests. Generic Sandbox verification, Git-specific verification, stale-marker fail-closed behavior, MCP stdio negotiation, model-facing successful Automatic Git operations, model-facing content-bearing rejection guidance, and Broker containment/audit fields were all verified on the target Windows machine.
 
-Verification is complete. PR #26 remains draft/unmerged only because verification completion is not merge authorization.
+Verification is complete for the Automatic Git remediation at the recorded pre-integration source/test head. PR #26 remains draft/unmerged because verification completion does not authorize merge.
+
+## Concurrent-main integration verification
+
+After the Automatic Git target-machine E2E completed, `main` advanced to `63e3e75b4bf9fb1cf9ce8cef9c4eb1380b3e264a` through the WLMCP-R2-001 Approved Host LocalSystem authority remediation. The overlapping source, workflow, README, Security Contract, and specification changes were resolved together on the isolated integration branch rather than by choosing either side wholesale.
+
+Current synthetic integration candidate before this documentation-only record: `c0ff548dbba40abdb370dca33552b7e8efaa55d3`.
+
+The integration preserves both execution boundaries:
+
+- Automatic Git remains a `broker` operation routed only to the dedicated `git_broker_worker`, with current Git-specific marker enforcement, sanitized projection containment, strict all-property Sandbox gating, and `host_fallback_performed=false`.
+- Approved Host remains a separate one-shot approval route. `Executor` sends only `approved_host` operations to the authenticated LocalSystem authority service, while the final command uses the verified non-elevated requester token.
+- `session_info()` retains the Git helper's `git-specific-live-marker` availability semantics and the Approved Host capability's `runtime_and_authority_preflight_only` semantics simultaneously. A dedicated integration regression now locks this combined model-facing surface.
+- README, `SECURITY_CONTRACT.md`, and `SPEC.md` describe Automatic Git as an active verified Broker capability and Approved Host as an active authority-separated route. The former temporary fail-closed descriptions are retained only as historical context, not current capability state.
+- Automatic Git containment failure still has no normal-worker or Approved Host fallback.
+
+Windows CI run #426 on `c0ff548dbba40abdb370dca33552b7e8efaa55d3` completed successfully on Windows Server 2025 / Python 3.12, with the production-shaped MCP stdio check also run under Python 3.13:
+
+- focused process-identity security regression: 17 passed
+- focused race/recovery/transaction regression: 38 passed
+- focused WLMCP-R2-001 Approved Host authority regression: 49 passed
+- focused Automatic Git Broker regression, including the integrated capability-surface test: 122 passed
+- full pytest: 595 passed in 134.13 seconds
+- Ruff: passed
+- compileall: passed
+- PowerShell parser: passed
+- diff whitespace: passed
+- Python 3.13 wheel-install real MCP stdio negotiation: passed
+
+The pre-integration target-machine Automatic Git E2E remains valid evidence for the Automatic Git implementation and containment design that was carried into the integrated tree. It is not promoted to evidence for the final integrated commit identity. Because shared `executor.py` and `server.py` changed during concurrent-main integration, the final PR #26 integrated head still requires one target-Windows revalidation of `verify-codex-sandbox`, `verify-git-broker`, MCP stdio negotiation, successful metadata-only Automatic Git operations, content-bearing rejection guidance, and audit/result boundary fields before integrated-head live verification can be called complete.
+
+Until that revalidation is performed, the correct state is: source-level integration and hosted Windows regression PASS; final integrated-head target-machine E2E pending. PR #26 must remain draft/unmerged.
