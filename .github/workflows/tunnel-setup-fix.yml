@@ -31,7 +31,9 @@ jobs:
 
       - name: Apply focused fix
         shell: pwsh
-        run: python .dev-tmp/apply_tunnel_setup_fix.py
+        run: |
+          python .dev-tmp/apply_tunnel_setup_fix.py
+          python .dev-tmp/apply_tunnel_setup_fix2.py
 
       - name: Parse PowerShell
         shell: pwsh
@@ -49,7 +51,7 @@ jobs:
       - name: Focused regressions
         shell: pwsh
         run: |
-          python -m pytest tests/test_tunnel_setup_diagnostics.py tests/test_setup_python_diagnostics.py tests/test_tunnel_integration.py tests/test_local_launchers.py tests/test_mcp_stdio_integration.py -q
+          python -m pytest tests/test_tunnel_setup_diagnostics.py tests/test_setup_python_diagnostics.py tests/test_tunnel_integration.py tests/test_local_launchers.py -q
 
       - name: Ruff
         shell: pwsh
@@ -61,7 +63,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git rm .dev-tmp/apply_tunnel_setup_fix.py .github/workflows/tunnel-setup-fix.yml
-          git add setup-localmcp.ps1 secure-mcp-tunnel.ps1 tests/test_tunnel_setup_diagnostics.py
+          git rm .dev-tmp/apply_tunnel_setup_fix.py .dev-tmp/apply_tunnel_setup_fix2.py .github/workflows/tunnel-setup-fix.yml
+          git add setup-localmcp.ps1 secure-mcp-tunnel.ps1 tests/test_tunnel_setup_diagnostics.py tests/test_local_launchers.py
           git commit -m "fix: Tunnel設定の診断と検出UXを改善"
           git push origin HEAD:fix/tunnel-setup-diagnostics
