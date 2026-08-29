@@ -1,0 +1,79 @@
+name: Finalize rebuilt Tunnel PR
+
+on:
+  push:
+    branches:
+      - work/rebuild-tunnel-ux-latest-main
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-finalize:
+    runs-on: windows-2025
+    steps:
+      - name: Checkout staging branch
+        uses: actions/checkout@v7
+        with:
+          ref: work/rebuild-tunnel-ux-latest-main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+          python -m pip check
+
+      - name: Apply final selective adjustments
+        shell: pwsh
+        run: python .dev-tmp/finalize_rebuilt_pr.py
+
+      - name: Parse PowerShell
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($path in @('setup-localmcp.ps1', 'secure-mcp-tunnel.ps1', 'run-localmcp.ps1', 'run-server.ps1')) {
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $path), [ref]$null, [ref]$errors)
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Error $_.Message }
+              throw "$path parse failed"
+            }
+          }
+
+      - name: Focused regressions
+        shell: pwsh
+        run: |
+          python -m pytest tests/test_setup_python_diagnostics.py tests/test_tunnel_integration.py tests/test_local_launchers.py tests/test_mcp_stdio_integration.py -q
+
+      - name: Repository core regression
+        shell: pwsh
+        run: python -m pytest --ignore=tests/test_runtime_closure_integration.py
+
+      - name: Runtime closure regression
+        shell: pwsh
+        run: python -m pytest tests/test_runtime_closure_integration.py
+
+      - name: Ruff
+        shell: pwsh
+        run: python -m ruff check .
+
+      - name: Diff whitespace
+        shell: bash
+        run: git diff --check origin/main -- setup-localmcp.ps1 secure-mcp-tunnel.ps1 tests/test_tunnel_integration.py tests/test_local_launchers.py tests/test_mcp_stdio_integration.py
+
+      - name: Commit final validated tree
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .dev-tmp/finalize_rebuilt_pr.py .github/workflows/finalize-rebuilt-tunnel-pr.yml
+          git add setup-localmcp.ps1 secure-mcp-tunnel.ps1 tests/test_tunnel_integration.py tests/test_local_launchers.py tests/test_mcp_stdio_integration.py
+          git commit -m "test: 最新mainのWindows回帰に整合"
+          git push origin HEAD:work/rebuild-tunnel-ux-latest-main
