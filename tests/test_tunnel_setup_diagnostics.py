@@ -74,6 +74,23 @@ $secure.Dispose()
     assert "sk-test-secret" not in output
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows tunnel-client doctor fail-closed regression")
+def test_doctor_invalid_json_is_never_classified_as_success() -> None:
+    command = f"""
++$ErrorActionPreference = 'Stop'
++. {_ps_literal(HELPER)}
++$class = Get-TunnelDoctorFailureClass -Report $null -Stdout 'not-json' -Stderr '' -ExitCode 0
++if ($class -ne 'doctor_output_invalid') {{ throw 'invalid doctor JSON did not fail closed: ' + $class }}
++'doctor-invalid-json-failclosed-ok'
++"""
+    completed = _run(command)
+    output = completed.stdout + completed.stderr
+    assert completed.returncode == 0, output
+    assert "doctor-invalid-json-failclosed-ok" in output
+    helper = HELPER.read_text(encoding="utf-8-sig")
+    assert 'Succeeded = ($exitCode -eq 0 -and $null -ne $report -and $report.Result -eq "ok")' in helper
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows tunnel-client candidate discovery")
 def test_candidate_discovery_checks_desktop_downloads_shallowly(tmp_path: Path) -> None:
     user = tmp_path / "user"

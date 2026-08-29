@@ -1055,14 +1055,15 @@ function Get-TunnelDoctorFailureClass {
         [int]$ExitCode
     )
 
-    $failed = @()
-    if ($null -ne $Report) { $failed = @($Report.FailedChecks) }
+    if ($null -eq $Report) { return "doctor_output_invalid" }
+    $failed = @($Report.FailedChecks)
     if ($failed -contains "tunnel_id") { return "tunnel_id_invalid" }
     if ($failed -contains "control_plane_api_key") { return "credential_configuration" }
     if ($failed -contains "mcp_target" -or $failed -contains "mcp_command_executable") { return "server_start_failed" }
     if (@($failed | Where-Object { $_ -in @("profile_load", "config_source", "config_validation", "control_plane_base_url", "control_plane_url_path") }).Count -gt 0) {
         return "profile_invalid"
     }
+    if ([string]$Report.Result -ne "ok") { return "doctor_validation_failed" }
     return Get-TunnelFailureClass -Stdout $Stdout -Stderr $Stderr -ExitCode $ExitCode
 }
 
@@ -1164,7 +1165,7 @@ function Invoke-TunnelClientDoctor {
         $fallback = (($safeStdout, $safeStderr | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }) -join [Environment]::NewLine).Trim()
         if ($fallback.Length -gt 12000) { $fallback = $fallback.Substring(0, 12000) + "`n[truncated]" }
         return [PSCustomObject]@{
-            Succeeded = ($exitCode -eq 0 -and ($null -eq $report -or $report.Result -eq "ok"))
+            Succeeded = ($exitCode -eq 0 -and $null -ne $report -and $report.Result -eq "ok")
             ExitCode = $exitCode
             FailureClass = Get-TunnelDoctorFailureClass -Report $report -Stdout $safeStdout -Stderr $safeStderr -ExitCode $exitCode
             Report = $report
@@ -1378,6 +1379,12 @@ function Show-TunnelFailureGuide {
         }
         "credential_configuration" {
             Write-Host "Runtime API Key の参照または設定を tunnel-client doctor が確認できません。上の診断詳細を確認し、必要なら key を再入力してください。" -ForegroundColor Yellow
+        }
+        "doctor_output_invalid" {
+            Write-Host "tunnel-client doctor の構造化診断を解析できませんでした。公式 tunnel-client v0.0.10 互換の配布物か確認し、必要なら client を入れ直してください。" -ForegroundColor Yellow
+        }
+        "doctor_validation_failed" {
+            Write-Host "tunnel-client doctor は失敗を返しましたが、失敗項目を特定できませんでした。上の診断内容を確認し、必要なら client または profile を再確認してください。" -ForegroundColor Yellow
         }
         "profile_invalid" {
             Write-Host "Tunnel profile の検証に失敗しました。上の doctor 診断を確認し、必要な場合だけ configure-localmcp.bat の Tunnel 設定変更から profile を再生成してください。" -ForegroundColor Yellow
