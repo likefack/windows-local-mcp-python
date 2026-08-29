@@ -358,3 +358,67 @@ try {{
     output = completed.stdout + completed.stderr
     assert completed.returncode == 0, output
     assert "existing-profile-detected" in output
+
+
+@pytest.mark.skipif(os.name != "nt", reason="PowerShell helper is Windows-only")
+def test_common_download_locations_discover_tunnel_client(tmp_path: Path) -> None:
+    user_profile = tmp_path / "user profile"
+    client_dir = user_profile / "Desktop" / "tunnel-client-v0.0.10-windows-amd64"
+    client_dir.mkdir(parents=True)
+    expected = client_dir / "tunnel-client.exe"
+    shutil.copy2(os.environ.get("ComSpec", r"C:\Windows\System32\cmd.exe"), expected)
+    state_root = tmp_path / "state"
+    command = f"""
+$ErrorActionPreference = 'Stop'
+. {_ps_literal(_HELPER)}
+$oldUserProfile = $env:USERPROFILE
+$oldOneDrive = $env:OneDrive
+$oldBin = $env:TUNNEL_CLIENT_BIN
+try {{
+    $env:USERPROFILE = {_ps_literal(user_profile)}
+    Remove-Item Env:OneDrive -ErrorAction SilentlyContinue
+    Remove-Item Env:TUNNEL_CLIENT_BIN -ErrorAction SilentlyContinue
+    $candidates = @(Get-TunnelClientCandidates -StateRoot {_ps_literal(state_root)} -ForbiddenRoots @())
+    $expected = [IO.Path]::GetFullPath({_ps_literal(expected)})
+    if (-not ($candidates | Where-Object {{ [IO.Path]::GetFullPath($_.Path).Equals($expected, [StringComparison]::OrdinalIgnoreCase) }})) {{
+        throw 'Desktop extraction candidate was not discovered'
+    }}
+    'download-candidate-ok'
+}} finally {{
+    $env:USERPROFILE = $oldUserProfile
+    if ($null -eq $oldOneDrive) {{ Remove-Item Env:OneDrive -ErrorAction SilentlyContinue }} else {{ $env:OneDrive = $oldOneDrive }}
+    if ($null -eq $oldBin) {{ Remove-Item Env:TUNNEL_CLIENT_BIN -ErrorAction SilentlyContinue }} else {{ $env:TUNNEL_CLIENT_BIN = $oldBin }}
+}}
+"""
+    completed = _run_powershell(command)
+    output = completed.stdout + completed.stderr
+    assert completed.returncode == 0, output
+    assert "download-candidate-ok" in output
+
+
+@pytest.mark.skipif(os.name != "nt", reason="PowerShell setup helper is Windows-only")
+def test_tunnel_client_directory_input_resolves_direct_executable(tmp_path: Path) -> None:
+    client_dir = tmp_path / "tunnel client extracted"
+    client_dir.mkdir()
+    expected = client_dir / "tunnel-client.exe"
+    shutil.copy2(os.environ.get("ComSpec", r"C:\Windows\System32\cmd.exe"), expected)
+    setup = _REPOSITORY_ROOT / "setup-localmcp.ps1"
+    command = f"""
+$ErrorActionPreference = 'Stop'
+. {_ps_literal(setup)} -FunctionsOnly
+$script:selectionValue = {_ps_literal(client_dir)}
+function Get-TunnelClientCandidates {{ return @() }}
+function Read-Host {{ param([string]$Prompt); return $script:selectionValue }}
+function Read-YesNo {{ param([string]$Prompt, [bool]$Default = $true); return $true }}
+$result = Select-TunnelClient -State $null -ForbiddenRoots @()
+$expected = [IO.Path]::GetFullPath({_ps_literal(expected)})
+if ($null -eq $result -or -not [IO.Path]::GetFullPath($result.Path).Equals($expected, [StringComparison]::OrdinalIgnoreCase)) {{
+    throw 'directory input did not resolve its direct tunnel-client.exe child'
+}}
+'directory-input-ok'
+"""
+    completed = _run_powershell(command)
+    output = completed.stdout + completed.stderr
+    assert completed.returncode == 0, output
+    assert "directory-input-ok" in output
+

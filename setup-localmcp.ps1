@@ -170,7 +170,7 @@ function Invoke-Python {
         $utf8 = [Text.UTF8Encoding]::new($false)
         [Console]::OutputEncoding = $utf8
         $OutputEncoding = $utf8
-        $output = @(& $PythonPath @Arguments 2>&1)
+        $output = @(& $PythonPath -X utf8 @Arguments 2>&1)
         $exitCode = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previousErrorActionPreference
@@ -1156,6 +1156,18 @@ function Select-TunnelClient {
             continue
         }
         try {
+            if (Test-Path -LiteralPath $selection -PathType Container) {
+                $directChild = Join-Path $selection "tunnel-client.exe"
+                if (-not (Test-Path -LiteralPath $directChild -PathType Leaf)) {
+                    Write-Warn "指定したフォルダー直下に tunnel-client.exe がありません。実行ファイルまで含む path を指定してください。"
+                    continue
+                }
+                Write-Info "フォルダー直下の tunnel-client.exe を検出しました: $directChild"
+                if (-not (Read-YesNo -Prompt "この tunnel-client.exe を使用しますか" -Default $true)) {
+                    continue
+                }
+                $selection = $directChild
+            }
             $resolved = Resolve-TunnelExecutable -Path $selection -ForbiddenRoots $ForbiddenRoots
             return [PSCustomObject]@{ Path = $resolved; Hash = Get-TunnelSha256 -Path $resolved }
         } catch {
