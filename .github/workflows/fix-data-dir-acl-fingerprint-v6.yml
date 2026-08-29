@@ -1,0 +1,127 @@
+name: Fix data_dir ACL fingerprint v6
+
+on:
+  push:
+    branches: [fix/data-dir-acl-fingerprint]
+    paths: [.github/workflows/fix-data-dir-acl-fingerprint-v6.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fix/data-dir-acl-fingerprint
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Patch source and tests
+        shell: bash
+        run: |
+          python - <<'PY'
+          import re
+          from pathlib import Path
+
+          p = Path('src/windows_local_mcp/config.py')
+          s = p.read_text(encoding='utf-8')
+          pattern = re.compile(
+              r'    logical_texts = \{raw\.decode\("utf-8", errors="replace"\)\}\n'
+              r'    for codec in codecs:\n'
+              r'        try:\n'
+              r'            logical_texts\.add\(raw\.decode\(codec, errors="strict"\)\)\n'
+              r'        except \(LookupError, UnicodeDecodeError\):\n'
+              r'            continue\n\n'
+              r'    digests: set\[str\] = set\(\)\n'
+          )
+          replacement = '''    decoded_texts = {raw.decode("utf-8", errors="replace")}
+          for codec in codecs:
+              try:
+                  decoded_texts.add(raw.decode(codec, errors="strict"))
+              except (LookupError, UnicodeDecodeError):
+                  continue
+
+          # v1 used subprocess text mode, which normalized CRLF before hashing.
+          # Preserve both forms when reconstructing a marker from localized icacls output.
+          logical_texts = set(decoded_texts)
+          logical_texts.update(
+              text.replace("\\r\\n", "\\n").replace("\\r", "\\n")
+              for text in decoded_texts
+          )
+
+          digests: set[str] = set()
+          '''
+          s, n = pattern.subn(replacement, s, count=1)
+          if n != 1:
+              raise SystemExit(f'config replacement count={n}')
+          p.write_text(s, encoding='utf-8')
+
+          p = Path('secure-mcp-tunnel.ps1')
+          raw = p.read_bytes()
+          bom = raw.startswith(b'\xef\xbb\xbf')
+          s = raw.decode('utf-8-sig')
+          old = '$output = @(& $PythonPath -I -B -c $probe 2>$null)'
+          if s.count(old) != 1:
+              raise SystemExit(f'tunnel replacement count={s.count(old)}')
+          s = s.replace(old, '$output = @(& $PythonPath -X utf8 -I -B -c $probe 2>$null)', 1)
+          p.write_bytes((b'\xef\xbb\xbf' if bom else b'') + s.encode('utf-8'))
+
+          p = Path('tests/test_config.py')
+          s = p.read_text(encoding='utf-8')
+          old = '    legacy_text = legacy_raw.decode("utf-8", errors="replace")\n    legacy_digest = hashlib.sha256(legacy_text.encode("utf-8")).hexdigest()\n'
+          new = '    legacy_text = legacy_raw.decode("utf-8", errors="replace")\n    legacy_text = legacy_text.replace("\\r\\n", "\\n").replace("\\r", "\\n")\n    legacy_digest = hashlib.sha256(legacy_text.encode("utf-8")).hexdigest()\n'
+          if s.count(old) != 1:
+              raise SystemExit(f'test_config replacement count={s.count(old)}')
+          p.write_text(s.replace(old, new, 1), encoding='utf-8')
+
+          p = Path('tests/test_local_launchers.py')
+          s = p.read_text(encoding='utf-8')
+          old = '    assert f\'data_dir = "{toml_path(new_data_dir)}"\' in config.read_text(encoding="utf-8")\n'
+          new = '''    saved_data_dir = next(
+              line.split("=", 1)[1].strip().strip('"').replace("\\\\", "\\")
+              for line in config.read_text(encoding="utf-8").splitlines()
+              if line.startswith("data_dir = ")
+          )
+          assert Path(saved_data_dir).samefile(new_data_dir)
+          '''
+          if s.count(old) != 1:
+              raise SystemExit(f'launcher replacement count={s.count(old)}')
+          p.write_text(s.replace(old, new, 1), encoding='utf-8')
+          PY
+
+      - name: Install
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Config and diagnostics tests
+        shell: pwsh
+        run: |
+          python -m pytest tests/test_config.py tests/test_setup_python_diagnostics.py -q
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Launcher tests
+        shell: pwsh
+        run: |
+          python -m pytest tests/test_local_launchers.py -q
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Ruff
+        shell: pwsh
+        run: |
+          python -m ruff check src/windows_local_mcp/config.py tests/test_config.py tests/test_setup_python_diagnostics.py tests/test_local_launchers.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Commit source fix
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/windows_local_mcp/config.py setup-localmcp.ps1 secure-mcp-tunnel.ps1 tests/test_config.py tests/test_local_launchers.py
+          git commit -m "fix: data_dir ACL検証をコードページ非依存化"
+          git push origin HEAD:fix/data-dir-acl-fingerprint
