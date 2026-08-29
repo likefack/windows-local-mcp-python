@@ -34,6 +34,7 @@ jobs:
         run: |
           python .dev-tmp/apply_tunnel_setup_fix.py
           python .dev-tmp/apply_tunnel_setup_fix2.py
+          python .dev-tmp/apply_tunnel_setup_fix3.py
 
       - name: Parse PowerShell
         shell: pwsh
@@ -55,7 +56,7 @@ jobs:
 
       - name: Ruff
         shell: pwsh
-        run: python -m ruff check tests/test_tunnel_setup_diagnostics.py
+        run: python -m ruff check tests/test_tunnel_setup_diagnostics.py tests/test_local_launchers.py
 
       - name: Commit validated fix
         if: success()
@@ -63,7 +64,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git rm .dev-tmp/apply_tunnel_setup_fix.py .dev-tmp/apply_tunnel_setup_fix2.py .github/workflows/tunnel-setup-fix.yml
+          git rm .dev-tmp/apply_tunnel_setup_fix.py .dev-tmp/apply_tunnel_setup_fix2.py .dev-tmp/apply_tunnel_setup_fix3.py .github/workflows/tunnel-setup-fix.yml
           git add setup-localmcp.ps1 secure-mcp-tunnel.ps1 tests/test_tunnel_setup_diagnostics.py tests/test_local_launchers.py
           git commit -m "fix: Tunnel設定の診断と検出UXを改善"
           git push origin HEAD:fix/tunnel-setup-diagnostics
