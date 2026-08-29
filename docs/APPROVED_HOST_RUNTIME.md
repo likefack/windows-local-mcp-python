@@ -146,6 +146,14 @@ marker mismatch、SHA mismatch、operation mismatch、independent tamper marker�
 
 旧版 `recover-approved-host-authority.ps1` が SYSTEM latch だけを先に解除してしまい、version-1 SYSTEM recovery archive と user-owned postflight marker が残っている historical split-recovery state に限り、`recover-approved-host-postflight.ps1` を使います。この compatibility path は protected `ApprovedHostAuthority/completed` 配下の version-1 archive、archive 内 active/status operation binding、`recovery_required`、旧 administrator acknowledgement を検証し、同じ operation の postflight marker を immutable runtime で quarantine します。新規 recovery では使用しません。
 
+## Secure MCP Tunnel との運用用実行環境の結び付け
+
+runtime と authority service を導入・確認した後、通常 runtime user で `configure-localmcp.bat` を実行し、`現在の設定を確認・変更する` → `Approved Host 運用 runtime を設定 / 無効化する` を選びます。Program Files 配下のインストール先を指定すると、ウィザードは変更不能性検証と現在の authority preflight を実行し、成功した場合だけ managed Tunnel profile の server command をインストール済み `run-server.ps1` に置き換えて `approved_host_enabled=true` にします。
+
+Tunnel state は `server_runtime_kind=approved_host`、運用用 `run-server.ps1` の絶対 path と SHA-256 を保持します。`run-localmcp.bat` は起動ごとに Program Files 配下であること、必須の installed Python／verifier、保存済み SHA-256、runtime の変更不能性を再検証します。一つでも失敗した場合は起動を停止し、editable checkout の開発用 runtime や Tunnel なしの server へ自動的に切り替えません。
+
+無効化は config の `approved_host_enabled` だけを `false` にし、インストール済み runtime、authority service、Tunnel ID、Runtime API Key を削除しません。再有効化には同じ検証をもう一度通す必要があります。ウィザードは管理者権限を要求する runtime／service のインストールや置換を代行しません。
+
 ## Windows live verification
 
 ### Normal path

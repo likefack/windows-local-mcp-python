@@ -119,9 +119,13 @@ Tunnel ID は [OpenAI Platform の Tunnels 管理画面](https://platform.openai
 
 入力した Runtime API Key は Windows の現在のユーザーに紐付く Credential Manager へ保存します。`config.toml`、Tunnel profile、workspace、`data_dir`、`.env`、Git、ログ、監査記録、コマンドライン、永続環境変数には保存しません。`run-localmcp.bat` の起動時だけ、検証済み `tunnel-client` の child process 環境へ渡します。
 
-Tunnel 設定後は、`run-localmcp.bat` が profile、tunnel-client の実体と SHA-256、Credential Manager、LocalMCP config、起動中プロセスを確認し、Tunnel client から現在の `run-server.ps1 -Config <absolute config>` を一度だけ起動します。Tunnel が設定済みで確認できない場合に、Tunnel を迂回して直接 server を起動する自動 fallback は行いません。ChatGPT 側で接続やツールが表示されない場合は、Tunnel／connector の tool refresh や再接続が必要になることがあります。
+Tunnel 設定後は、`run-localmcp.bat` が profile、tunnel-client の実体と SHA-256、Credential Manager、LocalMCP config、起動中プロセスを確認し、Tunnel client から state に固定した `run-server.ps1 -Config <absolute config>` を一度だけ起動します。通常は開発用実行環境、Approved Host を有効にした構成では検証済みの Program Files 配下の運用用実行環境を使用します。運用用実行環境の検証に失敗しても、開発用実行環境へ戻しません。Tunnel が設定済みで確認できない場合に、Tunnel を迂回して直接 server を起動する自動 fallback も行いません。ChatGPT 側で接続やツールが表示されない場合は、Tunnel／connector の tool refresh や再接続が必要になることがあります。
 
-後から変更する場合は `configure-localmcp.bat` の `2. 現在の設定を確認・変更する` を選びます。概要を確認したうえで、workspace の変更、Tunnel ID／client／profile の変更、Runtime API Key の単独ローテーション、Tunnel の有効化・無効化、active config の変更、診断、保存済み key の削除を行えます。Key の切り替えに失敗した場合は、旧 key を維持します。
+後から変更する場合は `configure-localmcp.bat` の `2. 現在の設定を確認・変更する` を選びます。概要を確認したうえで、workspace の変更、Tunnel ID／client／profile の変更、Runtime API Key の単独ローテーション、Tunnel の有効化・無効化、Codex Sandbox／Automatic Git の有効化・無効化、Approved Host 運用用実行環境の設定、active config の変更、診断、保存済み key の削除を行えます。新規設定では Codex Sandbox と Automatic Git を有効、Approved Host を無効にします。有効化は利用意図の設定であり、Sandbox／Git の現在の実体と実機検証記録が一致しなければ実行経路は引き続き利用不可です。Key の切り替えに失敗した場合は、旧 key を維持します。
+
+`run-localmcp.bat` のウィンドウには、起動後に作成された監査操作と状態変化を一行ずつ表示します。`activity_timeline`／`audit_list` と同じ監査DBを読み取り専用で参照し、操作 ID、ツール、実行経路、状態、承認状態、安全に伏せ字化したコマンドまたは対象の要約を表示します。ローカル承認が必要になると `PENDING_APPROVAL 要承認` を表示しますが、承認操作は引き続き `run-approvals.ps1` の別画面で行います。生の要求・結果、ファイル内容、標準出力・標準エラー、Runtime API Key は表示・保存しません。
+
+同じ行は `<data_dir>\logs\localmcp-activity.log` に UTF-8 で保存します。5 MiB ごとに切り替え、過去10ファイルまで保持します。Tunnel client 自身の生出力は秘密情報を含む可能性があるため、従来どおり画面にもログにも流しません。
 
 ## できることと、実行経路の違い
 
@@ -218,7 +222,7 @@ $env:LOCAL_MCP_CONFIG = (Resolve-Path .\config.local.toml).Path
 
 ### 5. 承認画面を必要なときだけ起動する
 
-Sandbox や Approved Host などの承認が必要な処理を使う場合は、別の PowerShell ウィンドウで承認プロセスを起動します。
+Sandbox や Approved Host などの承認が必要な処理を使う場合は、別の PowerShell ウィンドウで承認プロセスを起動します。承認要求の発生と状態変化は `run-localmcp.bat` のウィンドウにも表示されますが、この表示から承認は行いません。
 
 ~~~powershell
 Set-Location C:\dev\windows-local-mcp-python
@@ -364,7 +368,7 @@ powershell.exe -NoProfile -File C:\dev\windows-local-mcp-python\run-server.ps1 -
 
 Approved Host を運用で使うには、変更できない運用用実行環境と、LocalSystem で動く監視サービスの両方が必要です。`approved_host_enabled=true` にしたり、`request_host_command` が表示されたりするだけでは、実行できる状態とは限りません。
 
-導入は、運用用実行環境のインストール、通常権限での確認、監視サービスの管理者インストール、通常権限での確認、という順に行います。対応するスクリプトは `install-approved-host-runtime.ps1`、`verify-approved-host-runtime.ps1`、`install-approved-host-authority.ps1`、`verify-approved-host-authority.ps1` です。セキュリティ境界を変更した場合は、異常終了と復旧後の通常処理まで再確認します。
+導入は、運用用実行環境のインストール、通常権限での確認、監視サービスの管理者インストール、通常権限での確認、`configure-localmcp.bat` の `Approved Host 運用 runtime を設定 / 無効化する` で Tunnel と運用用実行環境を結び付ける、という順に行います。対応するスクリプトは `install-approved-host-runtime.ps1`、`verify-approved-host-runtime.ps1`、`install-approved-host-authority.ps1`、`verify-approved-host-authority.ps1` です。ウィザードは既存の運用用実行環境と authority service の検証が成功した場合だけ `approved_host_enabled=true` にし、管理者インストールそのものは行いません。セキュリティ境界を変更した場合は、異常終了と復旧後の通常処理まで再確認します。
 
 `session_info` の `available=true` は、現在の実行環境と監視サービスの事前確認が通ったことを示すだけです。自動テストやサービスが動いているという情報だけで、Windows の実機検証済みとは扱いません。WLMCP-R2-001 については、2026-08-28 に通常処理、worker の停止、サービス再起動、復旧要求、復旧後の通常処理を含む実機確認を完了しています。
 
@@ -574,7 +578,7 @@ ADB は任意コマンドを実行する機能ではありません。`adb_read`
 
 | 項目 | 内容 |
 | --- | --- |
-| `approved_host_enabled` | Approved Host を利用する設定。設定モデルの既定値は `true` ですが、editable checkout の開発環境では `false` を推奨します |
+| `approved_host_enabled` | Approved Host を利用する設定。設定ウィザードとサンプルの初期値は `false` で、運用用実行環境と authority service の検証後に有効化します |
 | `approval_request_ttl_seconds` | 承認要求の有効期間。サンプルは 1800 秒 |
 | `approval_execution_ttl_seconds` | 承認後の実行有効期間。サンプルは 60 秒 |
 | `default_approver` | 既定の承認者識別子。サンプルは `local-user` |

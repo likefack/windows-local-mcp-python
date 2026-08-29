@@ -457,7 +457,8 @@ function New-ConfigContent {
     $lines.Add('approved_sandbox_windows_mode = "elevated"')
     $lines.Add('approved_sandbox_permission_profile = ":workspace"')
     $lines.Add("approved_sandbox_require_live_verification = true")
-    $lines.Add("approved_host_enabled = true")
+    # Approved Host は変更不能な運用 runtime と LocalSystem service の導入後だけ有効化します。
+    $lines.Add("approved_host_enabled = false")
     $lines.Add("adb_emulator_only = true")
     $lines.Add("adb_allowed_serials = []")
     $lines.Add("protect_data_dir_acl = true")
@@ -738,6 +739,149 @@ function Save-WorkspaceConfig {
     Save-Config -Content $updated -Path $ConfigPath -PythonPath $PythonPath -AllowExistingReplacement
 }
 
+function Get-TunnelServerRuntimeForSetup {
+    param(
+        [AllowNull()][object]$State,
+        [switch]$VerifyApprovedHostRuntime
+    )
+
+    $runtime = Resolve-TunnelServerRuntime `
+        -ScriptRoot $ScriptRoot `
+        -State $State `
+        -VerifyApprovedHostRuntime:$VerifyApprovedHostRuntime
+    if (-not $runtime.Valid) {
+        throw $runtime.Message
+    }
+    return $runtime
+}
+
+function Save-ConfigBooleanValue {
+    param(
+        [Parameter(Mandatory = $true)][string]$PythonPath,
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [Parameter(Mandatory = $true)][string]$SettingName,
+        [Parameter(Mandatory = $true)][bool]$Value
+    )
+
+    if ($SettingName -notin @("approved_sandbox_enabled", "git_enabled", "approved_host_enabled")) {
+        throw "設定ウィザードから変更できない項目です: $SettingName"
+    }
+    $encoding = [Text.UTF8Encoding]::new($false, $true)
+    $content = [IO.File]::ReadAllText($ConfigPath, $encoding)
+    $match = [regex]::Match($content, '(?m)^[ \t]*' + [regex]::Escape($SettingName) + '[ \t]*=[^\r\n]*')
+    $replacement = "$SettingName = $($Value.ToString().ToLowerInvariant())"
+    if ($match.Success) {
+        $updated = $content.Substring(0, $match.Index) + $replacement + $content.Substring($match.Index + $match.Length)
+    } else {
+        $newline = if ($content.Contains("`r`n")) { "`r`n" } else { "`n" }
+        $updated = $content
+        if (-not $updated.EndsWith("`n")) { $updated += $newline }
+        $updated += $replacement + $newline
+    }
+    Save-Config -Content $updated -Path $ConfigPath -PythonPath $PythonPath -AllowExistingReplacement
+}
+
+function Set-CapabilityEnabledForSetup {
+    param(
+        [Parameter(Mandatory = $true)][string]$PythonPath,
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [Parameter(Mandatory = $true)][string]$SettingName,
+        [Parameter(Mandatory = $true)][string]$DisplayName,
+        [Parameter(Mandatory = $true)][bool]$CurrentValue,
+        [AllowNull()][object]$TunnelState
+    )
+
+    Assert-TunnelNotRunning -State $TunnelState
+    $newValue = -not $CurrentValue
+    Save-ConfigBooleanValue -PythonPath $PythonPath -ConfigPath $ConfigPath -SettingName $SettingName -Value $newValue
+    if ($newValue) {
+        Write-Ok "$DisplayName を有効にしました。保存済み live marker は現在の環境と一致する場合だけ再利用されます。"
+        Write-Info "起動後に session_info で available と live_verified を確認してください。"
+    } else {
+        Write-Ok "$DisplayName を無効にしました。live marker は削除していません。"
+    }
+    Write-Info "変更は次回の run-localmcp.bat 起動から反映されます。"
+}
+
+function Configure-ApprovedHostRuntimeForSetup {
+    param(
+        [Parameter(Mandatory = $true)][string]$PythonPath,
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [Parameter(Mandatory = $true)][object]$Context,
+        [AllowNull()][object]$TunnelState
+    )
+
+    Assert-TunnelNotRunning -State $TunnelState
+    if ($null -eq $TunnelState -or [string]$TunnelState.profile_scope -ne "managed") {
+        throw "Approved Host 運用 runtime へ切り替えるには、このウィザードで生成した managed Tunnel profile が必要です。"
+    }
+    if ([string]$TunnelState.credential_mode -ne "credential_manager") {
+        throw "Approved Host 運用 runtime へ切り替えるには、Credential Manager を使用する managed Tunnel 設定が必要です。"
+    }
+
+    $defaultInstallRoot = Join-Path $env:ProgramFiles "WindowsLocalMCP"
+    $inputRoot = (Read-Host "Approved Host の運用 runtime（空欄で $defaultInstallRoot）").Trim().Trim('"')
+    $installRoot = if ([string]::IsNullOrWhiteSpace($inputRoot)) { $defaultInstallRoot } else { [IO.Path]::GetFullPath($inputRoot) }
+    $candidateState = [PSCustomObject]@{
+        server_runtime_kind = "approved_host"
+        server_script_path = Join-Path $installRoot "run-server.ps1"
+        server_script_sha256 = ""
+    }
+    $runtime = Resolve-TunnelServerRuntime -ScriptRoot $ScriptRoot -State $candidateState -VerifyApprovedHostRuntime
+    if (-not $runtime.Valid) {
+        throw "Approved Host 運用 runtime を使用できません: $($runtime.Message)"
+    }
+
+    # runtime が変更不能でも、認証済み LocalSystem authority がなければ Host 経路は使えません。
+    $authorityProbe = @(
+        "import json",
+        "from windows_local_mcp.approved_host_policy import assert_approved_host_authority_available",
+        "print(json.dumps(assert_approved_host_authority_available(), ensure_ascii=False, sort_keys=True))"
+    ) -join "; "
+    Invoke-Python -PythonPath $runtime.PythonPath -Arguments @("-I", "-B", "-c", $authorityProbe) | Out-Null
+
+    $configurationInfo = Get-ConfigurationInfo -PythonPath $PythonPath -ConfigPath $ConfigPath
+    $wasEnabled = [bool]$configurationInfo.approved_host_enabled
+    $configChanged = $false
+    $integrationSaved = $false
+    $credential = $null
+    try {
+        $credential = Get-TunnelSavedCredential -ConfigPath $ConfigPath
+        if ($null -eq $credential) {
+            throw "保存済み Runtime API Key を取得できません。先に Tunnel の Key を設定してください。"
+        }
+        # Tunnel は停止済みなので、profile 更新前に route intent を切り替えられます。
+        # profile／doctor が失敗した場合は元の値へ戻し、片方だけの確定を避けます。
+        Save-ConfigBooleanValue -PythonPath $PythonPath -ConfigPath $ConfigPath -SettingName "approved_host_enabled" -Value $true
+        $configChanged = -not $wasEnabled
+        $saved = Save-TunnelManagedIntegration `
+            -ConfigPath $ConfigPath `
+            -ClientPath ([string]$TunnelState.tunnel_client_path) `
+            -TunnelId ([string]$TunnelState.tunnel_id) `
+            -Credential $credential `
+            -PreviousState $TunnelState `
+            -ServerRuntimeKind "approved_host" `
+            -ServerScriptPath $runtime.ServerScript
+        if (-not $saved) {
+            throw "運用 runtime を使用する Tunnel profile の検証に失敗しました。"
+        }
+        $integrationSaved = $true
+        Write-Ok "Tunnel を変更不能な Approved Host 運用 runtimeへ切り替え、Approved Host を有効にしました。"
+        Write-Info "次回の run-localmcp.bat 起動後、session_info で approved_host.available を確認してください。"
+    } catch {
+        if ($configChanged -and -not $integrationSaved) {
+            try {
+                Save-ConfigBooleanValue -PythonPath $PythonPath -ConfigPath $ConfigPath -SettingName "approved_host_enabled" -Value $wasEnabled
+            } catch {
+                throw "Tunnel profile の切り替えに失敗し、Approved Host 設定の復元も確認できません。Tunnel を起動せず config と state を診断してください。"
+            }
+        }
+        throw
+    } finally {
+        if ($null -ne $credential) { $credential.Dispose() }
+    }
+}
+
 function Read-DataDirectoryPath {
     param(
         [Parameter(Mandatory = $true)][string]$WorkspacePath,
@@ -834,6 +978,7 @@ function Get-TunnelSettingsSummary {
         ClientPath = ""
         ProfilePath = ""
         ProcessStatus = "停止"
+        ServerRuntime = "development"
     }
     $forbiddenRoots = @(Get-TunnelForbiddenRoots -Context $Context)
     if ($null -eq $State) {
@@ -847,14 +992,23 @@ function Get-TunnelSettingsSummary {
 
     $summary.TunnelId = if (Test-TunnelId -TunnelId ([string]$State.tunnel_id)) { [string]$State.tunnel_id } else { "形式不正" }
     $summary.ProfilePath = [string]$State.profile_path
+    if (-not [string]::IsNullOrWhiteSpace([string]$State.server_runtime_kind)) {
+        $summary.ServerRuntime = [string]$State.server_runtime_kind
+    }
     if ([bool]$State.enabled -ne $true) {
         $summary.Status = "無効"
     } else {
         $summary.Status = "設定済み"
+        $serverRuntime = Resolve-TunnelServerRuntime -ScriptRoot $ScriptRoot -State $State
+        if (-not $serverRuntime.Valid) {
+            $summary.Status = "要診断"
+            $summary.ClientStatus = "要診断"
+            return [PSCustomObject]$summary
+        }
         $binding = Test-TunnelProfileBinding `
             -State $State `
             -ConfigPath $ConfigPath `
-            -ServerScript (Join-Path $ScriptRoot "run-server.ps1") `
+            -ServerScript $serverRuntime.ServerScript `
             -ProfileRoot (Join-Path $StateRoot "tunnel-profiles") `
             -StateRoot $StateRoot `
             -ForbiddenRoots $forbiddenRoots
@@ -931,6 +1085,7 @@ function Show-ConfigurationSummary {
         if (-not [string]::IsNullOrWhiteSpace([string]$tunnel.ProfilePath)) {
             Write-Host "Tunnel profile: $($tunnel.ProfilePath)" -ForegroundColor Gray
         }
+        Write-Host "LocalMCP server runtime: $($tunnel.ServerRuntime)" -ForegroundColor Gray
         Write-Host "Tunnel process: $($tunnel.ProcessStatus)" -ForegroundColor Gray
     }
     Write-Host ("オプション: filesystem={0}, git={1}, ADB={2}, PowerShell={3}, Codex Sandbox={4}, Approved Host={5}" -f `
@@ -1095,10 +1250,11 @@ function Test-TunnelIntegrationForSetup {
 
     Assert-TunnelNotRunning -State $State
     $forbiddenRoots = @(Get-TunnelForbiddenRoots -Context $Context)
+    $serverRuntime = Get-TunnelServerRuntimeForSetup -State $State -VerifyApprovedHostRuntime
     $binding = Test-TunnelProfileBinding `
         -State $State `
         -ConfigPath $ConfigPath `
-        -ServerScript (Join-Path $ScriptRoot "run-server.ps1") `
+        -ServerScript $serverRuntime.ServerScript `
         -ProfileRoot (Join-Path $StateRoot "tunnel-profiles") `
         -StateRoot $StateRoot `
         -ForbiddenRoots $forbiddenRoots
@@ -1138,8 +1294,15 @@ function New-TunnelManagedState {
         [Parameter(Mandatory = $true)][string]$HealthUrlFile,
         [Parameter(Mandatory = $true)][string]$CredentialMode,
         [string]$CredentialTarget = "",
-        [string]$ProfileScope = "managed"
+        [string]$ProfileScope = "managed",
+        [string]$ServerRuntimeKind = "development",
+        [string]$ServerScriptPath = ""
     )
+
+    if ([string]::IsNullOrWhiteSpace($ServerScriptPath)) {
+        $ServerScriptPath = (Resolve-Path -LiteralPath (Join-Path $ScriptRoot "run-server.ps1") -ErrorAction Stop).Path
+    }
+    $resolvedServerScript = (Resolve-Path -LiteralPath $ServerScriptPath -ErrorAction Stop).Path
 
     return [PSCustomObject][ordered]@{
         version = 1
@@ -1155,6 +1318,9 @@ function New-TunnelManagedState {
         health_url_file = [IO.Path]::GetFullPath($HealthUrlFile)
         credential_mode = $CredentialMode
         credential_target = $CredentialTarget
+        server_runtime_kind = $ServerRuntimeKind
+        server_script_path = $resolvedServerScript
+        server_script_sha256 = if ($ServerRuntimeKind -eq "approved_host") { Get-TunnelSha256 -Path $resolvedServerScript } else { "" }
     }
 }
 
@@ -1164,7 +1330,9 @@ function Save-TunnelManagedIntegration {
         [Parameter(Mandatory = $true)][string]$ClientPath,
         [Parameter(Mandatory = $true)][string]$TunnelId,
         [Parameter(Mandatory = $true)][Security.SecureString]$Credential,
-        [Parameter(Mandatory = $true)][AllowNull()][object]$PreviousState
+        [Parameter(Mandatory = $true)][AllowNull()][object]$PreviousState,
+        [string]$ServerRuntimeKind = "",
+        [string]$ServerScriptPath = ""
     )
 
     Assert-TunnelNotRunning -State $PreviousState
@@ -1182,7 +1350,19 @@ function Save-TunnelManagedIntegration {
         }
 
         $resolvedConfig = [IO.Path]::GetFullPath($ConfigPath)
-        $serverScript = (Resolve-Path -LiteralPath (Join-Path $ScriptRoot "run-server.ps1") -ErrorAction Stop).Path
+        if ([string]::IsNullOrWhiteSpace($ServerRuntimeKind)) {
+            if ($null -ne $PreviousState -and [string]$PreviousState.server_runtime_kind -eq "approved_host") {
+                $previousRuntime = Get-TunnelServerRuntimeForSetup -State $PreviousState -VerifyApprovedHostRuntime
+                $ServerRuntimeKind = "approved_host"
+                $ServerScriptPath = $previousRuntime.ServerScript
+            } else {
+                $ServerRuntimeKind = "development"
+            }
+        }
+        if ([string]::IsNullOrWhiteSpace($ServerScriptPath)) {
+            $ServerScriptPath = Join-Path $ScriptRoot "run-server.ps1"
+        }
+        $serverScript = (Resolve-Path -LiteralPath $ServerScriptPath -ErrorAction Stop).Path
         $profilePath = Get-TunnelProfilePath -StateRoot $StateRoot -ConfigPath $resolvedConfig
         $fingerprint = (Get-TunnelCredentialTarget -ConfigPath $resolvedConfig).Split('/')[-1]
         $pidFile = Join-Path $StateRoot "tunnel-state\$fingerprint.pid"
@@ -1220,7 +1400,9 @@ function Save-TunnelManagedIntegration {
             -PidFile $pidFile `
             -HealthUrlFile $healthUrlFile `
             -CredentialMode "credential_manager" `
-            -CredentialTarget (Get-TunnelCredentialTarget -ConfigPath $resolvedConfig)
+            -CredentialTarget (Get-TunnelCredentialTarget -ConfigPath $resolvedConfig) `
+            -ServerRuntimeKind $ServerRuntimeKind `
+            -ServerScriptPath $serverScript
         $stateSave = Save-TunnelStateAtomic -State $state -StatePath (Get-TunnelStatePath -StateRoot $StateRoot -ConfigPath $resolvedConfig)
         Write-Ok "Tunnel profile と設定を保存しました。API Key は Windows のユーザー資格情報領域に保存しています。"
         return $true
@@ -1383,10 +1565,11 @@ function Enable-TunnelIntegrationForSetup {
     )
 
     Assert-TunnelNotRunning -State $State
+    $serverRuntime = Get-TunnelServerRuntimeForSetup -State $State -VerifyApprovedHostRuntime
     $binding = Test-TunnelProfileBinding `
         -State $State `
         -ConfigPath $ConfigPath `
-        -ServerScript (Join-Path $ScriptRoot "run-server.ps1") `
+        -ServerScript $serverRuntime.ServerScript `
         -ProfileRoot (Join-Path $StateRoot "tunnel-profiles") `
         -StateRoot $StateRoot `
         -ForbiddenRoots @(Get-TunnelForbiddenRoots -Context $Context)
@@ -1610,10 +1793,11 @@ function Update-TunnelRuntimeApiKey {
 
     Assert-TunnelNotRunning -State $State
     $forbiddenRoots = @(Get-TunnelForbiddenRoots -Context $Context)
+    $serverRuntime = Get-TunnelServerRuntimeForSetup -State $State -VerifyApprovedHostRuntime
     $binding = Test-TunnelProfileBinding `
         -State $State `
         -ConfigPath $ConfigPath `
-        -ServerScript (Join-Path $ScriptRoot "run-server.ps1") `
+        -ServerScript $serverRuntime.ServerScript `
         -ProfileRoot (Join-Path $StateRoot "tunnel-profiles") `
         -StateRoot $StateRoot `
         -ForbiddenRoots $forbiddenRoots
@@ -1682,6 +1866,9 @@ function Invoke-SettingsMenu {
         Write-Host "5. active config を変更する"
         Write-Host "6. 設定を診断する"
         Write-Host "7. 保存済み Runtime API Key を削除する"
+        Write-Host "8. Codex Sandbox を有効化 / 無効化する"
+        Write-Host "9. Automatic Git を有効化 / 無効化する"
+        Write-Host "10. Approved Host 運用 runtime を設定 / 無効化する"
         Write-Host "0. 変更せず終了する"
         $choice = (Read-Host "番号").Trim()
 
@@ -1740,6 +1927,53 @@ function Invoke-SettingsMenu {
                     $state = Get-TunnelStateForConfig -ConfigPath $ConfigPath
                     if (Read-YesNo -Prompt "保存済み Runtime API Key を削除しますか（Tunnel も無効化します）" -Default $false) {
                         Remove-TunnelSavedCredentialForSetup -ConfigPath $ConfigPath -State $state
+                    }
+                    break
+                }
+                "8" {
+                    $info = Get-ConfigurationInfo -PythonPath $PythonPath -ConfigPath $ConfigPath
+                    $state = Get-TunnelStateForConfig -ConfigPath $ConfigPath
+                    Set-CapabilityEnabledForSetup `
+                        -PythonPath $PythonPath `
+                        -ConfigPath $ConfigPath `
+                        -SettingName "approved_sandbox_enabled" `
+                        -DisplayName "Codex Sandbox" `
+                        -CurrentValue ([bool]$info.approved_sandbox_enabled) `
+                        -TunnelState $state
+                    break
+                }
+                "9" {
+                    $info = Get-ConfigurationInfo -PythonPath $PythonPath -ConfigPath $ConfigPath
+                    $state = Get-TunnelStateForConfig -ConfigPath $ConfigPath
+                    Set-CapabilityEnabledForSetup `
+                        -PythonPath $PythonPath `
+                        -ConfigPath $ConfigPath `
+                        -SettingName "git_enabled" `
+                        -DisplayName "Automatic Git" `
+                        -CurrentValue ([bool]$info.git_enabled) `
+                        -TunnelState $state
+                    break
+                }
+                "10" {
+                    $info = Get-ConfigurationInfo -PythonPath $PythonPath -ConfigPath $ConfigPath
+                    $state = Get-TunnelStateForConfig -ConfigPath $ConfigPath
+                    Write-Host "1. 変更不能な運用 runtime を検証して Approved Host を有効にする"
+                    Write-Host "2. Approved Host を無効にする（運用 runtime と service は削除しない）"
+                    Write-Host "0. 戻る"
+                    $hostChoice = (Read-Host "番号").Trim()
+                    if ($hostChoice -eq "1") {
+                        $context = Get-TunnelConfigContext -PythonPath $PythonPath -ConfigPath $ConfigPath
+                        Configure-ApprovedHostRuntimeForSetup `
+                            -PythonPath $PythonPath `
+                            -ConfigPath $ConfigPath `
+                            -Context $context `
+                            -TunnelState $state
+                    } elseif ($hostChoice -eq "2") {
+                        Assert-TunnelNotRunning -State $state
+                        Save-ConfigBooleanValue -PythonPath $PythonPath -ConfigPath $ConfigPath -SettingName "approved_host_enabled" -Value $false
+                        Write-Ok "Approved Host を無効にしました。運用 runtime、service、Tunnel profile は削除していません。"
+                    } elseif ($hostChoice -ne "0") {
+                        Write-Warn "番号が正しくありません。"
                     }
                     break
                 }

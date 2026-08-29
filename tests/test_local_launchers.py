@@ -293,6 +293,64 @@ if (@(Get-ChildItem -LiteralPath (Split-Path -Parent {_ps_literal(config)}) -Fil
     assert "candidate-save-regression-ok" in output
 
 
+@pytest.mark.skipif(os.name != "nt", reason="PowerShell capability toggle is Windows-only")
+def test_setup_capability_toggles_are_validated_and_persisted(tmp_path: Path) -> None:
+    shell = shutil.which("pwsh.exe") or shutil.which("powershell.exe")
+    python = _REPOSITORY_ROOT / ".venv" / "Scripts" / "python.exe"
+    if shell is None or not python.is_file():
+        pytest.skip("PowerShell or the repository Python runtime is unavailable")
+
+    workspace = tmp_path / "workspace"
+    data = tmp_path / "data"
+    scratch = tmp_path / "scratch"
+    for directory in (workspace, data, scratch):
+        directory.mkdir()
+
+    def toml_path(value: Path) -> str:
+        return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+    config = tmp_path / "config.toml"
+    config.write_text(
+        "\n".join(
+            (
+                f'workspace_root = "{toml_path(workspace)}"',
+                f'data_dir = "{toml_path(data)}"',
+                f'sandbox_scratch_dir = "{toml_path(scratch)}"',
+                "filesystem_enabled = true",
+                "git_enabled = false",
+                "protect_data_dir_acl = false",
+                "approved_sandbox_enabled = false",
+                "approved_host_enabled = false",
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    command = f"""
+$ErrorActionPreference = 'Stop'
+. {_ps_literal(_REPOSITORY_ROOT / 'setup-localmcp.ps1')} -FunctionsOnly
+Save-ConfigBooleanValue -PythonPath {_ps_literal(python)} -ConfigPath {_ps_literal(config)} -SettingName 'approved_sandbox_enabled' -Value $true
+Save-ConfigBooleanValue -PythonPath {_ps_literal(python)} -ConfigPath {_ps_literal(config)} -SettingName 'git_enabled' -Value $true
+$toggled = [IO.File]::ReadAllText({_ps_literal(config)}, [Text.Encoding]::UTF8)
+if ($toggled -notmatch '(?m)^approved_sandbox_enabled = true\r?$') {{ throw 'sandbox toggle was not saved' }}
+if ($toggled -notmatch '(?m)^git_enabled = true\r?$') {{ throw 'git toggle was not saved' }}
+'capability-toggle-ok'
+"""
+    completed = subprocess.run(
+        [shell, "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=180,
+        check=False,
+        shell=False,
+    )
+    output = completed.stdout + completed.stderr
+    assert completed.returncode == 0, output
+    assert "capability-toggle-ok" in output
+
+
 def test_run_launcher_delegates_selector_handling_to_powershell() -> None:
     script = (_REPOSITORY_ROOT / "run-localmcp.bat").read_text(encoding="utf-8")
 
@@ -309,7 +367,9 @@ def test_setup_wizard_preserves_security_relevant_setup_contract() -> None:
     )
 
     assert "LOCALAPPDATA" in script
-    assert "approved_host_enabled = true" in script
+    assert "approved_host_enabled = false" in script
+    assert "approved_sandbox_enabled = true" in script
+    assert "git_enabled = true" in script
     assert "approved_sandbox_require_live_verification = true" in script
     assert "Set-ActiveConfig" in script
     assert "Test-Configuration" in script
@@ -342,6 +402,14 @@ def test_setup_wizard_preserves_security_relevant_setup_contract() -> None:
     assert "Save-WorkspaceConfig" in script
     assert "Update-TunnelRuntimeApiKey" in script
     assert "Enable-TunnelIntegrationForSetup" in script
+    assert "Set-CapabilityEnabledForSetup" in script
+    assert "Codex Sandbox を有効化 / 無効化する" in script
+    assert "Automatic Git を有効化 / 無効化する" in script
+    assert "Configure-ApprovedHostRuntimeForSetup" in script
+    assert "Approved Host 運用 runtime を設定 / 無効化する" in script
+    assert "server_runtime_kind" in script
+    assert "Get-TunnelServerRuntimeForSetup -State $PreviousState -VerifyApprovedHostRuntime" in script
+    assert "$integrationSaved" in script
     assert "保持済み Tunnel profile、Tunnel ID、Runtime API Key を変更せず" in script
     assert "validate_configuration_candidate" in script
     assert "-FinalConfigPath $Path" in script
@@ -378,6 +446,9 @@ def test_run_launcher_preserves_tunnel_fail_closed_and_direct_compatibility() ->
     assert "Test-TunnelProfileBinding" in script
     assert "Invoke-TunnelClientDoctor" in script
     assert "Start-TunnelClientProcess" in script
+    assert "Start-LocalMcpActivityMonitor" in script
+    assert "Stop-LocalMcpActivityMonitor" in script
+    assert "windows_local_mcp.activity_monitor" in script
     assert "二重起動を避けるため停止します" in script
     assert "Tunnel を迂回" not in script
 
@@ -427,6 +498,9 @@ def test_tunnel_onboarding_and_failure_guidance_are_beginner_facing() -> None:
     assert "Get-TunnelMutexName" in setup
     assert "Save-TunnelStateAtomic" in setup
     assert "Restore-TunnelFileBackup" in setup
+    assert "Resolve-TunnelServerRuntime" in helper
+    assert "server_runtime_kind" in runner
+    assert "VerifyApprovedHostRuntime" in runner
 
 
 def test_launcher_docs_explain_manual_setup_and_single_root_boundary() -> None:
@@ -446,3 +520,7 @@ def test_launcher_docs_explain_manual_setup_and_single_root_boundary() -> None:
     assert "設定変更:   configure-localmcp.bat → 現在の設定を確認・変更する" in docs
     assert "platform.openai.com/settings/organization/tunnels" in docs
     assert "platform.openai.com/settings/organization/api-keys" in docs
+    assert "PENDING_APPROVAL 要承認" in docs
+    assert "localmcp-activity.log" in docs
+    assert "5 MiB" in docs
+    assert "過去10ファイル" in docs

@@ -16,6 +16,9 @@ flutter_enabled = false
 dart_enabled = false
 adb_enabled = false
 powershell_enabled = false
+# Approved Host は変更不能な Program Files runtime と LocalSystem authority service を
+# 導入し、設定ウィザードで Tunnel runtime を切り替えた後だけ true にします。
+approved_host_enabled = false
 
 # Broker の Git／ADB helper は PATH から探索しません。各 capability を使う場合は、
 # workspace／data_dir／scratch 外の実行ファイルの絶対 path と SHA-256 を対で固定します。

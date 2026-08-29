@@ -54,6 +54,8 @@ Tunnel ID は OpenAI の Tunnels 管理画面で確認または作成する識�
 
 設定済みの場合、`run-localmcp.bat` が `tunnel-client doctor` 相当の事前確認を行い、Tunnel client から現在の `run-server.ps1 -Config <absolute config>` を一度だけ起動します。Tunnel 未設定またはスキップ済みの場合は、従来どおり `run-server.ps1` を直接起動します。通常の LocalMCP server は管理者権限で起動しません。
 
+新しい設定では Codex Sandbox と Automatic Git を有効、Approved Host を無効にします。設定確認・変更メニューから三つを個別に切り替えられます。Sandbox／Automatic Git を有効にしても実機検証を省略せず、保存済み marker が現在の実体・設定・workspace と一致する場合だけ利用できます。無効化では marker を削除しません。再有効化時は通常の起動前検証を通過した場合だけ再利用します。
+
 既存の profile／runtime 設定が検出された場合は、再利用、managed profile の新規設定、スキップを選べます。既存 profile の内容を無断で上書き・削除・再生成しません。`configure-localmcp.bat` の `2. 現在の設定を確認・変更する` から、LocalMCP 全体を初期化せずに次の操作ができます。
 
 - Tunnel ID の変更
@@ -62,6 +64,8 @@ Tunnel ID は OpenAI の Tunnels 管理画面で確認または作成する識�
 - 保持済み profile／Tunnel ID／Runtime API Key を再作成しない再有効化
 - 保存済み API Key の削除
 - 既存 profile と client の診断
+- Codex Sandbox／Automatic Git の有効化・無効化
+- Approved Host 運用用実行環境の検証、Tunnel profile との結び付け、無効化
 
 設定確認・変更モードでは、最初に workspace、active config、Tunnel の有効状態、Tunnel ID、Runtime API Key の登録状態（secret 本体は非表示）、tunnel-client の検出状態を表示します。workspace の変更は、副作用のない候補検証を行ってから config を原子的に置換し、最終 config path で通常検証を完了した場合だけ確定します。候補検証では一時 config path に namespace／ACL marker やディレクトリを作りません。置換後の検証に失敗した場合は旧 config を復元します。Runtime API Key の更新は新しい key の `doctor` 成功後に credential だけを切り替え、失敗時は旧 key を維持します。
 
@@ -99,13 +103,17 @@ run-localmcp.bat -Config C:\path\to\config.toml
 
 `run-localmcp.bat` は `run-localmcp.ps1` を呼び出します。PowerShell 側で UTF-8 の active config を読み、Tunnel integration が有効なら profile／client／Credential Manager／ready 状態を確認して Tunnel 経由で `run-server.ps1 -Config` を一度だけ起動します。無効または未設定なら、従来の `run-server.ps1 -Config` へ直接渡します。
 
+起動中は、`activity_timeline`／`audit_list` と同じ `<data_dir>\audit.db` を別プロセスが読み取り専用で確認し、起動後に発生した操作と状態変化をこのウィンドウへ一行ずつ表示します。表示項目は操作 ID、ツール、実行経路、状態、承認状態、安全に伏せ字化したコマンドまたは対象の短い要約です。承認待ちは `PENDING_APPROVAL 要承認` と表示します。承認の実行は権限境界を混ぜないため `run-approvals.ps1` の別画面に残します。
+
+表示した行は `<data_dir>\logs\localmcp-activity.log` にも UTF-8 で保存し、5 MiB ごとに切り替えて過去10ファイルまで保持します。生の要求・結果、ファイル内容、標準出力・標準エラーは監視ログへ複製しません。Tunnel client の生出力も Runtime API Key などを含む可能性があるため、画面・ログへ転送しません。活動監視だけを開始できなかった場合は警告を出して LocalMCP を起動しますが、Tunnel や実行経路の安全性検証を迂回することはありません。
+
 Windows PowerShell 5.1 を正式サポートする配布対象の `.ps1`（setup、run、server、approvals、Tunnel helper）は、ソース内の日本語を正しく解釈できるよう UTF-8 BOM 付きで保存します。PowerShell 7 だけでなく、実際の Windows PowerShell 5.1 parser でも配布対象全体を検証します。
 
 stdio server の初期化に成功すると、`起動に成功しました`、`ChatGPT からの接続を待っています`、`このウィンドウを閉じないでください`、`Ctrl+C` で終了できることを標準エラーへ表示します。MCP protocol が使用する標準出力には人向け案内を出しません。
 
 そのため、設定ファイルのパスに日本語が含まれていても、コマンドプロンプトの文字コードに依存しません。設定がない場合は自動的に設定を推測せず、`configure-localmcp.bat` の実行を案内します。
 
-通常のサーバーは管理者権限で起動しません。管理者権限が必要な Approved Host の runtime／authority service の導入は、通常起動とは別の明示的な手順です。この初版のウィザードは既存の production runtime／service を勝手に置き換えません。
+通常のサーバーは管理者権限で起動しません。管理者権限が必要な Approved Host の runtime／authority service の導入は、通常起動とは別の明示的な手順です。ウィザードは既存の Program Files runtime と authority service を検証して Tunnel profile へ結び付けられますが、production runtime／service を勝手にインストール・置換しません。Approved Host 用 state では `run-server.ps1` の絶対 path と SHA-256 を保存し、起動ごとに runtime の変更不能性を検証します。失敗時に開発用 runtime へ戻しません。
 
 Tunnel の設定不整合、client の変更、API Key の取得失敗、認証失敗、LocalMCP server の起動失敗、ready 応答未確認は、それぞれ別の案内を表示して起動を停止します。Tunnel を設定済みの状態で問題がある場合に、Tunnel を迂回して LocalMCP を直接公開する自動 fallback は行いません。二重起動を避けるため、起動中のプロセスを確認できない場合も停止します。
 

@@ -977,6 +977,102 @@ function Get-TunnelFailedChecks {
     return @($checks)
 }
 
+function Resolve-TunnelServerRuntime {
+    param(
+        [Parameter(Mandatory = $true)][string]$ScriptRoot,
+        [AllowNull()][object]$State,
+        [switch]$VerifyApprovedHostRuntime
+    )
+
+    $developmentServer = (Resolve-Path -LiteralPath (Join-Path $ScriptRoot "run-server.ps1") -ErrorAction Stop).Path
+    $runtimeKind = if (
+        $null -ne $State -and
+        -not [string]::IsNullOrWhiteSpace([string]$State.server_runtime_kind)
+    ) {
+        ([string]$State.server_runtime_kind).ToLowerInvariant()
+    } else {
+        "development"
+    }
+
+    if ($runtimeKind -eq "development") {
+        return [PSCustomObject]@{
+            Valid = $true
+            Kind = "development"
+            ServerScript = $developmentServer
+            PythonPath = Get-TunnelLocalMcpPythonPath -ScriptRoot $ScriptRoot
+            Message = "開発用 runtime を使用します。"
+        }
+    }
+    if ($runtimeKind -ne "approved_host") {
+        return [PSCustomObject]@{
+            Valid = $false
+            Kind = $runtimeKind
+            ServerScript = $null
+            PythonPath = $null
+            Message = "Tunnel state の server runtime 種別が対応していません。"
+        }
+    }
+
+    try {
+        if ($null -eq $State -or [string]::IsNullOrWhiteSpace([string]$State.server_script_path)) {
+            throw "Approved Host 用 server path が Tunnel state にありません。"
+        }
+        $serverScript = (Resolve-Path -LiteralPath ([string]$State.server_script_path) -ErrorAction Stop).Path
+        $installRoot = Split-Path -Parent $serverScript
+        $programFilesRoots = @(
+            [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles),
+            [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFilesX86)
+        ) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -Unique
+        if (-not ($programFilesRoots | Where-Object { Test-TunnelPathInside -Candidate $serverScript -Parent $_ })) {
+            throw "Approved Host server は Program Files 配下にある必要があります。"
+        }
+        if ([IO.Path]::GetFileName($serverScript) -ne "run-server.ps1") {
+            throw "Approved Host server のファイル名が正しくありません。"
+        }
+        $pythonPath = Join-Path $installRoot "runtime\Scripts\python.exe"
+        $installedVerifierPath = Join-Path $installRoot "verify-approved-host-runtime.ps1"
+        $launcherVerifierPath = Join-Path $ScriptRoot "verify-approved-host-runtime.ps1"
+        foreach ($requiredPath in @($pythonPath, $installedVerifierPath, $launcherVerifierPath)) {
+            if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
+                throw "Approved Host 運用 runtime の必須ファイルがありません: $requiredPath"
+            }
+        }
+        if (
+            -not [string]::IsNullOrWhiteSpace([string]$State.server_script_sha256) -and
+            (Get-TunnelSha256 -Path $serverScript) -ne ([string]$State.server_script_sha256).ToLowerInvariant()
+        ) {
+            throw "Approved Host の run-server.ps1 が Tunnel 設定後に変更されています。"
+        }
+        if ($VerifyApprovedHostRuntime) {
+            $windowsPowerShell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+            if (-not (Test-Path -LiteralPath $windowsPowerShell -PathType Leaf)) {
+                throw "Windows PowerShell 5.1 を確認できません。"
+            }
+            # 検証対象側の script を先に信用せず、現在実行中の配布物と同じ
+            # verifier から Program Files runtime を検査します。
+            $verifyOutput = @(& $windowsPowerShell -NoProfile -File $launcherVerifierPath -InstallRoot $installRoot 2>&1)
+            if ($LASTEXITCODE -ne 0) {
+                throw "Approved Host 運用 runtime の変更不能性検証に失敗しました。"
+            }
+        }
+        return [PSCustomObject]@{
+            Valid = $true
+            Kind = "approved_host"
+            ServerScript = $serverScript
+            PythonPath = (Resolve-Path -LiteralPath $pythonPath -ErrorAction Stop).Path
+            Message = "変更不能な Approved Host 運用 runtime を使用します。"
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Valid = $false
+            Kind = "approved_host"
+            ServerScript = $null
+            PythonPath = $null
+            Message = $_.Exception.Message
+        }
+    }
+}
+
 function Get-TunnelFailureDetail {
     param(
         [string]$Stdout,

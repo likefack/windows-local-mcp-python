@@ -34,6 +34,59 @@ function Get-RunTunnelFailureClass {
     }
 }
 
+function Start-LocalMcpActivityMonitor {
+    param(
+        [AllowNull()][string]$PythonPath,
+        [Parameter(Mandatory = $true)][string]$ConfigPath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($PythonPath) -or -not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) {
+        Write-Warning "Live Activity 監視用の専用 Python が見つからないため、活動表示だけを開始できません。LocalMCP の起動は継続します。"
+        return $null
+    }
+
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $PythonPath
+    $startInfo.Arguments = "-I -B -m windows_local_mcp.activity_monitor --config " + (ConvertTo-TunnelCommandArgument -Value $ConfigPath)
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $false
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) {
+            throw "活動監視プロセスを開始できません。"
+        }
+        if ($process.WaitForExit(500)) {
+            $exitCode = $process.ExitCode
+            $process.Dispose()
+            Write-Warning "Live Activity 監視が起動直後に終了しました（終了コード: $exitCode）。LocalMCP の起動は継続します。"
+            return $null
+        }
+        Write-Host "Live Activity、監査操作、ローカル承認要求をこのウィンドウへ表示します。" -ForegroundColor Cyan
+        return $process
+    } catch {
+        $process.Dispose()
+        Write-Warning "Live Activity 監視を開始できません。LocalMCP の起動は継続します。"
+        return $null
+    }
+}
+
+function Stop-LocalMcpActivityMonitor {
+    param([AllowNull()][Diagnostics.Process]$Process)
+
+    if ($null -eq $Process) { return }
+    try {
+        if (-not $Process.HasExited) {
+            $Process.Kill()
+            $Process.WaitForExit(3000) | Out-Null
+        }
+    } catch {
+        Write-Warning "Live Activity 監視プロセスの終了を確認できませんでした。"
+    } finally {
+        $Process.Dispose()
+    }
+}
+
 try {
     if (-not (Test-Path -LiteralPath $TunnelHelperPath -PathType Leaf)) {
         throw "secure-mcp-tunnel.ps1 が見つかりません。配布パッケージ全体を展開し直してください。"
@@ -55,10 +108,6 @@ try {
         Write-Error "設定ファイルが見つかりません。先に configure-localmcp.bat を実行してください。" -ErrorAction Continue
         exit 2
     }
-    if (-not (Test-Path -LiteralPath $ServerScript -PathType Leaf)) {
-        throw "run-server.ps1 が見つかりません。配布パッケージ全体を展開し直してください。"
-    }
-
     $resolvedConfig = (Resolve-Path -LiteralPath $Config).Path
     $statePath = Get-TunnelStatePath -StateRoot $StateRoot -ConfigPath $resolvedConfig
     $state = $null
@@ -77,6 +126,15 @@ try {
         }
     }
 
+    $serverRuntime = Resolve-TunnelServerRuntime `
+        -ScriptRoot $ScriptRoot `
+        -State $state `
+        -VerifyApprovedHostRuntime:($null -ne $state -and [string]$state.server_runtime_kind -eq "approved_host")
+    if (-not $serverRuntime.Valid) {
+        throw "LocalMCP server runtime を安全に確認できません: $($serverRuntime.Message)"
+    }
+    $ServerScript = $serverRuntime.ServerScript
+
     if ($null -eq $state -or [bool]$state.enabled -ne $true) {
         if ($null -ne $state -and -not [string]::IsNullOrWhiteSpace([string]$state.pid_file) -and
             -not [string]::IsNullOrWhiteSpace([string]$state.tunnel_client_path) -and
@@ -94,12 +152,18 @@ try {
         }
 
         # Tunnel 未設定の既存ユーザーは、従来どおり LocalMCP 単体を起動します。
-        & $ServerScript -Config $resolvedConfig
-        exit $LASTEXITCODE
+        $activityMonitor = Start-LocalMcpActivityMonitor -PythonPath $serverRuntime.PythonPath -ConfigPath $resolvedConfig
+        try {
+            & $ServerScript -Config $resolvedConfig
+            $directExitCode = $LASTEXITCODE
+        } finally {
+            Stop-LocalMcpActivityMonitor -Process $activityMonitor
+        }
+        exit $directExitCode
     }
 
     Write-Host "LocalMCP の active config と Secure MCP Tunnel の設定を確認しています。" -ForegroundColor Cyan
-    $pythonPath = Get-TunnelLocalMcpPythonPath -ScriptRoot $ScriptRoot
+    $pythonPath = $serverRuntime.PythonPath
     if ([string]::IsNullOrWhiteSpace($pythonPath)) {
         Show-TunnelFailureGuide -FailureClass "server_start_failed"
         throw "Tunnel 起動に必要な専用 Python が見つかりません。"
@@ -142,6 +206,7 @@ try {
     $mutex = [Threading.Mutex]::new($false, (Get-TunnelMutexName -ConfigPath $resolvedConfig))
     $hasMutex = $false
     $exitCode = 0
+    $activityMonitor = $null
     try {
         try { $hasMutex = $mutex.WaitOne(0) } catch { $hasMutex = $false }
         if (-not $hasMutex) {
@@ -164,6 +229,7 @@ try {
             if (Test-Path -LiteralPath $state.health_url_file -PathType Leaf) {
                 Remove-Item -LiteralPath $state.health_url_file -Force -ErrorAction Stop
             }
+            $activityMonitor = Start-LocalMcpActivityMonitor -PythonPath $pythonPath -ConfigPath $resolvedConfig
             $started = Start-TunnelClientProcess -ClientPath $binding.ClientPath -ProfilePath $binding.ProfilePath -Credential $credential
             $ready = Wait-TunnelReady -HealthUrlFile $state.health_url_file -TimeoutSeconds 20
             if ($ready.Ready) {
@@ -179,6 +245,7 @@ try {
             }
         }
     } finally {
+        Stop-LocalMcpActivityMonitor -Process $activityMonitor
         if ($hasMutex) { try { $mutex.ReleaseMutex() } catch { } }
         $mutex.Dispose()
         if ($null -ne $credential) { $credential.Dispose() }

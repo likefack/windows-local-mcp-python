@@ -49,6 +49,29 @@ def test_secure_mcp_tunnel_helper_parses() -> None:
 
 
 @pytest.mark.skipif(os.name != "nt", reason="PowerShell helper is Windows-only")
+def test_tunnel_server_runtime_defaults_to_development_and_rejects_untrusted_host_path() -> None:
+    command = f"""
+$ErrorActionPreference = 'Stop'
+. {_ps_literal(_HELPER)}
+$development = Resolve-TunnelServerRuntime -ScriptRoot {_ps_literal(_REPOSITORY_ROOT)} -State $null
+if (-not $development.Valid -or $development.Kind -ne 'development') {{ throw 'development runtime was not resolved' }}
+if (-not $development.ServerScript.EndsWith('run-server.ps1')) {{ throw 'development server path is invalid' }}
+$untrusted = [PSCustomObject]@{{
+    server_runtime_kind = 'approved_host'
+    server_script_path = {_ps_literal(_REPOSITORY_ROOT / 'run-server.ps1')}
+    server_script_sha256 = ''
+}}
+$rejected = Resolve-TunnelServerRuntime -ScriptRoot {_ps_literal(_REPOSITORY_ROOT)} -State $untrusted
+if ($rejected.Valid -or $rejected.Kind -ne 'approved_host') {{ throw 'mutable approved-host runtime was accepted' }}
+'server-runtime-binding-ok'
+"""
+    completed = _run_powershell(command)
+    output = completed.stdout + completed.stderr
+    assert completed.returncode == 0, output
+    assert "server-runtime-binding-ok" in output
+
+
+@pytest.mark.skipif(os.name != "nt", reason="PowerShell helper is Windows-only")
 def test_doctor_failure_classification_uses_failed_checks_without_leaking_output() -> None:
     command = f"""
 $ErrorActionPreference = 'Stop'
@@ -126,6 +149,7 @@ def test_tunnel_secret_storage_and_launch_contract_is_explicit() -> None:
     assert "api_key: env:WLMCP_TUNNEL_RUNTIME_API_KEY" in helper
     assert "RedirectStandardOutput = $true" in helper
     assert "RedirectStandardError = $true" in helper
+    assert '$launcherVerifierPath = Join-Path $ScriptRoot "verify-approved-host-runtime.ps1"' in helper
     assert "Tunnel 対象ファイルの SHA-256 を確認できません: $($_.Exception.Message)" in helper
     assert "[Security.Cryptography.SHA256]::Create()" in helper
     assert "Get-FileHash" not in helper
