@@ -369,7 +369,7 @@ function Test-TunnelLocalMcpConfiguration {
             "print('workspace_root=' + str(settings.workspace_root))",
             "print('data_dir=' + str(settings.data_dir))"
         ) -join "; "
-        $output = @(& $PythonPath -I -B -c $probe 2>$null)
+        $output = @(& $PythonPath -I -X utf8 -B -c $probe 2>$null)
         if ($LASTEXITCODE -ne 0) {
             return [PSCustomObject]@{ Valid = $false; WorkspaceRoot = $null; DataDir = $null }
         }
@@ -481,6 +481,25 @@ function Get-TunnelClientCandidates {
         }
     }
 
+    $downloadRoots = [System.Collections.Generic.List[string]]::new()
+    if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+        $null = $downloadRoots.Add((Join-Path $env:USERPROFILE "Desktop"))
+        $null = $downloadRoots.Add((Join-Path $env:USERPROFILE "Downloads"))
+        $null = $downloadRoots.Add((Join-Path $env:USERPROFILE "OneDrive\Desktop"))
+        $null = $downloadRoots.Add((Join-Path $env:USERPROFILE "OneDrive\Downloads"))
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:OneDrive)) {
+        $null = $downloadRoots.Add((Join-Path $env:OneDrive "Desktop"))
+        $null = $downloadRoots.Add((Join-Path $env:OneDrive "Downloads"))
+    }
+    foreach ($root in @($downloadRoots | Select-Object -Unique)) {
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
+        $null = $paths.Add((Join-Path $root "tunnel-client.exe"))
+        foreach ($directory in @(Get-ChildItem -LiteralPath $root -Directory -Force -Filter "tunnel-client*" -ErrorAction SilentlyContinue | Select-Object -First 50)) {
+            $null = $paths.Add((Join-Path $directory.FullName "tunnel-client.exe"))
+        }
+    }
+
     $profileRoots = [System.Collections.Generic.List[string]]::new()
     foreach ($root in @(
         $env:TUNNEL_CLIENT_PROFILE_DIR,
@@ -561,6 +580,20 @@ function ConvertFrom-TunnelYamlScalar {
         return $text.Substring(1, $text.Length - 2).Replace('\"', '"')
     }
     return $text
+}
+
+function Get-TunnelComparablePath {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if ($Path -match '[\r\n]') {
+        throw "Tunnel command の path に改行は使用できません。"
+    }
+    $full = [IO.Path]::GetFullPath($Path.Replace('/', [IO.Path]::DirectorySeparatorChar))
+    $item = Get-Item -LiteralPath $full -Force -ErrorAction Stop
+    if ($item.PSIsContainer -or (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw "Tunnel command の path は通常のファイルである必要があります。"
+    }
+    return ([IO.Path]::GetFullPath($item.FullName)).TrimEnd('\', '/')
 }
 
 function New-TunnelProfileContent {
@@ -650,10 +683,23 @@ function Get-TunnelProfileInfo {
     $matchesLocalMcp = $false
     if (-not [string]::IsNullOrWhiteSpace($ServerScript) -and -not [string]::IsNullOrWhiteSpace($ConfigPath)) {
         try {
-            $expectedServer = ConvertTo-TunnelCommandArgument -Value ([IO.Path]::GetFullPath($ServerScript))
-            $expectedConfig = ConvertTo-TunnelCommandArgument -Value ([IO.Path]::GetFullPath($ConfigPath))
-            $expectedCommand = ConvertTo-TunnelYamlScalar -Value "powershell.exe -NoProfile -File $expectedServer -Config $expectedConfig"
-            $matchesLocalMcp = $content.IndexOf("command: $expectedCommand", [StringComparison]::OrdinalIgnoreCase) -ge 0
+            $commandMatches = [regex]::Matches($content, '(?im)^\s*command\s*:\s*(?<value>[^\r\n]+)\s*$')
+            if ($commandMatches.Count -eq 1) {
+                $command = ConvertFrom-TunnelYamlScalar -Value $commandMatches[0].Groups["value"].Value
+                $parsedCommand = [regex]::Match(
+                    $command,
+                    '^powershell\.exe\s+-NoProfile\s+-File\s+"(?<server>[^"\r\n]+)"\s+-Config\s+"(?<config>[^"\r\n]+)"$'
+                )
+                if ($parsedCommand.Success) {
+                    $actualServer = Get-TunnelComparablePath -Path $parsedCommand.Groups["server"].Value
+                    $actualConfig = Get-TunnelComparablePath -Path $parsedCommand.Groups["config"].Value
+                    $expectedServer = Get-TunnelComparablePath -Path $ServerScript
+                    $expectedConfig = Get-TunnelComparablePath -Path $ConfigPath
+                    $matchesLocalMcp =
+                        $actualServer.Equals($expectedServer, [StringComparison]::OrdinalIgnoreCase) -and
+                        $actualConfig.Equals($expectedConfig, [StringComparison]::OrdinalIgnoreCase)
+                }
+            }
         } catch {
             $matchesLocalMcp = $false
         }
