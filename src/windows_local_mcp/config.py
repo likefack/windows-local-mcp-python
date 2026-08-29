@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import csv
+import ctypes
 import hashlib
 import io
 import json
+import locale
 import os
 import stat
 import subprocess
@@ -532,6 +534,183 @@ def _ensure_control_plane_namespace(settings: Settings) -> bool:
         return False
 
 
+def _windows_dacl_fingerprint(path: Path) -> str:
+    """Return a locale-independent fingerprint of the Windows DACL."""
+    if os.name != "nt":
+        raise RuntimeError("Windows DACL fingerprint is only available on Windows")
+
+    from ctypes import wintypes
+
+    se_file_object = 1
+    dacl_security_information = 0x00000004
+    sddl_revision_1 = 1
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    get_named_security_info = advapi32.GetNamedSecurityInfoW
+    get_named_security_info.argtypes = [
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    get_named_security_info.restype = wintypes.DWORD
+
+    convert_security_descriptor = (
+        advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW
+    )
+    convert_security_descriptor.argtypes = [
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.LPWSTR),
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    convert_security_descriptor.restype = wintypes.BOOL
+
+    local_free = kernel32.LocalFree
+    local_free.argtypes = [ctypes.c_void_p]
+    local_free.restype = ctypes.c_void_p
+
+    descriptor = ctypes.c_void_p()
+    status = get_named_security_info(
+        str(path.resolve(strict=True)),
+        se_file_object,
+        dacl_security_information,
+        None,
+        None,
+        None,
+        None,
+        ctypes.byref(descriptor),
+    )
+    if status != 0:
+        raise ctypes.WinError(status)
+
+    sddl = wintypes.LPWSTR()
+    length = wintypes.DWORD()
+    try:
+        if not convert_security_descriptor(
+            descriptor,
+            sddl_revision_1,
+            dacl_security_information,
+            ctypes.byref(sddl),
+            ctypes.byref(length),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        value = sddl.value
+        if not value:
+            raise PermissionError("Windows returned an empty data_dir DACL")
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+    finally:
+        if sddl:
+            local_free(ctypes.cast(sddl, ctypes.c_void_p))
+        if descriptor:
+            local_free(descriptor)
+
+
+def _windows_acl_candidate_codecs() -> tuple[str, ...]:
+    codecs = {
+        "utf-8",
+        "cp437",
+        "cp850",
+        "cp852",
+        "cp866",
+        "cp932",
+        "cp936",
+        "cp949",
+        "cp950",
+        "cp1250",
+        "cp1251",
+        "cp1252",
+        "cp1254",
+    }
+    preferred = locale.getpreferredencoding(False)
+    if preferred:
+        codecs.add(preferred)
+    if os.name == "nt":
+        try:
+            code_page = int(ctypes.WinDLL("kernel32").GetConsoleOutputCP())
+        except (AttributeError, OSError, ValueError):
+            code_page = 0
+        if code_page:
+            codecs.add("utf-8" if code_page == 65001 else f"cp{code_page}")
+    return tuple(sorted(codecs))
+
+
+def _legacy_acl_digest_candidates_from_raw(raw: bytes) -> set[str]:
+    """Reconstruct v1 text digests across plausible Windows console encodings."""
+    codecs = _windows_acl_candidate_codecs()
+    logical_texts = {raw.decode("utf-8", errors="replace")}
+    for codec in codecs:
+        try:
+            logical_texts.add(raw.decode(codec, errors="strict"))
+        except (LookupError, UnicodeDecodeError):
+            continue
+
+    digests: set[str] = set()
+    for text in logical_texts:
+        for codec in codecs:
+            try:
+                legacy_raw = text.encode(codec, errors="strict")
+            except (LookupError, UnicodeEncodeError):
+                continue
+            legacy_text = legacy_raw.decode("utf-8", errors="replace")
+            digests.add(hashlib.sha256(legacy_text.encode("utf-8")).hexdigest())
+    return digests
+
+
+def _legacy_windows_acl_digest_candidates(path: Path) -> set[str]:
+    current = subprocess.run(
+        [windows_system_executable("icacls.exe"), str(path)],
+        capture_output=True,
+        timeout=30,
+        check=False,
+        shell=False,
+    )
+    if current.returncode != 0:
+        details = current.stderr.decode(
+            locale.getpreferredencoding(False) or "utf-8", errors="replace"
+        ).strip()
+        raise PermissionError(f"failed to inspect data_dir ACL: {details}")
+    return _legacy_acl_digest_candidates_from_raw(current.stdout)
+
+
+def _write_windows_acl_policy_marker(marker: Path, *, sid: str, fingerprint: str) -> None:
+    payload = json.dumps(
+        {
+            "version": 2,
+            "sid": sid,
+            "root_dacl_sddl_sha256": fingerprint,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    temporary = marker.with_name(
+        f"{marker.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}"
+    )
+    try:
+        with temporary.open("x", encoding="utf-8") as output:
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, marker)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _raise_windows_acl_mismatch() -> None:
+    raise PermissionError(
+        "data_dir ACL changed after provisioning; automatic repair is disabled. "
+        "Do not delete .acl-policy.json. Preserve data_dir and its marker, inspect "
+        "the ACL difference, then use a new config/data_dir or explicitly "
+        "reprovision the reviewed ACL before retrying"
+    )
+
+
 def _protect_windows_acl(path: Path, *, allow_initial_provision: bool) -> None:
     identity = subprocess.run(
         [windows_system_executable("whoami.exe"), "/user", "/fo", "csv", "/nh"],
@@ -558,32 +737,28 @@ def _protect_windows_acl(path: Path, *, allow_initial_provision: bool) -> None:
                 expected_marker = loaded
         except (OSError, ValueError):
             raise PermissionError("data_dir ACL policy marker is corrupt") from None
-    current = subprocess.run(
-        [windows_system_executable("icacls.exe"), str(path)],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=30,
-        check=False,
-        shell=False,
-    )
-    if current.returncode != 0:
-        raise PermissionError(f"failed to inspect data_dir ACL: {current.stderr.strip()}")
-    current_digest = hashlib.sha256(current.stdout.encode("utf-8")).hexdigest()
+
     if expected_marker is not None:
-        if (
-            expected_marker.get("version") != 1
-            or expected_marker.get("sid") != sid
-            or expected_marker.get("root_acl_sha256") != current_digest
-        ):
-            raise PermissionError(
-                "data_dir ACL changed after provisioning; automatic repair is disabled. "
-                "Do not delete .acl-policy.json. Preserve data_dir and its marker, inspect "
-                "the ACL difference, then use a new config/data_dir or explicitly "
-                "reprovision the reviewed ACL before retrying"
+        if expected_marker.get("sid") != sid:
+            _raise_windows_acl_mismatch()
+        current_fingerprint = _windows_dacl_fingerprint(path)
+        version = expected_marker.get("version")
+        if version == 2:
+            if expected_marker.get("root_dacl_sddl_sha256") != current_fingerprint:
+                _raise_windows_acl_mismatch()
+            return
+        if version == 1:
+            legacy_digest = expected_marker.get("root_acl_sha256")
+            if not isinstance(legacy_digest, str):
+                _raise_windows_acl_mismatch()
+            if legacy_digest not in _legacy_windows_acl_digest_candidates(path):
+                _raise_windows_acl_mismatch()
+            _write_windows_acl_policy_marker(
+                marker, sid=sid, fingerprint=current_fingerprint
             )
-        return
+            return
+        _raise_windows_acl_mismatch()
+
     if not allow_initial_provision:
         raise PermissionError(
             "data_dir ACL policy marker is missing after provisioning; automatic repair "
@@ -664,18 +839,7 @@ def _protect_windows_acl(path: Path, *, allow_initial_provision: bool) -> None:
         raise PermissionError(
             f"failed to provision inherited data_dir ACL: {inheritance.stderr.strip()}"
         )
-    verified = subprocess.run(
-        [windows_system_executable("icacls.exe"), str(path)],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=30,
-        check=False,
-        shell=False,
-    )
-    if verified.returncode != 0:
-        raise PermissionError("failed to verify protected data_dir ACL")
+    current_fingerprint = _windows_dacl_fingerprint(path)
     namespace_marker = path / "control-plane" / "namespace.json"
     try:
         namespace_marker.read_bytes()
@@ -688,20 +852,10 @@ def _protect_windows_acl(path: Path, *, allow_initial_provision: bool) -> None:
         raise PermissionError(
             "protected data_dir ACL denied the current WLMCP principal"
         ) from error
-    marker.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "sid": sid,
-                "root_acl_sha256": hashlib.sha256(
-                    verified.stdout.encode("utf-8")
-                ).hexdigest(),
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ),
-        encoding="utf-8",
+    _write_windows_acl_policy_marker(
+        marker, sid=sid, fingerprint=current_fingerprint
     )
+
 
 
 def _load_file_backed_config(

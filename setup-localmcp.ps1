@@ -132,26 +132,19 @@ function Invoke-Python {
     }
 
     # Windows PowerShell 5.1 treats native stderr records as PowerShell errors when
-    # $ErrorActionPreference is Stop. Temporarily collect them non-terminating so a
-    # multi-line Python traceback is preserved and can be reported with the exit code.
-    # Force UTF-8 only for this child process so non-ASCII paths do not depend on the
-    # host console code page, then restore the caller's environment exactly.
+    # $ErrorActionPreference is Stop. Collect them non-terminating so the complete
+    # traceback is preserved. -X utf8 is a command-line interpreter option, so it
+    # remains effective even with -I and does not depend on PYTHON* environment vars.
     $previousErrorActionPreference = $ErrorActionPreference
-    $previousPythonIoEncoding = $env:PYTHONIOENCODING
     $output = @()
     $exitCode = $null
     try {
         $ErrorActionPreference = "Continue"
-        $env:PYTHONIOENCODING = "utf-8"
-        $output = @(& $PythonPath @Arguments 2>&1)
+        $effectiveArguments = @("-X", "utf8") + @($Arguments)
+        $output = @(& $PythonPath @effectiveArguments 2>&1)
         $exitCode = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previousErrorActionPreference
-        if ($null -eq $previousPythonIoEncoding) {
-            Remove-Item Env:PYTHONIOENCODING -ErrorAction SilentlyContinue
-        } else {
-            $env:PYTHONIOENCODING = $previousPythonIoEncoding
-        }
     }
 
     $lines = @($output | ForEach-Object { $_.ToString() })

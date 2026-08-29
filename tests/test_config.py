@@ -1,3 +1,5 @@
+import hashlib
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -7,6 +9,7 @@ from pydantic import ValidationError
 
 from windows_local_mcp.config import (
     Settings,
+    _legacy_acl_digest_candidates_from_raw,
     load_settings,
     validate_configuration_candidate,
 )
@@ -291,6 +294,21 @@ def test_obsolete_appcontainer_configuration_fails_closed(
         load_settings()
 
 
+def test_legacy_acl_digest_candidates_bridge_windows_console_encodings() -> None:
+    logical = (
+        "C:\\日本語\\data USER:(F)\r\n"
+        "1 個のファイルを正常に処理しました。0 個のファイルを処理できませんでした\r\n"
+    )
+    legacy_raw = logical.encode("cp932")
+    legacy_text = legacy_raw.decode("utf-8", errors="replace")
+    legacy_digest = hashlib.sha256(legacy_text.encode("utf-8")).hexdigest()
+
+    current_raw = logical.encode("utf-8")
+    candidates = _legacy_acl_digest_candidates_from_raw(current_raw)
+
+    assert legacy_digest in candidates
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows ACL integration")
 def test_data_dir_acl_grants_current_principal_and_system(tmp_path: Path) -> None:
     root = tmp_path / "workspace"
@@ -320,6 +338,35 @@ def test_data_dir_acl_grants_current_principal_and_system(tmp_path: Path) -> Non
         # checking that the protected namespace remains usable by the bound principal.
         settings.ensure_directories()
         acl_marker = data / ".acl-policy.json"
+        marker_payload = json.loads(acl_marker.read_text(encoding="utf-8"))
+        assert marker_payload["version"] == 2
+        assert isinstance(marker_payload["root_dacl_sddl_sha256"], str)
+        legacy_acl = subprocess.run(
+            ["icacls.exe", str(data)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=True,
+            shell=False,
+        ).stdout
+        legacy_digest = hashlib.sha256(legacy_acl.encode("utf-8")).hexdigest()
+        acl_marker.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "sid": marker_payload["sid"],
+                    "root_acl_sha256": legacy_digest,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+        settings.ensure_directories()
+        migrated_payload = json.loads(acl_marker.read_text(encoding="utf-8"))
+        assert migrated_payload["version"] == 2
         marker_bytes = acl_marker.read_bytes()
         acl_marker.unlink()
         with pytest.raises(PermissionError, match="marker is missing"):
