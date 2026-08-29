@@ -1,0 +1,43 @@
+name: fix-snapshot-only-diagnose-v2
+
+on:
+  push:
+    branches: [fix-snapshot-only-runner]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Apply candidate to exact main
+        shell: pwsh
+        run: |
+          $expected = '2b5df559cd69c14d1a46cb3407e09fbda61aa771'
+          $patcher = Join-Path $env:RUNNER_TEMP 'fix_snapshot_only.py'
+          Copy-Item .github/fix_snapshot_only.py $patcher
+          git checkout --detach $expected
+          git clean -fdx
+          python $patcher
+          git diff --check
+      - name: Install
+        shell: pwsh
+        run: |
+          python -m pip install -e ".[dev]"
+          python -m pip check
+      - name: Diagnose Approved Host integration
+        shell: pwsh
+        run: |
+          python -m pytest -q tests/test_approval_execution_integration.py -k "local_approval_rejects_changed_transitive_live_workspace_input or snapshot_execution_succeeds_when_bound_workspace_is_unchanged"
+          $code = $LASTEXITCODE
+          python -c "import sqlite3; from pathlib import Path; dbs=list(Path('.dev-tmp').rglob('audit.db')); print('AUDIT_DBS', [str(p) for p in dbs]); [(lambda c: print('ROWS', c.execute(\"select id,status,error,child_pid,result_json from operations where id in ('approval-execution-integration','snapshot-bound-workspace')\").fetchall()))(sqlite3.connect(str(p))) for p in dbs]"
+          exit $code
