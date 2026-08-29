@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     # 回帰テストでは対話 UI を起動せず、設定関数だけを読み込みます。
     [switch]$FunctionsOnly
