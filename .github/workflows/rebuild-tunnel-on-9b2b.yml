@@ -1,0 +1,176 @@
+name: Rebuild Tunnel UX on latest main
+
+on:
+  push:
+    branches:
+      - work/rebuild-tunnel-ux-main-9b2b
+
+permissions:
+  contents: write
+
+jobs:
+  rebuild-and-validate:
+    runs-on: windows-2025
+    timeout-minutes: 25
+    steps:
+      - name: Checkout latest-main staging branch
+        uses: actions/checkout@v7
+        with:
+          ref: work/rebuild-tunnel-ux-main-9b2b
+          fetch-depth: 2
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+          python -m pip check
+
+      - name: Reapply selected changes deterministically
+        shell: pwsh
+        run: |
+          git fetch origin work/rebuild-tunnel-ux-latest-main:refs/remotes/origin/rebuild-tunnel-old --depth=20
+          git checkout 641c29771d1666e6db7a4b11827cc20a9de8a9af -- secure-mcp-tunnel.ps1 tests/test_mcp_stdio_integration.py tests/test_tunnel_integration.py
+          @'
+          from pathlib import Path
+          import subprocess
+
+          OLD = "641c29771d1666e6db7a4b11827cc20a9de8a9af"
+
+          def decode_ps_bytes(data: bytes) -> tuple[str, bytes, str]:
+              bom = b"\xef\xbb\xbf" if data.startswith(b"\xef\xbb\xbf") else b""
+              payload = data[len(bom):].decode("utf-8")
+              newline = "\r\n" if "\r\n" in payload else "\n"
+              return payload.replace("\r\n", "\n"), bom, newline
+
+          def write_ps(path: Path, normalized: str, bom: bytes, newline: str) -> None:
+              payload = normalized if newline == "\n" else normalized.replace("\n", "\r\n")
+              path.write_bytes(bom + payload.encode("utf-8"))
+
+          setup = Path("setup-localmcp.ps1")
+          current, bom, newline = decode_ps_bytes(setup.read_bytes())
+          old_raw = subprocess.check_output(["git", "show", f"{OLD}:setup-localmcp.ps1"])
+          old, _, _ = decode_ps_bytes(old_raw)
+
+          invoke_before = "$output = @(& $PythonPath @Arguments 2>&1)"
+          invoke_after = "$output = @(& $PythonPath -X utf8 @Arguments 2>&1)"
+          if current.count(invoke_before) != 1 or invoke_after in current:
+              raise SystemExit("Invoke-Python source shape changed; refusing automatic rewrite")
+          current = current.replace(invoke_before, invoke_after, 1)
+
+          function_start = "function Select-TunnelClient {"
+          function_end = "\nfunction Read-TunnelIdForSetup"
+          old_start = old.index(function_start)
+          old_end = old.index(function_end, old_start)
+          old_body = old[old_start:old_end]
+          cur_start = current.index(function_start)
+          cur_end = current.index(function_end, cur_start)
+          cur_body = current[cur_start:cur_end]
+          try_anchor = "        try {\n"
+          resolve_line = "            $resolved = Resolve-TunnelExecutable -Path $selection -ForbiddenRoots $ForbiddenRoots\n"
+          old_try = old_body.index(try_anchor) + len(try_anchor)
+          old_resolve = old_body.index(resolve_line, old_try)
+          middle = old_body[old_try:old_resolve]
+          if "Test-Path -LiteralPath $selection -PathType Container" not in middle:
+              raise SystemExit("Validated directory-input block was not found")
+          current_sequence = try_anchor + resolve_line
+          if cur_body.count(current_sequence) != 1:
+              raise SystemExit("Select-TunnelClient source shape changed; refusing automatic rewrite")
+          cur_body = cur_body.replace(current_sequence, try_anchor + middle + resolve_line, 1)
+          current = current[:cur_start] + cur_body + current[cur_end:]
+          write_ps(setup, current, bom, newline)
+
+          test_path = Path("tests/test_local_launchers.py")
+          tests = test_path.read_text(encoding="utf-8")
+          import_before = "import tempfile\nfrom pathlib import Path"
+          import_after = "import tempfile\nimport tomllib\nfrom pathlib import Path"
+          if tests.count(import_before) != 1 or "import tomllib\n" in tests:
+              raise SystemExit("test_local_launchers import shape changed; refusing automatic rewrite")
+          tests = tests.replace(import_before, import_after, 1)
+
+          test_start = tests.index("def test_settings_menu_displays_summary_and_atomically_changes_workspace(")
+          assertion_start = tests.index("    assert f'workspace_root = ", test_start)
+          next_test = tests.index("\n\n@pytest.mark.skipif", assertion_start)
+          assertion_region = tests[assertion_start:next_test]
+          if assertion_region.count("assert ") != 2:
+              raise SystemExit("settings assertion region contains unexpected assertions")
+          if "toml_path(new_workspace)" not in assertion_region or "toml_path(new_data_dir)" not in assertion_region:
+              raise SystemExit("settings assertion targets changed; refusing automatic rewrite")
+          assertion_after = (
+              '    updated = tomllib.loads(config.read_text(encoding="utf-8"))\n'
+              '    assert os.path.samefile(updated["workspace_root"], new_workspace), output\n'
+              '    assert os.path.samefile(updated["data_dir"], new_data_dir), output'
+          )
+          tests = tests[:assertion_start] + assertion_after + tests[next_test:]
+          test_path.write_text(tests, encoding="utf-8", newline="")
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Remove-Item .github/workflows/rebuild-tunnel-on-9b2b.yml -Force
+
+      - name: Verify selected diff only
+        shell: pwsh
+        run: |
+          $changed = @(git diff --name-only 9b2b5197ec8eb0b2451a7a9eacd53754f45479b5)
+          $expected = @(
+            'secure-mcp-tunnel.ps1',
+            'setup-localmcp.ps1',
+            'tests/test_local_launchers.py',
+            'tests/test_mcp_stdio_integration.py',
+            'tests/test_tunnel_integration.py'
+          )
+          $unexpected = @($changed | Where-Object { $_ -notin $expected })
+          if ($unexpected.Count -gt 0) { throw "Unexpected changed files: $($unexpected -join ', ')" }
+          if ($changed.Count -ne $expected.Count) { throw "Expected exactly 5 changed files, got $($changed.Count)" }
+          foreach ($path in $expected) { if ($path -notin $changed) { throw "Expected change missing: $path" } }
+          if (Test-Path .github/workflows/rebuild-tunnel-on-9b2b.yml) { throw 'Temporary workflow must not remain in final tree' }
+
+      - name: Parse PowerShell with Windows PowerShell 5.1
+        shell: pwsh
+        run: |
+          & 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -NoProfile -NonInteractive -Command '$files = @("setup-localmcp.ps1","secure-mcp-tunnel.ps1","run-localmcp.ps1","run-approvals.ps1"); foreach ($file in $files) { $tokens=$null; $errors=$null; [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $file), [ref]$tokens, [ref]$errors) | Out-Null; if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Error $_.Message }; exit 1 } }'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Focused regressions including approval UI
+        shell: pwsh
+        run: |
+          python -m pytest `
+            tests/test_setup_python_diagnostics.py `
+            tests/test_tunnel_integration.py `
+            tests/test_local_launchers.py::test_settings_menu_displays_summary_and_atomically_changes_workspace `
+            tests/test_mcp_stdio_integration.py::test_saved_acl_config_starts_through_normal_launcher `
+            tests/test_approval_ui_autostart.py
+
+      - name: Repository core regression
+        shell: pwsh
+        run: python -m pytest --ignore=tests/test_runtime_closure_integration.py
+
+      - name: Runtime closure regression
+        shell: pwsh
+        run: python -m pytest tests/test_runtime_closure_integration.py
+
+      - name: Ruff
+        shell: pwsh
+        run: python -m ruff check .
+
+      - name: Diff whitespace
+        shell: pwsh
+        run: git diff --check 9b2b5197ec8eb0b2451a7a9eacd53754f45479b5 -- secure-mcp-tunnel.ps1 setup-localmcp.ps1 tests/test_local_launchers.py tests/test_mcp_stdio_integration.py tests/test_tunnel_integration.py
+
+      - name: Commit validated latest-main tree
+        shell: pwsh
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add secure-mcp-tunnel.ps1 setup-localmcp.ps1 tests/test_local_launchers.py tests/test_mcp_stdio_integration.py tests/test_tunnel_integration.py
+          $staged = @(git diff --cached --name-only)
+          $expected = @('secure-mcp-tunnel.ps1','setup-localmcp.ps1','tests/test_local_launchers.py','tests/test_mcp_stdio_integration.py','tests/test_tunnel_integration.py')
+          if ($staged.Count -ne $expected.Count) { throw "Unexpected staged file count: $($staged.Count)" }
+          foreach ($path in $expected) { if ($path -notin $staged) { throw "Expected staged file missing: $path" } }
+          git commit -m 'fix: Tunnel設定UXを最新mainへ再適用'
+          git push origin HEAD:work/rebuild-tunnel-ux-main-9b2b
