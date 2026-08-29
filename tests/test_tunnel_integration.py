@@ -421,4 +421,3 @@ if ($null -eq $result -or -not [IO.Path]::GetFullPath($result.Path).Equals($expe
     output = completed.stdout + completed.stderr
     assert completed.returncode == 0, output
     assert "directory-input-ok" in output
-
