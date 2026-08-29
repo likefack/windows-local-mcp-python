@@ -135,6 +135,7 @@ try {
 
     $doctor = Invoke-TunnelClientDoctor -ClientPath $binding.ClientPath -ProfilePath $binding.ProfilePath -Credential $credential
     if (-not $doctor.Succeeded) {
+        Show-TunnelDoctorDiagnostics -Doctor $doctor
         Show-TunnelFailureGuide -FailureClass $doctor.FailureClass
         throw "Tunnel の起動前検証に失敗しました。"
     }
