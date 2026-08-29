@@ -304,10 +304,27 @@ function Get-TunnelSha256 {
         [string]$Path
     )
 
+    $stream = $null
+    $algorithm = $null
     try {
-        return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path -ErrorAction Stop).Hash.ToLowerInvariant()
+        # configure-localmcp.bat が起動する Windows PowerShell で Utility
+        # module を自動読込できない場合もあるため、標準 hash cmdlet へ依存しません。
+        $stream = [IO.File]::Open(
+            $Path,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::Read,
+            [IO.FileShare]::Read
+        )
+        $algorithm = [Security.Cryptography.SHA256]::Create()
+        $bytes = $algorithm.ComputeHash($stream)
+        return ([BitConverter]::ToString($bytes)).Replace('-', '').ToLowerInvariant()
     } catch {
-        throw "Tunnel client の SHA-256 を確認できません。"
+        # hash 計算の例外は file path／アクセス／I/O に限定され、secret を
+        # 扱いません。上位で原因を表示できるよう詳細を維持します。
+        throw "Tunnel 対象ファイルの SHA-256 を確認できません: $($_.Exception.Message)"
+    } finally {
+        if ($null -ne $algorithm) { $algorithm.Dispose() }
+        if ($null -ne $stream) { $stream.Dispose() }
     }
 }
 
@@ -788,8 +805,14 @@ function Write-TunnelProfileStaging {
         [Parameter(Mandatory = $true)][string]$Content,
         [Parameter(Mandatory = $true)][string]$DestinationPath
     )
-    New-Item -ItemType Directory -Path (Split-Path -Parent $DestinationPath) -Force | Out-Null
-    $temporary = "$DestinationPath.tmp-$PID-$([Guid]::NewGuid().ToString('N'))"
+    $destinationDirectory = Split-Path -Parent $DestinationPath
+    New-Item -ItemType Directory -Path $destinationDirectory -Force | Out-Null
+    # tunnel-client v0.0.10 の --profile-file は path が .yaml で終わることを
+    # config_source 検証で要求します。atomic install と同じ directory 内に置き、
+    # staging 中も有効な profile-file 名を維持します。
+    $baseName = [IO.Path]::GetFileNameWithoutExtension($DestinationPath)
+    $temporaryName = "$baseName.tmp-$PID-$([Guid]::NewGuid().ToString('N')).yaml"
+    $temporary = Join-Path $destinationDirectory $temporaryName
     [IO.File]::WriteAllText($temporary, $Content, [Text.UTF8Encoding]::new($false))
     return $temporary
 }
@@ -935,20 +958,102 @@ function Test-TunnelProfileBinding {
     }
 }
 
+function Get-TunnelFailedChecks {
+    param(
+        [string]$Stdout,
+        [string]$Stderr
+    )
+
+    $text = "$Stdout`n$Stderr"
+    $checks = [Collections.Generic.List[string]]::new()
+    foreach ($match in [regex]::Matches($text, '(?im)^\s*FAILED_CHECKS\s+(?<checks>[A-Za-z0-9_., -]+?)\s*$')) {
+        foreach ($name in ($match.Groups['checks'].Value -split '[\s,]+')) {
+            $normalized = $name.Trim().ToLowerInvariant()
+            if ($normalized -match '^[a-z][a-z0-9_]*$' -and -not $checks.Contains($normalized)) {
+                $checks.Add($normalized)
+            }
+        }
+    }
+    return @($checks)
+}
+
+function Get-TunnelFailureDetail {
+    param(
+        [string]$Stdout,
+        [string]$Stderr,
+        [int]$ExitCode
+    )
+
+    $text = "$Stdout`n$Stderr"
+    $failedChecks = @(Get-TunnelFailedChecks -Stdout $Stdout -Stderr $Stderr)
+    $failureClass = "tunnel_client_failed"
+    $failureCode = "doctor_unknown_failure"
+
+    if ($ExitCode -eq 0) {
+        $failureClass = "ok"
+        $failureCode = "ok"
+    } elseif ($failedChecks -contains "config_source") {
+        $failureClass = "profile_invalid"
+        $failureCode = "doctor_config_source"
+    } elseif ($failedChecks -contains "profile_load") {
+        $failureClass = "profile_invalid"
+        $failureCode = "doctor_profile_load"
+    } elseif ($failedChecks -contains "control_plane_api_key") {
+        $failureClass = "auth_failed"
+        $failureCode = "doctor_control_plane_api_key"
+    } elseif ($failedChecks -contains "tunnel_id") {
+        $failureClass = "tunnel_id_invalid"
+        $failureCode = "doctor_tunnel_id"
+    } elseif ($failedChecks -contains "mcp_command_executable") {
+        $failureClass = "server_start_failed"
+        $failureCode = "doctor_mcp_command_executable"
+    } elseif ($failedChecks -contains "mcp_server_reachable") {
+        $failureClass = "server_start_failed"
+        $failureCode = "doctor_mcp_server_reachable"
+    } elseif ($failedChecks -contains "health_listener") {
+        $failureClass = "health_listener_failed"
+        $failureCode = "doctor_health_listener"
+    } elseif ($failedChecks -contains "oauth_metadata") {
+        $failureClass = "oauth_metadata_failed"
+        $failureCode = "doctor_oauth_metadata"
+    } elseif (@($failedChecks | Where-Object { $_ -like "control_plane_*" }).Count -gt 0) {
+        $failureClass = "control_plane_failed"
+        $failureCode = "doctor_control_plane"
+    } elseif ($failedChecks.Count -gt 0) {
+        $failureClass = "tunnel_client_failed"
+        $failureCode = "doctor_reported_checks"
+    } elseif ($text -match '(?i)(?:http[^\r\n]{0,20})?\b401\b|unauthori[sz]ed|invalid.{0,20}(?:api|runtime).{0,20}key') {
+        $failureClass = "auth_failed"
+        $failureCode = "doctor_auth_rejected"
+    } elseif ($text -match '(?i)(?:http[^\r\n]{0,20})?\b403\b|forbidden|permission denied') {
+        $failureClass = "permission_denied"
+        $failureCode = "doctor_permission_denied"
+    } elseif ($text -match '(?i)(?:tunnel[^\r\n]{0,40}(?:\b404\b|not found|unknown)|invalid tunnel)') {
+        $failureClass = "tunnel_id_invalid"
+        $failureCode = "doctor_tunnel_not_found"
+    } elseif ($text -match '(?i)(?:parse|decode|load|read).{0,40}(?:profile|yaml|config)|(?:profile|yaml|config).{0,40}(?:parse|syntax|unsupported|unknown field|invalid config_version)') {
+        $failureClass = "profile_invalid"
+        $failureCode = "doctor_profile_parse"
+    } elseif ($text -match '(?i)(?:mcp|command|server|powershell).{0,40}(?:missing|not found|unavailable|cannot|failed|spawn|start)') {
+        $failureClass = "server_start_failed"
+        $failureCode = "doctor_server_start"
+    }
+
+    # doctor の生出力には将来 secret が含まれる可能性があるため保持しません。
+    return [PSCustomObject]@{
+        FailureClass = $failureClass
+        FailureCode = $failureCode
+        FailedChecks = @($failedChecks)
+    }
+}
+
 function Get-TunnelFailureClass {
     param(
         [string]$Stdout,
         [string]$Stderr,
         [int]$ExitCode
     )
-    $text = "$Stdout`n$Stderr"
-    if ($text -match '(?i)401|unauthori[sz]ed|invalid.{0,20}(api|runtime).{0,20}key|credential') { return "auth_failed" }
-    if ($text -match '(?i)403|forbidden|permission|access denied') { return "permission_denied" }
-    if ($text -match '(?i)404|tunnel.{0,20}(not found|unknown)|invalid tunnel') { return "tunnel_id_invalid" }
-    if ($text -match '(?i)profile|yaml|config.{0,20}(invalid|error)|parse') { return "profile_invalid" }
-    if ($text -match '(?i)mcp|command|server|powershell|spawn|start') { return "server_start_failed" }
-    if ($ExitCode -eq 0) { return "ok" }
-    return "tunnel_client_failed"
+    return (Get-TunnelFailureDetail -Stdout $Stdout -Stderr $Stderr -ExitCode $ExitCode).FailureClass
 }
 
 function New-TunnelProcessStartInfo {
@@ -1001,13 +1106,22 @@ function Invoke-TunnelClientDoctor {
         $stdout = $stdoutTask.GetAwaiter().GetResult()
         $stderr = $stderrTask.GetAwaiter().GetResult()
         $exitCode = $process.ExitCode
+        $failure = Get-TunnelFailureDetail -Stdout $stdout -Stderr $stderr -ExitCode $exitCode
         return [PSCustomObject]@{
             Succeeded = ($exitCode -eq 0)
             ExitCode = $exitCode
-            FailureClass = Get-TunnelFailureClass -Stdout $stdout -Stderr $stderr -ExitCode $exitCode
+            FailureClass = $failure.FailureClass
+            FailureCode = $failure.FailureCode
+            FailedChecks = @($failure.FailedChecks)
         }
     } catch {
-        return [PSCustomObject]@{ Succeeded = $false; ExitCode = -1; FailureClass = "tunnel_client_unavailable" }
+        return [PSCustomObject]@{
+            Succeeded = $false
+            ExitCode = -1
+            FailureClass = "tunnel_client_unavailable"
+            FailureCode = "doctor_process_start_failed"
+            FailedChecks = @()
+        }
     } finally {
         $plain = $null
         if ($null -ne $process) { $process.Dispose() }
@@ -1195,19 +1309,47 @@ function Show-TunnelClientInstallGuide {
 }
 
 function Show-TunnelFailureGuide {
-    param([Parameter(Mandatory = $true)][string]$FailureClass)
+    param(
+        [Parameter(Mandatory = $true)][string]$FailureClass,
+        [string]$ReasonCode = "",
+        [string]$Detail = "",
+        [string[]]$FailedChecks = @(),
+        [int]$ExitCode = -1
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($ReasonCode)) {
+        Write-Host "診断コード: $ReasonCode" -ForegroundColor Gray
+    }
+    if ($FailedChecks.Count -gt 0) {
+        Write-Host "失敗した tunnel-client doctor check: $($FailedChecks -join ', ')" -ForegroundColor Gray
+    }
+    if ($ExitCode -ge 0) {
+        Write-Host "tunnel-client doctor 終了コード: $ExitCode" -ForegroundColor Gray
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Detail)) {
+        Write-Host "検出内容: $Detail" -ForegroundColor Yellow
+    }
+
     switch ($FailureClass) {
         "auth_failed" {
-            Write-Host "Runtime API Key が無効、期限切れ、または取得できません。Platform で Restricted key（Tunnels Read + Use）を確認し、必要なら新しい key を作成して再設定してください。" -ForegroundColor Yellow
+            if ($ReasonCode -eq "doctor_control_plane_api_key") {
+                Write-Host "tunnel-client が Runtime API Key を profile の参照先から取得・検証できませんでした。入力値、環境変数参照、Restricted key の Tunnels Read + Use を確認してください。" -ForegroundColor Yellow
+            } else {
+                Write-Host "Runtime API Key が認証で拒否されたか、安全な資格情報領域から取得できません。Platform で Restricted key（Tunnels Read + Use）を確認し、必要なら新しい key を作成して再設定してください。" -ForegroundColor Yellow
+            }
         }
         "permission_denied" {
             Write-Host "Tunnel への権限がありません。Runtime key の Tunnels Read + Use と、対象 Tunnel の組織・workspace 関連付けを確認してください。" -ForegroundColor Yellow
         }
         "tunnel_id_invalid" {
-            Write-Host "Tunnel ID が存在しないか形式が正しくありません。Platform の Tunnels 管理画面から対象 ID を再確認してください。" -ForegroundColor Yellow
+            if ($ReasonCode -eq "doctor_tunnel_id") {
+                Write-Host "tunnel-client の Tunnel ID check に失敗しました。profile 内の値と `tunnel_` + 小文字 hexadecimal 32 桁の形式を確認してください。" -ForegroundColor Yellow
+            } else {
+                Write-Host "Tunnel ID が存在しないか形式が正しくありません。Platform の Tunnels 管理画面から対象 ID を再確認してください。" -ForegroundColor Yellow
+            }
         }
         "profile_invalid" {
-            Write-Host "Tunnel profile が不正または変更されています。configure-localmcp.bat の Tunnel 設定変更を選び、検証済み profile を再生成してください。" -ForegroundColor Yellow
+            Write-Host "Tunnel profile の読み込み、構文、保存場所、または保存済み整合性の検証に失敗しました。上記の診断コードに対応する箇所を確認してください。" -ForegroundColor Yellow
         }
         "server_start_failed" {
             Write-Host "Tunnel から LocalMCP server を起動できません。config.toml、run-server.ps1、専用 Python 環境を確認してください。" -ForegroundColor Yellow
@@ -1215,8 +1357,27 @@ function Show-TunnelFailureGuide {
         "tunnel_client_unavailable" {
             Write-Host "tunnel-client を起動または実行できません。実行ファイルの path、権限、公式配布物を確認してください。" -ForegroundColor Yellow
         }
+        "health_listener_failed" {
+            Write-Host "Tunnel のローカル health listener を確保できません。listen address の競合、使用中 port、またはローカル socket 設定を確認してください。" -ForegroundColor Yellow
+        }
+        "oauth_metadata_failed" {
+            Write-Host "LocalMCP の OAuth metadata 検証に失敗しました。MCP endpoint の応答と認証 metadata を確認してください。" -ForegroundColor Yellow
+        }
+        "control_plane_failed" {
+            Write-Host "OpenAI Tunnel control plane の検証に失敗しました。ネットワーク、TLS、proxy、Tunnel の組織関連付けを確認してください。" -ForegroundColor Yellow
+        }
         default {
             Write-Host "Tunnel の検証に失敗しました。tunnel-client doctor --profile-file を再実行できるよう、configure-localmcp.bat から診断・再設定してください。" -ForegroundColor Yellow
         }
     }
+}
+
+function Show-TunnelDoctorFailureGuide {
+    param([Parameter(Mandatory = $true)][object]$DoctorResult)
+
+    Show-TunnelFailureGuide `
+        -FailureClass ([string]$DoctorResult.FailureClass) `
+        -ReasonCode ([string]$DoctorResult.FailureCode) `
+        -FailedChecks @($DoctorResult.FailedChecks) `
+        -ExitCode ([int]$DoctorResult.ExitCode)
 }

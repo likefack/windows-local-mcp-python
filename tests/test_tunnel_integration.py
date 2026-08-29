@@ -48,6 +48,72 @@ def test_secure_mcp_tunnel_helper_parses() -> None:
     assert completed.returncode == 0, completed.stderr or completed.stdout
 
 
+@pytest.mark.skipif(os.name != "nt", reason="PowerShell helper is Windows-only")
+def test_doctor_failure_classification_uses_failed_checks_without_leaking_output() -> None:
+    command = f"""
+$ErrorActionPreference = 'Stop'
+. {_ps_literal(_HELPER)}
+$marker = 'diagnostic-secret-' + [Guid]::NewGuid().ToString('N')
+
+# profile-file という語が案内に含まれていても、構造化された失敗 check を優先します。
+$authText = "CHECK profile_load pass profile file: C:/safe/profile.yaml`nRESULT fail`nFAILED_CHECKS control_plane_api_key`nNEXT tunnel-client run --profile-file C:/safe/profile.yaml`n$marker"
+$auth = Get-TunnelFailureDetail -Stdout $authText -Stderr '' -ExitCode 2
+if ($auth.FailureClass -ne 'auth_failed' -or $auth.FailureCode -ne 'doctor_control_plane_api_key') {{ throw 'API key check was misclassified' }}
+if (@($auth.FailedChecks).Count -ne 1 -or $auth.FailedChecks[0] -ne 'control_plane_api_key') {{ throw 'failed check was not preserved' }}
+if (($auth | ConvertTo-Json -Compress) -match [regex]::Escape($marker)) {{ throw 'raw doctor output leaked into diagnostic result' }}
+
+$cases = @(
+    @('FAILED_CHECKS config_source', 'profile_invalid', 'doctor_config_source'),
+    @('FAILED_CHECKS profile_load', 'profile_invalid', 'doctor_profile_load'),
+    @('FAILED_CHECKS tunnel_id', 'tunnel_id_invalid', 'doctor_tunnel_id'),
+    @('FAILED_CHECKS mcp_command_executable', 'server_start_failed', 'doctor_mcp_command_executable'),
+    @('FAILED_CHECKS mcp_server_reachable', 'server_start_failed', 'doctor_mcp_server_reachable'),
+    @('FAILED_CHECKS health_listener', 'health_listener_failed', 'doctor_health_listener'),
+    @('FAILED_CHECKS oauth_metadata', 'oauth_metadata_failed', 'doctor_oauth_metadata'),
+    @('FAILED_CHECKS control_plane_route', 'control_plane_failed', 'doctor_control_plane'),
+    @('FAILED_CHECKS future_check', 'tunnel_client_failed', 'doctor_reported_checks')
+)
+foreach ($case in $cases) {{
+    $detail = Get-TunnelFailureDetail -Stdout $case[0] -Stderr '' -ExitCode 2
+    if ($detail.FailureClass -ne $case[1] -or $detail.FailureCode -ne $case[2]) {{
+        throw "unexpected classification for $($case[0]): $($detail.FailureClass)/$($detail.FailureCode)"
+    }}
+}}
+
+$parse = Get-TunnelFailureDetail -Stdout '' -Stderr 'parse config file C:/safe/profile.yaml: unsupported config_version 2' -ExitCode 1
+if ($parse.FailureClass -ne 'profile_invalid' -or $parse.FailureCode -ne 'doctor_profile_parse') {{ throw 'profile parse fallback was not classified' }}
+$unknown = Get-TunnelFailureDetail -Stdout 'profile file: C:/safe/profile.yaml' -Stderr 'unexpected failure' -ExitCode 1
+if ($unknown.FailureClass -ne 'tunnel_client_failed' -or $unknown.FailureCode -ne 'doctor_unknown_failure') {{ throw 'generic profile word caused a false profile classification' }}
+'doctor-classification-ok'
+"""
+    completed = _run_powershell(command)
+    output = completed.stdout + completed.stderr
+    assert completed.returncode == 0, output
+    assert "doctor-classification-ok" in output
+    assert "diagnostic-secret-" not in output
+
+
+@pytest.mark.skipif(os.name != "nt", reason="PowerShell helper is Windows-only")
+def test_managed_profile_staging_path_keeps_yaml_extension(tmp_path: Path) -> None:
+    destination = tmp_path / "localmcp-test.yaml"
+    command = f"""
+$ErrorActionPreference = 'Stop'
+. {_ps_literal(_HELPER)}
+$staging = Write-TunnelProfileStaging -Content 'config_version: 1' -DestinationPath {_ps_literal(destination)}
+try {{
+    if ([IO.Path]::GetExtension($staging) -ne '.yaml') {{ throw "staging profile must end with .yaml: $staging" }}
+    if (-not (Test-Path -LiteralPath $staging -PathType Leaf)) {{ throw 'staging profile was not created' }}
+    'staging-yaml-extension-ok'
+}} finally {{
+    Remove-TunnelStagingFile -Path $staging
+}}
+"""
+    completed = _run_powershell(command)
+    output = completed.stdout + completed.stderr
+    assert completed.returncode == 0, output
+    assert "staging-yaml-extension-ok" in output
+
+
 def test_tunnel_secret_storage_and_launch_contract_is_explicit() -> None:
     helper = _HELPER.read_text(encoding="utf-8")
     setup = (_REPOSITORY_ROOT / "setup-localmcp.ps1").read_text(encoding="utf-8-sig")
@@ -60,11 +126,15 @@ def test_tunnel_secret_storage_and_launch_contract_is_explicit() -> None:
     assert "api_key: env:WLMCP_TUNNEL_RUNTIME_API_KEY" in helper
     assert "RedirectStandardOutput = $true" in helper
     assert "RedirectStandardError = $true" in helper
+    assert "Tunnel 対象ファイルの SHA-256 を確認できません: $($_.Exception.Message)" in helper
+    assert "[Security.Cryptography.SHA256]::Create()" in helper
+    assert "Get-FileHash" not in helper
     assert "--api-key" not in helper
     assert "-ApiKey" not in helper
     assert "Read-Host \"Runtime API Key（入力内容は表示されません）\" -AsSecureString" in setup
     assert "Test-TunnelProfileBinding" in runner
     assert "Invoke-TunnelClientDoctor" in runner
+    assert "Show-TunnelDoctorFailureGuide" in runner
     assert "Start-TunnelClientProcess" in runner
     assert "run-server.ps1" in runner
 

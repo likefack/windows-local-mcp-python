@@ -79,7 +79,7 @@ def test_windows_powershell_51_launchers_use_utf8_bom_and_keep_japanese() -> Non
     assert "設定ファイルが見つかりません" in (
         _REPOSITORY_ROOT / "run-localmcp.ps1"
     ).read_text(encoding="utf-8-sig")
-    assert "Tunnel client の SHA-256 を確認できません" in (
+    assert "Tunnel 対象ファイルの SHA-256 を確認できません" in (
         _REPOSITORY_ROOT / "secure-mcp-tunnel.ps1"
     ).read_text(encoding="utf-8-sig")
 
@@ -403,6 +403,7 @@ def test_tunnel_onboarding_and_failure_guidance_are_beginner_facing() -> None:
     assert "秘密情報の全文は作成時だけ表示され" in helper
     assert "Restricted key" in helper
     assert "Show-TunnelClientInstallGuide" in setup
+    assert "指定した tunnel-client を安全に確認できません: $($_.Exception.Message)" in setup
     assert "tunnel-client が見つかりません" in helper
     assert "tool refresh" in runner
     assert "Get-TunnelMutexName" in setup

@@ -63,7 +63,15 @@ Tunnel ID は OpenAI の Tunnels 管理画面で確認または作成する識�
 
 設定確認・変更モードでは、最初に workspace、active config、Tunnel の有効状態、Tunnel ID、Runtime API Key の登録状態（secret 本体は非表示）、tunnel-client の検出状態を表示します。workspace の変更は、副作用のない候補検証を行ってから config を原子的に置換し、最終 config path で通常検証を完了した場合だけ確定します。候補検証では一時 config path に namespace／ACL marker やディレクトリを作りません。置換後の検証に失敗した場合は旧 config を復元します。Runtime API Key の更新は新しい key の `doctor` 成功後に credential だけを切り替え、失敗時は旧 key を維持します。
 
+`tunnel-client doctor --explain` が失敗した場合は、単語の部分一致ではなく、client が出力する `FAILED_CHECKS` の check 名を優先して原因を分類します。画面には `診断コード`、失敗した check 名、終了コードを表示し、認証情報、Tunnel ID、profile 読み込み、MCP command、health listener、OAuth metadata、control plane を区別します。将来の client が未知の check を返した場合も、その check 名を表示して fail closed します。doctor の生の標準出力・標準エラーは API Key などを含む可能性があるため、画面、ログ、state へ保存しません。
+
+`config_source` は profile-file の指定自体を解決できない失敗、`profile_load` は解決したファイルを読み取れない失敗として別の診断コードにします。managed profile の staging file は v0.0.10 の `--profile-file` が要求する `.yaml` suffix を維持し、doctor 成功後に同じ directory 内で atomic replacement します。
+
 Tunnel client が見つからない場合は、[公式 Tunnels 管理画面](https://platform.openai.com/settings/organization/tunnels) または [公式リリース](https://github.com/openai/tunnel-client/releases/latest) の案内を確認し、workspace・`data_dir`・リポジトリの外へ配置してから再実行します。ChatGPT 側で接続やツールが表示されない場合は、Tunnel／connector の tool refresh や再接続が必要になることがあります。
+
+手入力した tunnel-client の path が拒否された場合は、存在確認、通常ファイルか、reparse point か、workspace／`data_dir`／リポジトリ内か、SHA-256 を計算できるかのうち、失敗した具体的な理由を表示します。
+
+Tunnel client と profile の SHA-256 計算は、Windows PowerShell の module 自動読込状態に依存しない .NET `SHA256` を使用します。
 
 managed profile の MCP command に含める Windows path は、tunnel-client v0.0.10 でも drive path を安全に解釈できる `C:/...` 形式へ正規化します。空白や日本語を含む path は引用符内にそのまま保持します。
 

@@ -120,7 +120,7 @@ try {
         -StateRoot $StateRoot `
         -ForbiddenRoots $forbiddenRoots
     if (-not $binding.Valid) {
-        Show-TunnelFailureGuide -FailureClass (Get-RunTunnelFailureClass -ReasonCode $binding.ReasonCode)
+        Show-TunnelFailureGuide -FailureClass (Get-RunTunnelFailureClass -ReasonCode $binding.ReasonCode) -ReasonCode $binding.ReasonCode -Detail $binding.Message
         throw "Secure MCP Tunnel の profile/runtime 整合性を確認できません。"
     }
 
@@ -135,7 +135,7 @@ try {
 
     $doctor = Invoke-TunnelClientDoctor -ClientPath $binding.ClientPath -ProfilePath $binding.ProfilePath -Credential $credential
     if (-not $doctor.Succeeded) {
-        Show-TunnelFailureGuide -FailureClass $doctor.FailureClass
+        Show-TunnelDoctorFailureGuide -DoctorResult $doctor
         throw "Tunnel の起動前検証に失敗しました。"
     }
 

@@ -982,7 +982,9 @@ function Select-TunnelClient {
             $resolved = Resolve-TunnelExecutable -Path $selection -ForbiddenRoots $ForbiddenRoots
             return [PSCustomObject]@{ Path = $resolved; Hash = Get-TunnelSha256 -Path $resolved }
         } catch {
-            Write-Warn "指定した tunnel-client を安全に確認できません。公式配布物の path を指定してください。"
+            # Resolve-TunnelExecutable の例外は path／配置／file type に限定した
+            # 内部診断であり、secret を含みません。原因を潰さずそのまま案内します。
+            Write-Warn "指定した tunnel-client を安全に確認できません: $($_.Exception.Message)"
         }
     }
 }
@@ -1079,7 +1081,7 @@ function Test-TunnelIntegrationForSetup {
         -StateRoot $StateRoot `
         -ForbiddenRoots $forbiddenRoots
     if (-not $binding.Valid) {
-        Show-TunnelFailureGuide -FailureClass (Get-TunnelFailureClassForSetup -ReasonCode $binding.ReasonCode)
+        Show-TunnelFailureGuide -FailureClass (Get-TunnelFailureClassForSetup -ReasonCode $binding.ReasonCode) -ReasonCode $binding.ReasonCode -Detail $binding.Message
         return $false
     }
 
@@ -1094,7 +1096,7 @@ function Test-TunnelIntegrationForSetup {
         }
         $doctor = Invoke-TunnelClientDoctor -ClientPath $binding.ClientPath -ProfilePath $binding.ProfilePath -Credential $credential
         if (-not $doctor.Succeeded) {
-            Show-TunnelFailureGuide -FailureClass $doctor.FailureClass
+            Show-TunnelDoctorFailureGuide -DoctorResult $doctor
             return $false
         }
         Write-Ok "既存の Tunnel profile、tunnel-client、認証参照を検証しました。"
@@ -1174,7 +1176,7 @@ function Save-TunnelManagedIntegration {
         $doctor = Invoke-TunnelClientDoctor -ClientPath $ClientPath -ProfilePath $stagingPath -Credential $Credential
         if (-not $doctor.Succeeded) {
             Remove-TunnelStagingFile -Path $stagingPath
-            Show-TunnelFailureGuide -FailureClass $doctor.FailureClass
+            Show-TunnelDoctorFailureGuide -DoctorResult $doctor
             return $false
         }
 
@@ -1275,7 +1277,7 @@ function Save-TunnelExternalIntegration {
 
         $doctor = Invoke-TunnelClientDoctor -ClientPath $ClientPath -ProfilePath $Candidate.Path -Credential $credential
         if (-not $doctor.Succeeded) {
-            Show-TunnelFailureGuide -FailureClass $doctor.FailureClass
+            Show-TunnelDoctorFailureGuide -DoctorResult $doctor
             return $false
         }
 
@@ -1367,7 +1369,7 @@ function Enable-TunnelIntegrationForSetup {
         -StateRoot $StateRoot `
         -ForbiddenRoots @(Get-TunnelForbiddenRoots -Context $Context)
     if (-not $binding.Valid) {
-        Show-TunnelFailureGuide -FailureClass (Get-TunnelFailureClassForSetup -ReasonCode $binding.ReasonCode)
+        Show-TunnelFailureGuide -FailureClass (Get-TunnelFailureClassForSetup -ReasonCode $binding.ReasonCode) -ReasonCode $binding.ReasonCode -Detail $binding.Message
         Write-Warn "保持済み Tunnel 設定を安全に再利用できないため、有効化していません。"
         return $false
     }
@@ -1384,7 +1386,7 @@ function Enable-TunnelIntegrationForSetup {
         }
         $doctor = Invoke-TunnelClientDoctor -ClientPath $binding.ClientPath -ProfilePath $binding.ProfilePath -Credential $credential
         if (-not $doctor.Succeeded) {
-            Show-TunnelFailureGuide -FailureClass $doctor.FailureClass
+            Show-TunnelDoctorFailureGuide -DoctorResult $doctor
             Write-Warn "保持済み Tunnel 設定の検証に失敗したため、有効化していません。"
             return $false
         }
@@ -1594,7 +1596,7 @@ function Update-TunnelRuntimeApiKey {
         -StateRoot $StateRoot `
         -ForbiddenRoots $forbiddenRoots
     if (-not $binding.Valid) {
-        Show-TunnelFailureGuide -FailureClass (Get-TunnelFailureClassForSetup -ReasonCode $binding.ReasonCode)
+        Show-TunnelFailureGuide -FailureClass (Get-TunnelFailureClassForSetup -ReasonCode $binding.ReasonCode) -ReasonCode $binding.ReasonCode -Detail $binding.Message
         return $false
     }
 
@@ -1612,8 +1614,8 @@ function Update-TunnelRuntimeApiKey {
         # 新しい credential で先に doctor を実行し、成功するまで保存済み key は触りません。
         $doctor = Invoke-TunnelClientDoctor -ClientPath $binding.ClientPath -ProfilePath $binding.ProfilePath -Credential $newCredential
         if (-not $doctor.Succeeded) {
-            Show-TunnelFailureGuide -FailureClass $doctor.FailureClass
-            Write-Info "認証に失敗したため、以前の Runtime API Key は維持しています。"
+            Show-TunnelDoctorFailureGuide -DoctorResult $doctor
+            Write-Info "新しい key を使った Tunnel 検証に失敗したため、以前の Runtime API Key は維持しています。"
             return $false
         }
 

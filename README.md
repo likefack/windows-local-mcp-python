@@ -663,6 +663,7 @@ Approved Host の導入・復旧は、通常の editable checkout を起動す�
 | Tunnel ID がない・形式エラーになる | Tunnels 管理画面で既存 Tunnel を確認または作成し、`tunnel_` + 32 桁の小文字 hexadecimal を入力します。新規作成は必須ではありません |
 | Runtime API Key がない・取得できない | API Keys 画面で Restricted key の Tunnels `Read` + `Use` を確認します。全文を紛失した既存キーは再表示できないため、新しいキーを作成して Tunnel 設定メニューでローテーションします |
 | Tunnel 認証に失敗する | key の権限、Tunnel の組織・workspace 関連付け、対象 Tunnel ID を確認します。設定済み Tunnel の問題を direct-server 起動で迂回することはありません |
+| Tunnel の設定・検証で診断コードが表示される | `診断コード`、`失敗した tunnel-client doctor check`、終了コードを確認します。`doctor_control_plane_api_key` は key の参照・取得、`doctor_tunnel_id` は Tunnel ID、`doctor_config_source` は profile-file の指定、`doctor_profile_load` は指定済み profile の読み込み、`doctor_mcp_command_executable` は LocalMCP 起動 command、`doctor_health_listener` はローカル待受の問題です。API Key 本体ではなく、この3項目だけを問題報告へ添えてください |
 | Tunnel は起動したが ready にならない | `run-localmcp.bat` の表示、tunnel-client の公式 `doctor`、LocalMCP config、client の起動状態を確認します。ready 未確認は接続成功とは扱いません |
 | ChatGPT に Tunnel／ツールが表示されない | ChatGPT 側の workspace、Tunnel の `Read` + `Use`、connector の接続状態を確認し、必要なら tool refresh または再接続を行います |
 | Context が無効になる | sidecar のファイル名・環境変数、固定 endpoint、認証情報、サイズ上限を確認します。sidecar を変更した後はサーバーを再起動します |

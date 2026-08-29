@@ -1,5 +1,29 @@
 # 検証記録
 
+## 2026-08-30 Secure MCP Tunnel の失敗原因表示
+
+### 変更内容
+
+- `tunnel-client doctor --explain` の失敗を、単語 `profile` などの広い部分一致ではなく、`FAILED_CHECKS` の check 名を優先して分類するよう変更した。
+- 画面には診断コード、失敗した check 名、doctor の終了コードを表示し、profile 読み込み、Runtime API Key、Tunnel ID、MCP command、health listener、OAuth metadata、control plane、未知の check を区別する。
+- doctor の生の標準出力・標準エラーは診断結果、state、ログへ保持せず、Runtime API Key などの秘密情報が表示されない境界を維持した。
+- LocalMCP 側の state/profile binding 失敗では、既存の `ReasonCode` と、秘密を含まない内部検出メッセージを表示する。Tunnel 失敗時の fail-closed と direct-server への自動 fallback 禁止は変更していない。
+- `configure-localmcp.bat` の Windows PowerShell 環境で `Get-FileHash` を自動読込できない場合があるため、Tunnel client／profile の SHA-256 は PowerShell module に依存しない .NET `SHA256` で計算する。
+
+### 回帰検証
+
+- 通常の Windows user 文脈で Tunnel／launcher／PowerShell focused pytest: `39 passed in 24.25s`。
+- 制限環境内の先行実行では `34 passed, 4 deselected`。除外した4件は、Credential Manager 書き込み1件と既存 `.bat` 読み取り3件が制限環境で拒否されたためであり、同じ4件を含む上記の通常 Windows user 実行では成功した。
+- 新しい分類テストは、`profile-file` という語を含む API Key check が profile 異常へ誤分類されないこと、既知 check ごとの分類、未知 check の fail-closed、限定 fallback、doctor 生出力の非保持を確認した。
+- v0.0.10 の `config_source` が `--profile-file` の `.yaml` suffix を要求するため、managed staging path も `.yaml` で終わることを回帰テストで固定した。`config_source` と `profile_load` は別の診断コードとして扱う。
+- focused Ruff `--no-cache`: pass。変更した PowerShell 3ファイルの parser: pass。`git diff --check`: whitespace error なし（既存の改行コード warning のみ）。
+
+### 外部接続検証の境界
+
+- ローカル回帰検証は、実 Runtime API Key、OpenAI control plane、ChatGPT connector を通した接続成功の証明ではない。実 client による再試行では、表示された診断コード、失敗 check、終了コードを使って原因を切り分ける。
+- 修正後の `configure-localmcp.bat` を通常の設定経路で再試行し、従来は一般文へ潰れていた最初の失敗が、Windows PowerShell 実行環境で `Get-FileHash` を利用できないことだと確認した。.NET `SHA256` へ変更後は同じ v0.0.10 client を受理し、Tunnel ID 検証を通過して Runtime API Key の非表示入力欄まで到達した。control plane を使う `doctor` は key 入力前のため未実行。
+- ユーザーの key 入力を伴う次の再試行では `FAILED_CHECKS config_source`、終了コード `2` を確認した。v0.0.10 の公式実装は `--profile-file` path が `.yaml` で終わることを要求する一方、旧 staging path は `.yaml.tmp-<PID>-<GUID>` で終わっていたため、内容を読む前に拒否されていた。staging path 修正後の実 key／control plane 再試行は未実施。
+
 ## 2026-08-29 Secure MCP Tunnel onboarding／LocalMCP ランチャー統合
 
 ### 対象と仕様変更
