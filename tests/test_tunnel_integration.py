@@ -389,6 +389,7 @@ try {{
     if ($null -eq $oldOneDrive) {{ Remove-Item Env:OneDrive -ErrorAction SilentlyContinue }} else {{ $env:OneDrive = $oldOneDrive }}
     if ($null -eq $oldBin) {{ Remove-Item Env:TUNNEL_CLIENT_BIN -ErrorAction SilentlyContinue }} else {{ $env:TUNNEL_CLIENT_BIN = $oldBin }}
 }}
+exit 0
 """
     completed = _run_powershell(command)
     output = completed.stdout + completed.stderr
@@ -410,7 +411,9 @@ $script:selectionValue = {_ps_literal(client_dir)}
 function Get-TunnelClientCandidates {{ return @() }}
 function Read-Host {{ param([string]$Prompt); return $script:selectionValue }}
 function Read-YesNo {{ param([string]$Prompt, [bool]$Default = $true); return $true }}
-$result = Select-TunnelClient -State $null -ForbiddenRoots @()
+$forbiddenRoot = Join-Path {_ps_literal(tmp_path)} 'forbidden'
+New-Item -ItemType Directory -Path $forbiddenRoot -Force | Out-Null
+$result = Select-TunnelClient -State $null -ForbiddenRoots @($forbiddenRoot)
 $expected = [IO.Path]::GetFullPath({_ps_literal(expected)})
 if ($null -eq $result -or -not [IO.Path]::GetFullPath($result.Path).Equals($expected, [StringComparison]::OrdinalIgnoreCase)) {{
     throw 'directory input did not resolve its direct tunnel-client.exe child'
