@@ -1,0 +1,139 @@
+name: Apply setup Python diagnostics fix
+
+on:
+  push:
+    branches: [fix/setup-python-diagnostics]
+    paths: [.github/workflows/apply-setup-python-diagnostics.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v7
+        with:
+          ref: fix/setup-python-diagnostics
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Patch setup diagnostics and add regression tests
+        shell: pwsh
+        run: |
+          $path = 'setup-localmcp.ps1'
+          $bytes = [IO.File]::ReadAllBytes($path)
+          $bom = [byte[]](0xEF, 0xBB, 0xBF)
+          $offset = 0
+          if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+            $offset = 3
+          }
+          $text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes, $offset, $bytes.Length - $offset)
+          $newline = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
+
+          $old = @'
+          function Invoke-Python {
+              param(
+                  [Parameter(Mandatory = $true)][string]$PythonPath,
+                  [Parameter(Mandatory = $true)][string[]]$Arguments
+              )
+
+              $output = & $PythonPath @Arguments 2>&1
+              $exitCode = $LASTEXITCODE
+              if ($exitCode -ne 0) {
+                  $details = ($output | Out-String).Trim()
+                  if ([string]::IsNullOrWhiteSpace($details)) {
+                      $details = "終了コード $exitCode"
+                  }
+                  throw "Python の処理に失敗しました: $details"
+              }
+              return $output
+          }
+          '@
+          $new = @'
+          function Invoke-Python {
+              param(
+                  [Parameter(Mandatory = $true)][string]$PythonPath,
+                  [Parameter(Mandatory = $true)][string[]]$Arguments
+              )
+
+              if (-not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) {
+                  throw "Python executable が見つかりません: $PythonPath"
+              }
+
+              # Windows PowerShell 5.1 treats native stderr records as PowerShell errors when
+              # $ErrorActionPreference is Stop. Temporarily collect them non-terminating so a
+              # multi-line Python traceback is preserved and can be reported with the exit code.
+              # Force UTF-8 only for this child process so non-ASCII paths do not depend on the
+              # host console code page, then restore the caller's environment exactly.
+              $previousErrorActionPreference = $ErrorActionPreference
+              $previousPythonIoEncoding = $env:PYTHONIOENCODING
+              $output = @()
+              $exitCode = $null
+              try {
+                  $ErrorActionPreference = "Continue"
+                  $env:PYTHONIOENCODING = "utf-8"
+                  $output = @(& $PythonPath @Arguments 2>&1)
+                  $exitCode = $LASTEXITCODE
+              } finally {
+                  $ErrorActionPreference = $previousErrorActionPreference
+                  if ($null -eq $previousPythonIoEncoding) {
+                      Remove-Item Env:PYTHONIOENCODING -ErrorAction SilentlyContinue
+                  } else {
+                      $env:PYTHONIOENCODING = $previousPythonIoEncoding
+                  }
+              }
+
+              $lines = @($output | ForEach-Object { $_.ToString() })
+              if ($null -eq $exitCode) {
+                  throw "Python の処理を開始できませんでした: $PythonPath"
+              }
+              if ($exitCode -ne 0) {
+                  $details = ($lines -join [Environment]::NewLine).Trim()
+                  if ([string]::IsNullOrWhiteSpace($details)) {
+                      $details = "標準出力・標準エラーに詳細はありません。"
+                  }
+                  throw "Python の処理に失敗しました（終了コード $exitCode）: $details"
+              }
+              return $lines
+          }
+          '@
+          $old = $old.Trim().Replace("`r`n", "`n").Replace("`n", $newline)
+          $new = $new.Trim().Replace("`r`n", "`n").Replace("`n", $newline)
+          $matches = ([regex]::Matches($text, [regex]::Escape($old))).Count
+          if ($matches -ne 1) {
+            throw "Invoke-Python patch target count was $matches, expected 1"
+          }
+          $text = $text.Replace($old, $new)
+          $payload = [Text.UTF8Encoding]::new($true).GetBytes($text)
+          [IO.File]::WriteAllBytes($path, $payload)
+
+          $testBase64 = 'ZnJvbSBfX2Z1dHVyZV9fIGltcG9ydCBhbm5vdGF0aW9ucwoKaW1wb3J0IG9zCmltcG9ydCBzdWJwcm9jZXNzCmltcG9ydCBzeXMKZnJvbSBwYXRobGliIGltcG9ydCBQYXRoCgppbXBvcnQgcHl0ZXN0CgpfUkVQT1NJVE9SWV9ST09UID0gUGF0aChfX2ZpbGVfXykucmVzb2x2ZSgpLnBhcmVudHNbMV0KCgpkZWYgX3dpbmRvd3NfcG93ZXJzaGVsbF81MSgpIC0+IFBhdGg6CiAgICBzeXN0ZW1fcm9vdCA9IG9zLmVudmlyb24uZ2V0KCJTeXN0ZW1Sb290IikKICAgIGlmIG5vdCBzeXN0ZW1fcm9vdDoKICAgICAgICBweXRlc3Quc2tpcCgiU3lzdGVtUm9vdCBpcyB1bmF2YWlsYWJsZSIpCiAgICBzaGVsbCA9ICgKICAgICAgICBQYXRoKHN5c3RlbV9yb290KQogICAgICAgIC8gIlN5c3RlbTMyIgogICAgICAgIC8gIldpbmRvd3NQb3dlclNoZWxsIgogICAgICAgIC8gInYxLjAiCiAgICAgICAgLyAicG93ZXJzaGVsbC5leGUiCiAgICApCiAgICBpZiBub3Qgc2hlbGwuaXNfZmlsZSgpOgogICAgICAgIHB5dGVzdC5za2lwKCJXaW5kb3dzIFBvd2VyU2hlbGwgNS4xIGlzIHVuYXZhaWxhYmxlIikKICAgIHJldHVybiBzaGVsbAoKCmRlZiBfcHNfbGl0ZXJhbCh2YWx1ZTogc3RyIHwgUGF0aCkgLT4gc3RyOgogICAgcmV0dXJuICInIiArIHN0cih2YWx1ZSkucmVwbGFjZSgiJyIsICInJyIpICsgIiciCgoKQHB5dGVzdC5tYXJrLnNraXBpZihvcy5uYW1lICE9ICJudCIsIHJlYXNvbj0iV2luZG93cyBQb3dlclNoZWxsIDUuMSByZWdyZXNzaW9uIGlzIFdpbmRvd3Mtb25seSIpCmRlZiB0ZXN0X2ludm9rZV9weXRob25fcHJlc2VydmVzX2NvbXBsZXRlX3N0ZGVycl9hbmRfcmVzdG9yZXNfZW5jb2RpbmcoKSAtPiBOb25lOgogICAgc2hlbGwgPSBfd2luZG93c19wb3dlcnNoZWxsXzUxKCkKICAgIHB5dGhvbiA9IFBhdGgoc3lzLmV4ZWN1dGFibGUpCiAgICBzZXR1cCA9IF9SRVBPU0lUT1JZX1JPT1QgLyAic2V0dXAtbG9jYWxtY3AucHMxIgogICAgY2hpbGQgPSAoCiAgICAgICAgImltcG9ydCBzeXM7ICIKICAgICAgICAicHJpbnQoJ3N0ZG91dC1iZWZvcmUnKTsgIgogICAgICAgICJwcmludCgnVHJhY2ViYWNrIChtb3N0IHJlY2VudCBjYWxsIGxhc3QpOicsIGZpbGU9c3lzLnN0ZGVycik7ICIKICAgICAgICAicHJpbnQoJ0RFVEFJTF/ml6XmnKzoqp4nLCBmaWxlPXN5cy5zdGRlcnIpOyAiCiAgICAgICAgInN5cy5leGl0KDcpIgogICAgKQogICAgY29tbWFuZCA9IGYiIiIKJEVycm9yQWN0aW9uUHJlZmVyZW5jZSA9ICdTdG9wJwouIHtfcHNfbGl0ZXJhbChzZXR1cCl9IC1GdW5jdGlvbnNPbmx5CiRlbnY6UFlUSE9OSU9FTkNPRElORyA9ICdjcDEyNTInCnRyeSB7ewogICAgSW52b2tlLVB5dGhvbiAtUHl0aG9uUGF0aCB7X3BzX2xpdGVyYWwocHl0aG9uKX0gLUFyZ3VtZW50cyBAKCctSScsICctQicsICctYycsIHtfcHNfbGl0ZXJhbChjaGlsZCl9KSB8IE91dC1OdWxsCiAgICB0aHJvdyAnSW52b2tlLVB5dGhvbiB1bmV4cGVjdGVkbHkgc3VjY2VlZGVkJwp9fSBjYXRjaCB7ewogICAgaWYgKCRfLkV4Y2VwdGlvbi5NZXNzYWdlIC1lcSAnSW52b2tlLVB5dGhvbiB1bmV4cGVjdGVkbHkgc3VjY2VlZGVkJykge3sgdGhyb3cgfX0KICAgIGlmICgkXy5FeGNlcHRpb24uTWVzc2FnZSAtbm90bGlrZSAnKlRyYWNlYmFjayAobW9zdCByZWNlbnQgY2FsbCBsYXN0KToqJykge3sKICAgICAgICB0aHJvdyAnZmlyc3Qgc3RkZXJyIGxpbmUgbWlzc2luZzogJyArICRfLkV4Y2VwdGlvbi5NZXNzYWdlCiAgICB9fQogICAgaWYgKCRfLkV4Y2VwdGlvbi5NZXNzYWdlIC1ub3RsaWtlICcqREVUQUlMX+aXpeacrOiqnionKSB7ewogICAgICAgIHRocm93ICdsYXRlciBzdGRlcnIgbGluZSBtaXNzaW5nOiAnICsgJF8uRXhjZXB0aW9uLk1lc3NhZ2UKICAgIH19Cn19CmlmICgkZW52OlBZVEhPTklPRU5DT0RJTkcgLW5lICdjcDEyNTInKSB7ewogICAgdGhyb3cgJ1BZVEhPTklPRU5DT0RJTkcgd2FzIG5vdCByZXN0b3JlZCcKfX0KJ2RpYWdub3N0aWNzLW9rJwoiIiIKICAgIGNvbXBsZXRlZCA9IHN1YnByb2Nlc3MucnVuKAogICAgICAgIFtzaGVsbCwgIi1Ob1Byb2ZpbGUiLCAiLU5vbkludGVyYWN0aXZlIiwgIi1Db21tYW5kIiwgY29tbWFuZF0sCiAgICAgICAgY2FwdHVyZV9vdXRwdXQ9VHJ1ZSwKICAgICAgICB0ZXh0PVRydWUsCiAgICAgICAgZW5jb2Rpbmc9InV0Zi04IiwKICAgICAgICBlcnJvcnM9InJlcGxhY2UiLAogICAgICAgIHRpbWVvdXQ9NjAsCiAgICAgICAgY2hlY2s9RmFsc2UsCiAgICAgICAgc2hlbGw9RmFsc2UsCiAgICApCiAgICBvdXRwdXQgPSBjb21wbGV0ZWQuc3Rkb3V0ICsgY29tcGxldGVkLnN0ZGVycgogICAgYXNzZXJ0IGNvbXBsZXRlZC5yZXR1cm5jb2RlID09IDAsIG91dHB1dAogICAgYXNzZXJ0ICJkaWFnbm9zdGljcy1vayIgaW4gb3V0cHV0CgoKQHB5dGVzdC5tYXJrLnNraXBpZihvcy5uYW1lICE9ICJudCIsIHJlYXNvbj0iV2luZG93cyBQb3dlclNoZWxsIDUuMSByZWdyZXNzaW9uIGlzIFdpbmRvd3Mtb25seSIpCmRlZiB0ZXN0X2ludm9rZV9weXRob25fdXNlc191dGY4X2Zvcl9ub25fYXNjaWlfc3Rkb3V0KCkgLT4gTm9uZToKICAgIHNoZWxsID0gX3dpbmRvd3NfcG93ZXJzaGVsbF81MSgpCiAgICBweXRob24gPSBQYXRoKHN5cy5leGVjdXRhYmxlKQogICAgc2V0dXAgPSBfUkVQT1NJVE9SWV9ST09UIC8gInNldHVwLWxvY2FsbWNwLnBzMSIKICAgIGNoaWxkID0gInByaW50KCfml6XmnKzoqp4tcGF0aC1vaycpIgogICAgY29tbWFuZCA9IGYiIiIKJEVycm9yQWN0aW9uUHJlZmVyZW5jZSA9ICdTdG9wJwouIHtfcHNfbGl0ZXJhbChzZXR1cCl9IC1GdW5jdGlvbnNPbmx5ClJlbW92ZS1JdGVtIEVudjpQWVRIT05JT0VOQ09ESU5HIC1FcnJvckFjdGlvbiBTaWxlbnRseUNvbnRpbnVlCiRvdXRwdXQgPSBAKEludm9rZS1QeXRob24gLVB5dGhvblBhdGgge19wc19saXRlcmFsKHB5dGhvbil9IC1Bcmd1bWVudHMgQCgnLUknLCAnLUInLCAnLWMnLCB7X3BzX2xpdGVyYWwoY2hpbGQpfSkpCmlmICgoJG91dHB1dCAtam9pbiAiYG4iKSAtbm90bGlrZSAnKuaXpeacrOiqni1wYXRoLW9rKicpIHt7CiAgICB0aHJvdyAnbm9uLUFTQ0lJIHN0ZG91dCB3YXMgbm90IHByZXNlcnZlZCcKfX0KaWYgKFRlc3QtUGF0aCBFbnY6UFlUSE9OSU9FTkNPRElORykge3sKICAgIHRocm93ICdQWVRIT05JT0VOQ09ESU5HIHNob3VsZCByZW1haW4gdW5zZXQgYWZ0ZXIgaW52b2NhdGlvbicKfX0KJ3V0Zjgtb2snCiIiIgogICAgY29tcGxldGVkID0gc3VicHJvY2Vzcy5ydW4oCiAgICAgICAgW3NoZWxsLCAiLU5vUHJvZmlsZSIsICItTm9uSW50ZXJhY3RpdmUiLCAiLUNvbW1hbmQiLCBjb21tYW5kXSwKICAgICAgICBjYXB0dXJlX291dHB1dD1UcnVlLAogICAgICAgIHRleHQ9VHJ1ZSwKICAgICAgICBlbmNvZGluZz0idXRmLTgiLAogICAgICAgIGVycm9ycz0icmVwbGFjZSIsCiAgICAgICAgdGltZW91dD02MCwKICAgICAgICBjaGVjaz1GYWxzZSwKICAgICAgICBzaGVsbD1GYWxzZSwKICAgICkKICAgIG91dHB1dCA9IGNvbXBsZXRlZC5zdGRvdXQgKyBjb21wbGV0ZWQuc3RkZXJyCiAgICBhc3NlcnQgY29tcGxldGVkLnJldHVybmNvZGUgPT0gMCwgb3V0cHV0CiAgICBhc3NlcnQgInV0Zjgtb2siIGluIG91dHB1dAo='
+          [IO.File]::WriteAllBytes('tests/test_setup_python_diagnostics.py', [Convert]::FromBase64String($testBase64))
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Focused regression tests
+        run: |
+          python -m pytest -q tests/test_setup_python_diagnostics.py
+          python -m pytest -q tests/test_local_launchers.py::test_settings_menu_displays_summary_and_atomically_changes_workspace
+          python -m ruff check tests/test_setup_python_diagnostics.py
+
+      - name: Commit fix to branch
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add setup-localmcp.ps1 tests/test_setup_python_diagnostics.py
+          git diff --cached --check
+          git diff --cached --quiet && { echo "No changes to commit"; exit 1; }
+          git commit -m "fix: setupのPython診断出力を保持"
+          git push origin HEAD:fix/setup-python-diagnostics
