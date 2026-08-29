@@ -13,6 +13,7 @@ $SelectorPath = Join-Path $StateRoot "active-config.txt"
 $MinimumPython = [Version]::new(3, 11)
 $PythonWindowsDownloadUrl = "https://www.python.org/downloads/windows/"
 $CodexCliDocsUrl = "https://developers.openai.com/codex/cli/"
+$script:SetupStartedAt = Get-Date
 $TunnelHelperPath = Join-Path $ScriptRoot "secure-mcp-tunnel.ps1"
 if (-not (Test-Path -LiteralPath $TunnelHelperPath -PathType Leaf)) {
     throw "secure-mcp-tunnel.ps1 が見つかりません。配布パッケージ全体を展開し直してください。"
@@ -45,6 +46,25 @@ function Write-Info {
 function Write-Warn {
     param([string]$Message)
     Write-Host "[注意] $Message" -ForegroundColor Yellow
+}
+
+function Get-ElapsedTimeText {
+    param([Parameter(Mandatory = $true)][datetime]$StartedAt)
+
+    $elapsed = (Get-Date) - $StartedAt
+    $minutes = [math]::Floor($elapsed.TotalMinutes)
+    return "{0:00}:{1:00}.{2:000}" -f $minutes, $elapsed.Seconds, $elapsed.Milliseconds
+}
+
+function Write-SetupProgress {
+    param(
+        [Parameter(Mandatory = $true)][ValidateRange(0, 100)][int]$Percent,
+        [Parameter(Mandatory = $true)][string]$Message
+    )
+
+    # Write-Progress は cmd から起動した画面で見えにくいため、常に残る行として表示します。
+    $elapsed = Get-ElapsedTimeText -StartedAt $script:SetupStartedAt
+    Write-Host ("[進行中] {0}% | 経過時間 {1} | {2}" -f $Percent, $elapsed, $Message) -ForegroundColor Cyan
 }
 
 function Read-YesNo {
@@ -535,6 +555,7 @@ function Test-Configuration {
         [Parameter(Mandatory = $true)][string]$ConfigPath
     )
 
+    $validationStartedAt = Get-Date
     Write-Info "設定と操作対象フォルダーの境界を確認しています。"
     $previousConfig = $env:LOCAL_MCP_CONFIG
     $previousRoot = $env:LOCAL_MCP_ROOT
@@ -562,7 +583,8 @@ function Test-Configuration {
             $env:LOCAL_MCP_ROOT = $previousRoot
         }
     }
-    Write-Ok "設定ファイルの検証が完了しました。"
+    $validationElapsed = Get-ElapsedTimeText -StartedAt $validationStartedAt
+    Write-Ok "設定ファイルの検証が完了しました。（所要時間: $validationElapsed）"
 }
 
 function Test-ConfigurationCandidate {
@@ -1896,8 +1918,11 @@ try {
         $configPath = Select-ExistingConfig
         $python = Ensure-PythonRuntime
         Test-Configuration -PythonPath $python.Path -ConfigPath $configPath
+        Write-SetupProgress -Percent 65 -Message "設定ファイルを確認しました。active config と追加の安全確認を続けています。"
         Set-ActiveConfig -ConfigPath $configPath
+        Write-SetupProgress -Percent 75 -Message "Codex Sandbox backend を確認しています。数秒かかる場合があります。"
         $codexBackend = Resolve-CodexSandboxBackend -PythonPath $python.Path -ConfigPath $configPath
+        Write-SetupProgress -Percent 90 -Message "検出結果と任意機能の状態を確認しています。"
         Show-OptionalChecks -ConfigPath $configPath -CodexBackend $codexBackend
         Write-Ok "既存設定を通常起動の対象にしました。"
         $configPath = Invoke-SettingsMenu -PythonPath $python.Path -ConfigPath $configPath
@@ -1920,29 +1945,38 @@ try {
             }
         }
         Save-Config -Content $content -Path $DefaultConfigPath -PythonPath $python.Path -AllowExistingReplacement
+        Write-SetupProgress -Percent 65 -Message "保存後の追加確認を続けています。処理中はこの画面を閉じないでください。"
         Test-Configuration -PythonPath $python.Path -ConfigPath $DefaultConfigPath
         Set-ActiveConfig -ConfigPath $DefaultConfigPath
         $configPath = $DefaultConfigPath
+        Write-SetupProgress -Percent 75 -Message "Codex Sandbox backend を確認しています。数秒かかる場合があります。"
         $codexBackend = Resolve-CodexSandboxBackend -PythonPath $python.Path -ConfigPath $configPath
         if ($null -ne $codexBackend) {
+            Write-SetupProgress -Percent 82 -Message "Codex Sandbox の設定を保存しています。保存後にもう一度検証します。"
             Set-CodexSandboxPath -PythonPath $python.Path -ConfigPath $configPath -NativePath ([string]$codexBackend.executable)
+            Write-SetupProgress -Percent 88 -Message "Codex Sandbox 設定後の追加検証を続けています。"
             Test-Configuration -PythonPath $python.Path -ConfigPath $configPath
             # 保存後の明示 path でも同じ resolver が成功することを確認してから成功表示します。
+            Write-SetupProgress -Percent 92 -Message "保存した Codex Sandbox backend を最終確認しています。"
             $codexBackend = Resolve-CodexSandboxBackend -PythonPath $python.Path -ConfigPath $configPath
         }
         Show-OptionalChecks -ConfigPath $configPath -CodexBackend $codexBackend
         Write-Ok "初回設定が完了しました。"
+        Write-SetupProgress -Percent 95 -Message "Secure MCP Tunnel の設定を確認しています。"
         $tunnelEnabled = Configure-TunnelIntegration -PythonPath $python.Path -ConfigPath $configPath
     } elseif ($mode -eq "3") {
         $configPath = Select-ExistingConfig
         $python = Ensure-PythonRuntime
         Test-Configuration -PythonPath $python.Path -ConfigPath $configPath
+        Write-SetupProgress -Percent 65 -Message "設定ファイルを確認しました。active config と Tunnel 設定の確認を続けています。"
         Set-ActiveConfig -ConfigPath $configPath
+        Write-SetupProgress -Percent 80 -Message "Tunnel 設定を読み込んでいます。数秒かかる場合があります。"
         $tunnelEnabled = Configure-TunnelIntegration -PythonPath $python.Path -ConfigPath $configPath
     } else {
         throw "メニューの番号が正しくありません。"
     }
 
+    Write-SetupProgress -Percent 100 -Message "設定処理が完了しました。"
     Write-Host ""
     Show-ConfigurationSummary -PythonPath $python.Path -ConfigPath $configPath
     Show-ManualConfigGuidance -ConfigPath $configPath -TunnelEnabled ([bool]$tunnelEnabled)

@@ -352,6 +352,24 @@ def test_setup_wizard_preserves_security_relevant_setup_contract() -> None:
     assert "secret は表示しません" in script
 
 
+def test_setup_wizard_reports_progress_after_configuration_validation() -> None:
+    script = (_REPOSITORY_ROOT / "setup-localmcp.ps1").read_text(
+        encoding="utf-8-sig"
+    )
+
+    assert "function Write-SetupProgress" in script
+    assert "[進行中] {0}% | 経過時間 {1} | {2}" in script
+    assert "Get-ElapsedTimeText -StartedAt $validationStartedAt" in script
+    save_position = script.index(
+        "Save-Config -Content $content -Path $DefaultConfigPath"
+    )
+    progress_position = script.index(
+        'Write-SetupProgress -Percent 65 -Message "保存後の追加確認を続けています。',
+        save_position,
+    )
+    assert progress_position > save_position
+
+
 def test_run_launcher_preserves_tunnel_fail_closed_and_direct_compatibility() -> None:
     script = (_REPOSITORY_ROOT / "run-localmcp.ps1").read_text(encoding="utf-8-sig")
 
@@ -421,6 +439,8 @@ def test_launcher_docs_explain_manual_setup_and_single_root_boundary() -> None:
     assert "https://developers.openai.com/codex/cli/" in docs
     assert "同じプロセスから複数フォルダーを同時に操作する機能" in docs
     assert "Credential Manager" in docs
+    assert "[進行中] 65%" in docs
+    assert "割合は処理段階の目安" in docs
     assert "configure-localmcp.bat → かんたんセットアップ → workspace → Tunnel → 完了 → 今すぐ起動" in docs
     assert "通常:       run-localmcp.bat" in docs
     assert "設定変更:   configure-localmcp.bat → 現在の設定を確認・変更する" in docs
