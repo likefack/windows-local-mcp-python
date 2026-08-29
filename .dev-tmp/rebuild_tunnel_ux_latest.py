@@ -20,10 +20,15 @@ def write_text_preserve_bom(path: Path, text: str, bom: bool) -> None:
 
 def replace_once(path: Path, old: str, new: str) -> None:
     text, bom = read_text_preserve_bom(path)
-    count = text.count(old)
+    old_native = old
+    new_native = new
+    if "\r\n" in text and "\r\n" not in old:
+        old_native = old.replace("\n", "\r\n")
+        new_native = new.replace("\n", "\r\n")
+    count = text.count(old_native)
     if count != 1:
         raise RuntimeError(f"{path}: expected one replacement target, found {count}")
-    write_text_preserve_bom(path, text.replace(old, new, 1), bom)
+    write_text_preserve_bom(path, text.replace(old_native, new_native, 1), bom)
 
 
 setup = Path("setup-localmcp.ps1")
@@ -46,31 +51,9 @@ replace_once(
 # Discover the official client in the common locations where a user is likely to
 # have extracted it. Keep the scan bounded and still run every candidate through
 # Resolve-TunnelExecutable and the existing forbidden-root/hash checks.
-old_candidates = '''    foreach ($name in @("tunnel-client.exe", "tunnel-client")) {
-        try {
-            $command = Get-Command $name -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($null -ne $command -and $command.Source) {
-                $null = $paths.Add($command.Source)
-            }
-        } catch {
-            # PATH 上の候補を確認できない場合は次の候補へ進みます。
-        }
-    }
-
-    $profileRoots = [System.Collections.Generic.List[string]]::new()
+old_candidates = '''    $profileRoots = [System.Collections.Generic.List[string]]::new()
 '''
-new_candidates = '''    foreach ($name in @("tunnel-client.exe", "tunnel-client")) {
-        try {
-            $command = Get-Command $name -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($null -ne $command -and $command.Source) {
-                $null = $paths.Add($command.Source)
-            }
-        } catch {
-            # PATH 上の候補を確認できない場合は次の候補へ進みます。
-        }
-    }
-
-    $downloadRoots = [System.Collections.Generic.List[string]]::new()
+new_candidates = '''    $downloadRoots = [System.Collections.Generic.List[string]]::new()
     if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
         $null = $downloadRoots.Add((Join-Path $env:USERPROFILE "Desktop"))
         $null = $downloadRoots.Add((Join-Path $env:USERPROFILE "Downloads"))
