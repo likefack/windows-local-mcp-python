@@ -99,7 +99,7 @@ stdio server の初期化に成功すると、`起動に成功しました`、`C
 
 Tunnel の設定不整合、client の変更、API Key の取得失敗、認証失敗、LocalMCP server の起動失敗、ready 応答未確認は、それぞれ別の案内を表示して起動を停止します。Tunnel を設定済みの状態で問題がある場合に、Tunnel を迂回して LocalMCP を直接公開する自動 fallback は行いません。二重起動を避けるため、起動中のプロセスを確認できない場合も停止します。
 
-`data_dir ACL changed after provisioning` が出た場合は実際の ACL 変更として fail closed にし、`.acl-policy.json` の削除による通常起動への復帰や自動 ACL 再設定は行いません。`data_dir` と marker を保全して ACL 差分を確認し、既存 state を引き継がない新しい config／`data_dir` を作るか、確認済み ACL を明示的に再設定してから再検証します。
+`data_dir ACL changed after provisioning` が出た場合は、Win32 security descriptor から取得した SID、ACE 種別、継承フラグ、権限値を固定 policy と比較して fail closed にします。`.acl-policy.json` の削除による通常起動への復帰や自動 ACL 再設定は行いません。旧 marker が `icacls` の表示文字列ハッシュを保持している場合だけ、現在の ACL が固定 policy と完全一致することを確認して新形式へ移行します。実際の ACL 差分がある場合は移行しません。エラー時は `data_dir` と marker を保全して ACL 差分を確認し、既存 state を引き継がない新しい config／`data_dir` を作るか、確認済み ACL を明示的に再設定してから再検証します。
 
 ## 自動設定しないもの
 

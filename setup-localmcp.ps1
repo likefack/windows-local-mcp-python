@@ -138,15 +138,24 @@ function Invoke-Python {
     # host console code page, then restore the caller's environment exactly.
     $previousErrorActionPreference = $ErrorActionPreference
     $previousPythonIoEncoding = $env:PYTHONIOENCODING
+    $previousConsoleOutputEncoding = [Console]::OutputEncoding
+    $previousOutputEncoding = $OutputEncoding
     $output = @()
     $exitCode = $null
     try {
         $ErrorActionPreference = "Continue"
         $env:PYTHONIOENCODING = "utf-8"
+        # Windows PowerShell 5.1 decodes captured native stdout/stderr with the console
+        # output encoding. Keep it aligned with the Python child for this call only.
+        $utf8 = [Text.UTF8Encoding]::new($false)
+        [Console]::OutputEncoding = $utf8
+        $OutputEncoding = $utf8
         $output = @(& $PythonPath @Arguments 2>&1)
         $exitCode = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $previousErrorActionPreference
+        [Console]::OutputEncoding = $previousConsoleOutputEncoding
+        $OutputEncoding = $previousOutputEncoding
         if ($null -eq $previousPythonIoEncoding) {
             Remove-Item Env:PYTHONIOENCODING -ErrorAction SilentlyContinue
         } else {

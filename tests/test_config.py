@@ -1,5 +1,7 @@
+import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -292,13 +294,38 @@ def test_obsolete_appcontainer_configuration_fails_closed(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows ACL integration")
-def test_data_dir_acl_grants_current_principal_and_system(tmp_path: Path) -> None:
+def test_data_dir_acl_survives_process_boundary_and_rejects_real_tamper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     root = tmp_path / "workspace"
     root.mkdir()
     data = tmp_path / "protected-data"
-    settings = Settings(workspace_root=root, data_dir=data, protect_data_dir_acl=True)
+    scratch = tmp_path / "scratch"
+    config = tmp_path / "config.toml"
+
+    def toml_path(value: Path) -> str:
+        return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+    config.write_text(
+        "\n".join(
+            [
+                f'workspace_root = "{toml_path(root)}"',
+                f'data_dir = "{toml_path(data)}"',
+                f'sandbox_scratch_dir = "{toml_path(scratch)}"',
+                "filesystem_enabled = false",
+                "git_enabled = false",
+                "approved_sandbox_enabled = false",
+                "protect_data_dir_acl = true",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LOCAL_MCP_CONFIG", str(config))
+    monkeypatch.delenv("LOCAL_MCP_ROOT", raising=False)
+    environment = os.environ.copy()
     try:
-        settings.ensure_directories()
+        load_settings()
         acl = subprocess.run(
             ["icacls.exe", str(data)],
             capture_output=True,
@@ -316,14 +343,50 @@ def test_data_dir_acl_grants_current_principal_and_system(tmp_path: Path) -> Non
         nested = data / "control-plane" / "acl-roundtrip.bin"
         nested.write_bytes(b"roundtrip")
         assert nested.read_bytes() == b"roundtrip"
-        # The marker path avoids a recursive ACL reset on ordinary startup while still
-        # checking that the protected namespace remains usable by the bound principal.
-        settings.ensure_directories()
+        load_settings()
         acl_marker = data / ".acl-policy.json"
+        marker = json.loads(acl_marker.read_text(encoding="utf-8"))
+        assert marker["version"] == 2
+
+        # Version 1 hashed localized icacls text. A mismatched legacy text digest is safe
+        # to migrate only after the native DACL records exactly match the required policy.
+        acl_marker.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "sid": marker["sid"],
+                    "root_acl_sha256": "0" * 64,
+                },
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+        separate_process = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                "-c",
+                "from windows_local_mcp.config import load_settings; load_settings(); print('ok')",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+            check=False,
+            shell=False,
+            env=environment,
+        )
+        assert separate_process.returncode == 0, (
+            separate_process.stdout + separate_process.stderr
+        )
+        assert json.loads(acl_marker.read_text(encoding="utf-8"))["version"] == 2
+
         marker_bytes = acl_marker.read_bytes()
         acl_marker.unlink()
         with pytest.raises(PermissionError, match="marker is missing"):
-            settings.ensure_directories()
+            load_settings()
         acl_marker.write_bytes(marker_bytes)
 
         tamper = subprocess.run(
@@ -337,8 +400,25 @@ def test_data_dir_acl_grants_current_principal_and_system(tmp_path: Path) -> Non
             shell=False,
         )
         assert tamper.returncode == 0, tamper.stderr or tamper.stdout
-        with pytest.raises(PermissionError, match="ACL changed after provisioning"):
-            settings.ensure_directories()
+        tampered_process = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                "-c",
+                "from windows_local_mcp.config import load_settings; load_settings()",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+            check=False,
+            shell=False,
+            env=environment,
+        )
+        assert tampered_process.returncode != 0
+        assert "ACL changed after provisioning" in tampered_process.stderr
     finally:
         subprocess.run(
             ["icacls.exe", str(data), "/remove:g", "*S-1-1-0", "/C"],

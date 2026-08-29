@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import ctypes
 import hashlib
 import io
 import json
@@ -9,6 +10,7 @@ import stat
 import subprocess
 import tomllib
 import uuid
+from ctypes import wintypes
 from pathlib import Path
 from typing import Literal
 
@@ -532,6 +534,165 @@ def _ensure_control_plane_namespace(settings: Settings) -> bool:
         return False
 
 
+def _required_windows_acl_digest(path: Path, sid: str) -> str:
+    """Return a stable digest only when the root DACL exactly matches our policy."""
+    if os.name != "nt":
+        raise RuntimeError("Windows ACL inspection requires native Windows")
+
+    class _ACL(ctypes.Structure):
+        _fields_ = [
+            ("AclRevision", ctypes.c_ubyte),
+            ("Sbz1", ctypes.c_ubyte),
+            ("AclSize", wintypes.WORD),
+            ("AceCount", wintypes.WORD),
+            ("Sbz2", wintypes.WORD),
+        ]
+
+    class _ACE_HEADER(ctypes.Structure):
+        _fields_ = [
+            ("AceType", ctypes.c_ubyte),
+            ("AceFlags", ctypes.c_ubyte),
+            ("AceSize", wintypes.WORD),
+        ]
+
+    class _ACCESS_ALLOWED_ACE(ctypes.Structure):
+        _fields_ = [
+            ("Header", _ACE_HEADER),
+            ("Mask", wintypes.DWORD),
+            ("SidStart", wintypes.DWORD),
+        ]
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_named_security_info = advapi32.GetNamedSecurityInfoW
+    get_named_security_info.argtypes = [
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.POINTER(_ACL)),
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    get_named_security_info.restype = wintypes.DWORD
+    get_descriptor_control = advapi32.GetSecurityDescriptorControl
+    get_descriptor_control.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.WORD),
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    get_descriptor_control.restype = wintypes.BOOL
+    get_ace = advapi32.GetAce
+    get_ace.argtypes = [
+        ctypes.POINTER(_ACL),
+        wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    get_ace.restype = wintypes.BOOL
+    sid_to_string = advapi32.ConvertSidToStringSidW
+    sid_to_string.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
+    sid_to_string.restype = wintypes.BOOL
+    local_free = kernel32.LocalFree
+    local_free.argtypes = [ctypes.c_void_p]
+    local_free.restype = ctypes.c_void_p
+
+    dacl = ctypes.POINTER(_ACL)()
+    descriptor = ctypes.c_void_p()
+    error = get_named_security_info(
+        str(path),
+        1,  # SE_FILE_OBJECT
+        0x00000004,  # DACL_SECURITY_INFORMATION
+        None,
+        None,
+        ctypes.byref(dacl),
+        None,
+        ctypes.byref(descriptor),
+    )
+    if error != 0 or not descriptor.value or not dacl:
+        raise RuntimeError(f"GetNamedSecurityInfoW failed for data_dir: {error}")
+    try:
+        control = wintypes.WORD()
+        revision = wintypes.DWORD()
+        if not get_descriptor_control(
+            descriptor,
+            ctypes.byref(control),
+            ctypes.byref(revision),
+        ):
+            raise RuntimeError(
+                f"GetSecurityDescriptorControl failed: WinError {ctypes.get_last_error()}"
+            )
+        protected = bool(int(control.value) & 0x1000)  # SE_DACL_PROTECTED
+        records: list[tuple[int, int, int, str]] = []
+        for index in range(int(dacl.contents.AceCount)):
+            ace_pointer = ctypes.c_void_p()
+            if not get_ace(dacl, index, ctypes.byref(ace_pointer)):
+                raise RuntimeError(f"GetAce failed: WinError {ctypes.get_last_error()}")
+            header = ctypes.cast(ace_pointer, ctypes.POINTER(_ACE_HEADER)).contents
+            if int(header.AceType) != 0:  # ACCESS_ALLOWED_ACE_TYPE
+                raise PermissionError("data_dir root contains an unsupported ACL entry")
+            ace = ctypes.cast(ace_pointer, ctypes.POINTER(_ACCESS_ALLOWED_ACE)).contents
+            sid_pointer = ctypes.c_void_p(
+                int(ace_pointer.value) + _ACCESS_ALLOWED_ACE.SidStart.offset
+            )
+            sid_text = wintypes.LPWSTR()
+            if not sid_to_string(sid_pointer, ctypes.byref(sid_text)):
+                raise RuntimeError(
+                    f"ConvertSidToStringSidW failed: WinError {ctypes.get_last_error()}"
+                )
+            try:
+                records.append(
+                    (
+                        int(ace.Header.AceType),
+                        int(ace.Header.AceFlags),
+                        int(ace.Mask),
+                        str(sid_text.value),
+                    )
+                )
+            finally:
+                local_free(sid_text)
+    finally:
+        local_free(descriptor)
+
+    full_control = 0x001F01FF
+    inherit_only = 0x01 | 0x02 | 0x08  # OBJECT/CONTAINER_INHERIT + INHERIT_ONLY
+    expected = sorted(
+        [
+            (0, 0, full_control, "S-1-5-18"),
+            (0, 0, full_control, sid),
+            (0, inherit_only, full_control, "S-1-5-18"),
+            (0, inherit_only, full_control, sid),
+        ]
+    )
+    if not protected or sorted(records) != expected:
+        raise PermissionError("data_dir root ACL does not match the required policy")
+    payload = json.dumps(
+        {"protected": protected, "aces": sorted(records)},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _write_acl_policy_marker(marker: Path, *, sid: str, acl_digest: str) -> None:
+    payload = json.dumps(
+        {
+            "version": 2,
+            "sid": sid,
+            "acl_policy": "current-user-system-full-control-v1",
+            "root_acl_sha256": acl_digest,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    temporary = marker.with_name(f"{marker.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}")
+    try:
+        temporary.write_text(payload, encoding="utf-8")
+        os.replace(temporary, marker)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _protect_windows_acl(path: Path, *, allow_initial_provision: bool) -> None:
     identity = subprocess.run(
         [windows_system_executable("whoami.exe"), "/user", "/fo", "csv", "/nh"],
@@ -558,31 +719,34 @@ def _protect_windows_acl(path: Path, *, allow_initial_provision: bool) -> None:
                 expected_marker = loaded
         except (OSError, ValueError):
             raise PermissionError("data_dir ACL policy marker is corrupt") from None
-    current = subprocess.run(
-        [windows_system_executable("icacls.exe"), str(path)],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=30,
-        check=False,
-        shell=False,
-    )
-    if current.returncode != 0:
-        raise PermissionError(f"failed to inspect data_dir ACL: {current.stderr.strip()}")
-    current_digest = hashlib.sha256(current.stdout.encode("utf-8")).hexdigest()
     if expected_marker is not None:
-        if (
-            expected_marker.get("version") != 1
-            or expected_marker.get("sid") != sid
-            or expected_marker.get("root_acl_sha256") != current_digest
-        ):
+        try:
+            current_digest = _required_windows_acl_digest(path, sid)
+        except (OSError, RuntimeError, PermissionError):
+            current_digest = None
+        marker_version = expected_marker.get("version")
+        marker_matches = (
+            current_digest is not None
+            and marker_version == 2
+            and expected_marker.get("sid") == sid
+            and expected_marker.get("acl_policy") == "current-user-system-full-control-v1"
+            and expected_marker.get("root_acl_sha256") == current_digest
+        )
+        legacy_can_upgrade = (
+            marker_version == 1
+            and expected_marker.get("sid") == sid
+            and isinstance(expected_marker.get("root_acl_sha256"), str)
+            and current_digest is not None
+        )
+        if not marker_matches and not legacy_can_upgrade:
             raise PermissionError(
                 "data_dir ACL changed after provisioning; automatic repair is disabled. "
                 "Do not delete .acl-policy.json. Preserve data_dir and its marker, inspect "
                 "the ACL difference, then use a new config/data_dir or explicitly "
                 "reprovision the reviewed ACL before retrying"
             )
+        if legacy_can_upgrade:
+            _write_acl_policy_marker(marker, sid=sid, acl_digest=current_digest)
         return
     if not allow_initial_provision:
         raise PermissionError(
@@ -664,18 +828,10 @@ def _protect_windows_acl(path: Path, *, allow_initial_provision: bool) -> None:
         raise PermissionError(
             f"failed to provision inherited data_dir ACL: {inheritance.stderr.strip()}"
         )
-    verified = subprocess.run(
-        [windows_system_executable("icacls.exe"), str(path)],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=30,
-        check=False,
-        shell=False,
-    )
-    if verified.returncode != 0:
-        raise PermissionError("failed to verify protected data_dir ACL")
+    try:
+        verified_digest = _required_windows_acl_digest(path, sid)
+    except (OSError, RuntimeError, PermissionError) as error:
+        raise PermissionError("failed to verify protected data_dir ACL") from error
     namespace_marker = path / "control-plane" / "namespace.json"
     try:
         namespace_marker.read_bytes()
@@ -688,20 +844,7 @@ def _protect_windows_acl(path: Path, *, allow_initial_provision: bool) -> None:
         raise PermissionError(
             "protected data_dir ACL denied the current WLMCP principal"
         ) from error
-    marker.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "sid": sid,
-                "root_acl_sha256": hashlib.sha256(
-                    verified.stdout.encode("utf-8")
-                ).hexdigest(),
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        ),
-        encoding="utf-8",
-    )
+    _write_acl_policy_marker(marker, sid=sid, acl_digest=verified_digest)
 
 
 def _load_file_backed_config(

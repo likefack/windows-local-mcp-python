@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import anyio
+import pytest
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
@@ -17,6 +18,105 @@ def _tool_result_text(result: object) -> str:
         for item in content
         if getattr(item, "text", None) is not None
     )
+
+
+def _ps_literal(value: str | Path) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows launcher and ACL integration")
+def test_saved_acl_config_starts_through_normal_launcher(tmp_path: Path) -> None:
+    repository_root = Path(__file__).resolve().parents[1]
+    shell = shutil.which("pwsh.exe") or shutil.which("powershell.exe")
+    if shell is None:
+        pytest.skip("PowerShell is unavailable")
+
+    workspace = tmp_path / "日本語 workspace"
+    data = tmp_path / "日本語 data"
+    scratch = tmp_path / "scratch with spaces"
+    local_app_data = tmp_path / "local app data"
+    config = local_app_data / "WindowsLocalMCP" / "config.toml"
+    candidate = tmp_path / "candidate.toml"
+    workspace.mkdir()
+
+    def toml_path(value: Path) -> str:
+        return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+    candidate.write_text(
+        "\n".join(
+            [
+                f'workspace_root = "{toml_path(workspace)}"',
+                f'data_dir = "{toml_path(data)}"',
+                f'sandbox_scratch_dir = "{toml_path(scratch)}"',
+                "filesystem_enabled = false",
+                "git_enabled = false",
+                "approved_sandbox_enabled = false",
+                "protect_data_dir_acl = true",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment["LOCALAPPDATA"] = str(local_app_data)
+    environment.pop("LOCAL_MCP_CONFIG", None)
+    environment.pop("LOCAL_MCP_ROOT", None)
+    environment["PYTHONIOENCODING"] = "utf-8"
+
+    setup_command = f"""
+$ErrorActionPreference = 'Stop'
+. {_ps_literal(repository_root / 'setup-localmcp.ps1')} -FunctionsOnly
+$content = [IO.File]::ReadAllText({_ps_literal(candidate)}, [Text.Encoding]::UTF8)
+Save-Config -Content $content -Path {_ps_literal(config)} -PythonPath {_ps_literal(sys.executable)}
+Set-ActiveConfig -ConfigPath {_ps_literal(config)}
+"""
+    try:
+        configured = subprocess.run(
+            [shell, "-NoProfile", "-NonInteractive", "-Command", setup_command],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=180,
+            check=False,
+            shell=False,
+            env=environment,
+        )
+        assert configured.returncode == 0, configured.stdout + configured.stderr
+        marker = data / ".acl-policy.json"
+        assert marker.is_file()
+
+        async def exercise_launcher() -> None:
+            server = StdioServerParameters(
+                command=shell,
+                args=[
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(repository_root / "run-localmcp.ps1"),
+                ],
+                env=environment,
+                cwd=str(repository_root),
+            )
+            async with (
+                stdio_client(server) as (read_stream, write_stream),
+                ClientSession(read_stream, write_stream) as session,
+            ):
+                await session.initialize()
+                listed = await session.list_tools()
+                assert "session_info" in {tool.name for tool in listed.tools}
+
+        anyio.run(exercise_launcher)
+    finally:
+        subprocess.run(
+            ["icacls.exe", str(data), "/inheritance:e", "/T", "/C"],
+            capture_output=True,
+            timeout=30,
+            check=False,
+            shell=False,
+        )
 
 
 def test_real_stdio_tools_list_and_file_round_trip(tmp_path: Path) -> None:
