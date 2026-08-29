@@ -16,6 +16,8 @@ flutter_enabled = false
 dart_enabled = false
 adb_enabled = false
 powershell_enabled = false
+# run-localmcp.bat と同時に、同じ config の承認画面を別ウィンドウで一つだけ起動します。
+approval_ui_autostart = true
 # Approved Host は変更不能な Program Files runtime と LocalSystem authority service を
 # 導入し、設定ウィザードで Tunnel runtime を切り替えた後だけ true にします。
 approved_host_enabled = false

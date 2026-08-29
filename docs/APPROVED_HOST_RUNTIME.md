@@ -152,6 +152,8 @@ runtime と authority service を導入・確認した後、通常 runtime user 
 
 Tunnel state は `server_runtime_kind=approved_host`、運用用 `run-server.ps1` の絶対 path と SHA-256 を保持します。`run-localmcp.bat` は起動ごとに Program Files 配下であること、必須の installed Python／verifier、保存済み SHA-256、runtime の変更不能性を再検証します。一つでも失敗した場合は起動を停止し、editable checkout の開発用 runtime や Tunnel なしの server へ自動的に切り替えません。
 
+承認画面を自動起動する場合も、検証済み運用用`run-server.ps1`のsiblingであるinstalled `run-approvals.ps1`だけを使用します。editable checkout側の承認ランチャーへfallbackせず、承認画面とserverは同じinstalled Python packageと同じconfigを使用します。
+
 無効化は config の `approved_host_enabled` だけを `false` にし、インストール済み runtime、authority service、Tunnel ID、Runtime API Key を削除しません。再有効化には同じ検証をもう一度通す必要があります。ウィザードは管理者権限を要求する runtime／service のインストールや置換を代行しません。
 
 ## Windows live verification

@@ -132,6 +132,8 @@ class Settings(BaseModel):
     )
     safe_powershell_scripts: list[str] = Field(default_factory=list)
     default_approver: str = "local-user"
+    # 起動時に別ウィンドウの対話型承認UIを開く設定。通常のローカル運用では有効にする。
+    approval_ui_autostart: bool = True
 
     http_enabled: bool = False
     http_host: str = "127.0.0.1"

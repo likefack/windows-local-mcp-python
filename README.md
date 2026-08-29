@@ -123,7 +123,7 @@ Tunnel 設定後は、`run-localmcp.bat` が profile、tunnel-client の実体�
 
 後から変更する場合は `configure-localmcp.bat` の `2. 現在の設定を確認・変更する` を選びます。概要を確認したうえで、workspace の変更、Tunnel ID／client／profile の変更、Runtime API Key の単独ローテーション、Tunnel の有効化・無効化、Codex Sandbox／Automatic Git の有効化・無効化、Approved Host 運用用実行環境の設定、active config の変更、診断、保存済み key の削除を行えます。新規設定では Codex Sandbox と Automatic Git を有効、Approved Host を無効にします。有効化は利用意図の設定であり、Sandbox／Git の現在の実体と実機検証記録が一致しなければ実行経路は引き続き利用不可です。Key の切り替えに失敗した場合は、旧 key を維持します。
 
-`run-localmcp.bat` のウィンドウには、起動後に作成された監査操作と状態変化を一行ずつ表示します。`activity_timeline`／`audit_list` と同じ監査DBを読み取り専用で参照し、操作 ID、ツール、実行経路、状態、承認状態、安全に伏せ字化したコマンドまたは対象の要約を表示します。ローカル承認が必要になると `PENDING_APPROVAL 要承認` を表示しますが、承認操作は引き続き `run-approvals.ps1` の別画面で行います。生の要求・結果、ファイル内容、標準出力・標準エラー、Runtime API Key は表示・保存しません。
+`run-localmcp.bat` のウィンドウには、起動後に作成された監査操作と状態変化を一行ずつ表示します。`activity_timeline`／`audit_list` と同じ監査DBを読み取り専用で参照し、操作 ID、ツール、実行経路、状態、承認状態、安全に伏せ字化したコマンドまたは対象の要約を表示します。ローカル承認が必要になると `PENDING_APPROVAL 要承認` を表示します。初期設定では同じconfigの`run-approvals.ps1`も可視な別ウィンドウで一つだけ自動起動するため、その画面で承認または拒否します。生の要求・結果、ファイル内容、標準出力・標準エラー、Runtime API Key は表示・保存しません。
 
 同じ行は `<data_dir>\logs\localmcp-activity.log` に UTF-8 で保存します。5 MiB ごとに切り替え、過去10ファイルまで保持します。Tunnel client 自身の生出力は秘密情報を含む可能性があるため、従来どおり画面にもログにも流しません。
 
@@ -222,7 +222,7 @@ $env:LOCAL_MCP_CONFIG = (Resolve-Path .\config.local.toml).Path
 
 ### 5. 承認画面を必要なときだけ起動する
 
-Sandbox や Approved Host などの承認が必要な処理を使う場合は、別の PowerShell ウィンドウで承認プロセスを起動します。承認要求の発生と状態変化は `run-localmcp.bat` のウィンドウにも表示されますが、この表示から承認は行いません。
+Sandbox や Approved Host などの承認が必要な処理を使う場合、初期設定では`run-localmcp.bat`が別のPowerShellウィンドウで承認プロセスを自動起動します。承認要求の発生と状態変化は起動ウィンドウにも表示されますが、承認または拒否は自動起動した承認画面で行います。自動起動を無効にした場合や画面を閉じた後に再び必要になった場合だけ、次のコマンドで手動起動します。
 
 ~~~powershell
 Set-Location C:\dev\windows-local-mcp-python
@@ -579,6 +579,7 @@ ADB は任意コマンドを実行する機能ではありません。`adb_read`
 | 項目 | 内容 |
 | --- | --- |
 | `approved_host_enabled` | Approved Host を利用する設定。設定ウィザードとサンプルの初期値は `false` で、運用用実行環境と authority service の検証後に有効化します |
+| `approval_ui_autostart` | `run-localmcp.bat` と同時に同じconfigの承認画面を別ウィンドウで自動起動します。初期値は`true`です |
 | `approval_request_ttl_seconds` | 承認要求の有効期間。サンプルは 1800 秒 |
 | `approval_execution_ttl_seconds` | 承認後の実行有効期間。サンプルは 60 秒 |
 | `default_approver` | 既定の承認者識別子。サンプルは `local-user` |
@@ -662,7 +663,7 @@ Approved Host の導入・復旧は、通常の editable checkout を起動す�
 | Sandbox が unavailable | 承認プロセス、Codex path、WFP／Job／process census を含む live verification、scratch quota、必須 property を確認します。Host へ自動移行はしません |
 | Approved Host が unavailable または recovery required | service、immutable runtime、承認世代、postflight、durable authority state を確認し、必要な場合だけ管理者の recovery 手順を実行します |
 | ADB が拒否される | `adb.exe` の絶対 path と SHA-256、`-s SERIAL`、`adb_allowed_serials`、emulator-only 条件、固定 read grammar を確認します |
-| 承認要求が処理されない | `run-approvals.ps1` が同じ設定を使って起動しているか、要求の TTL が切れていないか、理由と manifest が表示されているかを確認します |
+| 承認要求が処理されない | 自動起動した承認画面が残っているか、同じconfigを使っているか、要求のTTLが切れていないか、理由とmanifestが表示されているかを確認します。必要なら`run-approvals.ps1 -Config <path>`を手動起動します |
 | Tunnel client が見つからない | [公式 Tunnels 管理画面](https://platform.openai.com/settings/organization/tunnels) または [公式リリース](https://github.com/openai/tunnel-client/releases/latest) から用意し、workspace、`data_dir`、リポジトリの外へ置いてから `configure-localmcp.bat` を再実行します |
 | Tunnel ID がない・形式エラーになる | Tunnels 管理画面で既存 Tunnel を確認または作成し、`tunnel_` + 32 桁の小文字 hexadecimal を入力します。新規作成は必須ではありません |
 | Runtime API Key がない・取得できない | API Keys 画面で Restricted key の Tunnels `Read` + `Use` を確認します。全文を紛失した既存キーは再表示できないため、新しいキーを作成して Tunnel 設定メニューでローテーションします |

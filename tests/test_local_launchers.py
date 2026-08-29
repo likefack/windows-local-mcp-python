@@ -321,6 +321,7 @@ def test_setup_capability_toggles_are_validated_and_persisted(tmp_path: Path) ->
                 "protect_data_dir_acl = false",
                 "approved_sandbox_enabled = false",
                 "approved_host_enabled = false",
+                "approval_ui_autostart = false",
             )
         )
         + "\n",
@@ -331,9 +332,11 @@ $ErrorActionPreference = 'Stop'
 . {_ps_literal(_REPOSITORY_ROOT / 'setup-localmcp.ps1')} -FunctionsOnly
 Save-ConfigBooleanValue -PythonPath {_ps_literal(python)} -ConfigPath {_ps_literal(config)} -SettingName 'approved_sandbox_enabled' -Value $true
 Save-ConfigBooleanValue -PythonPath {_ps_literal(python)} -ConfigPath {_ps_literal(config)} -SettingName 'git_enabled' -Value $true
+Save-ConfigBooleanValue -PythonPath {_ps_literal(python)} -ConfigPath {_ps_literal(config)} -SettingName 'approval_ui_autostart' -Value $true
 $toggled = [IO.File]::ReadAllText({_ps_literal(config)}, [Text.Encoding]::UTF8)
 if ($toggled -notmatch '(?m)^approved_sandbox_enabled = true\r?$') {{ throw 'sandbox toggle was not saved' }}
 if ($toggled -notmatch '(?m)^git_enabled = true\r?$') {{ throw 'git toggle was not saved' }}
+if ($toggled -notmatch '(?m)^approval_ui_autostart = true\r?$') {{ throw 'approval UI toggle was not saved' }}
 'capability-toggle-ok'
 """
     completed = subprocess.run(
@@ -371,6 +374,7 @@ def test_setup_wizard_preserves_security_relevant_setup_contract() -> None:
     assert "approved_sandbox_enabled = true" in script
     assert "git_enabled = true" in script
     assert "approved_sandbox_require_live_verification = true" in script
+    assert "approval_ui_autostart = true" in script
     assert "Set-ActiveConfig" in script
     assert "Test-Configuration" in script
     assert "Find-TrustedGit" in script
@@ -407,6 +411,7 @@ def test_setup_wizard_preserves_security_relevant_setup_contract() -> None:
     assert "Automatic Git を有効化 / 無効化する" in script
     assert "Configure-ApprovedHostRuntimeForSetup" in script
     assert "Approved Host 運用 runtime を設定 / 無効化する" in script
+    assert "承認画面の自動起動を有効化 / 無効化する" in script
     assert "server_runtime_kind" in script
     assert "Get-TunnelServerRuntimeForSetup -State $PreviousState -VerifyApprovedHostRuntime" in script
     assert "$integrationSaved" in script
@@ -524,3 +529,5 @@ def test_launcher_docs_explain_manual_setup_and_single_root_boundary() -> None:
     assert "localmcp-activity.log" in docs
     assert "5 MiB" in docs
     assert "過去10ファイル" in docs
+    assert "approval_ui_autostart=true" in docs
+    assert "名前付きmutex" in docs

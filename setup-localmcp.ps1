@@ -457,6 +457,7 @@ function New-ConfigContent {
     $lines.Add('approved_sandbox_windows_mode = "elevated"')
     $lines.Add('approved_sandbox_permission_profile = ":workspace"')
     $lines.Add("approved_sandbox_require_live_verification = true")
+    $lines.Add("approval_ui_autostart = true")
     # Approved Host は変更不能な運用 runtime と LocalSystem service の導入後だけ有効化します。
     $lines.Add("approved_host_enabled = false")
     $lines.Add("adb_emulator_only = true")
@@ -670,6 +671,7 @@ function Get-ConfigurationInfo {
             "'adb_enabled': bool(settings.adb_enabled),",
             "'powershell_enabled': bool(settings.powershell_enabled),",
             "'approved_sandbox_enabled': bool(settings.approved_sandbox_enabled),",
+            "'approval_ui_autostart': bool(settings.approval_ui_autostart),",
             "'approved_host_enabled': bool(settings.approved_host_enabled)",
             "}, ensure_ascii=False))"
         ) -join " "
@@ -763,7 +765,7 @@ function Save-ConfigBooleanValue {
         [Parameter(Mandatory = $true)][bool]$Value
     )
 
-    if ($SettingName -notin @("approved_sandbox_enabled", "git_enabled", "approved_host_enabled")) {
+    if ($SettingName -notin @("approved_sandbox_enabled", "git_enabled", "approved_host_enabled", "approval_ui_autostart")) {
         throw "設定ウィザードから変更できない項目です: $SettingName"
     }
     $encoding = [Text.UTF8Encoding]::new($false, $true)
@@ -1091,6 +1093,7 @@ function Show-ConfigurationSummary {
     Write-Host ("オプション: filesystem={0}, git={1}, ADB={2}, PowerShell={3}, Codex Sandbox={4}, Approved Host={5}" -f `
         $info.filesystem_enabled, $info.git_enabled, $info.adb_enabled, $info.powershell_enabled,
         $info.approved_sandbox_enabled, $info.approved_host_enabled) -ForegroundColor Gray
+    Write-Host "承認画面の自動起動: $($info.approval_ui_autostart)" -ForegroundColor Gray
 }
 
 function Get-TunnelCurrentProcessStatus {
@@ -1869,6 +1872,7 @@ function Invoke-SettingsMenu {
         Write-Host "8. Codex Sandbox を有効化 / 無効化する"
         Write-Host "9. Automatic Git を有効化 / 無効化する"
         Write-Host "10. Approved Host 運用 runtime を設定 / 無効化する"
+        Write-Host "11. 承認画面の自動起動を有効化 / 無効化する"
         Write-Host "0. 変更せず終了する"
         $choice = (Read-Host "番号").Trim()
 
@@ -1974,6 +1978,23 @@ function Invoke-SettingsMenu {
                         Write-Ok "Approved Host を無効にしました。運用 runtime、service、Tunnel profile は削除していません。"
                     } elseif ($hostChoice -ne "0") {
                         Write-Warn "番号が正しくありません。"
+                    }
+                    break
+                }
+                "11" {
+                    $info = Get-ConfigurationInfo -PythonPath $PythonPath -ConfigPath $ConfigPath
+                    $state = Get-TunnelStateForConfig -ConfigPath $ConfigPath
+                    Assert-TunnelNotRunning -State $state
+                    $newValue = -not [bool]$info.approval_ui_autostart
+                    Save-ConfigBooleanValue `
+                        -PythonPath $PythonPath `
+                        -ConfigPath $ConfigPath `
+                        -SettingName "approval_ui_autostart" `
+                        -Value $newValue
+                    if ($newValue) {
+                        Write-Ok "次回起動から承認画面を別ウィンドウで自動起動します。"
+                    } else {
+                        Write-Ok "承認画面の自動起動を無効にしました。必要な場合は run-approvals.ps1 を手動で起動してください。"
                     }
                     break
                 }
