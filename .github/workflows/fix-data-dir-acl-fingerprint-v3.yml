@@ -1,0 +1,74 @@
+name: Fix data_dir ACL fingerprint v3
+
+on:
+  push:
+    branches: [fix/data-dir-acl-fingerprint]
+    paths: [.github/workflows/fix-data-dir-acl-fingerprint-v3.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v7
+        with:
+          ref: fix/data-dir-acl-fingerprint
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Apply source patch
+        shell: bash
+        run: |
+          python - <<'PY'
+          import re
+          from pathlib import Path
+
+          workflow = Path('.github/workflows/fix-data-dir-acl-fingerprint.yml').read_text(encoding='utf-8')
+          lines = workflow.splitlines()
+          start = next(i for i, line in enumerate(lines) if line.strip() == "python - <<'PY'") + 1
+          end = next(i for i in range(start, len(lines)) if lines[i].strip() == 'PY')
+          script = '\n'.join(line[10:] if line.startswith('          ') else line for line in lines[start:end])
+          script = script.replace(
+              'setup = raw.decode("utf-8-sig")',
+              'setup = raw.decode("utf-8-sig").replace("\\r\\n", "\\n")',
+          )
+          for name in ('new_acl_block', 'new_invoke', 'synthetic_test'):
+              pattern = re.compile(
+                  rf'{name} = "\\n"\.join\(\n'
+                  rf'    line\[10:\] if line\.startswith\("          "\) else line\n'
+                  rf'    for line in {name}\.splitlines\(\)\n'
+                  rf'\)\n'
+              )
+              script, count = pattern.subn('', script)
+              if count != 1:
+                  raise SystemExit(f'{name} deindent replacement count was {count}')
+          exec(compile(script, '<acl-fingerprint-patch>', 'exec'))
+          PY
+
+      - name: Install test dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Focused regression tests
+        shell: pwsh
+        run: |
+          python -m pytest tests/test_config.py tests/test_setup_python_diagnostics.py tests/test_local_launchers.py -q
+          python -m ruff check src/windows_local_mcp/config.py tests/test_config.py tests/test_setup_python_diagnostics.py
+
+      - name: Commit fixes to branch
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/windows_local_mcp/config.py setup-localmcp.ps1 tests/test_config.py
+          git commit -m "fix: data_dir ACL検証をコードページ非依存化"
+          git push origin HEAD:fix/data-dir-acl-fingerprint
