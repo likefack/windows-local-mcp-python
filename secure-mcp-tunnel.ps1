@@ -352,7 +352,7 @@ function Test-TunnelLocalMcpConfiguration {
             "print('workspace_root=' + str(settings.workspace_root))",
             "print('data_dir=' + str(settings.data_dir))"
         ) -join "; "
-        $output = @(& $PythonPath -I -B -c $probe 2>$null)
+        $output = @(& $PythonPath -I -X utf8 -B -c $probe 2>$null)
         if ($LASTEXITCODE -ne 0) {
             return [PSCustomObject]@{ Valid = $false; WorkspaceRoot = $null; DataDir = $null }
         }
@@ -464,6 +464,25 @@ function Get-TunnelClientCandidates {
         }
     }
 
+    $downloadRoots = [System.Collections.Generic.List[string]]::new()
+    if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+        $null = $downloadRoots.Add((Join-Path $env:USERPROFILE "Desktop"))
+        $null = $downloadRoots.Add((Join-Path $env:USERPROFILE "Downloads"))
+        $null = $downloadRoots.Add((Join-Path $env:USERPROFILE "OneDrive\Desktop"))
+        $null = $downloadRoots.Add((Join-Path $env:USERPROFILE "OneDrive\Downloads"))
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:OneDrive)) {
+        $null = $downloadRoots.Add((Join-Path $env:OneDrive "Desktop"))
+        $null = $downloadRoots.Add((Join-Path $env:OneDrive "Downloads"))
+    }
+    foreach ($root in @($downloadRoots | Select-Object -Unique)) {
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) { continue }
+        $null = $paths.Add((Join-Path $root "tunnel-client.exe"))
+        foreach ($directory in @(Get-ChildItem -LiteralPath $root -Directory -Force -Filter "tunnel-client*" -ErrorAction SilentlyContinue | Select-Object -First 50)) {
+            $null = $paths.Add((Join-Path $directory.FullName "tunnel-client.exe"))
+        }
+    }
+
     $profileRoots = [System.Collections.Generic.List[string]]::new()
     foreach ($root in @(
         $env:TUNNEL_CLIENT_PROFILE_DIR,
@@ -544,6 +563,24 @@ function ConvertFrom-TunnelYamlScalar {
         return $text.Substring(1, $text.Length - 2).Replace('\"', '"')
     }
     return $text
+}
+
+function Get-TunnelComparablePath {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if ($Path -match '[\r\n]') {
+        throw "Tunnel command の path に改行は使用できません。"
+    }
+    $full = [IO.Path]::GetFullPath($Path.Replace('/', [IO.Path]::DirectorySeparatorChar))
+    $item = Get-Item -LiteralPath $full -Force -ErrorAction Stop
+    if ($item.PSIsContainer -or (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw "Tunnel command の path は通常のファイルである必要があります。"
+    }
+    # PowerShell's filesystem provider expands an existing Windows 8.3 alias
+    # (for example RUNNER~1) to the file's normal FullName. This lets us accept
+    # path spelling aliases only when both sides resolve to the same concrete
+    # existing file, while still rejecting a command that targets another file.
+    return ([IO.Path]::GetFullPath($item.FullName)).TrimEnd('\', '/')
 }
 
 function New-TunnelProfileContent {
@@ -633,10 +670,23 @@ function Get-TunnelProfileInfo {
     $matchesLocalMcp = $false
     if (-not [string]::IsNullOrWhiteSpace($ServerScript) -and -not [string]::IsNullOrWhiteSpace($ConfigPath)) {
         try {
-            $expectedServer = ConvertTo-TunnelCommandArgument -Value ([IO.Path]::GetFullPath($ServerScript))
-            $expectedConfig = ConvertTo-TunnelCommandArgument -Value ([IO.Path]::GetFullPath($ConfigPath))
-            $expectedCommand = ConvertTo-TunnelYamlScalar -Value "powershell.exe -NoProfile -File $expectedServer -Config $expectedConfig"
-            $matchesLocalMcp = $content.IndexOf("command: $expectedCommand", [StringComparison]::OrdinalIgnoreCase) -ge 0
+            $commandMatches = [regex]::Matches($content, '(?im)^\s*command\s*:\s*(?<value>[^\r\n]+)\s*$')
+            if ($commandMatches.Count -eq 1) {
+                $command = ConvertFrom-TunnelYamlScalar -Value $commandMatches[0].Groups["value"].Value
+                $parsedCommand = [regex]::Match(
+                    $command,
+                    '^powershell\.exe\s+-NoProfile\s+-File\s+"(?<server>[^"\r\n]+)"\s+-Config\s+"(?<config>[^"\r\n]+)"$'
+                )
+                if ($parsedCommand.Success) {
+                    $actualServer = Get-TunnelComparablePath -Path $parsedCommand.Groups["server"].Value
+                    $actualConfig = Get-TunnelComparablePath -Path $parsedCommand.Groups["config"].Value
+                    $expectedServer = Get-TunnelComparablePath -Path $ServerScript
+                    $expectedConfig = Get-TunnelComparablePath -Path $ConfigPath
+                    $matchesLocalMcp =
+                        $actualServer.Equals($expectedServer, [StringComparison]::OrdinalIgnoreCase) -and
+                        $actualConfig.Equals($expectedConfig, [StringComparison]::OrdinalIgnoreCase)
+                }
+            }
         } catch {
             $matchesLocalMcp = $false
         }
@@ -935,6 +985,114 @@ function Test-TunnelProfileBinding {
     }
 }
 
+function Protect-TunnelDiagnosticText {
+    param(
+        [AllowNull()][string]$Text,
+        [Security.SecureString]$Credential
+    )
+
+    if ($null -eq $Text) { return "" }
+    $safe = [string]$Text
+    $plain = $null
+    try {
+        if ($null -ne $Credential) {
+            $plain = ConvertFrom-TunnelSecureString -Secret $Credential
+            if (-not [string]::IsNullOrEmpty($plain)) {
+                $safe = $safe.Replace($plain, "[REDACTED]")
+            }
+        }
+    } finally {
+        $plain = $null
+    }
+    $safe = [regex]::Replace($safe, '(?i)\b(?:sk|rk|sess)-[A-Za-z0-9_-]{8,}\b', '[REDACTED]')
+    $safe = [regex]::Replace($safe, '(?i)(authorization\s*:\s*bearer\s+)[^\s,;]+', '$1[REDACTED]')
+    return $safe
+}
+
+function ConvertFrom-TunnelDoctorJson {
+    param(
+        [AllowNull()][string]$JsonText,
+        [Security.SecureString]$Credential
+    )
+
+    if ([string]::IsNullOrWhiteSpace($JsonText)) { return $null }
+    try {
+        $parsed = $JsonText | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        return $null
+    }
+    if ($null -eq $parsed -or [string]::IsNullOrWhiteSpace([string]$parsed.result)) {
+        return $null
+    }
+
+    $checks = [System.Collections.Generic.List[object]]::new()
+    foreach ($check in @($parsed.checks)) {
+        if ($null -eq $check) { continue }
+        $evidence = @($check.evidence | ForEach-Object { Protect-TunnelDiagnosticText -Text ([string]$_) -Credential $Credential })
+        $next = @($check.next | ForEach-Object { Protect-TunnelDiagnosticText -Text ([string]$_) -Credential $Credential })
+        $null = $checks.Add([PSCustomObject]@{
+            Id = Protect-TunnelDiagnosticText -Text ([string]$check.id) -Credential $Credential
+            Status = ([string]$check.status).ToUpperInvariant()
+            Summary = Protect-TunnelDiagnosticText -Text ([string]$check.summary) -Credential $Credential
+            Why = Protect-TunnelDiagnosticText -Text ([string]$check.why) -Credential $Credential
+            Evidence = $evidence
+            Next = $next
+        })
+    }
+    return [PSCustomObject]@{
+        Result = ([string]$parsed.result).ToLowerInvariant()
+        FailedChecks = @($parsed.failed_checks | ForEach-Object { Protect-TunnelDiagnosticText -Text ([string]$_) -Credential $Credential })
+        Next = Protect-TunnelDiagnosticText -Text ([string]$parsed.next) -Credential $Credential
+        Checks = @($checks)
+    }
+}
+
+function Get-TunnelDoctorFailureClass {
+    param(
+        [object]$Report,
+        [string]$Stdout,
+        [string]$Stderr,
+        [int]$ExitCode
+    )
+
+    $failed = @()
+    if ($null -ne $Report) { $failed = @($Report.FailedChecks) }
+    if ($failed -contains "tunnel_id") { return "tunnel_id_invalid" }
+    if ($failed -contains "control_plane_api_key") { return "credential_configuration" }
+    if ($failed -contains "mcp_target" -or $failed -contains "mcp_command_executable") { return "server_start_failed" }
+    if (@($failed | Where-Object { $_ -in @("profile_load", "config_source", "config_validation", "control_plane_base_url", "control_plane_url_path") }).Count -gt 0) {
+        return "profile_invalid"
+    }
+    return Get-TunnelFailureClass -Stdout $Stdout -Stderr $Stderr -ExitCode $ExitCode
+}
+
+function Show-TunnelDoctorDiagnostics {
+    param([Parameter(Mandatory = $true)][object]$Doctor)
+
+    if ([bool]$Doctor.Succeeded) { return }
+    Write-Host "tunnel-client doctor の事前検証に失敗しました（終了コード $($Doctor.ExitCode)）。" -ForegroundColor Yellow
+    if ($null -ne $Doctor.Report) {
+        $failedChecks = @($Doctor.Report.FailedChecks)
+        if ($failedChecks.Count -gt 0) {
+            Write-Host ("失敗した確認項目: " + ($failedChecks -join ", ")) -ForegroundColor Yellow
+        }
+        foreach ($check in @($Doctor.Report.Checks | Where-Object { $_.Status -eq "FAIL" })) {
+            Write-Host ("  - {0}: {1}" -f $check.Id, $check.Summary) -ForegroundColor Yellow
+            foreach ($line in @($check.Evidence | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })) {
+                Write-Host ("    根拠: " + [string]$line) -ForegroundColor Gray
+            }
+            foreach ($line in @($check.Next | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })) {
+                Write-Host ("    対応候補: " + [string]$line) -ForegroundColor Gray
+            }
+        }
+    } elseif (-not [string]::IsNullOrWhiteSpace([string]$Doctor.FallbackText)) {
+        Write-Host "構造化診断を読み取れなかったため、安全化した tunnel-client 出力を表示します:" -ForegroundColor Yellow
+        foreach ($line in @(([string]$Doctor.FallbackText -split "`r?`n") | Select-Object -First 30)) {
+            if (-not [string]::IsNullOrWhiteSpace($line)) { Write-Host ("  " + $line) -ForegroundColor Gray }
+        }
+    }
+}
+
 function Get-TunnelFailureClass {
     param(
         [string]$Stdout,
@@ -987,10 +1145,9 @@ function Invoke-TunnelClientDoctor {
         [Security.SecureString]$Credential
     )
     $process = $null
-    $plain = $null
     try {
         $prepared = New-TunnelProcessStartInfo -ClientPath $ClientPath -Arguments @(
-            "doctor", "--profile-file", $ProfilePath, "--explain"
+            "doctor", "--profile-file", $ProfilePath, "--json"
         ) -Credential $Credential
         $process = [Diagnostics.Process]::new()
         $process.StartInfo = $prepared.StartInfo
@@ -1001,15 +1158,28 @@ function Invoke-TunnelClientDoctor {
         $stdout = $stdoutTask.GetAwaiter().GetResult()
         $stderr = $stderrTask.GetAwaiter().GetResult()
         $exitCode = $process.ExitCode
+        $report = ConvertFrom-TunnelDoctorJson -JsonText $stdout -Credential $Credential
+        $safeStdout = Protect-TunnelDiagnosticText -Text $stdout -Credential $Credential
+        $safeStderr = Protect-TunnelDiagnosticText -Text $stderr -Credential $Credential
+        $fallback = (($safeStdout, $safeStderr | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }) -join [Environment]::NewLine).Trim()
+        if ($fallback.Length -gt 12000) { $fallback = $fallback.Substring(0, 12000) + "`n[truncated]" }
         return [PSCustomObject]@{
-            Succeeded = ($exitCode -eq 0)
+            Succeeded = ($exitCode -eq 0 -and ($null -eq $report -or $report.Result -eq "ok"))
             ExitCode = $exitCode
-            FailureClass = Get-TunnelFailureClass -Stdout $stdout -Stderr $stderr -ExitCode $exitCode
+            FailureClass = Get-TunnelDoctorFailureClass -Report $report -Stdout $safeStdout -Stderr $safeStderr -ExitCode $exitCode
+            Report = $report
+            FallbackText = $fallback
         }
     } catch {
-        return [PSCustomObject]@{ Succeeded = $false; ExitCode = -1; FailureClass = "tunnel_client_unavailable" }
+        $safeError = Protect-TunnelDiagnosticText -Text $_.Exception.Message -Credential $Credential
+        return [PSCustomObject]@{
+            Succeeded = $false
+            ExitCode = -1
+            FailureClass = "tunnel_client_unavailable"
+            Report = $null
+            FallbackText = $safeError
+        }
     } finally {
-        $plain = $null
         if ($null -ne $process) { $process.Dispose() }
     }
 }
@@ -1206,8 +1376,11 @@ function Show-TunnelFailureGuide {
         "tunnel_id_invalid" {
             Write-Host "Tunnel ID が存在しないか形式が正しくありません。Platform の Tunnels 管理画面から対象 ID を再確認してください。" -ForegroundColor Yellow
         }
+        "credential_configuration" {
+            Write-Host "Runtime API Key の参照または設定を tunnel-client doctor が確認できません。上の診断詳細を確認し、必要なら key を再入力してください。" -ForegroundColor Yellow
+        }
         "profile_invalid" {
-            Write-Host "Tunnel profile が不正または変更されています。configure-localmcp.bat の Tunnel 設定変更を選び、検証済み profile を再生成してください。" -ForegroundColor Yellow
+            Write-Host "Tunnel profile の検証に失敗しました。上の doctor 診断を確認し、必要な場合だけ configure-localmcp.bat の Tunnel 設定変更から profile を再生成してください。" -ForegroundColor Yellow
         }
         "server_start_failed" {
             Write-Host "Tunnel から LocalMCP server を起動できません。config.toml、run-server.ps1、専用 Python 環境を確認してください。" -ForegroundColor Yellow
