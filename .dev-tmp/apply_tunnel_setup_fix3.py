@@ -23,15 +23,15 @@ $content = New-TunnelProfileContent -TunnelId 'tunnel_0123456789abcdef0123456789
 )
 
 # On Windows tempfile may surface an 8.3 spelling while PowerShell persists the
-# equivalent long spelling. Compare the resolved filesystem identity instead of
-# raw TOML text for data_dir.
+# equivalent long spelling. Parse TOML, then compare resolved filesystem identity
+# instead of raw path spelling.
 path = Path("tests/test_local_launchers.py")
 text = path.read_text(encoding="utf-8")
+if "import tomllib\n" not in text:
+    text = text.replace("import tempfile\n", "import tempfile\nimport tomllib\n", 1)
 old = '''    assert f'data_dir = "{toml_path(new_data_dir)}"' in config.read_text(encoding="utf-8")
 '''
-new = '''    configured_text = config.read_text(encoding="utf-8")
-    data_line = next(line for line in configured_text.splitlines() if line.startswith("data_dir = "))
-    configured_data = Path(data_line.split('"', 2)[1].replace("\\\\", "\\"))
+new = '''    configured_data = Path(tomllib.loads(config.read_text(encoding="utf-8"))["data_dir"])
     assert configured_data.resolve() == new_data_dir.resolve()
 '''
 if text.count(old) != 1:
