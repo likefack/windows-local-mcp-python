@@ -1,0 +1,67 @@
+name: Tunnel setup fix validation
+
+on:
+  push:
+    branches:
+      - fix/tunnel-setup-diagnostics
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-validate:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v7
+        with:
+          ref: fix/tunnel-setup-diagnostics
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install test dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Apply focused fix
+        shell: pwsh
+        run: python .dev-tmp/apply_tunnel_setup_fix.py
+
+      - name: Parse PowerShell
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($path in @('setup-localmcp.ps1', 'secure-mcp-tunnel.ps1')) {
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $path), [ref]$null, [ref]$errors)
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Error $_.Message }
+              throw "$path parse failed"
+            }
+          }
+
+      - name: Focused regressions
+        shell: pwsh
+        run: |
+          python -m pytest tests/test_tunnel_setup_diagnostics.py tests/test_setup_python_diagnostics.py tests/test_tunnel_integration.py tests/test_local_launchers.py tests/test_mcp_stdio_integration.py -q
+
+      - name: Ruff
+        shell: pwsh
+        run: python -m ruff check tests/test_tunnel_setup_diagnostics.py
+
+      - name: Commit validated fix
+        if: success()
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git rm .dev-tmp/apply_tunnel_setup_fix.py .github/workflows/tunnel-setup-fix.yml
+          git add setup-localmcp.ps1 secure-mcp-tunnel.ps1 tests/test_tunnel_setup_diagnostics.py
+          git commit -m "fix: Tunnel設定の診断と検出UXを改善"
+          git push origin HEAD:fix/tunnel-setup-diagnostics
