@@ -6,10 +6,18 @@
 - Revalidated baseline: `eba8b8ac59e0730ad2c8abe646b6ac997d31d433`
 - Validity: `valid`
 - Remediation decision: `unresolved / architecture-blocked`
+- Operational disposition: `known / deferred` — 現時点では production remediation を実施しない。
+- Revisit trigger: 実運用で本 finding に起因する Approved Host の failure / `recovery_required` が反復し、無視できない availability impact が確認された場合に再検討する。
 - Scope: Approved Host requester-user process census の attribution precision と、それに起因する availability failure。
 - `WLMCP-R2-001` は `fixed / live verified` を維持する。本 finding は LocalSystem authority separation、SYSTEM-worker-owned Job Object、durable authority/postflight latch、requester PID/create-time/SID/token binding、control-plane tamper detection の成立を否定しない。
 
 本 finding のために production security boundary は弱めない。non-bypassable な replacement attribution boundary を実装して live verification できるまで、現行 requester-user census と uncertainty fail-closed は維持する。
+
+### Current disposition and revisit policy
+
+R3-004 は既知の valid finding として記録を維持するが、現時点では修正を実施しない。現在確認されている影響は、unrelated same-user process を operation 起因と誤認することによる availability / result-integrity failure であり、安全側への fail-closed である。これを回避するために current broad census を緩和すると、WMI/CIM / `Win32_Process.Create` 等による Job-external process を見逃す fail-open risk を導入し得るため、既存 security guarantee を優先する。
+
+再検討は、実運用 telemetry、再現可能な incident、または repeated E2E verification により、本 finding が Approved Host の通常利用を実質的に阻害していると確認された場合に行う。単発または低頻度の false positive のみを理由に architecture を変更しない。再検討時も、下記 acceptance criteria と fail-closed requirement を満たす root attribution mechanism がない限り、単純な ignore/filter、timeout 延長、PPID/command-line 等の heuristic による緩和は採用しない。
 
 ## Current behavior
 
