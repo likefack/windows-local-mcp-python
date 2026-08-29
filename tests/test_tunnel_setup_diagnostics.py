@@ -77,12 +77,12 @@ $secure.Dispose()
 @pytest.mark.skipif(os.name != "nt", reason="Windows tunnel-client doctor fail-closed regression")
 def test_doctor_invalid_json_is_never_classified_as_success() -> None:
     command = f"""
-+$ErrorActionPreference = 'Stop'
-+. {_ps_literal(HELPER)}
-+$class = Get-TunnelDoctorFailureClass -Report $null -Stdout 'not-json' -Stderr '' -ExitCode 0
-+if ($class -ne 'doctor_output_invalid') {{ throw 'invalid doctor JSON did not fail closed: ' + $class }}
-+'doctor-invalid-json-failclosed-ok'
-+"""
+$ErrorActionPreference = 'Stop'
+. {_ps_literal(HELPER)}
+$class = Get-TunnelDoctorFailureClass -Report $null -Stdout 'not-json' -Stderr '' -ExitCode 0
+if ($class -ne 'doctor_output_invalid') {{ throw 'invalid doctor JSON did not fail closed: ' + $class }}
+'doctor-invalid-json-failclosed-ok'
+"""
     completed = _run(command)
     output = completed.stdout + completed.stderr
     assert completed.returncode == 0, output
