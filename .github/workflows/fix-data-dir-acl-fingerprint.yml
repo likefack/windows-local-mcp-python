@@ -1,0 +1,529 @@
+name: Fix data_dir ACL fingerprint
+
+on:
+  push:
+    branches: [fix/data-dir-acl-fingerprint]
+    paths: [.github/workflows/fix-data-dir-acl-fingerprint.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v7
+        with:
+          ref: fix/data-dir-acl-fingerprint
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Apply ACL and setup diagnostics fixes
+        shell: bash
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import re
+          from pathlib import Path
+
+          config_path = Path("src/windows_local_mcp/config.py")
+          config = config_path.read_text(encoding="utf-8")
+
+          old_imports = "import csv\nimport hashlib\nimport io\nimport json\nimport os\nimport stat\n"
+          new_imports = "import csv\nimport ctypes\nimport hashlib\nimport io\nimport json\nimport locale\nimport os\nimport stat\n"
+          if old_imports not in config:
+              raise SystemExit("config import target not found")
+          config = config.replace(old_imports, new_imports, 1)
+
+          new_acl_block = r'''def _windows_dacl_fingerprint(path: Path) -> str:
+              """Return a locale-independent fingerprint of the Windows DACL."""
+              if os.name != "nt":
+                  raise RuntimeError("Windows DACL fingerprint is only available on Windows")
+
+              from ctypes import wintypes
+
+              se_file_object = 1
+              dacl_security_information = 0x00000004
+              sddl_revision_1 = 1
+              advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+              kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+              get_named_security_info = advapi32.GetNamedSecurityInfoW
+              get_named_security_info.argtypes = [
+                  wintypes.LPWSTR,
+                  wintypes.DWORD,
+                  wintypes.DWORD,
+                  ctypes.POINTER(ctypes.c_void_p),
+                  ctypes.POINTER(ctypes.c_void_p),
+                  ctypes.POINTER(ctypes.c_void_p),
+                  ctypes.POINTER(ctypes.c_void_p),
+                  ctypes.POINTER(ctypes.c_void_p),
+              ]
+              get_named_security_info.restype = wintypes.DWORD
+
+              convert_security_descriptor = (
+                  advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW
+              )
+              convert_security_descriptor.argtypes = [
+                  ctypes.c_void_p,
+                  wintypes.DWORD,
+                  wintypes.DWORD,
+                  ctypes.POINTER(wintypes.LPWSTR),
+                  ctypes.POINTER(wintypes.DWORD),
+              ]
+              convert_security_descriptor.restype = wintypes.BOOL
+
+              local_free = kernel32.LocalFree
+              local_free.argtypes = [ctypes.c_void_p]
+              local_free.restype = ctypes.c_void_p
+
+              descriptor = ctypes.c_void_p()
+              status = get_named_security_info(
+                  str(path.resolve(strict=True)),
+                  se_file_object,
+                  dacl_security_information,
+                  None,
+                  None,
+                  None,
+                  None,
+                  ctypes.byref(descriptor),
+              )
+              if status != 0:
+                  raise ctypes.WinError(status)
+
+              sddl = wintypes.LPWSTR()
+              length = wintypes.DWORD()
+              try:
+                  if not convert_security_descriptor(
+                      descriptor,
+                      sddl_revision_1,
+                      dacl_security_information,
+                      ctypes.byref(sddl),
+                      ctypes.byref(length),
+                  ):
+                      raise ctypes.WinError(ctypes.get_last_error())
+                  value = sddl.value
+                  if not value:
+                      raise PermissionError("Windows returned an empty data_dir DACL")
+                  return hashlib.sha256(value.encode("utf-8")).hexdigest()
+              finally:
+                  if sddl:
+                      local_free(ctypes.cast(sddl, ctypes.c_void_p))
+                  if descriptor:
+                      local_free(descriptor)
+
+
+          def _windows_acl_candidate_codecs() -> tuple[str, ...]:
+              codecs = {
+                  "utf-8",
+                  "cp437",
+                  "cp850",
+                  "cp852",
+                  "cp866",
+                  "cp932",
+                  "cp936",
+                  "cp949",
+                  "cp950",
+                  "cp1250",
+                  "cp1251",
+                  "cp1252",
+                  "cp1254",
+              }
+              preferred = locale.getpreferredencoding(False)
+              if preferred:
+                  codecs.add(preferred)
+              if os.name == "nt":
+                  try:
+                      code_page = int(ctypes.WinDLL("kernel32").GetConsoleOutputCP())
+                  except (AttributeError, OSError, ValueError):
+                      code_page = 0
+                  if code_page:
+                      codecs.add("utf-8" if code_page == 65001 else f"cp{code_page}")
+              return tuple(sorted(codecs))
+
+
+          def _legacy_acl_digest_candidates_from_raw(raw: bytes) -> set[str]:
+              """Reconstruct v1 text digests across plausible Windows console encodings."""
+              codecs = _windows_acl_candidate_codecs()
+              logical_texts = {raw.decode("utf-8", errors="replace")}
+              for codec in codecs:
+                  try:
+                      logical_texts.add(raw.decode(codec, errors="strict"))
+                  except (LookupError, UnicodeDecodeError):
+                      continue
+
+              digests: set[str] = set()
+              for text in logical_texts:
+                  for codec in codecs:
+                      try:
+                          legacy_raw = text.encode(codec, errors="strict")
+                      except (LookupError, UnicodeEncodeError):
+                          continue
+                      legacy_text = legacy_raw.decode("utf-8", errors="replace")
+                      digests.add(hashlib.sha256(legacy_text.encode("utf-8")).hexdigest())
+              return digests
+
+
+          def _legacy_windows_acl_digest_candidates(path: Path) -> set[str]:
+              current = subprocess.run(
+                  [windows_system_executable("icacls.exe"), str(path)],
+                  capture_output=True,
+                  timeout=30,
+                  check=False,
+                  shell=False,
+              )
+              if current.returncode != 0:
+                  details = current.stderr.decode(
+                      locale.getpreferredencoding(False) or "utf-8", errors="replace"
+                  ).strip()
+                  raise PermissionError(f"failed to inspect data_dir ACL: {details}")
+              return _legacy_acl_digest_candidates_from_raw(current.stdout)
+
+
+          def _write_windows_acl_policy_marker(marker: Path, *, sid: str, fingerprint: str) -> None:
+              payload = json.dumps(
+                  {
+                      "version": 2,
+                      "sid": sid,
+                      "root_dacl_sddl_sha256": fingerprint,
+                  },
+                  sort_keys=True,
+                  separators=(",", ":"),
+              )
+              temporary = marker.with_name(
+                  f"{marker.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}"
+              )
+              try:
+                  with temporary.open("x", encoding="utf-8") as output:
+                      output.write(payload)
+                      output.flush()
+                      os.fsync(output.fileno())
+                  os.replace(temporary, marker)
+              finally:
+                  temporary.unlink(missing_ok=True)
+
+
+          def _raise_windows_acl_mismatch() -> None:
+              raise PermissionError(
+                  "data_dir ACL changed after provisioning; automatic repair is disabled. "
+                  "Do not delete .acl-policy.json. Preserve data_dir and its marker, inspect "
+                  "the ACL difference, then use a new config/data_dir or explicitly "
+                  "reprovision the reviewed ACL before retrying"
+              )
+
+
+          def _protect_windows_acl(path: Path, *, allow_initial_provision: bool) -> None:
+              identity = subprocess.run(
+                  [windows_system_executable("whoami.exe"), "/user", "/fo", "csv", "/nh"],
+                  capture_output=True,
+                  text=True,
+                  encoding="utf-8",
+                  errors="replace",
+                  timeout=15,
+                  check=False,
+                  shell=False,
+              )
+              if identity.returncode != 0:
+                  raise PermissionError("failed to determine the current Windows security principal")
+              row = next(csv.reader(io.StringIO(identity.stdout)), None)
+              if not row or len(row) < 2 or not row[1].startswith("S-"):
+                  raise PermissionError("failed to parse the current Windows security principal SID")
+              sid = row[1]
+              marker = path / ".acl-policy.json"
+              expected_marker: dict[str, object] | None = None
+              if marker.is_file():
+                  try:
+                      loaded = json.loads(marker.read_text(encoding="utf-8"))
+                      if isinstance(loaded, dict):
+                          expected_marker = loaded
+                  except (OSError, ValueError):
+                      raise PermissionError("data_dir ACL policy marker is corrupt") from None
+
+              if expected_marker is not None:
+                  if expected_marker.get("sid") != sid:
+                      _raise_windows_acl_mismatch()
+                  current_fingerprint = _windows_dacl_fingerprint(path)
+                  version = expected_marker.get("version")
+                  if version == 2:
+                      if expected_marker.get("root_dacl_sddl_sha256") != current_fingerprint:
+                          _raise_windows_acl_mismatch()
+                      return
+                  if version == 1:
+                      legacy_digest = expected_marker.get("root_acl_sha256")
+                      if not isinstance(legacy_digest, str):
+                          _raise_windows_acl_mismatch()
+                      if legacy_digest not in _legacy_windows_acl_digest_candidates(path):
+                          _raise_windows_acl_mismatch()
+                      _write_windows_acl_policy_marker(
+                          marker, sid=sid, fingerprint=current_fingerprint
+                      )
+                      return
+                  _raise_windows_acl_mismatch()
+
+              if not allow_initial_provision:
+                  raise PermissionError(
+                      "data_dir ACL policy marker is missing after provisioning; automatic repair "
+                      "and marker deletion recovery are disabled. Preserve data_dir and inspect the "
+                      "ACL state before explicit reprovisioning"
+                  )
+              reset = subprocess.run(
+                  [windows_system_executable("icacls.exe"), str(path), "/reset", "/T", "/C"],
+                  capture_output=True,
+                  text=True,
+                  encoding="utf-8",
+                  errors="replace",
+                  timeout=60,
+                  check=False,
+                  shell=False,
+              )
+              if reset.returncode != 0:
+                  raise PermissionError(f"failed to reset data_dir ACL: {reset.stderr.strip()}")
+              isolation = subprocess.run(
+                  [
+                      windows_system_executable("icacls.exe"),
+                      str(path),
+                      "/inheritance:r",
+                      "/T",
+                      "/C",
+                  ],
+                  capture_output=True,
+                  text=True,
+                  encoding="utf-8",
+                  errors="replace",
+                  timeout=30,
+                  check=False,
+                  shell=False,
+              )
+              if isolation.returncode != 0:
+                  raise PermissionError(
+                      f"failed to isolate data_dir ACL inheritance: {isolation.stderr.strip()}"
+                  )
+              result = subprocess.run(
+                  [
+                      windows_system_executable("icacls.exe"),
+                      str(path),
+                      "/grant:r",
+                      f"*{sid}:F",
+                      "SYSTEM:F",
+                      "/T",
+                      "/C",
+                  ],
+                  capture_output=True,
+                  text=True,
+                  encoding="utf-8",
+                  errors="replace",
+                  timeout=30,
+                  check=False,
+                  shell=False,
+              )
+              if result.returncode != 0:
+                  raise PermissionError(f"failed to protect data_dir ACL: {result.stderr.strip()}")
+              inheritance = subprocess.run(
+                  [
+                      windows_system_executable("icacls.exe"),
+                      str(path),
+                      "/grant",
+                      f"*{sid}:(OI)(CI)(IO)F",
+                      "SYSTEM:(OI)(CI)(IO)F",
+                      "/T",
+                      "/C",
+                  ],
+                  capture_output=True,
+                  text=True,
+                  encoding="utf-8",
+                  errors="replace",
+                  timeout=30,
+                  check=False,
+                  shell=False,
+              )
+              if inheritance.returncode != 0:
+                  raise PermissionError(
+                      f"failed to provision inherited data_dir ACL: {inheritance.stderr.strip()}"
+                  )
+              current_fingerprint = _windows_dacl_fingerprint(path)
+              namespace_marker = path / "control-plane" / "namespace.json"
+              try:
+                  namespace_marker.read_bytes()
+                  probe = path / f".acl-write-probe-{os.getpid()}"
+                  probe.write_bytes(b"acl-probe")
+                  if probe.read_bytes() != b"acl-probe":
+                      raise OSError("ACL write probe did not round-trip")
+                  probe.unlink()
+              except OSError as error:
+                  raise PermissionError(
+                      "protected data_dir ACL denied the current WLMCP principal"
+                  ) from error
+              _write_windows_acl_policy_marker(
+                  marker, sid=sid, fingerprint=current_fingerprint
+              )
+          '''
+          new_acl_block = "\n".join(
+              line[10:] if line.startswith("          ") else line
+              for line in new_acl_block.splitlines()
+          )
+          pattern = re.compile(
+              r"def _protect_windows_acl\(path: Path, \*, allow_initial_provision: bool\) -> None:\n.*?\n\n\ndef _load_file_backed_config",
+              re.S,
+          )
+          config, count = pattern.subn(new_acl_block + "\n\n\ndef _load_file_backed_config", config)
+          if count != 1:
+              raise SystemExit(f"ACL function replacement count was {count}")
+          config_path.write_text(config, encoding="utf-8")
+
+          setup_path = Path("setup-localmcp.ps1")
+          raw = setup_path.read_bytes()
+          has_bom = raw.startswith(b"\xef\xbb\xbf")
+          setup = raw.decode("utf-8-sig")
+          new_invoke = r'''function Invoke-Python {
+              param(
+                  [Parameter(Mandatory = $true)][string]$PythonPath,
+                  [Parameter(Mandatory = $true)][string[]]$Arguments
+              )
+
+              if (-not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) {
+                  throw "Python executable が見つかりません: $PythonPath"
+              }
+
+              # Windows PowerShell 5.1 treats native stderr records as PowerShell errors when
+              # $ErrorActionPreference is Stop. Collect them non-terminating so the complete
+              # traceback is preserved. -X utf8 is a command-line interpreter option, so it
+              # remains effective even with -I and does not depend on PYTHON* environment vars.
+              $previousErrorActionPreference = $ErrorActionPreference
+              $output = @()
+              $exitCode = $null
+              try {
+                  $ErrorActionPreference = "Continue"
+                  $effectiveArguments = @("-X", "utf8") + @($Arguments)
+                  $output = @(& $PythonPath @effectiveArguments 2>&1)
+                  $exitCode = $LASTEXITCODE
+              } finally {
+                  $ErrorActionPreference = $previousErrorActionPreference
+              }
+
+              $lines = @($output | ForEach-Object { $_.ToString() })
+              if ($null -eq $exitCode) {
+                  throw "Python の処理を開始できませんでした: $PythonPath"
+              }
+              if ($exitCode -ne 0) {
+                  $details = ($lines -join [Environment]::NewLine).Trim()
+                  if ([string]::IsNullOrWhiteSpace($details)) {
+                      $details = "標準出力・標準エラーに詳細はありません。"
+                  }
+                  throw "Python の処理に失敗しました（終了コード $exitCode）: $details"
+              }
+              return $lines
+          }
+          '''
+          new_invoke = "\n".join(
+              line[10:] if line.startswith("          ") else line
+              for line in new_invoke.splitlines()
+          )
+          setup_pattern = re.compile(r"function Invoke-Python \{\n.*?\n\}\n\nfunction Test-WlmcpImport", re.S)
+          setup, count = setup_pattern.subn(new_invoke.rstrip() + "\n\nfunction Test-WlmcpImport", setup)
+          if count != 1:
+              raise SystemExit(f"Invoke-Python replacement count was {count}")
+          setup_path.write_bytes((b"\xef\xbb\xbf" if has_bom else b"") + setup.encode("utf-8"))
+
+          test_path = Path("tests/test_config.py")
+          tests = test_path.read_text(encoding="utf-8")
+          tests = tests.replace(
+              "import os\nimport subprocess\n",
+              "import hashlib\nimport json\nimport os\nimport subprocess\n",
+              1,
+          )
+          tests = tests.replace(
+              "    Settings,\n    load_settings,\n    validate_configuration_candidate,\n)",
+              "    Settings,\n    _legacy_acl_digest_candidates_from_raw,\n    load_settings,\n    validate_configuration_candidate,\n)",
+              1,
+          )
+          synthetic_test = r'''
+
+          def test_legacy_acl_digest_candidates_bridge_windows_console_encodings() -> None:
+              logical = (
+                  "C:\\日本語\\data USER:(F)\r\n"
+                  "1 個のファイルを正常に処理しました。0 個のファイルを処理できませんでした\r\n"
+              )
+              legacy_raw = logical.encode("cp932")
+              legacy_text = legacy_raw.decode("utf-8", errors="replace")
+              legacy_digest = hashlib.sha256(legacy_text.encode("utf-8")).hexdigest()
+
+              current_raw = logical.encode("utf-8")
+              candidates = _legacy_acl_digest_candidates_from_raw(current_raw)
+
+              assert legacy_digest in candidates
+          '''
+          synthetic_test = "\n".join(
+              line[10:] if line.startswith("          ") else line
+              for line in synthetic_test.splitlines()
+          )
+          insertion = "\n\n@pytest.mark.skipif(os.name != \"nt\", reason=\"Windows ACL integration\")\ndef test_data_dir_acl_grants_current_principal_and_system"
+          if insertion not in tests:
+              raise SystemExit("ACL integration insertion point not found")
+          tests = tests.replace(
+              insertion,
+              synthetic_test + insertion,
+              1,
+          )
+          tests = tests.replace(
+              "        marker_bytes = acl_marker.read_bytes()\n",
+              "        marker_payload = json.loads(acl_marker.read_text(encoding=\"utf-8\"))\n"
+              "        assert marker_payload[\"version\"] == 2\n"
+              "        assert isinstance(marker_payload[\"root_dacl_sddl_sha256\"], str)\n"
+              "        legacy_acl = subprocess.run(\n"
+              "            [\"icacls.exe\", str(data)],\n"
+              "            capture_output=True,\n"
+              "            text=True,\n"
+              "            encoding=\"utf-8\",\n"
+              "            errors=\"replace\",\n"
+              "            timeout=30,\n"
+              "            check=True,\n"
+              "            shell=False,\n"
+              "        ).stdout\n"
+              "        legacy_digest = hashlib.sha256(legacy_acl.encode(\"utf-8\")).hexdigest()\n"
+              "        acl_marker.write_text(\n"
+              "            json.dumps(\n"
+              "                {\n"
+              "                    \"version\": 1,\n"
+              "                    \"sid\": marker_payload[\"sid\"],\n"
+              "                    \"root_acl_sha256\": legacy_digest,\n"
+              "                },\n"
+              "                sort_keys=True,\n"
+              "                separators=(\",\", \":\"),\n"
+              "            ),\n"
+              "            encoding=\"utf-8\",\n"
+              "        )\n"
+              "        settings.ensure_directories()\n"
+              "        migrated_payload = json.loads(acl_marker.read_text(encoding=\"utf-8\"))\n"
+              "        assert migrated_payload[\"version\"] == 2\n"
+              "        marker_bytes = acl_marker.read_bytes()\n",
+              1,
+          )
+          test_path.write_text(tests, encoding="utf-8")
+          PY
+
+      - name: Install test dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Focused regression tests
+        shell: pwsh
+        run: |
+          python -m pytest tests/test_config.py tests/test_setup_python_diagnostics.py tests/test_local_launchers.py -q
+          python -m ruff check src/windows_local_mcp/config.py tests/test_config.py tests/test_setup_python_diagnostics.py
+
+      - name: Commit fixes to branch
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/windows_local_mcp/config.py setup-localmcp.ps1 tests/test_config.py
+          git commit -m "fix: data_dir ACL検証をコードページ非依存化"
+          git push origin HEAD:fix/data-dir-acl-fingerprint
