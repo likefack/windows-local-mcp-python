@@ -319,7 +319,7 @@ function Select-ExistingConfig {
     }
 
     $selectionPrompt = if ($candidates.Count -gt 0) {
-        "使う番号、または config のパス（空欄で 1 番）"
+        "使用する設定の番号または config のパスを入力してください（Enter で 1 番を使用）"
     } else {
         "既存 config.toml のパス"
     }
