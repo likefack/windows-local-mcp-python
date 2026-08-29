@@ -36,6 +36,7 @@ jobs:
           python .dev-tmp/apply_tunnel_setup_fix2.py
           python .dev-tmp/apply_tunnel_setup_fix3.py
           python .dev-tmp/apply_tunnel_setup_fix4.py
+          python -m ruff check --fix tests/test_tunnel_setup_diagnostics.py tests/test_local_launchers.py
 
       - name: Parse PowerShell
         shell: pwsh
@@ -54,6 +55,54 @@ jobs:
         shell: pwsh
         run: |
           python -m pytest tests/test_tunnel_setup_diagnostics.py tests/test_setup_python_diagnostics.py tests/test_tunnel_integration.py tests/test_local_launchers.py -q
+
+      - name: Validate official tunnel-client v0.0.10 doctor JSON
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = Join-Path $env:RUNNER_TEMP 'tunnel-client-v0.0.10-windows-amd64.zip'
+          $unpack = Join-Path $env:RUNNER_TEMP 'tunnel-client-v0.0.10'
+          Invoke-WebRequest -Uri 'https://github.com/openai/tunnel-client/releases/download/v0.0.10/tunnel-client-v0.0.10-windows-amd64.zip' -OutFile $zip
+          $expectedZipSha256 = '5e64a056f1d96786da0a6f8db1da5f5f4a03fd19a90d951a25cf2ca8d9093d00'
+          $actualZipSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLowerInvariant()
+          if ($actualZipSha256 -ne $expectedZipSha256) { throw "official tunnel-client ZIP digest mismatch: $actualZipSha256" }
+          Expand-Archive -LiteralPath $zip -DestinationPath $unpack -Force
+          $client = Get-ChildItem -LiteralPath $unpack -Filter tunnel-client.exe -File -Recurse | Select-Object -First 1
+          if ($null -eq $client) { throw 'tunnel-client.exe missing from official archive' }
+
+          . .\secure-mcp-tunnel.ps1
+          $probeRoot = Join-Path $env:RUNNER_TEMP 'wlmcp-tunnel-doctor-probe'
+          New-Item -ItemType Directory -Path $probeRoot -Force | Out-Null
+          $config = Join-Path $probeRoot 'config.toml'
+          $profile = Join-Path $probeRoot 'profile.yaml'
+          [IO.File]::WriteAllText($config, 'workspace_root = "C:\\Users\\Public\\workspace"' + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+          $profileText = New-TunnelProfileContent `
+            -TunnelId 'tunnel_0123456789abcdef0123456789abcdef' `
+            -ServerScript (Resolve-Path .\run-server.ps1).Path `
+            -ConfigPath $config `
+            -PidFile (Join-Path $probeRoot 'tunnel.pid') `
+            -HealthUrlFile (Join-Path $probeRoot 'health-url.txt')
+          [IO.File]::WriteAllText($profile, $profileText, [Text.UTF8Encoding]::new($false))
+
+          $secretText = 'rk-local-validation-do-not-use-0123456789'
+          $secret = [Security.SecureString]::new()
+          foreach ($character in $secretText.ToCharArray()) { $secret.AppendChar($character) }
+          $secret.MakeReadOnly()
+          try {
+            $doctor = Invoke-TunnelClientDoctor -ClientPath $client.FullName -ProfilePath $profile -Credential $secret
+          } finally {
+            $secret.Dispose()
+          }
+          if ($null -eq $doctor.Report) { throw "official doctor JSON was not parsed: $($doctor.FallbackText)" }
+          $criticalIds = @('config_source', 'profile_load', 'tunnel_id', 'control_plane_api_key', 'mcp_target', 'mcp_command_executable')
+          $criticalFailures = @($doctor.Report.Checks | Where-Object { $_.Status -eq 'FAIL' -and $_.Id -in $criticalIds })
+          if ($criticalFailures.Count -gt 0) {
+            $details = ($criticalFailures | ForEach-Object { "$($_.Id): $($_.Summary)" }) -join '; '
+            throw "official doctor rejected generated managed profile: $details"
+          }
+          $serialized = $doctor.Report | ConvertTo-Json -Depth 8 -Compress
+          if ($serialized.Contains($secretText) -or ([string]$doctor.FallbackText).Contains($secretText)) { throw 'doctor diagnostics leaked runtime API key' }
+          Write-Host "official tunnel-client doctor JSON validated; result=$($doctor.Report.Result); failed=$(@($doctor.Report.FailedChecks) -join ',')"
 
       - name: Ruff
         shell: pwsh
