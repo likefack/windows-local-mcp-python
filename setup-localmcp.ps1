@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
     # 回帰テストでは対話 UI を起動せず、設定関数だけを読み込みます。
     [switch]$FunctionsOnly
@@ -127,16 +127,45 @@ function Invoke-Python {
         [Parameter(Mandatory = $true)][string[]]$Arguments
     )
 
-    $output = & $PythonPath @Arguments 2>&1
-    $exitCode = $LASTEXITCODE
-    if ($exitCode -ne 0) {
-        $details = ($output | Out-String).Trim()
-        if ([string]::IsNullOrWhiteSpace($details)) {
-            $details = "終了コード $exitCode"
-        }
-        throw "Python の処理に失敗しました: $details"
+    if (-not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) {
+        throw "Python executable が見つかりません: $PythonPath"
     }
-    return $output
+
+    # Windows PowerShell 5.1 treats native stderr records as PowerShell errors when
+    # $ErrorActionPreference is Stop. Temporarily collect them non-terminating so a
+    # multi-line Python traceback is preserved and can be reported with the exit code.
+    # Force UTF-8 only for this child process so non-ASCII paths do not depend on the
+    # host console code page, then restore the caller's environment exactly.
+    $previousErrorActionPreference = $ErrorActionPreference
+    $previousPythonIoEncoding = $env:PYTHONIOENCODING
+    $output = @()
+    $exitCode = $null
+    try {
+        $ErrorActionPreference = "Continue"
+        $env:PYTHONIOENCODING = "utf-8"
+        $output = @(& $PythonPath @Arguments 2>&1)
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+        if ($null -eq $previousPythonIoEncoding) {
+            Remove-Item Env:PYTHONIOENCODING -ErrorAction SilentlyContinue
+        } else {
+            $env:PYTHONIOENCODING = $previousPythonIoEncoding
+        }
+    }
+
+    $lines = @($output | ForEach-Object { $_.ToString() })
+    if ($null -eq $exitCode) {
+        throw "Python の処理を開始できませんでした: $PythonPath"
+    }
+    if ($exitCode -ne 0) {
+        $details = ($lines -join [Environment]::NewLine).Trim()
+        if ([string]::IsNullOrWhiteSpace($details)) {
+            $details = "標準出力・標準エラーに詳細はありません。"
+        }
+        throw "Python の処理に失敗しました（終了コード $exitCode）: $details"
+    }
+    return $lines
 }
 
 function Test-WlmcpImport {
