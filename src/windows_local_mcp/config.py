@@ -644,12 +644,20 @@ def _windows_acl_candidate_codecs() -> tuple[str, ...]:
 def _legacy_acl_digest_candidates_from_raw(raw: bytes) -> set[str]:
     """Reconstruct v1 text digests across plausible Windows console encodings."""
     codecs = _windows_acl_candidate_codecs()
-    logical_texts = {raw.decode("utf-8", errors="replace")}
+    decoded_texts = {raw.decode("utf-8", errors="replace")}
     for codec in codecs:
         try:
-            logical_texts.add(raw.decode(codec, errors="strict"))
+            decoded_texts.add(raw.decode(codec, errors="strict"))
         except (LookupError, UnicodeDecodeError):
             continue
+
+    # v1 used subprocess text mode, which normalized CRLF before hashing.
+    # Preserve both forms when reconstructing a marker from localized icacls output.
+    logical_texts = set(decoded_texts)
+    logical_texts.update(
+        text.replace("\r\n", "\n").replace("\r", "\n")
+        for text in decoded_texts
+    )
 
     digests: set[str] = set()
     for text in logical_texts:

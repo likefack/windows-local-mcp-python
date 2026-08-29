@@ -301,6 +301,7 @@ def test_legacy_acl_digest_candidates_bridge_windows_console_encodings() -> None
     )
     legacy_raw = logical.encode("cp932")
     legacy_text = legacy_raw.decode("utf-8", errors="replace")
+    legacy_text = legacy_text.replace("\r\n", "\n").replace("\r", "\n")
     legacy_digest = hashlib.sha256(legacy_text.encode("utf-8")).hexdigest()
 
     current_raw = logical.encode("utf-8")

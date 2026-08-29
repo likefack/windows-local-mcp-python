@@ -180,7 +180,7 @@ def test_settings_menu_displays_summary_and_atomically_changes_workspace(
     assert f'workspace_root = "{toml_path(new_workspace)}"' in config.read_text(
         encoding="utf-8"
     ), output
-    assert f'data_dir = "{toml_path(new_data_dir)}"' in config.read_text(encoding="utf-8")
+    assert f'data_dir = "{toml_path(new_data_dir.resolve())}"' in config.read_text(encoding="utf-8")
 
 
 @pytest.mark.skipif(os.name != "nt", reason="PowerShell config replacement is Windows-only")

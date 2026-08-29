@@ -352,7 +352,7 @@ function Test-TunnelLocalMcpConfiguration {
             "print('workspace_root=' + str(settings.workspace_root))",
             "print('data_dir=' + str(settings.data_dir))"
         ) -join "; "
-        $output = @(& $PythonPath -I -B -c $probe 2>$null)
+        $output = @(& $PythonPath -X utf8 -I -B -c $probe 2>$null)
         if ($LASTEXITCODE -ne 0) {
             return [PSCustomObject]@{ Valid = $false; WorkspaceRoot = $null; DataDir = $null }
         }
