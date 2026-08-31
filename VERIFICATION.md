@@ -38,7 +38,7 @@
 
 - 通常の Windows user 文脈で Tunnel／launcher／PowerShell focused pytest: `39 passed in 24.25s`。
 - 制限環境内の先行実行では `34 passed, 4 deselected`。除外した4件は、Credential Manager 書き込み1件と既存 `.bat` 読み取り3件が制限環境で拒否されたためであり、同じ4件を含む上記の通常 Windows user 実行では成功した。
-- 新しい分類テストは、`profile-file` という語を含む API Key check が profile 異常へ誤分類されないこと、既知 check ごとの分類、未知 check の fail-closed、限定 fallback、doctor 生出力の非保持を確認した。
+- 新しい分類テストは、`profile-file` という語を含む API Key check が profile 異常へ誤分類されないこと、既知 check ごとの分類、未知の check の fail-closed、限定 fallback、doctor 生出力の非保持を確認した。
 - v0.0.10 の `config_source` が `--profile-file` の `.yaml` suffix を要求するため、managed staging path も `.yaml` で終わることを回帰テストで固定した。`config_source` と `profile_load` は別の診断コードとして扱う。
 - focused Ruff `--no-cache`: pass。変更した PowerShell 3ファイルの parser: pass。`git diff --check`: whitespace error なし（既存の改行コード warning のみ）。
 
@@ -139,7 +139,7 @@ pre-closure の詳細な検証履歴、過去の capability-reduction checkpoint
 
 - production service: `WindowsLocalMCPApprovedHost` / LocalSystem / protected SCM DACL。
 - durable state: `%ProgramData%\WindowsLocalMCP\ApprovedHostAuthority` / LocalSystem owner / protected SYSTEM+Administrators DACL。
-- final command: authenticated pipe requester PID／create-time／SID／non-elevated token を検証し、`CreateProcessAsUserW` で suspended child を作成する。child を SYSTEM へ昇格しない。
+- final command: authenticated pipe requester PID／create-time／SID／non-elevated token を検証し、`CreateProcessAsUserW` で suspended child を作成する。child を SYSTEM に昇格しない。
 - SYSTEM worker-owned Job Object へ child を assign してから resume する。
 - requester-user WMI／CIM process census を保持し、`Win32_Process.Create` 等による Job 外 same-user helper を postflight まで fail closed に追跡する。
 - SYSTEM-owned immutable `active.json` は normal verified completion まで残す。worker loss、service restart、channel loss、postflight uncertainty、epoch mismatch では解除せず `recovery_required` とする。
@@ -293,3 +293,18 @@ Live verification limitation:
 ## Historical verification record
 
 WLMCP-R2-001 closure 前の詳細な repository-wide verification chronology は `VERIFICATION_HISTORY_PRE_R2_001_CLOSURE.md` を参照する。そこに記録された古い `LIVE VERIFICATION PENDING`、capability-reduction、Round 2 `unresolved / release blocker` 等は historical point-in-time evidence として保持し、上記 current verdict により supersede される。
+
+<!-- CHATGPT_LIVE_TEST_PROGRESS_V1:BEGIN -->
+## CHATGPT_LIVE_TEST_PROGRESS_V1
+
+- run_id: `20260831T2250JST-chatgpt-live`
+- test_definition_version: `CHATGPT_LIVE_TEST_V1`
+- target_repository: `likefack/windows-local-mcp-python`
+- tested_code_revision_baseline: `a09cf5372be147f46eb1f5a63e7cf4f64f659c7a`
+- progress_document_commit: `SELF`（このブロックを含む現在の Git commit。次回更新では直前 commit SHA を証拠として扱う）
+- fixture_root: `.dev-tmp/chatgpt-live/20260831T2250JST-chatgpt-live`
+
+| case_id | test_definition_version | status | tested_code_revision | main_tip_at_test | live_runtime_fingerprint | config_policy_fingerprint | executed_at | evidence_summary | operation_id または監査参照 | reusable | rerun_condition |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| CONN-01 | CHATGPT_LIVE_TEST_V1 | RUNNING | a09cf5372be147f46eb1f5a63e7cf4f64f659c7a | a09cf5372be147f46eb1f5a63e7cf4f64f659c7a | pending | pending | 2026-08-31T22:50:53+09:00 | 開始前記録。Secure MCP Tunnel ready と実 MCP tool 応答を実経路で確認する。 | pending | false | 実 Tunnel／LocalMCP 応答と runtime／config fingerprint を取得して終端判定する。 |
+<!-- CHATGPT_LIVE_TEST_PROGRESS_V1:END -->
