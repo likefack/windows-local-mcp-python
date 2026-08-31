@@ -626,6 +626,110 @@ def test_image_conversion_uses_distinct_hash_bound_output_path(
         )
 
 
+def test_xlsx_apply_preserves_source_when_writing_distinct_output_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, root = load_server(tmp_path, monkeypatch)
+    monkeypatch.setattr(server, "assert_control_plane_healthy", lambda _settings: None)
+    source = root / "source.xlsx"
+    original = xlsx_bytes()
+    source.write_bytes(original)
+    source_sha256 = sha256_bytes(original)
+
+    result = server.structured_file_apply(
+        "source.xlsx",
+        [{"op": "cell_set", "sheet": "Data", "cell": "A2", "value": "edited"}],
+        expected_sha256=source_sha256,
+        output_path="edited.xlsx",
+    )
+
+    output = root / "edited.xlsx"
+    output_bytes = output.read_bytes()
+    assert source.read_bytes() == original
+    assert sha256_bytes(source.read_bytes()) == source_sha256
+    assert result["path"] == "edited.xlsx"
+    assert result["before_sha256"] == sha256_bytes(b"")
+    assert result["after_sha256"] == sha256_bytes(output_bytes)
+    assert result["after_sha256"] != source_sha256
+    book = load_workbook(output, data_only=False)
+    try:
+        assert book["Data"]["A2"].value == "edited"
+    finally:
+        book.close()
+
+
+def test_xlsx_apply_existing_output_requires_and_checks_output_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, root = load_server(tmp_path, monkeypatch)
+    monkeypatch.setattr(server, "assert_control_plane_healthy", lambda _settings: None)
+    source = root / "source.xlsx"
+    output = root / "edited.xlsx"
+    source_bytes = xlsx_bytes()
+    output_bytes = xlsx_bytes()
+    source.write_bytes(source_bytes)
+    output.write_bytes(output_bytes)
+    source_sha256 = sha256_bytes(source_bytes)
+    output_sha256 = sha256_bytes(output_bytes)
+
+    with pytest.raises(ValueError, match="expected_output_sha256 is required"):
+        server.structured_file_apply(
+            "source.xlsx",
+            [{"op": "cell_set", "sheet": "Data", "cell": "A2", "value": "edited"}],
+            expected_sha256=source_sha256,
+            output_path="edited.xlsx",
+        )
+    assert output.read_bytes() == output_bytes
+
+    with pytest.raises(RuntimeError, match="expected_output_sha256 mismatch"):
+        server.structured_file_apply(
+            "source.xlsx",
+            [{"op": "cell_set", "sheet": "Data", "cell": "A2", "value": "edited"}],
+            expected_sha256=source_sha256,
+            output_path="edited.xlsx",
+            expected_output_sha256="0" * 64,
+        )
+    assert output.read_bytes() == output_bytes
+
+    result = server.structured_file_apply(
+        "source.xlsx",
+        [{"op": "cell_set", "sheet": "Data", "cell": "A2", "value": "edited"}],
+        expected_sha256=source_sha256,
+        output_path="edited.xlsx",
+        expected_output_sha256=output_sha256,
+    )
+    updated_bytes = output.read_bytes()
+    assert source.read_bytes() == source_bytes
+    assert result["path"] == "edited.xlsx"
+    assert result["before_sha256"] == output_sha256
+    assert result["after_sha256"] == sha256_bytes(updated_bytes)
+    book = load_workbook(output, data_only=False)
+    try:
+        assert book["Data"]["A2"].value == "edited"
+    finally:
+        book.close()
+
+
+def test_xlsx_apply_rejects_output_path_alias_of_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, root = load_server(tmp_path, monkeypatch)
+    monkeypatch.setattr(server, "assert_control_plane_healthy", lambda _settings: None)
+    source = root / "source.xlsx"
+    original = xlsx_bytes()
+    source.write_bytes(original)
+    (root / "nested").mkdir()
+
+    with pytest.raises(ValueError, match="output_path|same|distinct"):
+        server.structured_file_apply(
+            "source.xlsx",
+            [{"op": "cell_set", "sheet": "Data", "cell": "A2", "value": "edited"}],
+            expected_sha256=sha256_bytes(original),
+            output_path="nested/../source.xlsx",
+        )
+    assert source.read_bytes() == original
+
+
 def test_structured_edits_reject_oversized_ranges_before_materialization(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

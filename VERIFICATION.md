@@ -1,5 +1,21 @@
 # 検証記録
 
+## 2026-08-31 Approval UI Live Activity の人間向け表示
+
+### 実装と自動回帰
+
+- Approval UI専用のread-only投影を`live_activity.py`へ分離し、Audit／Activity Monitor／Timeline／承認実行の責務を変更せず、Read、Edited、Running、Finished、Approval、Uploaded、Downloaded、Failed、Rejected、Interrupted、Cancelled、Undone、Rolled back等へ分類した。
+- structured processingはAuditで確定したformatとtargetだけを使用する。artifact transferはbegin operation、chunk event、commit operationをtransfer IDで相関し、chunkごとの行を抑止した。Selective Undoとpoint-in-time rollbackは承認requestのbounded preview metadataだけを表示に使い、両者とUndoのUndoを区別する。
+- Live Activityのsummaryはallowlistしたmetadataだけを使用し、redaction、C0／C1、ANSI、双方向制御、surrogate、200文字上限を適用する。通常行にoperation ID、request hash、approval statusを出さず、request payload、stdout／stderr、file content、diffを読んでsummaryを作らない。
+- focused Live Activity: `30 passed`。Activity Monitor、transfer Timeline、rollback／Undo、approval、audit、server operation、structured file、approval UI launcher、Approved Host承認実行統合を含む最終関連回帰は、通常Windows user文脈で`142 passed, 1 skipped`。
+- 同じ関連回帰を制限環境内で先に実行した結果は、SCM queryが`sc.exe exited with 5`となり`31 failed, 102 passed, 1 skipped`だった。通常Windows user文脈で全対象が合格したため、これはLive Activity回帰ではなく制限環境のSCMアクセス境界として扱う。
+- repository全体のRuff `--no-cache`、`compileall -q src tests`、`git diff --check`はpass。Audit schema、server operation記録、承認claim、checkpoint、transaction、recovery、Approved Host／Sandbox／Automatic Gitの実行経路は変更していない。
+
+### 実機E2Eの境界
+
+- ChatGPT -> Secure MCP Tunnel -> 実Windows Local MCP -> 実workspace／Audit DB／Approval UIの受入試験は、この実装環境からは未実施。
+- 完成した試験手順は`docs/LIVE_ACTIVITY_E2E_ACCEPTANCE_PROMPT.md`に保存した。実経路、実ファイル、実Live Activity、Audit／Activity、ローカル承認後のUndo／rollbackを確認できるまで、実機E2EをPASSと扱わない。
+
 ## 2026-08-31 Approved Sandbox child 起動前の execution TTL 消費
 
 ### 実 audit による原因確定

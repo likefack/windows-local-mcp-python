@@ -3,13 +3,18 @@ from __future__ import annotations
 import json
 import threading
 import time
-from datetime import datetime
 
 from .approval import verify_approval_bundle
-from .audit import TERMINAL_STATUSES, AuditStore
+from .audit import AuditStore
 from .config import Settings, load_settings
 from .control_plane import assert_trusted_runtime, verify_control_plane_generation
 from .executor import Executor
+from .live_activity import (
+    LiveActivityTracker,
+    activity_detail,
+    format_activity,
+    terminal_safe,
+)
 from .policy import NormalizedCommand, approved_request_hash
 from .resources import WorkspaceExecutionLock
 from .risk import command_risk_facts
@@ -25,31 +30,23 @@ from .workspace_history import (
     workspace_recovery_required,
 )
 
-_BIDI_CONTROLS = set("\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
-
 
 def _terminal_safe(value: object) -> str:
-    """Make request-controlled text inert in a terminal approval boundary."""
-    text = str(value)
-    return "".join(
-        f"\\u{ord(character):04x}"
-        if ord(character) < 0x20
-        or 0x7F <= ord(character) <= 0x9F
-        or character in _BIDI_CONTROLS
-        else character
-        for character in text
-    )
+    """既存の承認画面呼び出し向けに terminal_safe を再公開する。"""
 
-_READ_ACTIVITY_TOOLS = {"list_directory", "read_file", "get_image", "git_info"}
-_COMMAND_ACTIVITY_TOOLS = {
-    "execute_readonly",
-    "execute_workspace_write",
-    "adb_read",
-    "request_host_command",
-    "request_sandbox_command",
-    "request_workspace_rollback",
-    "request_selective_undo",
-}
+    return terminal_safe(value)
+
+
+def _activity_detail(operation: dict[str, object]) -> str:
+    """既存の内部呼び出し向けに人間向け detail を再公開する。"""
+
+    return activity_detail(operation)
+
+
+def _format_activity(operation: dict[str, object]) -> str | None:
+    """既存公開関数の互換ラッパー。"""
+
+    return format_activity(operation)
 
 
 def _show(item: dict[str, object]) -> None:
@@ -153,89 +150,12 @@ def _show(item: dict[str, object]) -> None:
     print("=" * 80)
 
 
-def _activity_detail(operation: dict[str, object]) -> str:
-    tool = str(operation.get("tool_name") or "operation")
-    request = operation.get("request")
-    if isinstance(request, dict):
-        path = request.get("path")
-        if isinstance(path, str) and path:
-            return f"{tool} {path}"
-        safe_request = request.get("safe_request")
-        if isinstance(safe_request, dict):
-            program = safe_request.get("program")
-            args = safe_request.get("args")
-            if isinstance(program, str):
-                short_args = ""
-                if isinstance(args, list):
-                    short_args = " ".join(str(value) for value in args[:3])
-                return f"{program} {short_args}".strip()
-        target_operation = request.get("target_operation_id")
-        if isinstance(target_operation, str):
-            return f"{tool} target={target_operation}"
-    return tool
-
-
-def _format_activity(operation: dict[str, object]) -> str | None:
-    tool = str(operation.get("tool_name") or "")
-    status = str(operation.get("status") or "")
-
-    if status == "pending_approval" and tool in {
-        "request_host_command",
-        "request_sandbox_command",
-        "request_workspace_rollback",
-        "request_selective_undo",
-    }:
-        label = "Approval"
-    elif status in {"queued", "running", "approved"} and tool in _COMMAND_ACTIVITY_TOOLS:
-        label = "Running"
-    elif status == "succeeded" and tool == "write_file":
-        label = "Edited"
-    elif status == "succeeded" and tool in _READ_ACTIVITY_TOOLS:
-        label = "Read"
-    elif status in TERMINAL_STATUSES and tool in _COMMAND_ACTIVITY_TOOLS:
-        label = "Finished"
-    else:
-        return None
-
-    timestamp = str(operation.get("updated_at") or operation.get("created_at") or "")
-    try:
-        when = datetime.fromisoformat(timestamp).astimezone().strftime("%H:%M:%S")
-    except (TypeError, ValueError):
-        when = "--:--:--"
-    detail = _activity_detail(operation)
-    suffix = ""
-    if label == "Finished":
-        suffix = f" [{status}]"
-    return _terminal_safe(f"[{when}] {label:<8} {detail}{suffix}")
-
-
 def _activity_loop(audit: AuditStore, stop: threading.Event, paused: threading.Event) -> None:
-    # Establish a baseline so old successful operations are not replayed on every UI start.
-    baseline = audit.list_operations(limit=200)
-    seen: dict[str, tuple[str, str]] = {
-        str(item["id"]): (str(item.get("status") or ""), str(item.get("updated_at") or ""))
-        for item in baseline
-    }
-    for item in reversed(baseline):
-        if item.get("status") in {"queued", "running"}:
-            full = audit.get_operation(str(item["id"]), include_events=False)
-            line = _format_activity(full)
-            if line:
-                print(line, flush=True)
-
-    while not stop.wait(0.5):
-        if paused.is_set():
-            continue
-        for item in reversed(audit.list_operations(limit=200)):
-            operation_id = str(item["id"])
-            signature = (str(item.get("status") or ""), str(item.get("updated_at") or ""))
-            if seen.get(operation_id) == signature:
-                continue
-            seen[operation_id] = signature
-            full = audit.get_operation(operation_id, include_events=False)
-            line = _format_activity(full)
-            if line:
-                print(line, flush=True)
+    tracker = LiveActivityTracker(audit)
+    # The first poll establishes a no-replay baseline while still showing pending/running work.
+    for line in tracker.poll_once(emit=True):
+        print(line, flush=True)
+    tracker.run(stop, paused, output=print)
 
 
 def run_approval_ui(settings: Settings | None = None) -> None:
@@ -244,7 +164,10 @@ def run_approval_ui(settings: Settings | None = None) -> None:
     audit = AuditStore(settings)
     executor = Executor(settings, audit)
     print(f"Audit DB: {audit.db_path}")
-    print("Live activity: Read / Edited / Running / Finished")
+    print(
+        "Live activity: Read / Edited / Running / Finished / Approval / Uploaded / "
+        "Downloaded / Failed / Rejected / Interrupted / Cancelled / Undone / Rolled back"
+    )
     print("Pending approvals: y=approve and run once, n=reject, s=skip, q=quit")
 
     stop_activity = threading.Event()

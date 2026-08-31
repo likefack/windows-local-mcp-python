@@ -103,7 +103,9 @@ run-localmcp.bat -Config C:\path\to\config.toml
 
 `run-localmcp.bat` は `run-localmcp.ps1` を呼び出します。PowerShell 側で UTF-8 の active config を読み、Tunnel integration が有効なら profile／client／Credential Manager／ready 状態を確認して Tunnel 経由で `run-server.ps1 -Config` を一度だけ起動します。無効または未設定なら、従来の `run-server.ps1 -Config` へ直接渡します。
 
-起動中は、`activity_timeline`／`audit_list` と同じ `<data_dir>\audit.db` を別プロセスが読み取り専用で確認し、起動後に発生した操作と状態変化をこのウィンドウへ一行ずつ表示します。表示項目は操作 ID、ツール、実行経路、状態、承認状態、安全に伏せ字化したコマンドまたは対象の短い要約です。承認待ちは `PENDING_APPROVAL 要承認` と表示します。初期設定では`run-approvals.ps1`の別画面も自動起動し、承認または拒否はその画面で行います。
+起動中は、低レベルの Activity Monitor が `activity_timeline`／`audit_list` と同じ `<data_dir>\audit.db` を別プロセスから読み取り専用で確認し、起動後に発生したoperation lifecycleを一行ずつ表示します。表示項目は操作 ID、ツール、実行経路、状態、承認状態、安全に伏せ字化したコマンドまたは対象の短い要約です。承認待ちは `PENDING_APPROVAL 要承認` と表示します。
+
+初期設定で別ウィンドウに自動起動する`run-approvals.ps1`は、承認または拒否を行うローカル境界です。その画面のLive ActivityはActivity Monitorと別の人間向け投影で、ファイルの読み取り・編集、構造化処理、artifact転送、コマンド、失敗・拒否、Selective Undo、point-in-time rollbackを簡潔に表示します。監査・診断・poll操作は通常表示せず、詳細は`activity_get`／`audit_get`で確認します。Live Activityの表示内容は承認やsecurity decisionには使用されません。
 
 `approval_ui_autostart=true`の場合、選択済みserver runtimeと同じ場所の承認ランチャーを、同じconfigで通常ユーザーの可視なWindows PowerShell 5.1ウィンドウとして起動します。同じconfigの画面を手動起動済みなら名前付きmutexで二重起動を防ぎます。自動起動した画面だけを`run-localmcp.bat`が追跡し、終了時に通常のウィンドウ終了を要求します。画面が応答しない場合はPython承認プロセスを孤立させる強制終了を行わず、手動終了を案内します。起動失敗時も承認を省略せず、必要なら`run-approvals.ps1 -Config <path>`を手動実行します。設定確認・変更メニューの`承認画面の自動起動を有効化 / 無効化する`で切り替えられます。
 

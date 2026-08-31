@@ -29,3 +29,4 @@ diagnostics/hardening/
 diagnostics/c45-smoke-probe/
 diagnostics/c5-concurrency-probe/
 docs/セキュリティスキャン
+docs/テスト用プロンプト

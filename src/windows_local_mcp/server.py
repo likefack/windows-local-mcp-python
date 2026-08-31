@@ -1135,12 +1135,16 @@ def structured_file_apply(
         distinct_output = PureWindowsPath(target_path).as_posix().casefold() != PureWindowsPath(
             path
         ).as_posix().casefold()
-        if distinct_output and kind != "image":
-            raise ValueError("output_path is currently supported only for image transformations")
+        if distinct_output and kind not in {"image", "xlsx"}:
+            raise ValueError(
+                "output_path is currently supported only for XLSX and image transformations"
+            )
+        if distinct_output and infer_format(target_path) != kind:
+            raise ValueError("output_path extension must match the source structured format")
         if not distinct_output and expected_output_sha256 is not None:
             raise ValueError("expected_output_sha256 is only valid for a distinct output_path")
         allow_create = kind in {"csv", "tsv", "zip"} and not distinct_output
-        _target, prepared_source, source_exists = _read_bounded_binary(
+        source_target, prepared_source, source_exists = _read_bounded_binary(
             path, allow_missing=allow_create
         )
         prepared_sha = sha256_bytes(prepared_source)
@@ -1149,9 +1153,13 @@ def structured_file_apply(
         if expected_sha256 is not None and expected_sha256 != prepared_sha:
             raise RuntimeError("expected_sha256 mismatch; source is stale or concurrently modified")
         if distinct_output:
-            _output_target, prepared_output, output_exists = _read_bounded_binary(
+            output_target, prepared_output, output_exists = _read_bounded_binary(
                 target_path, allow_missing=True
             )
+            # Lexically different spellings can still resolve to the source file through
+            # ``.`` or ``..`` components. Keep copy-on-edit unambiguous and fail closed.
+            if output_target == source_target:
+                raise ValueError("output_path must resolve to a distinct file")
             if output_exists and expected_output_sha256 is None:
                 raise ValueError(
                     "expected_output_sha256 is required when replacing an existing output file"

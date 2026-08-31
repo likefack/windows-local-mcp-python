@@ -123,7 +123,9 @@ Tunnel 設定後は、`run-localmcp.bat` が profile、tunnel-client の実体�
 
 後から変更する場合は `configure-localmcp.bat` の `2. 現在の設定を確認・変更する` を選びます。概要を確認したうえで、workspace の変更、Tunnel ID／client／profile の変更、Runtime API Key の単独ローテーション、Tunnel の有効化・無効化、Codex Sandbox／Automatic Git の有効化・無効化、Approved Host 運用用実行環境の設定、active config の変更、診断、保存済み key の削除を行えます。新規設定では Codex Sandbox と Automatic Git を有効、Approved Host を無効にします。有効化は利用意図の設定であり、Sandbox／Git の現在の実体と実機検証記録が一致しなければ実行経路は引き続き利用不可です。Key の切り替えに失敗した場合は、旧 key を維持します。
 
-`run-localmcp.bat` のウィンドウには、起動後に作成された監査操作と状態変化を一行ずつ表示します。`activity_timeline`／`audit_list` と同じ監査DBを読み取り専用で参照し、操作 ID、ツール、実行経路、状態、承認状態、安全に伏せ字化したコマンドまたは対象の要約を表示します。ローカル承認が必要になると `PENDING_APPROVAL 要承認` を表示します。初期設定では同じconfigの`run-approvals.ps1`も可視な別ウィンドウで一つだけ自動起動するため、その画面で承認または拒否します。生の要求・結果、ファイル内容、標準出力・標準エラー、Runtime API Key は表示・保存しません。
+`run-localmcp.bat` のウィンドウには、低レベルの Activity Monitor が、起動後に作成された監査操作と lifecycle の変化を一行ずつ表示します。`activity_timeline`／`audit_list` と同じ監査DBを読み取り専用で参照し、操作 ID、ツール、実行経路、状態、承認状態、安全に伏せ字化したコマンドまたは対象の要約を表示します。ローカル承認が必要になると `PENDING_APPROVAL 要承認` を表示します。
+
+初期設定では、同じconfigの`run-approvals.ps1`も可視な別ウィンドウで一つだけ自動起動します。この承認画面の Live Activity は低レベル monitor と異なり、現在PC上で意味のある活動を `Read`、`Edited`、`Running`、`Uploaded`、`Downloaded`、`Failed`、`Rejected`、`Undone`、`Rolled back` などの人間向け分類で簡潔に表示します。承認または拒否はこの画面で行います。どちらの表示も生の要求・結果、ファイル内容、diff本文、標準出力・標準エラー、Runtime API Key を表示・保存しません。
 
 同じ行は `<data_dir>\logs\localmcp-activity.log` に UTF-8 で保存します。5 MiB ごとに切り替え、過去10ファイルまで保持します。Tunnel client 自身の生出力は秘密情報を含む可能性があるため、従来どおり画面にもログにも流しません。
 
@@ -407,7 +409,7 @@ ADB helper は設定済み path、SHA-256、file identity を正規化時と wor
 ## 構造化ファイル
 
 - **DOCX**: paragraph／run、検索置換、表、header/footer、style、section、page 設定、metadata。通常文書は文書ライブラリで処理します。追跡変更、コメント、macro、埋め込み object、データ連動 Custom XML などがある文書でも、電子署名がなく、操作が `replace_text` または `metadata_set` に限定される場合は、対象 XML 部分だけを書き換えて未対応部分を保持します。それ以外の操作は拒否します。
-- **XLSX**: 値／数式、範囲、行列、sheet、copy/fill、書式、merge、freeze pane、filter、Table、入力規則、条件付き書式、基本 chart／page setup。macro、pivot、外部接続、未対応拡張等がある workbook でも、電子署名がなく、操作が `cell_set`、`range_set`、`range_clear` に限定される場合は、対象 worksheet XML だけを書き換えて未対応部分を保持します。それ以外の操作は拒否します。
+- **XLSX**: 値／数式、範囲、行列、sheet、copy/fill、書式、merge、freeze pane、filter、Table、入力規則、条件付き書式、基本 chart／page setup。`output_path` に別の `.xlsx` を指定すると原本を残して編集済みファイルを作成でき、入力には `expected_sha256`、既存の出力先には `expected_output_sha256` が必要です。macro、pivot、外部接続、未対応拡張等がある workbook でも、電子署名がなく、操作が `cell_set`、`range_set`、`range_clear` に限定される場合は、対象 worksheet XML だけを書き換えて未対応部分を保持します。それ以外の操作は拒否します。
 - **CSV／TSV**: 範囲、cell／row／column、append／insert／delete。encoding、BOM、delimiter、quote 設定、newline、final newline を識別して保持し、判定が曖昧なら拒否します。ただし編集後は CSV writer が全体を書き直すため、未変更 cell の意味は保持しても元の quoting 表記や byte identity は保証しません。この範囲は inspect／apply 結果の `preservation_capabilities` に表示します。
 - **ZIP**: listing、read、create/update、複数展開。traversal、絶対 path、ADS、予約名、大小文字衝突、件数、展開後容量を検査し、複数 file は transaction で一括反映します。
 - **画像**: inspect、resize、thumbnail、crop、rotate、flip、形式変換、quality、metadata 除去。形式変換では `output_path` を別指定し、入力には `expected_sha256`、既存出力には `expected_output_sha256` を使います。pixel／decoded memory を制限し、未対応の multi-frame は破壊的変換せず拒否します。
@@ -485,9 +487,24 @@ $env:LOCAL_MCP_CONFIG = 'C:\path\to\config.local.toml'
 
 ## 活動履歴と変更の取り消し
 
-活動履歴とタイムラインには、読み取り、編集、実行中、完了などの状態、実行経路、通信の制限、変更前後、競合、失敗、復旧、出力の要約、取り消しが可能かどうかを記録します。詳しくは `activity_get` と `audit_get` で確認できます。
+Audit、Activity Monitor、Timeline、承認画面の Live Activity は、同じ記録を別の目的で扱います。
+
+| 表示・記録 | 役割 |
+| --- | --- |
+| Audit | operation ID、tool、route、status、approval、request／result、rollback／recoveryなどを含む完全な技術監査証跡 |
+| Activity Monitor | `audit.db` の NEW／UPDATE、tool、route、status、approval status、bounded summaryを起動ウィンドウへ表示する低レベル監視 |
+| `activity_timeline`／`activity_get` | 過去operationの軽量一覧と、必要時のbounded preview／diff／event／詳細 |
+| Approval UI Live Activity | 現在PC上で何をしているか、成功・失敗・拒否・転送・Undo／rollbackを人間向けに表示 |
+
+Live Activityは、ファイルの読み取り／編集、構造化ファイル処理、コマンド、artifactの送受信、重要な失敗や拒否、承認待ち、Undo／rollbackを表示します。artifactのbegin／chunk／commitは可能な範囲で一つの転送として扱います。`audit_list`、`audit_get`、`activity_timeline`、`activity_get`、`session_info`、poll等の監査・診断・metadata取得は、通常のLive Activityを埋めないよう意図的に表示しません。技術詳細は`activity_get`と`audit_get`で確認してください。Live Activityは観測用であり、承認、policy、checkpoint、transaction、rollbackその他のsecurity decisionの根拠にはなりません。
 
 checkpoint で戻せるのは、記録対象になった通常の作業ファイルです。`.git`、Windows のアクセス権、端末、ネットワーク、外部サービス、別のプログラムが行った変更は戻せません。選択的な Undo は独立したテキスト変更に使えますが、バイナリファイルや判断できない競合では停止します。
+
+`request_selective_undo`は、指定した一つのoperationが行った変更だけを取り消します。`request_workspace_rollback`は、指定したoperation完了時点の状態へ対象scopeを戻します。対象operationの選択はChatGPT／MCP client側が行い、Windows Approval UIは提示されたpreview、対象、create／restore／delete、理由とriskを人が確認する実行前境界です。どちらもローカル承認を省略できません。Undo／rollback自体も通常のmutation operationとしてbefore／after checkpointを持つため、後からSelective Undoの対象にできます。
+
+承認後もcurrent stateとpreview、checkpoint manifest、参照blobを再検証し、workspace mutation lock、staging、transaction journal、apply、post-apply verificationを通します。独立した後続のUTF-8 text変更は可能な範囲で保持し、曖昧または重複するtext、変更済みbinary、判断できないfile lifecycleはconflictとして停止し、推測上書きしません。適用失敗から開始状態へ安全に戻せた場合は`failed_recovered`、安全に復旧を証明できない場合は`recovery_required`として後続mutationを停止します。
+
+実機での受入試験は [Live Activity 実機 E2E 受入試験プロンプト](docs/LIVE_ACTIVITY_E2E_ACCEPTANCE_PROMPT.md) を使用します。単体テスト、モック、コードリーディング、CIだけで実機E2EをPASSにしてはいけません。
 
 `write_file`、1 ファイルの構造化編集、処理結果の確定、複数の ZIP 展開は、対象として明示したファイルだけを記録し、他の変更との競合を確認します。入力と出力が複数ある場合は、関係する場所をまとめて確認します。任意のプログラムがどこへ書き込むか事前に分からない場合は、作業領域全体を checkpoint の対象にします。
 
