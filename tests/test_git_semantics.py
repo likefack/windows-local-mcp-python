@@ -322,3 +322,123 @@ def test_projection_preserves_clean_crlf_worktree_semantics(tmp_path: Path) -> N
         assert b"tracked.txt" in false_status
     finally:
         shutil.rmtree(control.root, ignore_errors=True)
+
+
+def test_projection_keeps_status_and_diff_consistent_for_sanitized_attributes(
+    tmp_path: Path,
+) -> None:
+    git = shutil.which("git.exe") or shutil.which("git")
+    if git is None:
+        pytest.skip("Git is not installed")
+    settings = _settings(tmp_path)
+    subprocess.run(
+        [git, "init", str(settings.workspace_root)],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        check=True,
+        shell=False,
+    )
+    subprocess.run(
+        [git, "-C", str(settings.workspace_root), "config", "core.autocrlf", "true"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        check=True,
+        shell=False,
+    )
+    attributes = settings.workspace_root / ".gitattributes"
+    tracked = settings.workspace_root / "tracked.bin"
+    attributes.write_bytes(b"*.bin text working-tree-encoding=UTF-16\n")
+    tracked.write_bytes(b"\xff\xfe" + "tracked\n".encode("utf-16le"))
+    subprocess.run(
+        [
+            git,
+            "-C",
+            str(settings.workspace_root),
+            "add",
+            ".gitattributes",
+            "tracked.bin",
+        ],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        check=True,
+        shell=False,
+    )
+    subprocess.run(
+        [
+            git,
+            "-C",
+            str(settings.workspace_root),
+            "-c",
+            "user.name=Automatic Git Attribute Regression",
+            "-c",
+            "user.email=regression@example.invalid",
+            "commit",
+            "-m",
+            "initial",
+        ],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        check=True,
+        shell=False,
+    )
+
+    git_base = [
+        git,
+        "--no-pager",
+        "--no-optional-locks",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.untrackedCache=false",
+        "-c",
+        "diff.autoRefreshIndex=false",
+    ]
+    commands = (
+        [*git_base, "status", "--porcelain=v1", "--untracked-files=all"],
+        [*git_base, "diff", "--stat", "--name-status", "--no-ext-diff", "--no-textconv"],
+    )
+    source_status = subprocess.run(
+        commands[0],
+        cwd=settings.workspace_root,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        check=True,
+        shell=False,
+    ).stdout
+    assert source_status == b""
+
+    stage = stage_git_repository(
+        settings,
+        "attribute-consistency",
+        commands=commands,
+        inherited_core_autocrlf="true",
+    )
+    try:
+        projected_outputs = [
+            subprocess.run(
+                [command[0], "-C", str(stage.repository), *command[1:]],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                check=True,
+                shell=False,
+            ).stdout
+            for command in commands
+        ]
+        assert projected_outputs == [b"", b""]
+        projected_attributes = (stage.repository / ".gitattributes").read_bytes()
+        assert len(projected_attributes) == len(attributes.read_bytes())
+        assert projected_attributes != attributes.read_bytes()
+        assert set(projected_attributes) <= {ord("#"), ord("\n"), ord("\r")}
+    finally:
+        shutil.rmtree(stage.root, ignore_errors=True)
+
+    # If source stat evidence is stale, the Broker cannot safely emulate a project-controlled
+    # clean filter. It must reject the snapshot rather than reintroduce status/diff disagreement.
+    tracked.write_bytes(b"\xff\xfe" + "changed and larger\n".encode("utf-16le"))
+    with pytest.raises(GitBrokerUnavailable, match="current source index stat metadata"):
+        stage_git_repository(
+            settings,
+            "attribute-stale-index",
+            commands=commands,
+            inherited_core_autocrlf="true",
+        )

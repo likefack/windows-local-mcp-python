@@ -238,6 +238,54 @@ def test_worker_rebinds_redirector_identity_before_approved_payload_launch(
     }
 
 
+def test_approved_sandbox_does_not_spend_execution_ttl_on_optional_git_telemetry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    operation_id, _backend_value = _prepare_operation(settings, monkeypatch)
+    child = FakeChild()
+    job = FakeJob()
+    freshness_checks: list[str] = []
+
+    def reject_git_telemetry(**_kwargs: object) -> None:
+        raise AssertionError("Approved Sandbox must not run live Git telemetry")
+
+    def record_freshness(operation: dict[str, object]) -> None:
+        freshness_checks.append(str(operation["id"]))
+
+    def guarded_launch(
+        *_args: object, **kwargs: object
+    ) -> tuple[object, object, list[str], dict[str, object]]:
+        assert freshness_checks == [operation_id]
+        kwargs["on_guard_verified"](_guard_payload())
+        return child, job, ["codex", "sandbox"], _guard_payload()
+
+    monkeypatch.setattr("windows_local_mcp.worker.capture_git_snapshot", reject_git_telemetry)
+    monkeypatch.setattr(
+        "windows_local_mcp.worker._ensure_approval_execution_fresh", record_freshness
+    )
+    monkeypatch.setattr("windows_local_mcp.worker.guard_and_launch_codex_sandbox", guarded_launch)
+    monkeypatch.setattr(
+        "windows_local_mcp.worker._terminate_launched_child",
+        lambda launched, _identity: launched.terminate(),
+    )
+
+    assert run_operation(operation_id, settings) == 0
+    record = AuditStore(settings).get_operation(operation_id, include_events=True)
+    event_types = [event["event_type"] for event in record["events"]]
+
+    assert record["status"] == "succeeded"
+    assert record["child_pid"] == child.pid
+    assert record["pre_git_path"] is None
+    assert record["post_git_path"] is None
+    assert event_types.index("workspace_checkpoint_started") < event_types.index(
+        "workspace_checkpoint_completed"
+    )
+    assert event_types.index("workspace_checkpoint_completed") < event_types.index(
+        "child_started"
+    )
+
+
 def test_bootstrap_stop_prevents_worker_from_launching_payload_after_self_binding(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

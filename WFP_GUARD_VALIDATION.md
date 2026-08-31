@@ -984,6 +984,22 @@ C7 完了後も、WFP Guard だけを見て release しない。repository-wide 
 
 ---
 
+## 42.9 2026-08-31 UAC 再試行抑止への lifecycle 変更
+
+42.2～42.8 は、通常 production route から exact missing object を再構築できた時点の実機記録として保持する。
+現在仕様では、その自動再構築を通常 Sandbox／Automatic Git operation から削除した。再起動、BFE restart、object
+消失、read-back 不能、または mismatch を検出した通常 operation は child 起動前に停止し、
+`verify-codex-sandbox` の明示実行を要求する。
+
+明示 verifier は verification unit の先頭でだけ exact missing object の再構築を1回試行できる。以後の各 probe は
+非昇格 read-back に限定し、途中で状態を確認できなくなっても再 UAC を試さない。最初の固定 `exit 0` Sandbox probe が
+失敗した場合は、installed Codex の setup failure を後続 probe が繰り返さないよう残りを未検証として停止する。
+Automatic Git の明示 verifier も、最初の非ゼロ結果で残りの Git probe を起動しない。
+
+この変更は WFP read-back、marker binding、本人性確認、Guard implementation hold、child 前 verification、
+fail closed、Approved Host fallback 禁止を維持する。42.5 の通常 route 自動再構築成功は historical evidence であり、
+現在の通常 route が自動再構築するという保証には使用しない。
+
 # 43. 現在地
 
 C7 実装の開始 baseline は main commit `b81ebe654bf99d0e64d9b4e1c7a7bc1bb04d9026`、本体実装 commit は `1733701aea9ff8af0966a42a07605f646de62079` である。

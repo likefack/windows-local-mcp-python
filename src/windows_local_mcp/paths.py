@@ -596,7 +596,9 @@ class Workspace:
     def relative(self, path: Path) -> str:
         resolved = path.resolve(strict=False)
         self._check_inside(resolved)
-        return str(resolved.relative_to(self.root)) or "."
+        # Workspace-relative identifiers are persisted in manifests and journals, so keep
+        # one platform-independent spelling even when the server runs on Windows.
+        return resolved.relative_to(self.root).as_posix() or "."
 
     def is_hidden(self, path: Path) -> bool:
         try:

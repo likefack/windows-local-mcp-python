@@ -224,11 +224,14 @@ stale marker を理由に live verification を自動実行せず、`verify-code
 `Win32_Process.Create` を含む WMI／CIM brokered process creation は explicit denial probe の成功を必須とし、
 `brokered_process_creation_denied` が欠損または false の evidence は route eligible としません。
 
-WFP の static non-persistent fixed object は reboot や BFE restart で消失し得るため、marker v5 の Guard、
-policy、backend、account、OS identity がすべて現在値と一致し、object が単に missing の場合だけ、trusted
-Guard が exact object を再構築できます。その場合も `ensure → complete read-back → wfp_guard_verified →
-child launch` の順序を崩しません。既存 object の security-relevant field 不一致、conflicting object、または
-marker identity 不一致は無変更で fail closed とし、silent repair しません。
+WFP の static non-persistent fixed object は reboot や BFE restart で消失し得ます。通常の Sandbox／Automatic Git
+operation は UAC 昇格、live verification、または object 再構築を自動実行しません。起動直前の complete read-back で
+missing、unreadable、または mismatch を検出した場合は child を起動せず、`verify-codex-sandbox` の明示実行を要求します。
+明示 verifier だけが、同一 verification unit の最初に、marker v5 の Guard、policy、backend、account、OS identity が
+現在値と一致する文脈で exact missing object の再構築を1回試行できます。その場合も
+`ensure → complete read-back → probe ごとの complete read-back → child launch` の順序を崩しません。途中で object が
+消失した場合や、既存 object の security-relevant field 不一致、conflicting object、marker identity 不一致、または
+read-back 不能は追加昇格せず fail closed とします。
 
 Sandbox route の必須境界は少なくとも次です。
 

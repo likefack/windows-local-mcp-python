@@ -78,6 +78,31 @@ def test_crlf_read_identity_is_the_raw_commit_identity(
     assert target.read_bytes() == b"changed\r\n"
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"PK\x03\x04\xff\x00",
+        "従来文字".encode("cp932"),
+    ],
+    ids=["zip-binary", "non-utf8-text"],
+)
+def test_read_file_rejects_non_utf8_with_binary_download_guidance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, payload: bytes
+) -> None:
+    server, root = load_server(tmp_path, monkeypatch)
+    monkeypatch.setattr(server, "assert_control_plane_healthy", lambda _settings: None)
+    target = root / "not-utf8.bin"
+    target.write_bytes(payload)
+
+    with pytest.raises(
+        server.NonUtf8TextError,
+        match=r"not valid UTF-8 text.*artifact_download_begin",
+    ) as raised:
+        server.read_file("not-utf8.bin")
+
+    assert isinstance(raised.value, ValueError)
+
+
 def test_write_file_uses_a_target_scoped_execution_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -101,6 +126,45 @@ def test_write_file_uses_a_target_scoped_execution_lock(
     server.write_file("scoped.txt", "bounded mutation")
 
     assert locked_targets == [((root / "scoped.txt").resolve(),)]
+
+
+def test_write_file_commits_a_new_file_below_a_subdirectory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, root = load_server(tmp_path, monkeypatch)
+    monkeypatch.setattr(server, "assert_control_plane_healthy", lambda _settings: None)
+    (root / "results").mkdir()
+
+    result = server.write_file("results/fs-05.txt", "日本語のUTF-8本文")
+
+    assert result["path"] == "results/fs-05.txt"
+    assert (root / "results" / "fs-05.txt").read_text(encoding="utf-8") == "日本語のUTF-8本文"
+    assert server.workspace_recovery_required(server.runtime.settings) is False
+
+
+def test_recovered_post_write_failure_does_not_latch_workspace_mutations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, root = load_server(tmp_path, monkeypatch)
+    monkeypatch.setattr(server, "assert_control_plane_healthy", lambda _settings: None)
+    real_capture = server.capture_workspace_state
+
+    def fail_after_replacement(settings, operation_id, stage, *, paths=None):
+        if stage == "after":
+            raise RuntimeError("forced post-write failure")
+        return real_capture(settings, operation_id, stage, paths=paths)
+
+    monkeypatch.setattr(server, "capture_workspace_state", fail_after_replacement)
+    with pytest.raises(server.WorkspaceMutationError) as captured:
+        server.write_file("recovered.txt", "temporary")
+
+    assert captured.value.recovery_state == "failed_recovered"
+    assert not (root / "recovered.txt").exists()
+    assert server.workspace_recovery_required(server.runtime.settings) is False
+
+    monkeypatch.setattr(server, "capture_workspace_state", real_capture)
+    server.write_file("next.txt", "mutation remains available")
+    assert (root / "next.txt").read_text(encoding="utf-8") == "mutation remains available"
 
 
 def test_oversized_write_is_rejected_and_audited(

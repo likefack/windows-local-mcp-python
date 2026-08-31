@@ -1,9 +1,10 @@
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from windows_local_mcp import git_broker_live_verify
+from windows_local_mcp import git_broker_live_verify, git_broker_sandbox
 from windows_local_mcp.git_broker_sandbox import (
     GitBrokerStage,
     _prepare_git_launch,
@@ -174,7 +175,6 @@ def test_verify_git_broker_live_uses_bootstrap_probe_mode(
         ]
 
     monkeypatch.setattr(git_broker_live_verify, "run_git_broker_batch", fake_batch)
-
     marker = git_broker_live_verify.verify_git_broker_live(settings)
 
     assert marker["route_eligible"] is True
@@ -182,3 +182,88 @@ def test_verify_git_broker_live_uses_bootstrap_probe_mode(
     assert marker["checks"]["git_allowed_commands_builtin"] is True
     assert seen["live_verification_probe"] is True
     assert seen["timeout"] == 180.0
+
+
+def test_live_verification_batch_stops_after_first_nonzero_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = object()
+    identity = {"path": str(tmp_path / "git.exe")}
+    containment = SimpleNamespace(backend=object())
+    source = tmp_path / "workspace"
+    source.mkdir()
+    stage_root = tmp_path / "stage"
+    repository = stage_root / "repository"
+    runtime = stage_root / "runtime"
+    repository.mkdir(parents=True)
+    runtime.mkdir()
+    stage = GitBrokerStage(
+        root=stage_root,
+        repository=repository,
+        runtime=runtime,
+        source_root=source,
+        snapshot_digest="a" * 64,
+        file_count=0,
+        total_bytes=0,
+    )
+    launches: list[list[str]] = []
+
+    monkeypatch.setattr(
+        git_broker_sandbox,
+        "require_git_broker_containment",
+        lambda _settings, _identity: containment,
+    )
+    monkeypatch.setattr(
+        git_broker_sandbox,
+        "resolve_trusted_core_autocrlf",
+        lambda _settings, _identity: "false",
+    )
+    monkeypatch.setattr(
+        git_broker_sandbox,
+        "stage_git_repository",
+        lambda *_args, **_kwargs: stage,
+    )
+    monkeypatch.setattr(
+        git_broker_sandbox,
+        "hold_executable_identity",
+        lambda _identity: nullcontext(),
+    )
+    monkeypatch.setattr(
+        git_broker_sandbox,
+        "hold_codex_sandbox_backend",
+        lambda _backend: nullcontext(),
+    )
+    monkeypatch.setattr(
+        git_broker_sandbox,
+        "hold_wfp_guard_implementation",
+        lambda: nullcontext(),
+    )
+
+    def fail_first(**kwargs: object) -> git_broker_sandbox.GitBrokerResult:
+        command = list(kwargs["command"])
+        launches.append(command)
+        return git_broker_sandbox.GitBrokerResult(
+            returncode=1,
+            stdout=b"",
+            stderr=b"setup failed",
+            stdout_truncated=False,
+            stderr_truncated=False,
+            backend_version="test",
+            containment_policy_digest="policy",
+            snapshot_digest="a" * 64,
+            wfp_guard_verification={},
+        )
+
+    monkeypatch.setattr(git_broker_sandbox, "_run_one", fail_first)
+    results = git_broker_sandbox.run_git_broker_batch(
+        settings=settings,  # type: ignore[arg-type]
+        git_identity=identity,
+        commands=(["git", "status"], ["git", "rev-parse", "HEAD"]),
+        cwd=str(source),
+        timeout=60,
+        output_limit=1024,
+        live_verification_probe=True,
+    )
+
+    assert len(results) == 1
+    assert launches == [["git", "status"]]

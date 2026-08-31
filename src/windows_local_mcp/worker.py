@@ -272,6 +272,13 @@ def run_operation(operation_id: str, settings: Settings) -> int:
         and isinstance(request.get("approval_manifest_summary"), dict)
         and request["approval_manifest_summary"].get("mode") == "staged-workspace-write"
     )
+    # Approved Sandbox runs from its immutable projection and retains a complete workspace
+    # checkpoint for boundary detection and rollback. A second Git Broker snapshot is only
+    # optional telemetry, but each fixed Git query launches another sandbox and can consume the
+    # complete one-shot execution TTL before the approved child starts. Keep that telemetry for
+    # Approved Host, where it describes host-authority effects, but never place it on the
+    # Approved Sandbox child-launch path.
+    capture_live_git_telemetry = tracks_workspace and operation["tier"] != "codex_sandbox"
     pre_git = (
         capture_git_snapshot(
             settings=settings,
@@ -279,7 +286,7 @@ def run_operation(operation_id: str, settings: Settings) -> int:
             stage="before",
             required=False,
         )
-        if tracks_workspace and not staged_sandbox_commit
+        if capture_live_git_telemetry
         else None
     )
     if pre_git:
@@ -287,8 +294,20 @@ def run_operation(operation_id: str, settings: Settings) -> int:
     pre_workspace = None
     if tracks_workspace:
         try:
+            checkpoint_started = time.monotonic()
+            audit.add_event(operation_id, "workspace_checkpoint_started", {"stage": "before"})
             pre_workspace = capture_workspace_state(settings, operation_id, "before")
             audit.update_operation(operation_id, pre_workspace_path=pre_workspace.manifest_path)
+            audit.add_event(
+                operation_id,
+                "workspace_checkpoint_completed",
+                {
+                    "stage": "before",
+                    "duration_ms": int((time.monotonic() - checkpoint_started) * 1000),
+                    "file_count": pre_workspace.file_count,
+                    "total_bytes": pre_workspace.total_bytes,
+                },
+            )
         except Exception as snapshot_error:  # noqa: BLE001 - persist checkpoint failures
             audit.transition_operation(
                 operation_id,
@@ -926,7 +945,7 @@ def run_operation(operation_id: str, settings: Settings) -> int:
             stage="after",
             required=False,
         )
-        if tracks_workspace and not staged_sandbox_commit
+        if capture_live_git_telemetry
         else None
     )
     workspace_transaction_pending = False

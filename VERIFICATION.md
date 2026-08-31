@@ -1,5 +1,27 @@
 # 検証記録
 
+## 2026-08-31 Approved Sandbox child 起動前の execution TTL 消費
+
+### 実 audit による原因確定
+
+- 対象は 2026-08-29 の Approved Sandbox 2件。いずれも `approval_execution_ttl_seconds=60`、`approval_bundle_verified`、`worker_started` までは成功し、`child_pid` がないまま `approval execution grant expired before child start` で終了した。
+- 1件目は `worker_started` から pre-Git snapshot 生成まで約83.7秒、その後の workspace checkpoint が約2.7秒。2件目はそれぞれ約75.2秒、約0.3秒だった。失効 event は workspace checkpoint 完了直後に記録されていた。
+- 失敗後も optional な post-Git snapshot が約77秒動いたため、operation 全体は約160～173秒になった。主原因は recovery 待機や workspace checkpoint ではなく、Approved Sandbox child 起動前後に暗黙実行していた複数の Automatic Git Sandbox 起動だった。
+- 同じ `data_dir` の `workspace_recovery_required` が成立する場合、worker は approval bundle 検証より前に `workspace_recovery_required` event を記録して停止する。対象2件の event 列はこの経路ではないため、先行する `recovery_required` の直接的な二次障害ではない。
+
+### 修正と回帰検証
+
+- Approved Sandbox は承認済み immutable projection と complete workspace checkpoint を維持し、child 起動前後の optional Git telemetry だけを実行経路から外した。Approved Host の Git telemetry、one-shot TTL、child 直前の expiry 再確認、workspace lock／checkpoint、Host への自動 fallback 禁止は変更していない。
+- checkpoint の開始・完了、所要時間、file count、total bytes を audit event に追加し、今後の pre-child 遅延を Git telemetry と checkpoint で切り分けられるようにした。
+- Approved Sandbox が Git telemetry を一度も呼ばず、workspace checkpoint 後に TTL freshness check を通って child を起動し成功する回帰、worker identity 再結合、既に失効した grant が child を起動しない対照試験: `3 passed in 6.31s`（通常 Windows user 文脈）。
+- worker／Git snapshot focused suite: `16 passed in 8.10s`。変更ファイルの Ruff `--no-cache` と compileall: pass。
+- Approved Host 統合は通常 Windows user 文脈で `5 passed, 3 failed`。3件は今回変更していない Approved Host の長時間 worker／descendant 終了状態に関する既知の全体回帰であり、本修正の合格根拠には数えない。
+
+### 実機確認の境界
+
+- 修正後の production `request_sandbox_command` を新しい人間承認で実行する clean-state Windows 実機 E2E は未実施。Codex Desktop の制限環境から入れ子の Sandbox を起動した結果を通常 host の実機証拠とは扱わない。
+- ローカル回帰は原因となった呼び出しが child 前後に存在しないこと、必須 checkpoint と TTL fail-closed が残ることを確認したが、installed Codex／WFP／UAC を通る production child の起動成功そのものは次の明示的な実機再承認で確認する。
+
 ## 2026-08-30 Secure MCP Tunnel の失敗原因表示
 
 ### 変更内容

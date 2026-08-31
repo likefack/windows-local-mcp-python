@@ -70,7 +70,7 @@ def test_hardened_verifier_provisions_source_acl_before_base_probes(
             "backend_digest": sha256_text(canonical_json(backend_payload)),
             "backend_version": backend.version,
             "sandbox_account_identity": {"sid": sid},
-            "checks": {},
+            "checks": {"simple_command": True},
             "properties": _verified_properties(),
             "diagnostics": {},
             "probe_diagnostics": [],
@@ -151,3 +151,58 @@ def test_hardened_verifier_rejects_account_change_after_acl_provision(
 
     with pytest.raises(RuntimeError, match="account changed"):
         hardened.verify_codex_sandbox_live.__wrapped__(settings)
+
+
+def test_hardened_verifier_skips_followup_after_foundational_setup_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    sid = "S-1-5-21-100-200-300-1004"
+    writes: list[dict[str, object]] = []
+
+    def base(_settings: Settings) -> dict[str, object]:
+        return {
+            "sandbox_account_identity": {"sid": sid},
+            "checks": {"simple_command": None},
+            "properties": _verified_properties(),
+            "diagnostics": {"verification_error": "setup failed"},
+            "probe_diagnostics": [],
+            "passed": False,
+        }
+
+    def wrapped_placeholder(_settings: Settings) -> dict[str, object]:
+        raise AssertionError("decorated base wrapper must not be called")
+
+    wrapped_placeholder.__wrapped__ = base  # type: ignore[attr-defined]
+    monkeypatch.setattr(hardened, "_base_verify_codex_sandbox_live", wrapped_placeholder)
+    monkeypatch.setattr(
+        hardened,
+        "resolve_sandbox_account_identity",
+        lambda: SimpleNamespace(sid=sid),
+    )
+    monkeypatch.setattr(
+        hardened,
+        "ensure_source_workspace_read_deny",
+        lambda *_args: {"added": False},
+    )
+    monkeypatch.setattr(
+        hardened,
+        "resolve_codex_sandbox_backend",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("follow-up backend must not be resolved")
+        ),
+    )
+    monkeypatch.setattr(
+        hardened,
+        "_run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("follow-up Sandbox must not launch")
+        ),
+    )
+    monkeypatch.setattr(hardened, "_write_evidence", lambda _path, result: writes.append(result))
+
+    result = hardened.verify_codex_sandbox_live.__wrapped__(settings)
+
+    assert result["checks"]["brokered_process_creation_denied"] is None
+    assert result["passed"] is False
+    assert writes == [result]

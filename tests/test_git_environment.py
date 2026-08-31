@@ -167,7 +167,9 @@ def test_git_snapshot_excludes_secrets_and_project_behavior_metadata(tmp_path: P
     try:
         assert (stage.repository / "ordinary.txt").read_text(encoding="utf-8") == "ordinary"
         assert not (stage.repository / ".env").exists()
-        assert not (stage.repository / ".gitattributes").exists()
+        projected_attributes = (stage.repository / ".gitattributes").read_bytes()
+        assert len(projected_attributes) == len((workspace / ".gitattributes").read_bytes())
+        assert set(projected_attributes) <= {ord("#"), ord("\n"), ord("\r")}
         assert not (stage.repository / ".git" / "hooks").exists()
         staged_config = (stage.repository / ".git" / "config").read_text(encoding="utf-8")
         assert "attacker" not in staged_config

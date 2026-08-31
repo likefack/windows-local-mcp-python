@@ -16,6 +16,7 @@ from typing import Any
 
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Image
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
 from .approval import (
@@ -102,6 +103,10 @@ APPROVAL_REQUEST = ToolAnnotations(
 CONTROL = ToolAnnotations(
     readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False
 )
+
+
+class NonUtf8TextError(ValueError, ToolError):
+    """Expected text/binary route error that is safe to surface to the MCP model."""
 
 
 class Runtime:
@@ -711,7 +716,13 @@ def read_file(
         _require_filesystem()
         file_path = runtime.workspace.resolve_existing(path, allow_directory=False)
         raw = read_verified_bytes(file_path, runtime.settings.max_text_file_bytes)
-        text = raw.decode("utf-8")
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            # Keep the text API strict while directing opaque bytes to the byte-exact path.
+            raise NonUtf8TextError(
+                "file is not valid UTF-8 text; for binary files, use artifact_download_begin"
+            ) from None
         lines = text.splitlines()
         start = 1 if start_line is None else max(1, start_line)
         end = len(lines) if end_line is None else min(len(lines), max(start, end_line))
@@ -874,6 +885,7 @@ def _atomic_binary_mutation(
                 after_sha,
             )
             workspace_changed = False
+            journal_failed_recovered = False
             committed_native: tuple[int, int] | None = None
             committed_identity: PathIdentity | None = None
             committed_target: Path | None = None
@@ -981,6 +993,7 @@ def _atomic_binary_mutation(
                         state="failed_recovered",
                         error=error,
                     )
+                    journal_failed_recovered = True
                     raise WorkspaceMutationError(
                         f"structured file mutation failed; starting state recovered: {error}",
                         recovery_state="failed_recovered",
@@ -998,6 +1011,7 @@ def _atomic_binary_mutation(
                     state="failed_recovered",
                     error=error,
                 )
+                journal_failed_recovered = True
                 raise
             finally:
                 if committed_target is not None:
@@ -1011,6 +1025,10 @@ def _atomic_binary_mutation(
                         error="structured mutation failed before verified completion",
                     )
                     if transitioned:
+                        if journal_failed_recovered:
+                            mark_workspace_transaction_audit_reconciled(
+                                runtime.settings, operation_id
+                            )
                         runtime.audit.add_event(operation_id, "failed", {"path": path})
 
 
@@ -1934,6 +1952,7 @@ def write_file(
         "reason": reason,
     }
     operation_id: str | None = None
+    journal_failed_recovered = False
     try:
         _require_filesystem()
         _require_workspace_mutation_ready()
@@ -2048,6 +2067,7 @@ def write_file(
                         state="failed_recovered",
                         error=write_error,
                     )
+                    journal_failed_recovered = True
                 raise
 
             try:
@@ -2141,6 +2161,7 @@ def write_file(
                     state="failed_recovered",
                     error=post_error,
                 )
+                journal_failed_recovered = True
                 runtime.audit.update_operation(
                     operation_id,
                     rollback_state="failed_recovered",
@@ -2158,13 +2179,17 @@ def write_file(
         if operation_id is None:
             _audit_rejection("write_file", request_input, error)
         else:
-            runtime.audit.transition_operation(
+            transitioned = runtime.audit.transition_operation(
                 operation_id,
                 from_statuses={"running"},
                 status="failed",
                 finished_at=utc_now_iso(),
                 error=f"{type(error).__name__}: {error}",
             )
+            if transitioned and journal_failed_recovered:
+                mark_workspace_transaction_audit_reconciled(
+                    runtime.settings, operation_id
+                )
             runtime.audit.add_event(operation_id, "failed", {"error": str(error)[:1000]})
         raise
 

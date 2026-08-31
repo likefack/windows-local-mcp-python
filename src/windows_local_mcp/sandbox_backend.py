@@ -1195,7 +1195,8 @@ def guard_and_launch_codex_sandbox(
         ) from error
     except (OSError, RuntimeError, WfpGuardError) as error:
         raise ApprovedSandboxUnavailable(
-            f"Codex Sandbox WFP Guard verification failed: {error}"
+            "Codex Sandbox WFP Guard verification failed; automatic elevation was not "
+            f"attempted. Run verify-codex-sandbox explicitly: {error}"
         ) from error
     guard_payload = verification.as_dict()
     if expected_live_evidence is not None:

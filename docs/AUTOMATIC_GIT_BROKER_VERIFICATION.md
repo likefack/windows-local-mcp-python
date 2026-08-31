@@ -290,3 +290,21 @@ Automatic Git remediation and current-main source integration are verified at al
 The live-verified integrated source/test commit is `926fc24a46f2d2afe0d2ddc05f32fb9c6d55dad0` with integrated source/test tree `c3ccdebbbdcbea47c72cb953d337fb1315edb13c`.
 
 PR #26 was merged and closed on 2026-08-28. The final merge commit is `a466f86e46a635e9390569971d6d1ee160d77dbf`, and its tree `ce021bf7a468db5083632471ba92bc2954f7d62c` is identical to the final PR documentation-only head tree. There is no remaining Automatic Git integration verification or merge blocker recorded by this document.
+
+## 2026-08-31 status／diff consistency regression
+
+`CMD-02` で、通常の `git status --short --branch` は clean な tracked files を、Automatic Git の metadata-only `git diff` だけが多数の binary modification として報告する不一致を再現しました。
+
+原因は、Git LFS や `working-tree-encoding` により index blob と working-tree bytes が意図的に異なる repository で、sanitized projection が project attributes を除外しながら source index の ctime を新しい projection file identity へ結び直していなかったことです。`status` は内容を検査して clean と判断できても、`diff` は除外済みの属性変換なしで bytes を比較し、異なる結果になりました。
+
+修正後は、worktree `.gitattributes` を同じ長さと改行位置を持つ inert comment placeholder に置き換え、source index の ctime／mtime／size が source file と完全一致する entry だけ projection stat へ再結合します。source stat evidence が stale の attribute-controlled repository は、外部 filter を実行したり意味を推測したりせず fail closed します。
+
+この投影意味論の変更は Automatic Git containment-policy generation v7 とし、generation v6 の既存 Git-specific marker は自動移行せず stale にします。
+
+検証範囲は次のとおりです。
+
+- Git 組み込みの `working-tree-encoding=UTF-16` を使った再現 fixture: 修正前は projected `status` と `diff` が不一致、修正後は双方 empty
+- stale source index stat の対照: projection 作成前に fail closed
+- `tests/test_git_semantics.py`: PASS
+
+この項目は source-level regression evidence です。通常 Windows host 上の Codex Sandbox／Automatic Git marker、UAC／WFP、model-facing MCP E2E を再検証済みとは扱いません。

@@ -3,6 +3,7 @@ import os
 import shutil
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 import anyio
@@ -122,6 +123,9 @@ Set-ActiveConfig -ConfigPath {_ps_literal(config)}
 def test_real_stdio_tools_list_and_file_round_trip(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    binary_artifact = workspace / "bundle.zip"
+    with zipfile.ZipFile(binary_artifact, "w") as archive:
+        archive.writestr("payload.bin", b"\xff\x00")
     git = shutil.which("git.exe") or shutil.which("git")
     assert git is not None
     subprocess.run(
@@ -216,6 +220,21 @@ def test_real_stdio_tools_list_and_file_round_trip(tmp_path: Path) -> None:
             assert not read.is_error
             assert read.structured_content is not None
             assert read.structured_content["content"] == "hello stdio"
+
+            binary_read = await session.call_tool("read_file", {"path": "bundle.zip"})
+            assert binary_read.is_error
+            binary_error = _tool_result_text(binary_read)
+            assert "not valid UTF-8 text" in binary_error
+            assert "artifact_download_begin" in binary_error
+            assert "UnicodeDecodeError" not in binary_error
+            assert "can't decode byte" not in binary_error
+
+            binary_download = await session.call_tool(
+                "artifact_download_begin", {"path": "bundle.zip"}
+            )
+            assert not binary_download.is_error
+            assert binary_download.structured_content is not None
+            assert binary_download.structured_content["bytes"] == len(binary_artifact.read_bytes())
 
             git_info = await session.call_tool("git_info", {})
             assert git_info.is_error

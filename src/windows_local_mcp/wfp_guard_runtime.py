@@ -81,10 +81,15 @@ class _ProcessEntry32W(ctypes.Structure):
 
 def ensure_runtime_codex_loopback_guard(
     *,
+    allow_elevation: bool = False,
     force_elevated: bool = False,
     diagnostic_trace: dict[str, object] | None = None,
 ) -> GuardVerification:
-    """Ensure/read back the fixed WFP boundary, elevating only the Guard if needed.
+    """Read back the fixed WFP boundary and optionally perform one explicit repair.
+
+    Normal Sandbox and Automatic Git launches leave ``allow_elevation`` disabled.
+    This prevents stale, missing, or unreadable state from turning an ordinary launch
+    into a repeated UAC flow.  Only an explicit live-verification unit may opt in.
 
     ``force_elevated`` exists for the real-machine integration diagnostic. It makes
     that diagnostic exercise the production UAC/IPC path even when the fixed WFP
@@ -106,11 +111,15 @@ def ensure_runtime_codex_loopback_guard(
         # Existing conflicting state must not be sent to an elevated silent-repair path.
         raise
     except WfpGuardMissingError:
-        if _is_administrator():
+        if allow_elevation and _is_administrator():
             return ensure_codex_loopback_block(new_windows_wfp_api())
-    except Exception:  # noqa: BLE001 - elevated ensure re-checks all fields and still fails closed
-        if _is_administrator():
-            return ensure_codex_loopback_block(new_windows_wfp_api())
+        if not allow_elevation:
+            raise
+    except Exception:
+        # An unreadable or otherwise indeterminate state is not proof of exact
+        # absence. Elevating it would turn an unknown failure into an automatic
+        # privileged retry, so both normal and explicit verification fail closed.
+        raise
     return _run_elevated_ensure(diagnostic_trace=diagnostic_trace)
 
 

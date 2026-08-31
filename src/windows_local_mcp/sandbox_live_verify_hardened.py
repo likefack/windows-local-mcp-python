@@ -122,6 +122,26 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
             "Codex Sandbox account changed after source-workspace ACL provisioning"
         )
 
+    # The base verifier's fixed `exit 0` command is the setup-readiness gate. If it
+    # failed, do not launch the hardened follow-up and risk repeating the same UAC.
+    checks = result.get("checks")
+    if not isinstance(checks, dict) or checks.get("simple_command") is not True:
+        _apply_brokered_process_result(
+            result,
+            None,
+            "unverified: skipped after foundational Sandbox setup failure",
+        )
+        source_guard_after = ensure_source_workspace_read_deny(
+            settings.workspace_root, account.sid
+        )
+        source_guard_after["added_before_verification"] = bool(
+            source_guard_before.get("added")
+        )
+        result["source_workspace_read_acl_guard"] = source_guard_after
+        marker = settings.data_dir / "control-plane" / "sandbox-live-verification.json"
+        _write_evidence(marker, result)
+        return result
+
     backend = resolve_codex_sandbox_backend(settings)
     assert settings.sandbox_scratch_dir is not None
     root = (

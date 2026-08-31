@@ -61,7 +61,7 @@ Git-specific marker は次へ exact binding します。
 - exact operation projection だけを trust する command-scope `safe.directory` policy
 - sanitized `core.autocrlf` scalar reconstruction policy
 - Automatic grammar の required subcommand が pinned runtime の builtin であるという policy
-- Codex Sandbox backend identity と Automatic Git containment policy digest（current generation v6）
+- Codex Sandbox backend identity と Automatic Git containment policy digest（current generation v7）
 - Automatic Git command-policy generation v5
 - current generic Sandbox live evidence 全体の digest
 - current `workspace_root`

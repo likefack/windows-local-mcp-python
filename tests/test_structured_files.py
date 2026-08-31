@@ -355,6 +355,57 @@ def test_generic_artifact_transfer_commits_unknown_structured_format_as_opaque_b
     assert result["embedded_code_executed"] is False
 
 
+def test_artifact_upload_commits_a_new_file_below_a_subdirectory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, root = load_server(tmp_path, monkeypatch)
+    monkeypatch.setattr(server, "assert_control_plane_healthy", lambda _settings: None)
+    (root / "results").mkdir()
+    payload = b"structured-upload-result"
+    upload = server.artifact_upload_begin(
+        "results/bin-10.bin", len(payload), sha256_bytes(payload)
+    )
+    server.artifact_upload_chunk(
+        upload["transfer_id"], 0, base64.b64encode(payload).decode("ascii")
+    )
+
+    result = server.artifact_upload_commit(upload["transfer_id"])
+
+    assert result["path"] == "results/bin-10.bin"
+    assert (root / "results" / "bin-10.bin").read_bytes() == payload
+    assert server.workspace_recovery_required(server.runtime.settings) is False
+
+
+def test_recovered_artifact_commit_failure_does_not_latch_workspace_mutations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, root = load_server(tmp_path, monkeypatch)
+    monkeypatch.setattr(server, "assert_control_plane_healthy", lambda _settings: None)
+    payload = b"temporary-upload"
+    upload = server.artifact_upload_begin("recovered.bin", len(payload), sha256_bytes(payload))
+    server.artifact_upload_chunk(
+        upload["transfer_id"], 0, base64.b64encode(payload).decode("ascii")
+    )
+    real_capture = server.capture_workspace_state
+
+    def fail_after_replacement(settings, operation_id, stage, *, paths=None):
+        if stage == "after":
+            raise RuntimeError("forced post-write failure")
+        return real_capture(settings, operation_id, stage, paths=paths)
+
+    monkeypatch.setattr(server, "capture_workspace_state", fail_after_replacement)
+    with pytest.raises(server.WorkspaceMutationError) as captured:
+        server.artifact_upload_commit(upload["transfer_id"])
+
+    assert captured.value.recovery_state == "failed_recovered"
+    assert not (root / "recovered.bin").exists()
+    assert server.workspace_recovery_required(server.runtime.settings) is False
+
+    monkeypatch.setattr(server, "capture_workspace_state", real_capture)
+    server.write_file("next.txt", "mutation remains available")
+    assert (root / "next.txt").read_text(encoding="utf-8") == "mutation remains available"
+
+
 def test_artifact_upload_reserves_data_quota_before_accepting_session(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

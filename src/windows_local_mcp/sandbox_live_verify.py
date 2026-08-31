@@ -1077,7 +1077,12 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
                 )
             # Live verification may recreate exact missing static non-persistent objects.
             # Existing conflicting state still fails closed in the fixed Guard.
-            guard_verification = ensure_runtime_codex_loopback_guard()
+            # This explicit verifier is the only production path allowed to request
+            # one Guard elevation. Every probe below performs a fresh unelevated
+            # read-back and therefore cannot create a repeated UAC loop.
+            guard_verification = ensure_runtime_codex_loopback_guard(
+                allow_elevation=True
+            )
             simple = _run(
                 settings,
                 backend,
@@ -1090,6 +1095,14 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
                 simple, success=simple.returncode == 0, boundary_escape_code=None
             )
             _set_check(checks, check_reasons, "simple_command", value, reason)
+            if value is not True:
+                # A fixed `exit 0` failure is a shared Sandbox setup failure, not an
+                # independent property result. Stop before another Codex process can
+                # repeat the same upstream UAC/setup attempt.
+                raise RuntimeError(
+                    "foundational Codex Sandbox launch failed; verification stopped "
+                    "before additional probes"
+                )
 
             child = _run(
                 settings,

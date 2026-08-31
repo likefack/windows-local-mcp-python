@@ -269,8 +269,79 @@ def test_missing_exact_guard_object_uses_trusted_ensure_path(
     monkeypatch.setattr(runtime, "_is_administrator", lambda: False)
     monkeypatch.setattr(runtime, "_run_elevated_ensure", elevated)
 
-    assert runtime.ensure_runtime_codex_loopback_guard() == _verification()
+    assert runtime.ensure_runtime_codex_loopback_guard(
+        allow_elevation=True
+    ) == _verification()
     assert calls == ["verify-missing", "trusted-elevated-ensure"]
+
+
+def test_missing_guard_never_elevates_during_normal_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def missing(_api: object) -> GuardVerification:
+        calls.append("verify-missing")
+        raise WfpGuardMissingError("fixed filter is missing")
+
+    def forbidden(*_args: object, **_kwargs: object) -> GuardVerification:
+        calls.append("forbidden-elevation")
+        raise AssertionError("normal launch must not request elevation")
+
+    monkeypatch.setattr(runtime, "verify_codex_loopback_block", missing)
+    monkeypatch.setattr(runtime, "new_windows_wfp_api", lambda: object())
+    monkeypatch.setattr(runtime, "_is_administrator", lambda: False)
+    monkeypatch.setattr(runtime, "_run_elevated_ensure", forbidden)
+
+    with pytest.raises(WfpGuardMissingError, match="fixed filter is missing"):
+        runtime.ensure_runtime_codex_loopback_guard()
+    assert calls == ["verify-missing"]
+
+
+def test_unreadable_guard_never_elevates_during_normal_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def unreadable(_api: object) -> GuardVerification:
+        calls.append("verify-unreadable")
+        raise PermissionError("WFP read-back denied")
+
+    def forbidden(*_args: object, **_kwargs: object) -> GuardVerification:
+        calls.append("forbidden-elevation")
+        raise AssertionError("normal launch must not request elevation")
+
+    monkeypatch.setattr(runtime, "verify_codex_loopback_block", unreadable)
+    monkeypatch.setattr(runtime, "new_windows_wfp_api", lambda: object())
+    monkeypatch.setattr(runtime, "_is_administrator", lambda: False)
+    monkeypatch.setattr(runtime, "_run_elevated_ensure", forbidden)
+
+    with pytest.raises(PermissionError, match="read-back denied"):
+        runtime.ensure_runtime_codex_loopback_guard()
+    assert calls == ["verify-unreadable"]
+
+
+def test_unreadable_guard_never_elevates_during_explicit_verification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def unreadable(_api: object) -> GuardVerification:
+        calls.append("verify-unreadable")
+        raise PermissionError("WFP read-back denied")
+
+    def forbidden(*_args: object, **_kwargs: object) -> GuardVerification:
+        calls.append("forbidden-elevation")
+        raise AssertionError("unreadable state is not exact missing state")
+
+    monkeypatch.setattr(runtime, "verify_codex_loopback_block", unreadable)
+    monkeypatch.setattr(runtime, "new_windows_wfp_api", lambda: object())
+    monkeypatch.setattr(runtime, "_is_administrator", lambda: False)
+    monkeypatch.setattr(runtime, "_run_elevated_ensure", forbidden)
+
+    with pytest.raises(PermissionError, match="read-back denied"):
+        runtime.ensure_runtime_codex_loopback_guard(allow_elevation=True)
+    assert calls == ["verify-unreadable"]
 
 
 def test_existing_guard_state_mismatch_never_uses_silent_repair(
