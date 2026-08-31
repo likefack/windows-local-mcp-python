@@ -155,7 +155,7 @@ pre-closure の詳細な検証履歴、過去の capability-reduction checkpoint
 
 - production service: `WindowsLocalMCPApprovedHost` / LocalSystem / protected SCM DACL。
 - durable state: `%ProgramData%\WindowsLocalMCP\ApprovedHostAuthority` / LocalSystem owner / protected SYSTEM+Administrators DACL。
-- final command: authenticated pipe requester PID／create-time／SID／non-elevated token を検証し、`CreateProcessAsUserW` で suspended child を作成する。child を SYSTEM へ昇格しない。
+- final command: authenticated pipe requester PID／create-time／SID／non-elevated token を検証し、`CreateProcessAsUserW` で suspended child を作成する。child を SYSTEM に昇格しない。
 - SYSTEM worker-owned Job Object へ child を assign してから resume する。
 - requester-user WMI／CIM process census を保持し、`Win32_Process.Create` 等による Job 外 same-user helper を postflight まで fail closed に追跡する。
 - SYSTEM-owned immutable `active.json` は normal verified completion まで残す。worker loss、service restart、channel loss、postflight uncertainty、epoch mismatch では解除せず `recovery_required` とする。
@@ -309,3 +309,22 @@ Live verification limitation:
 ## Historical verification record
 
 WLMCP-R2-001 closure 前の詳細な repository-wide verification chronology は `VERIFICATION_HISTORY_PRE_R2_001_CLOSURE.md` を参照する。そこに記録された古い `LIVE VERIFICATION PENDING`、capability-reduction、Round 2 `unresolved / release blocker` 等は historical point-in-time evidence として保持し、上記 current verdict により supersede される。
+
+<!-- CHATGPT_LIVE_TEST_PROGRESS_V1:BEGIN -->
+## CHATGPT_LIVE_TEST_PROGRESS_V1
+
+- run_id: `20260831T2250JST-chatgpt-live`
+- test_definition_version: `CHATGPT_LIVE_TEST_V1`
+- target_repository: `likefack/windows-local-mcp-python`
+- tested_code_revision_baseline: `a09cf5372be147f46eb1f5a63e7cf4f64f659c7a`
+- progress_document_commit: `d042752254c1c7549fcca70275d739b3d7301771`（直前の進捗コミット。現在更新はこの commit の後続）
+- fixture_root: `.dev-tmp/chatgpt-live/20260831T2250JST-chatgpt-live`
+
+| case_id | test_definition_version | status | tested_code_revision | main_tip_at_test | live_runtime_fingerprint | config_policy_fingerprint | executed_at | evidence_summary | operation_id または監査参照 | reusable | rerun_condition |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| CONN-01 | CHATGPT_LIVE_TEST_V1 | PASS_NONREUSABLE | target=a09cf5372be147f46eb1f5a63e7cf4f64f659c7a; runtime_revision=unverified | fb96dcc783dfc8104580770fcb2c5358ec93db9a | backend=openai-codex-windows-sandbox; provenance=openai-codex-desktop-install-root; exact WLMCP code revision not exposed | config_source=LOCAL_MCP_CONFIG; exact config digest not exposed | 2026-08-31T22:53:16+09:00 | ChatGPT connected MCP tool から実 Windows LocalMCP `session_info` が成功し、audit でも tier=broker/status=succeeded。stdio startup validation=accepted。runtime revision/config digest を target main に binding できないため reusable にはしない。 | session_info 0f911f52-d393-482b-8199-9636411daff3; audit_get same id | false | runtime revision と config/policy fingerprint を current main に結合できる識別情報を取得して再実行する。 |
+| CONN-02 | CHATGPT_LIVE_TEST_V1 | PASS_NONREUSABLE | target=a09cf5372be147f46eb1f5a63e7cf4f64f659c7a; runtime_revision=unverified | ef2c4c19cf67bd3852fd35463a7e9cc1ff3635bc | backend=openai-codex-windows-sandbox; live marker stale; exact runtime revision not exposed | config_source=LOCAL_MCP_CONFIG; capability truthfulness observed; exact digest not exposed | 2026-08-31T22:57:32+09:00 | `session_info` を再取得。Codex Sandbox は configured/enabled/dependency_available=true と live_verified/windows_live_verified/execution_route_available=false を分離。Git は configured/enabled=true, available/live_verified/windows_live_verified=false。Approved Host は configured/enabled=true だが runtime_immutability failed により available/execution_route_available=false。ADB は configured/enabled=false。監査でも session_info 成功を確認。 | session_info 16f094fc-f45d-4e7e-9dfd-584ac0befc48; audit_get same id | false | current runtime revision と config digest を target code へ binding できる識別情報が得られれば reusable 判定のため再実行する。 |
+| CONN-03 | CHATGPT_LIVE_TEST_V1 | PASS_NONREUSABLE | target=a09cf5372be147f46eb1f5a63e7cf4f64f659c7a; runtime_revision=unverified | 3af2a262219583de5ad12dff10d6b5548b9c783a | published surface metadata from active connector; exact runtime revision not exposed | current session capability states from session_info; exact config digest not exposed | 2026-08-31T22:59:00+09:00 | Active connector から 41 tools を再取得。ユーザー指定/current spec の 41 surfaces と一致し、欠落・余分なし。disabled ADB も surface は存在し capability は false と別表示。runtime revision binding がないため reusable にはしない。 | connector tool discovery; related session_info 16f094fc-f45d-4e7e-9dfd-584ac0befc48 | false | exact runtime revision を current main に binding できる状態で surface を再取得する。 |
+| CONN-04 | CHATGPT_LIVE_TEST_V1 | PASS_NONREUSABLE | target=a09cf5372be147f46eb1f5a63e7cf4f64f659c7a; runtime_revision=unverified | d042752254c1c7549fcca70275d739b3d7301771 | workspace=C:\dev\decision-deck-localmcp-test; data_dir isolated; exact runtime revision not exposed | config_source=LOCAL_MCP_CONFIG; workspace_source=explicit_config; ambient_root_present=false; exact digest not exposed | 2026-08-31T23:02:43+09:00 | current `session_info` と audit を再取得。workspace/data directory は分離、config は LOCAL_MCP_CONFIG から explicit、ambient root は不存在かつ override=false。stdio configured/enabled/available=true・startup accepted。HTTP configured/enabled/available=false。表示上の暗黙 fallback は観測されない。runtime/config exact fingerprint を target main に結合できないため reusable にはしない。 | session_info 09f10c81-df4a-4e1b-97b0-2d6ce2f6a6e1; audit_get same id | false | exact runtime revision/config policy digest を得て同じ確認を再実行する。 |
+| FS-01 | CHATGPT_LIVE_TEST_V1 | RUNNING | a09cf5372be147f46eb1f5a63e7cf4f64f659c7a | d042752254c1c7549fcca70275d739b3d7301771 | pending | pending | 2026-08-31T23:03:11+09:00 | 開始前記録。fixture root の存在可否を含め、list_directory/read_file の通常動作、UTF-8、行範囲、改行、行数、SHA-256 を実経路で確認する。 | pending | false | fixture と安全な既存テキストを read/list して監査と結果を確認する。 |
+<!-- CHATGPT_LIVE_TEST_PROGRESS_V1:END -->
