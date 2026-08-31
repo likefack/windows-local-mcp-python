@@ -1318,8 +1318,62 @@ def _transform_xlsx_package_preserving(
     }
 
 
-def _sheet_cell_count(sheet: Any) -> int:
-    return max(1, sheet.max_row) * max(1, sheet.max_column)
+def _xlsx_sheet_extent(sheet: Any, package_data: bytes | None = None) -> tuple[int, int]:
+    """Return dimensions without expanding gaps in an unsized read-only worksheet."""
+    if sheet.max_row is None or sheet.max_column is None:
+        if package_data is None:
+            raise StructuredFileError("XLSX worksheet has no bounded dimension metadata")
+        from openpyxl.utils.cell import coordinate_to_tuple
+
+        part_name = str(sheet._worksheet_path).lstrip("/")
+        try:
+            with zipfile.ZipFile(io.BytesIO(package_data)) as archive:
+                root = _parse_package_xml(archive.read(part_name), "XLSX worksheet")
+        except (KeyError, zipfile.BadZipFile) as error:
+            raise StructuredFileError("XLSX worksheet part is missing or invalid") from error
+        max_row = 1
+        max_column = 1
+        for cell in root.iter(f"{{{_SHEET_NS}}}c"):
+            reference = cell.get("r")
+            if not reference:
+                continue
+            try:
+                row, column = coordinate_to_tuple(reference)
+            except (TypeError, ValueError) as error:
+                raise StructuredFileError("invalid XLSX cell reference") from error
+            if row > 1048576 or column > 16384:
+                raise StructuredFileError("XLSX cell reference is outside worksheet limits")
+            max_row = max(max_row, row)
+            max_column = max(max_column, column)
+        return max_row, max_column
+    return max(1, sheet.max_row or 1), max(1, sheet.max_column or 1)
+
+
+def _sheet_cell_count(sheet: Any, package_data: bytes | None = None) -> int:
+    max_row, max_column = _xlsx_sheet_extent(sheet, package_data)
+    return max_row * max_column
+
+
+def _xlsx_inspection_range(
+    range_ref: str | None, workbook: Any
+) -> tuple[str | None, str | None]:
+    """Split an optional ``Sheet!A1:B2`` selector from its cell range."""
+    if not range_ref:
+        return None, None
+    if "!" not in range_ref:
+        return workbook.active.title, range_ref
+    from openpyxl.utils.cell import get_column_letter, range_to_tuple
+
+    try:
+        sheet_name, bounds = range_to_tuple(range_ref)
+    except (TypeError, ValueError) as error:
+        raise StructuredFileError("invalid XLSX preview range") from error
+    min_col, min_row, max_col, max_row = bounds
+    coordinate_range = (
+        f"{get_column_letter(min_col)}{min_row}:"
+        f"{get_column_letter(max_col)}{max_row}"
+    )
+    return sheet_name, coordinate_range
 
 
 def _xlsx_range_bounds(
@@ -1353,6 +1407,7 @@ def _require_xlsx_extent(sheet: Any, bounds: tuple[int, int, int, int], settings
 def _inspect_xlsx(data: bytes, settings: Settings, range_ref: str | None = None) -> dict[str, Any]:
     _preflight_office_package(data, settings, "XLSX")
     _, load_workbook, *_ = _xlsx_modules()
+    from openpyxl.utils.cell import get_column_letter
     with warnings.catch_warnings():
         warnings.filterwarnings(
             "ignore",
@@ -1363,15 +1418,22 @@ def _inspect_xlsx(data: bytes, settings: Settings, range_ref: str | None = None)
         try:
             sheets = []
             total = 0
+            selected_sheet, selected_range = _xlsx_inspection_range(range_ref, book)
+            if selected_sheet is not None and selected_sheet not in book.sheetnames:
+                raise StructuredFileError(f"XLSX preview sheet does not exist: {selected_sheet}")
             for sheet in book.worksheets:
-                cells = _sheet_cell_count(sheet)
+                max_row, max_column = _xlsx_sheet_extent(sheet, data)
+                cells = max_row * max_column
                 total += cells
                 if total > settings.max_structured_elements:
                     raise StructuredFileError("XLSX cells exceed max_structured_elements")
                 preview_range = (
-                    range_ref
-                    if range_ref and sheet.title == book.active.title
-                    else f"A1:{sheet.cell(min(sheet.max_row, 20), min(sheet.max_column, 20)).coordinate}"
+                    selected_range
+                    if selected_range and sheet.title == selected_sheet
+                    else (
+                        f"A1:{get_column_letter(min(max_column, 20))}"
+                        f"{min(max_row, 20)}"
+                    )
                 )
                 try:
                     preview_range, _ = _xlsx_range_bounds(
@@ -1384,8 +1446,8 @@ def _inspect_xlsx(data: bytes, settings: Settings, range_ref: str | None = None)
                     {
                         "name": sheet.title,
                         "state": sheet.sheet_state,
-                        "max_row": sheet.max_row,
-                        "max_column": sheet.max_column,
+                        "max_row": max_row,
+                        "max_column": max_column,
                         "preview_range": preview_range,
                         "values": rows,
                     }

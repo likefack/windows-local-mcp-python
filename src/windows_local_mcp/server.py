@@ -1083,12 +1083,24 @@ def structured_file_inspect(
     try:
         _require_filesystem()
         source = runtime.workspace.resolve_existing(path, allow_directory=False)
-        identity = runtime.workspace.identity(source)
-        if identity is None or identity.size > runtime.settings.max_structured_file_bytes:
-            raise ValueError("structured file exceeds max_structured_file_bytes")
-        data = read_verified_bytes(source, runtime.settings.max_structured_file_bytes)
-        result = inspect_structured(data, runtime.workspace.relative(source), runtime.settings, format=format, range_ref=range_ref)
-        result["path"] = runtime.workspace.relative(source)
+        try:
+            identity = runtime.workspace.identity(source)
+            if identity is None or identity.size > runtime.settings.max_structured_file_bytes:
+                raise ValueError("structured file exceeds max_structured_file_bytes")
+            data = read_verified_bytes(source, runtime.settings.max_structured_file_bytes)
+            relative_source = runtime.workspace.relative(source)
+        finally:
+            # Parsing no longer needs the verified read handle. Releasing it here also avoids
+            # retaining a write-blocking handle when an inspect exception keeps its traceback.
+            release_verified_hold(source)
+        result = inspect_structured(
+            data,
+            relative_source,
+            runtime.settings,
+            format=format,
+            range_ref=range_ref,
+        )
+        result["path"] = relative_source
         result["execution_paths"] = ["broker_direct", "transfer"]
         result["operation_id"] = _log_simple(tool_name="structured_file_inspect", request=request, result=result)
         return result

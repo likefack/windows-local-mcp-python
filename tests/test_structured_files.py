@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import importlib
 import io
+import re
 import sys
 import zipfile
 from pathlib import Path
@@ -62,6 +63,19 @@ def xlsx_bytes() -> bytes:
     sheet.append(["A", 2])
     output = io.BytesIO()
     book.save(output)
+    return output.getvalue()
+
+
+def remove_xlsx_dimensions(data: bytes) -> bytes:
+    """Match producers that omit the optional worksheet dimension metadata."""
+    output = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(data)) as source, zipfile.ZipFile(output, "w") as target:
+        target.comment = source.comment
+        for info in source.infolist():
+            payload = source.read(info)
+            if info.filename.startswith("xl/worksheets/"):
+                payload = re.sub(br"<dimension\b[^>]*/>", b"", payload, count=1)
+            target.writestr(info, payload)
     return output.getvalue()
 
 
@@ -173,6 +187,78 @@ def test_docx_xlsx_and_csv_use_the_checkpointed_local_path(
         "termination",
         "resource_bound",
     }
+
+
+def test_xlsx_inspection_sizes_unsized_sheets_and_accepts_qualified_range(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, root = load_server(tmp_path, monkeypatch)
+    monkeypatch.setattr(server, "assert_control_plane_healthy", lambda _settings: None)
+    book = Workbook()
+    summary = book.active
+    summary.title = "Summary"
+    summary["A1"] = "summary"
+    verification = book.create_sheet("検証情報")
+    verification["A1"] = "項目"
+    verification["B8"] = "完了"
+    output = io.BytesIO()
+    book.save(output)
+    (root / "unsized.xlsx").write_bytes(remove_xlsx_dimensions(output.getvalue()))
+
+    inspected = server.structured_file_inspect("unsized.xlsx")
+    assert [(sheet["max_row"], sheet["max_column"]) for sheet in inspected["sheets"]] == [
+        (1, 1),
+        (8, 2),
+    ]
+
+    selected = server.structured_file_inspect(
+        "unsized.xlsx", range_ref="検証情報!A1:B8"
+    )
+    verification_result = next(
+        sheet for sheet in selected["sheets"] if sheet["name"] == "検証情報"
+    )
+    assert verification_result["preview_range"] == "A1:B8"
+    assert verification_result["values"][0] == ["項目", None]
+    assert verification_result["values"][7] == [None, "完了"]
+
+
+def test_structured_inspect_releases_verified_handle_before_parser_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, root = load_server(tmp_path, monkeypatch)
+    monkeypatch.setattr(server, "assert_control_plane_healthy", lambda _settings: None)
+    (root / "table.csv").write_bytes(b"a,b\n1,2\n")
+    released: list[Path] = []
+    real_release = server.release_verified_hold
+
+    def record_release(path: Path) -> None:
+        released.append(path)
+        real_release(path)
+
+    monkeypatch.setattr(server, "release_verified_hold", record_release)
+    monkeypatch.setattr(
+        server,
+        "inspect_structured",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("parser failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="parser failed"):
+        server.structured_file_inspect("table.csv")
+
+    assert [Path(str(path)).name for path in released] == ["table.csv"]
+    replacement = b"a,b\n3,4\n"
+    upload = server.artifact_upload_begin(
+        "table.csv",
+        len(replacement),
+        sha256_bytes(replacement),
+        expected_sha256=sha256_bytes(b"a,b\n1,2\n"),
+    )
+    server.artifact_upload_chunk(
+        upload["transfer_id"], 0, base64.b64encode(replacement).decode("ascii")
+    )
+    committed = server.artifact_upload_commit(upload["transfer_id"])
+    assert committed["after_sha256"] == sha256_bytes(replacement)
+    assert (root / "table.csv").read_bytes() == replacement
 
 
 def test_zip_image_and_transfer_boundaries(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

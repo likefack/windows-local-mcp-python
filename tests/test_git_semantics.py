@@ -1,4 +1,6 @@
+import hashlib
 import shutil
+import struct
 import subprocess
 from pathlib import Path
 
@@ -7,6 +9,7 @@ import pytest
 from windows_local_mcp.config import Settings
 from windows_local_mcp.git_broker_sandbox import (
     GitBrokerUnavailable,
+    _rebase_index_stat_cache_for_projection,
     _safe_repository_config,
     stage_git_repository,
 )
@@ -331,6 +334,15 @@ def test_projection_keeps_status_and_diff_consistent_for_sanitized_attributes(
     if git is None:
         pytest.skip("Git is not installed")
     settings = _settings(tmp_path)
+    lfs_version = subprocess.run(
+        [git, "lfs", "version"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        check=False,
+        shell=False,
+    )
+    if lfs_version.returncode != 0:
+        pytest.skip("Git LFS is not installed")
     subprocess.run(
         [git, "init", str(settings.workspace_root)],
         stdin=subprocess.DEVNULL,
@@ -339,7 +351,7 @@ def test_projection_keeps_status_and_diff_consistent_for_sanitized_attributes(
         shell=False,
     )
     subprocess.run(
-        [git, "-C", str(settings.workspace_root), "config", "core.autocrlf", "true"],
+        [git, "-C", str(settings.workspace_root), "lfs", "install", "--local"],
         stdin=subprocess.DEVNULL,
         capture_output=True,
         check=True,
@@ -347,8 +359,8 @@ def test_projection_keeps_status_and_diff_consistent_for_sanitized_attributes(
     )
     attributes = settings.workspace_root / ".gitattributes"
     tracked = settings.workspace_root / "tracked.bin"
-    attributes.write_bytes(b"*.bin text working-tree-encoding=UTF-16\n")
-    tracked.write_bytes(b"\xff\xfe" + "tracked\n".encode("utf-16le"))
+    attributes.write_bytes(b"*.bin filter=lfs diff=lfs merge=lfs -text\n")
+    tracked.write_bytes(b"Automatic Git LFS consistency regression fixture.\n")
     subprocess.run(
         [
             git,
@@ -406,6 +418,57 @@ def test_projection_keeps_status_and_diff_consistent_for_sanitized_attributes(
         shell=False,
     ).stdout
     assert source_status == b""
+    indexed = subprocess.run(
+        [git, "-C", str(settings.workspace_root), "show", ":tracked.bin"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        check=True,
+        shell=False,
+    ).stdout
+    assert indexed.startswith(b"version https://git-lfs.github.com/spec/v1\n")
+    assert indexed != tracked.read_bytes()
+
+    index_data = (settings.workspace_root / ".git" / "index").read_bytes()
+    assert struct.unpack(">I", index_data[4:8])[0] == 2
+    flags_offset = 12 + 60
+
+    v2_extended = bytearray(index_data)
+    flags = struct.unpack(">H", v2_extended[flags_offset : flags_offset + 2])[0]
+    struct.pack_into(">H", v2_extended, flags_offset, flags | 0x4000)
+    v2_extended[-20:] = hashlib.sha1(v2_extended[:-20]).digest()
+    with pytest.raises(GitBrokerUnavailable, match="extended flags in a v2 index"):
+        _rebase_index_stat_cache_for_projection(
+            bytes(v2_extended),
+            source_root=settings.workspace_root,
+            destination_root=settings.workspace_root,
+        )
+
+    v3_unknown_extended = bytearray(index_data)
+    struct.pack_into(">I", v3_unknown_extended, 4, 3)
+    struct.pack_into(">H", v3_unknown_extended, flags_offset, flags | 0x4000)
+    path_offset = flags_offset + 2
+    terminator = v3_unknown_extended.find(b"\0", path_offset, len(v3_unknown_extended) - 20)
+    first_path = bytes(v3_unknown_extended[path_offset:terminator])
+    v3_unknown_extended[path_offset + 2 : terminator + 3] = first_path + b"\0"
+    struct.pack_into(">H", v3_unknown_extended, path_offset, 0x0001)
+    v3_unknown_extended[-20:] = hashlib.sha1(v3_unknown_extended[:-20]).digest()
+    with pytest.raises(GitBrokerUnavailable, match="unsupported extended flags"):
+        _rebase_index_stat_cache_for_projection(
+            bytes(v3_unknown_extended),
+            source_root=settings.workspace_root,
+            destination_root=settings.workspace_root,
+        )
+
+    ads_path = bytearray(index_data)
+    replacement = b"x:" + b"a" * (len(first_path) - 2)
+    ads_path[path_offset:terminator] = replacement
+    ads_path[-20:] = hashlib.sha1(ads_path[:-20]).digest()
+    with pytest.raises(GitBrokerUnavailable, match="unsafe index path"):
+        _rebase_index_stat_cache_for_projection(
+            bytes(ads_path),
+            source_root=settings.workspace_root,
+            destination_root=settings.workspace_root,
+        )
 
     stage = stage_git_repository(
         settings,
@@ -432,9 +495,34 @@ def test_projection_keeps_status_and_diff_consistent_for_sanitized_attributes(
     finally:
         shutil.rmtree(stage.root, ignore_errors=True)
 
+    tracked.unlink()
+    deletion_stage = stage_git_repository(
+        settings,
+        "attribute-tracked-deletion",
+        commands=commands,
+        inherited_core_autocrlf="true",
+    )
+    try:
+        deletion_outputs = [
+            subprocess.run(
+                [command[0], "-C", str(deletion_stage.repository), *command[1:]],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                check=True,
+                shell=False,
+            ).stdout
+            for command in commands
+        ]
+        assert b"tracked.bin" in deletion_outputs[0]
+        assert b"tracked.bin" in deletion_outputs[1]
+        assert b".gitattributes" not in deletion_outputs[0]
+        assert b".gitattributes" not in deletion_outputs[1]
+    finally:
+        shutil.rmtree(deletion_stage.root, ignore_errors=True)
+
     # If source stat evidence is stale, the Broker cannot safely emulate a project-controlled
     # clean filter. It must reject the snapshot rather than reintroduce status/diff disagreement.
-    tracked.write_bytes(b"\xff\xfe" + "changed and larger\n".encode("utf-16le"))
+    tracked.write_bytes(b"Automatic Git LFS consistency regression fixture changed and larger.\n")
     with pytest.raises(GitBrokerUnavailable, match="current source index stat metadata"):
         stage_git_repository(
             settings,

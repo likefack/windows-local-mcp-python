@@ -394,7 +394,7 @@ Approved Host を運用で使うには、変更できない運用用実行環境
 
 raw system/global Git config は sandbox child に再公開しません。working-tree semantics に必要な `core.autocrlf` は trusted Broker 側で `true`／`false`／`input` の scalar としてだけ解決し、sanitized `.git/config` に投影します。repository-local の直接 scalar override は通常の precedence を維持します。一方、include/includeIf、workspace／`data_dir`／scratch と重なる config path、invalid value、未知で安全に解決できない Git runtime/config semantics は fail closed します。
 
-Git LFS や `working-tree-encoding` のように index の内容と作業ファイルの実バイトが意図的に異なる場合でも、source index の ctime／mtime／size が現在の source file と一致する entry だけを投影先の file identity へ再結合します。これにより clean な repository で Automatic Git の `status` と metadata-only `diff` が異なる状態を返しません。属性規則が存在するのに source index の stat 情報が古い場合は、安全な属性変換を推測したり外部 helper を起動したりせず、その投影を fail closed にします。
+Git LFS のように index の内容と作業ファイルの実バイトが意図的に異なる場合でも、source index の ctime／mtime／size が現在の source file と一致する entry だけを投影先の file identity へ再結合します。これにより clean な repository で Automatic Git の `status` と metadata-only `diff` が異なる状態を返しません。属性規則が存在するのに source index の stat 情報が古い場合は、安全な属性変換を推測したり外部 helper を起動したりせず、その投影を fail closed にします。
 
 Git object database には、現在の working-tree policy では protected な内容を含む historical blob が残り得ます。また攻撃者はその blob を一見安全な tree／commit／index path に再結合できます。そのため current workspace path の検証や `^{commit}` binding だけを content provenance とみなしません。Automatic `diff`／`show` は `--stat`、`--name-only`、`--name-status`、`--quiet`、`--no-patch` 等の metadata-only output に限定し、`--patch`／`-p`／`--binary`／`--check`／pathspec 付き暗黙 patch は `request_sandbox_command` の対象です。`git_info` snapshot も status、diff stat/name-status、log metadata 等に限定します。marker がない／stale な PC では process creation 前に拒否し、Approved Host へ fallback しません。
 

@@ -651,10 +651,19 @@ def _rebase_index_stat_cache_for_projection(
                 "automatic Git attribute semantics do not accept unresolved index stages"
             )
         offset += 62
+        if version < 3 and flags & _GIT_INDEX_EXTENDED:
+            raise GitBrokerUnavailable(
+                "automatic Git attribute semantics found extended flags in a v2 index"
+            )
         if version >= 3 and flags & _GIT_INDEX_EXTENDED:
             if offset + 2 > payload_end:
                 raise GitBrokerUnavailable(
                     "automatic Git attribute semantics found a truncated extended index entry"
+                )
+            extended_flags = struct.unpack(">H", data[offset : offset + 2])[0]
+            if extended_flags & ~0x6000:
+                raise GitBrokerUnavailable(
+                    "automatic Git attribute semantics found unsupported extended flags"
                 )
             offset += 2
         terminator = data.find(b"\0", offset, payload_end)
@@ -669,62 +678,118 @@ def _rebase_index_stat_cache_for_projection(
             raise GitBrokerUnavailable(
                 "automatic Git attribute semantics found an invalid index path"
             ) from error
-        relative = Path(*path_text.replace("\\", "/").split("/"))
-        if not raw_path or relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+        normalized_path = path_text.replace("\\", "/")
+        path_parts = normalized_path.split("/")
+        relative = Path(*path_parts)
+        if (
+            not raw_path
+            or relative.is_absolute()
+            or bool(relative.drive)
+            or bool(relative.anchor)
+            or any(":" in part for part in path_parts)
+            or any(part in {"", ".", ".."} for part in path_parts)
+        ):
             raise GitBrokerUnavailable(
                 "automatic Git attribute semantics found an unsafe index path"
             )
 
         source_path = source_root / relative
         destination_path = destination_root / relative
+        source_hold: Path | None = None
         try:
-            source_details = source_path.stat(follow_symlinks=False)
+            source_path.lstat()
         except FileNotFoundError:
             # A tracked deletion is represented faithfully by leaving the original index entry.
             source_details = None
-        except OSError as error:
+        except (OSError, RuntimeError, ValueError) as error:
             raise GitBrokerUnavailable(
                 "automatic Git cannot verify source stat metadata for attribute semantics"
             ) from error
-        if source_details is not None:
-            if not stat.S_ISREG(source_details.st_mode):
-                raise GitBrokerUnavailable(
-                    "automatic Git attribute semantics require regular tracked files"
-                )
-            source_ctime = _git_index_timestamp(source_details, "ctime")
-            source_mtime = _git_index_timestamp(source_details, "mtime")
-            cached = struct.unpack(">10I", data[entry_start : entry_start + 40])
-            cached_ctime = (cached[0], cached[1])
-            cached_mtime = (cached[2], cached[3])
-            cached_size = cached[9]
-            if (
-                cached_ctime != source_ctime
-                or cached_mtime != source_mtime
-                or cached_size != source_details.st_size
-            ):
-                raise GitBrokerUnavailable(
-                    "automatic Git attribute semantics require current source index stat metadata"
-                )
+        else:
             try:
-                destination_details = destination_path.stat(follow_symlinks=False)
-            except OSError as error:
-                raise GitBrokerUnavailable(
-                    "automatic Git attribute projection is missing a tracked file"
-                ) from error
-            if not stat.S_ISREG(destination_details.st_mode):
-                raise GitBrokerUnavailable(
-                    "automatic Git attribute projection produced a non-regular tracked file"
+                source_hold = hold_verified_path(
+                    source_path,
+                    allow_directory=False,
+                    allow_hardlinks=False,
+                    readable=True,
                 )
-            projected_ctime = _git_index_timestamp(destination_details, "ctime")
-            projected_mtime = _git_index_timestamp(destination_details, "mtime")
-            struct.pack_into(">II", result, entry_start, *projected_ctime)
-            struct.pack_into(">II", result, entry_start + 8, *projected_mtime)
-            struct.pack_into(">I", result, entry_start + 36, destination_details.st_size)
+            except (OSError, RuntimeError, ValueError) as error:
+                raise GitBrokerUnavailable(
+                    "automatic Git cannot hold source stat metadata for attribute semantics"
+                ) from error
+            try:
+                source_details = source_hold.stat()
+            except OSError as error:
+                release_verified_hold(source_hold)
+                raise GitBrokerUnavailable(
+                    "automatic Git cannot read held source stat metadata for attribute semantics"
+                ) from error
+        if source_details is not None:
+            try:
+                if not stat.S_ISREG(source_details.st_mode):
+                    raise GitBrokerUnavailable(
+                        "automatic Git attribute semantics require regular tracked files"
+                    )
+                source_ctime = _git_index_timestamp(source_details, "ctime")
+                source_mtime = _git_index_timestamp(source_details, "mtime")
+                cached = struct.unpack(">10I", data[entry_start : entry_start + 40])
+                cached_ctime = (cached[0], cached[1])
+                cached_mtime = (cached[2], cached[3])
+                cached_size = cached[9]
+                if (
+                    cached_ctime != source_ctime
+                    or cached_mtime != source_mtime
+                    or cached_size != source_details.st_size
+                ):
+                    raise GitBrokerUnavailable(
+                        "automatic Git attribute semantics require current source index stat metadata"
+                    )
+                try:
+                    destination_hold = hold_verified_path(
+                        destination_path,
+                        allow_directory=False,
+                        allow_hardlinks=False,
+                        readable=True,
+                    )
+                except (OSError, RuntimeError, ValueError) as error:
+                    raise GitBrokerUnavailable(
+                        "automatic Git attribute projection is missing a tracked file"
+                    ) from error
+                try:
+                    destination_details = destination_hold.stat()
+                    if not stat.S_ISREG(destination_details.st_mode):
+                        raise GitBrokerUnavailable(
+                            "automatic Git attribute projection produced a non-regular tracked file"
+                        )
+                    projected_ctime = _git_index_timestamp(destination_details, "ctime")
+                    projected_mtime = _git_index_timestamp(destination_details, "mtime")
+                    struct.pack_into(">II", result, entry_start, *projected_ctime)
+                    struct.pack_into(">II", result, entry_start + 8, *projected_mtime)
+                    struct.pack_into(">I", result, entry_start + 36, destination_details.st_size)
+                finally:
+                    release_verified_hold(destination_hold)
+            finally:
+                assert source_hold is not None
+                release_verified_hold(source_hold)
 
         consumed = terminator + 1 - entry_start
         offset = entry_start + ((consumed + 7) // 8) * 8
         if offset > payload_end:
             raise GitBrokerUnavailable("automatic Git attribute semantics found an invalid index")
+
+    while offset < payload_end:
+        if offset + 8 > payload_end:
+            raise GitBrokerUnavailable("automatic Git attribute semantics found an invalid index")
+        signature = data[offset : offset + 4]
+        extension_size = struct.unpack(">I", data[offset + 4 : offset + 8])[0]
+        offset += 8
+        if extension_size > payload_end - offset:
+            raise GitBrokerUnavailable("automatic Git attribute semantics found an invalid index")
+        if signature == b"link":
+            raise GitBrokerUnavailable(
+                "automatic Git attribute semantics do not accept split indexes"
+            )
+        offset += extension_size
 
     result[-20:] = hashlib.sha1(result[:-20]).digest()
     return bytes(result)
@@ -1036,6 +1101,7 @@ def _copy_repository_tree(
         ) from error
     else:
         sanitized_attributes_present = True
+    deferred_index: tuple[Path, Path, bytes] | None = None
     pending: list[tuple[Path, Path]] = [(source, Path())]
     while pending:
         current, relative_root = pending.pop()
@@ -1098,6 +1164,12 @@ def _copy_repository_tree(
                 raise GitBrokerUnavailable(
                     f"automatic Git does not accept nested .git metadata: {relative}"
                 )
+            elif relative.name.casefold() == ".gitattributes":
+                sanitized_attributes_present = True
+                if _protected_worktree_path(relative, settings):
+                    raise GitBrokerUnavailable(
+                        "automatic Git attributes overlap a protected worktree path"
+                    )
             elif _protected_worktree_path(relative, settings):
                 continue
 
@@ -1124,6 +1196,22 @@ def _copy_repository_tree(
                 raise GitBrokerUnavailable("automatic Git snapshot exceeds its byte limit")
 
             target = destination / relative
+            if folded == ".git/index":
+                if deferred_index is not None:
+                    raise GitBrokerUnavailable("automatic Git repository has multiple index files")
+                if folded in prune_policy.pinned_files:
+                    data = prune_policy.pinned_bytes[folded]
+                else:
+                    held_index, data = _hold_projection_file(
+                        candidate,
+                        byte_limit=min(remaining, _GIT_INDEX_LIMIT),
+                    )
+                    # Keep the verified source index handle until projection completion. The
+                    # prune policy owns and releases it from stage_git_repository's finally path.
+                    prune_policy.pinned_files[folded] = held_index
+                    prune_policy.pinned_bytes[folded] = data
+                deferred_index = (target, relative, data)
+                continue
             if folded == ".git/config":
                 data = _safe_repository_config(
                     candidate,
@@ -1131,35 +1219,6 @@ def _copy_repository_tree(
                     inherited_core_autocrlf=inherited_core_autocrlf,
                 )
                 _write_projection_bytes(target, data)
-                size = len(data)
-                _record_snapshot_file(digest, relative, data)
-            elif folded == ".git/index" and sanitized_attributes_present:
-                if folded in prune_policy.pinned_files:
-                    held = prune_policy.pinned_files[folded]
-                    data = prune_policy.pinned_bytes[folded]
-                else:
-                    held, data = _hold_projection_file(
-                        candidate,
-                        byte_limit=min(remaining, _GIT_INDEX_LIMIT),
-                    )
-                try:
-                    data = _rebase_index_stat_cache_for_projection(
-                        data,
-                        source_root=source,
-                        destination_root=destination,
-                    )
-                    if len(data) > remaining:
-                        raise GitBrokerUnavailable(
-                            "automatic Git snapshot exceeds its byte limit"
-                        )
-                    _write_projection_bytes(target, data)
-                    try:
-                        shutil.copystat(held, target, follow_symlinks=False)
-                    except OSError:
-                        pass
-                finally:
-                    if folded not in prune_policy.pinned_files:
-                        release_verified_hold(held)
                 size = len(data)
                 _record_snapshot_file(digest, relative, data)
             elif relative.name.casefold() == ".gitattributes":
@@ -1218,6 +1277,19 @@ def _copy_repository_tree(
             total_bytes += size
             if total_bytes > byte_limit:
                 raise GitBrokerUnavailable("automatic Git snapshot exceeds its byte limit")
+    if deferred_index is not None:
+        target, relative, data = deferred_index
+        if sanitized_attributes_present:
+            data = _rebase_index_stat_cache_for_projection(
+                data,
+                source_root=source,
+                destination_root=destination,
+            )
+        if len(data) > byte_limit - total_bytes:
+            raise GitBrokerUnavailable("automatic Git snapshot exceeds its byte limit")
+        _write_projection_bytes(target, data)
+        total_bytes += len(data)
+        _record_snapshot_file(digest, relative, data)
     if not (destination / ".git" / "config").is_file():
         raise GitBrokerUnavailable("automatic Git repository has no .git/config")
     if not (destination / ".git" / "HEAD").is_file():

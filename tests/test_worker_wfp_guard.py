@@ -238,11 +238,13 @@ def test_worker_rebinds_redirector_identity_before_approved_payload_launch(
     }
 
 
+@pytest.mark.parametrize("stored_tier", ["codex_sandbox", "approved_sandbox"])
 def test_approved_sandbox_does_not_spend_execution_ttl_on_optional_git_telemetry(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stored_tier: str
 ) -> None:
     settings = _settings(tmp_path)
     operation_id, _backend_value = _prepare_operation(settings, monkeypatch)
+    AuditStore(settings).update_operation(operation_id, tier=stored_tier)
     child = FakeChild()
     job = FakeJob()
     freshness_checks: list[str] = []

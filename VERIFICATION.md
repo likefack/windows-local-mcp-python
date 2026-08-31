@@ -8,14 +8,16 @@
 - 1件目は `worker_started` から pre-Git snapshot 生成まで約83.7秒、その後の workspace checkpoint が約2.7秒。2件目はそれぞれ約75.2秒、約0.3秒だった。失効 event は workspace checkpoint 完了直後に記録されていた。
 - 失敗後も optional な post-Git snapshot が約77秒動いたため、operation 全体は約160～173秒になった。主原因は recovery 待機や workspace checkpoint ではなく、Approved Sandbox child 起動前後に暗黙実行していた複数の Automatic Git Sandbox 起動だった。
 - 同じ `data_dir` の `workspace_recovery_required` が成立する場合、worker は approval bundle 検証より前に `workspace_recovery_required` event を記録して停止する。対象2件の event 列はこの経路ではないため、先行する `recovery_required` の直接的な二次障害ではない。
+- validity は `valid`、remediation decision は `proportionate-fix`。攻撃者による権限拡大や境界越えではないが、通常の一回承認で再現し、Approved Sandbox の中核機能を child 起動前に失敗させる可用性障害である。TTL 延長や fail-open ではなく、security／rollback に不要な任意 telemetry だけを外す小さい修正で解消できるため、残存 risk として受容しない。
 
 ### 修正と回帰検証
 
 - Approved Sandbox は承認済み immutable projection と complete workspace checkpoint を維持し、child 起動前後の optional Git telemetry だけを実行経路から外した。Approved Host の Git telemetry、one-shot TTL、child 直前の expiry 再確認、workspace lock／checkpoint、Host への自動 fallback 禁止は変更していない。
 - checkpoint の開始・完了、所要時間、file count、total bytes を audit event に追加し、今後の pre-child 遅延を Git telemetry と checkpoint で切り分けられるようにした。
-- Approved Sandbox が Git telemetry を一度も呼ばず、workspace checkpoint 後に TTL freshness check を通って child を起動し成功する回帰、worker identity 再結合、既に失効した grant が child を起動しない対照試験: `3 passed in 6.31s`（通常 Windows user 文脈）。
-- worker／Git snapshot focused suite: `16 passed in 8.10s`。変更ファイルの Ruff `--no-cache` と compileall: pass。
-- Approved Host 統合は通常 Windows user 文脈で `5 passed, 3 failed`。3件は今回変更していない Approved Host の長時間 worker／descendant 終了状態に関する既知の全体回帰であり、本修正の合格根拠には数えない。
+- canonical `codex_sandbox` と旧 `approved_sandbox` alias の双方が Git telemetry を一度も呼ばず、workspace checkpoint 後に TTL freshness check を通って child を起動し成功する回帰、worker identity 再結合、既に失効した grant が child を起動しない対照試験: `4 passed in 6.45s`（通常 Windows user 文脈）。
+- worker／Git snapshot focused suite: `17 passed in 7.35s`。変更ファイルの Ruff `--no-cache` と compileall: pass。
+- Approved Host 統合は通常 Windows user 文脈で `5 passed, 3 failed`。失敗は WMI／descendant 経路の期待状態 `failed`／`succeeded`／`timed_out` に対して `running`／`failed` となったもの。今回の条件分岐は Approved Host では従来どおり Git telemetry を実行するため、この3件を本修正の合格根拠にも新規回帰の根拠にも数えず、別の未解決全体回帰として残す。
+- 共有作業ツリー全体の pytest も実行したが、並行中の Automatic Git／WFP／Approved Host 変更を含む状態で50%までに多数失敗し、Windows 設定／ACL 系テストで CPU と生成物更新が約4分停止したため中断した。リポジトリ全体の合格状態とは扱わない。共有ツリー全体の Ruff `--no-cache` と今回変更ファイルの `git diff --check` は pass。
 
 ### 実機確認の境界
 
@@ -263,6 +265,30 @@ Live verification 自体を security design review の一部として扱い、�
 `normal operation → SYSTEM worker loss → Job-external WMI helper survival → service restart + durable recovery_required → stale/legacy execution rejection → exact helper cleanup → reviewed coordinated recovery → restored normal operation`
 
 WLMCP-R2-001 は `fixed / live verified` とする。これは別 PC、別 runtime、別 service configuration、または authority/security-boundary code の変更後にも自動的に live-verified とみなす意味ではない。production execution は各環境で immutable runtime と authenticated LocalSystem authority service の current preflight を引き続き要求し、security boundary を変更した場合は normal／abnormal／recovery lifecycle を再検証する。
+
+## 2026-08-31 Sandbox／Automatic Git の UAC 再試行抑止
+
+通常の Sandbox／Automatic Git 起動では WFP Guard の確認を read-back のみに限定し、missing、不一致、読み取り不能のいずれでも自動昇格や自動再構築を行わず fail closed とする。WFP object の変更を許可するのは、operator が明示的に開始した `verify-codex-sandbox` の先頭で exact missing を確認できた場合だけである。管理者権限が必要な場合、この検証単位で WLMCP が開始する UAC は原則 1 回であり、同じ検証内の後続 probe は再昇格しない。
+
+Codex Windows Sandbox 自身の初期セットアップが最初の固定 probe で失敗した場合は、その時点で後続 probe と Automatic Git の追加 probe を停止する。WFP の読み取り不能、identity／policy／binary／config mismatch など、exact missing と確認できない状態を「修復可能」と推測して再昇格することは禁止する。通常起動は Approved Host へ自動 fallback せず、明示的な再検証を案内する。
+
+Automated verification:
+
+- `python -m pytest -q tests/test_wfp_guard_runtime.py tests/test_sandbox_source_acl_verifier.py tests/test_git_broker_launch_gate.py --basetemp=.dev-tmp/pytest/uac-review-final`: `22 passed`
+- `python -m pytest -q tests -k "wfp or sandbox or git_broker" --basetemp=.dev-tmp/pytest/uac-related-host`: `162 passed, 1 skipped, 547 deselected`（通常 Windows 文脈）
+- `python -m ruff check --no-cache .`: PASS
+- `python -m compileall -q src/windows_local_mcp`: PASS
+- `git diff --check`: substantive error なし（既存の LF／CRLF warning のみ）
+
+Full-suite limitation:
+
+- 制限環境では `.bat` launcher の読み取りが `PermissionError` となるため、該当 launcher test は通常 Windows 文脈で再実行して PASS を確認した。
+- full pytest は `tests/test_mcp_stdio_integration.py::test_saved_acl_config_starts_through_normal_launcher` で長時間応答がなく、同 test は通常 Windows 文脈の個別再実行でも 60 秒を超えて完了しなかったため中断した。この test と関連する `tests/test_mcp_stdio_integration.py`、`paths.py`、`server.py` の変更は、作業中に別処理が作成した current HEAD `604ec84` に含まれるが、本 UAC 対応の経路とは独立している。
+
+Live verification limitation:
+
+- 現在の Codex Desktop 内から入れ子の Windows Sandbox／UAC を起動した結果は通常 Windows host の実機証拠として扱わないため、UAC の実表示回数、再起動後、BFE／WFP state 消失後、実 Codex Sandbox helper の初回セットアップは未検証である。
+- 通常 Windows PowerShell から明示 verifier を実行し、初回成功後の通常 Sandbox／Automatic Git 起動で追加 UAC がないこと、および再起動・WFP state 消失・binding 変更後に自動再昇格せず停止することを確認するまで、live verification verdict は `pending` とする。
 
 ## Historical verification record
 
