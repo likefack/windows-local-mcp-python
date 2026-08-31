@@ -25,6 +25,35 @@ def _ps_literal(value: str | Path) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
+def _ensure_launcher_runtime(repository_root: Path) -> bool:
+    development_python = repository_root / ".venv" / "Scripts" / "python.exe"
+    if development_python.is_file():
+        return False
+    development_root = repository_root / ".venv"
+    if development_root.exists():
+        pytest.skip("repository .venv exists but has no launcher Python; test will not modify it")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "venv",
+            "--system-site-packages",
+            "--without-pip",
+            str(development_root),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+        check=False,
+        shell=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert development_python.is_file()
+    return True
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows launcher and ACL integration")
 def test_saved_acl_config_starts_through_normal_launcher(tmp_path: Path) -> None:
     repository_root = Path(__file__).resolve().parents[1]
@@ -71,6 +100,7 @@ $content = [IO.File]::ReadAllText({_ps_literal(candidate)}, [Text.Encoding]::UTF
 Save-Config -Content $content -Path {_ps_literal(config)} -PythonPath {_ps_literal(sys.executable)}
 Set-ActiveConfig -ConfigPath {_ps_literal(config)}
 """
+    created_development_runtime = False
     try:
         configured = subprocess.run(
             [shell, "-NoProfile", "-NonInteractive", "-Command", setup_command],
@@ -86,6 +116,8 @@ Set-ActiveConfig -ConfigPath {_ps_literal(config)}
         assert configured.returncode == 0, configured.stdout + configured.stderr
         marker = data / ".acl-policy.json"
         assert marker.is_file()
+
+        created_development_runtime = _ensure_launcher_runtime(repository_root)
 
         async def exercise_launcher() -> None:
             server = StdioServerParameters(
@@ -118,6 +150,8 @@ Set-ActiveConfig -ConfigPath {_ps_literal(config)}
             check=False,
             shell=False,
         )
+        if created_development_runtime:
+            shutil.rmtree(repository_root / ".venv", ignore_errors=True)
 
 
 def test_real_stdio_tools_list_and_file_round_trip(tmp_path: Path) -> None:
