@@ -13,15 +13,15 @@ def _operation(operation_id: str | None, status: str = "succeeded") -> dict[str,
     return operation
 
 
-def test_live_activity_displays_full_operation_id() -> None:
+def test_live_activity_displays_full_operation_id_at_end() -> None:
     operation_id = "12345678-1234-5678-9abc-1234567890ab"
 
     line = format_activity(_operation(operation_id))
 
     assert line is not None
-    assert f"[op:{operation_id}]" in line
-    assert "Edited" in line
-    assert "README.md" in line
+    operation_tag = f"[op:{operation_id}]"
+    assert line.endswith(operation_tag)
+    assert line.index("Edited") < line.index("ファイルを編集") < line.index("README.md") < line.index(operation_tag)
 
 
 def test_live_activity_keeps_operation_id_across_lifecycle() -> None:
@@ -30,8 +30,9 @@ def test_live_activity_keeps_operation_id_across_lifecycle() -> None:
     running = format_activity(_operation(operation_id, status="running"))
     finished = format_activity(_operation(operation_id, status="succeeded"))
 
-    assert running is not None and f"[op:{operation_id}]" in running
-    assert finished is not None and f"[op:{operation_id}]" in finished
+    operation_tag = f"[op:{operation_id}]"
+    assert running is not None and running.endswith(operation_tag)
+    assert finished is not None and finished.endswith(operation_tag)
     assert "Running" in running
     assert "Edited" in finished
 

@@ -26,7 +26,7 @@ Windows Local MCP の Live Activity 実機 E2E 受入試験を実施してくだ
 - 各操作前後に専用ディレクトリのファイル名、byte数、SHA-256、必要なテキスト内容を記録し、期待外のファイル変更がないことを確認してください。ファイル本文は必要最小限の専用fixtureだけを扱い、Live Activityや報告へ秘密情報を出さないでください。
 - Live Activity の確認は、実際の Windows Approval UI に表示された行を利用者が目視した結果に基づきます。あなたがUIを直接読めない場合は、期待する表示と確認時刻を示して利用者へ確認を依頼し、その返答があるまで該当項目を PASS にしないでください。
 - audit_list / audit_get / activity_timeline / activity_get は対応 operation の確認に使います。Live Activity の表示文字列を承認、policy、rollback、security decision の根拠にしないでください。
-- operation ID、request hash、credential、token、秘密値、ファイル本文、diff本文、stdout/stderr本文を Live Activity に表示させたり、最終報告へ不用意に複製したりしないでください。必要な operation ID は試験証跡の表だけに記録してください。
+- Live Activity は完全な operation ID を行末に [op:<完全ID>] 形式で表示し、表示順を「時刻 → 状態 → 操作内容 → 対象 → [op:<完全ID>]」にしてください。request hash、credential、token、秘密値、ファイル本文、diff本文、stdout/stderr本文は表示させず、最終報告へ operation ID を不用意に複製しないでください。必要な operation ID は試験証跡の表に記録してください。
 - ある独立ケースが FAIL / BLOCKED / TIMEOUT になっても、安全に続行できる別ケースは続けてください。ただし workspace の期待状態が不明、復旧が必要、または cleanup の安全性を証明できない場合は mutation を停止してください。
 - policy、承認、checkpoint、transaction、rollback、Undo、Approved Host、Codex Sandbox、Automatic Git、structured processing、artifact transfer の保証を無効化、迂回、弱体化しないでください。
 

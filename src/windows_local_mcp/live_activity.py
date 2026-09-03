@@ -676,10 +676,10 @@ def format_projection(projection: ActivityProjection) -> str:
     """operation ID は表示し、request hash は出さずに一行へ安全に整形する。"""
 
     suffix = " [succeeded]" if projection.label == "Finished" and projection.status == "succeeded" else ""
-    operation_tag = f"[op:{projection.operation_id}] " if projection.operation_id else ""
+    operation_tag = f" [op:{projection.operation_id}]" if projection.operation_id else ""
     return terminal_safe(
         f"[{_timestamp(projection.timestamp)}] {projection.label:<10} "
-        f"{operation_tag}{projection.detail}{suffix}"
+        f"{projection.detail}{suffix}{operation_tag}"
     )
 
 
