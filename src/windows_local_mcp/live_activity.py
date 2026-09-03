@@ -673,12 +673,13 @@ def _timestamp(value: object) -> str:
 
 
 def format_projection(projection: ActivityProjection) -> str:
-    """低レベル ID や request hash を含めず、一行へ安全に整形する。"""
+    """operation ID は表示し、request hash は出さずに一行へ安全に整形する。"""
 
     suffix = " [succeeded]" if projection.label == "Finished" and projection.status == "succeeded" else ""
+    operation_tag = f"[op:{projection.operation_id}] " if projection.operation_id else ""
     return terminal_safe(
         f"[{_timestamp(projection.timestamp)}] {projection.label:<10} "
-        f"{projection.detail}{suffix}"
+        f"{operation_tag}{projection.detail}{suffix}"
     )
 
 
