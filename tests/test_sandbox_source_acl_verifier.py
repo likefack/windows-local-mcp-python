@@ -64,7 +64,8 @@ def test_hardened_verifier_provisions_source_acl_before_base_probes(
             "added": len(calls) == 1,
         }
 
-    def base(_settings: Settings) -> dict[str, object]:
+    def base(_settings: Settings, *, persist_evidence: bool = True) -> dict[str, object]:
+        assert persist_evidence is False
         calls.append("base-live-probes")
         return {
             "backend_digest": sha256_text(canonical_json(backend_payload)),
@@ -130,7 +131,8 @@ def test_hardened_verifier_rejects_account_change_after_acl_provision(
     settings = _settings(tmp_path)
     sid = "S-1-5-21-100-200-300-1004"
 
-    def base(_settings: Settings) -> dict[str, object]:
+    def base(_settings: Settings, *, persist_evidence: bool = True) -> dict[str, object]:
+        assert persist_evidence is False
         return {"sandbox_account_identity": {"sid": "S-1-5-21-OTHER"}}
 
     def wrapped_placeholder(_settings: Settings) -> dict[str, object]:
@@ -153,6 +155,48 @@ def test_hardened_verifier_rejects_account_change_after_acl_provision(
         hardened.verify_codex_sandbox_live.__wrapped__(settings)
 
 
+def test_hardened_verifier_preserves_unverified_result_when_identity_was_not_measured(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    sid = "S-1-5-21-100-200-300-1004"
+    writes: list[dict[str, object]] = []
+
+    def base(_settings: Settings, *, persist_evidence: bool = True) -> dict[str, object]:
+        assert persist_evidence is False
+        return {
+            "sandbox_account_identity": None,
+            "checks": {"simple_command": None},
+            "properties": _verified_properties(),
+            "diagnostics": {"verification_error": "WFP read-back unavailable"},
+            "probe_diagnostics": [],
+            "passed": False,
+        }
+
+    def wrapped_placeholder(_settings: Settings) -> dict[str, object]:
+        raise AssertionError("decorated base wrapper must not be called")
+
+    wrapped_placeholder.__wrapped__ = base  # type: ignore[attr-defined]
+    monkeypatch.setattr(hardened, "_base_verify_codex_sandbox_live", wrapped_placeholder)
+    monkeypatch.setattr(
+        hardened,
+        "resolve_sandbox_account_identity",
+        lambda: SimpleNamespace(sid=sid),
+    )
+    monkeypatch.setattr(
+        hardened,
+        "ensure_source_workspace_read_deny",
+        lambda *_args: {"added": False},
+    )
+    monkeypatch.setattr(hardened, "_write_evidence", lambda _path, value: writes.append(value))
+
+    result = hardened.verify_codex_sandbox_live.__wrapped__(settings)
+
+    assert result["verification_status"] == "unverified"
+    assert result["verification_failure_reason"] == "WFP read-back unavailable"
+    assert len(writes) == 2
+
+
 def test_hardened_verifier_skips_followup_after_foundational_setup_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -160,7 +204,8 @@ def test_hardened_verifier_skips_followup_after_foundational_setup_failure(
     sid = "S-1-5-21-100-200-300-1004"
     writes: list[dict[str, object]] = []
 
-    def base(_settings: Settings) -> dict[str, object]:
+    def base(_settings: Settings, *, persist_evidence: bool = True) -> dict[str, object]:
+        assert persist_evidence is False
         return {
             "sandbox_account_identity": {"sid": sid},
             "checks": {"simple_command": None},
@@ -205,4 +250,7 @@ def test_hardened_verifier_skips_followup_after_foundational_setup_failure(
 
     assert result["checks"]["brokered_process_creation_denied"] is None
     assert result["passed"] is False
-    assert writes == [result]
+    assert writes[0]["verification_status"] == "verifying"
+    assert writes[0]["passed"] is False
+    assert writes[1] == result
+    assert result["verification_status"] == "unverified"

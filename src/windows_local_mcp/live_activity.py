@@ -47,7 +47,9 @@ STRUCTURED_EDIT_TOOLS = frozenset(
         "zip_extract_many",
     }
 )
-MUTATION_TOOLS = frozenset({"write_file"})
+MUTATION_TOOLS = frozenset(
+    {"write_file", "move_file", "copy_file", "delete_file", "make_directory"}
+)
 COMMAND_TOOLS = frozenset(
     {
         "execute_readonly",
@@ -348,6 +350,18 @@ def _detail(
         action = f"{format_name}を編集" if format_name else "構造化ファイルを編集"
         return f"{action} {path}".strip()
     if tool in MUTATION_TOOLS:
+        if tool == "move_file":
+            source = _safe_text(request.get("source_path"))
+            destination = _safe_text(request.get("destination_path"))
+            return f"ファイルを移動 {source} -> {destination}".strip()
+        if tool == "copy_file":
+            source = _safe_text(request.get("source_path"))
+            destination = _safe_text(request.get("destination_path"))
+            return f"ファイルをコピー {source} -> {destination}".strip()
+        if tool == "delete_file":
+            return f"ファイルを削除 {path}".strip()
+        if tool == "make_directory":
+            return f"フォルダーを作成 {path}".strip()
         return f"ファイルを編集 {path}".strip()
     if tool in STRUCTURED_READ_TOOLS:
         action = f"{format_name}を読み取り" if format_name else "構造化ファイルを読み取り"
@@ -566,7 +580,12 @@ def project_operation(
             if kind == "read":
                 label = "Read"
             elif kind == "edit":
-                label = "Edited"
+                label = {
+                    "move_file": "Moved",
+                    "copy_file": "Copied",
+                    "delete_file": "Deleted",
+                    "make_directory": "Created directory",
+                }.get(tool, "Edited")
             elif kind == "transfer":
                 transfer_state = (transfer_states or {}).get(transfer_id, "")
                 if (

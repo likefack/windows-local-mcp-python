@@ -108,6 +108,9 @@ def timeline_entry(settings: Settings, audit: AuditStore, operation_id: str) -> 
     result = operation.get("result") or {}
     command = normalized.get("display_command") if isinstance(normalized, dict) else None
     changed = result.get("changed_files", []) if isinstance(result, dict) else []
+    changed_directories = (
+        result.get("changed_directories", []) if isinstance(result, dict) else []
+    )
     post_available = _checkpoint_available(settings, operation.get("post_workspace_path"))
     pre_available = _checkpoint_available(settings, operation.get("pre_workspace_path"))
     display_status, display_finished_at, _display_time = _transfer_display_state(operation)
@@ -129,6 +132,8 @@ def timeline_entry(settings: Settings, audit: AuditStore, operation_id: str) -> 
         "stderr_preview": result.get("stderr_preview", "") if isinstance(result, dict) else "",
         "changed_files": changed,
         "changed_file_count": len(changed),
+        "changed_directories": changed_directories,
+        "changed_directory_count": len(changed_directories),
         "added_lines": result.get("added_lines", 0) if isinstance(result, dict) else 0,
         "removed_lines": result.get("removed_lines", 0) if isinstance(result, dict) else 0,
         "unified_diff": _artifact_preview(settings, operation.get("diff_path")),
@@ -184,6 +189,9 @@ def timeline_list(settings: Settings, audit: AuditStore, limit: int = 50) -> lis
         normalized = request.get("normalized_command") if isinstance(request, dict) else None
         display = normalized.get("display_command") if isinstance(normalized, dict) else None
         changed = payload.get("changed_files", []) if isinstance(payload, dict) else []
+        changed_directories = (
+            payload.get("changed_directories", []) if isinstance(payload, dict) else []
+        )
         conflicts = (
             request.get("undo_preview", {}).get("conflict_count", 0)
             if isinstance(request, dict) and isinstance(request.get("undo_preview"), dict)
@@ -203,6 +211,7 @@ def timeline_list(settings: Settings, audit: AuditStore, limit: int = 50) -> lis
                 "status": display_status,
                 "summary": _summary(request, display),
                 "changed_file_count": len(changed),
+                "changed_directory_count": len(changed_directories),
                 "added_lines": payload.get("added_lines", 0)
                 if isinstance(payload, dict)
                 else 0,
@@ -232,16 +241,23 @@ def _summary(request: dict[str, Any], display: object) -> str:
     if isinstance(display, list):
         value = " ".join(str(part) for part in display)
     else:
-        value = str(
-            request.get("path")
+        source = request.get("source_path")
+        destination = request.get("destination_path")
+        if source and destination:
+            value = f"{source} -> {destination}"
+        else:
+            value = str(
+                request.get("path")
             or request.get("target_operation_id")
             or request.get("operation_id")
             or ""
-        )
+            )
     return value if len(value) <= 200 else value[:197] + "..."
 
 
 def _operation_type(tool_name: str) -> str:
+    if tool_name in {"move_file", "copy_file", "delete_file", "make_directory"}:
+        return tool_name
     if tool_name == "request_workspace_rollback":
         return "point_in_time_rollback"
     if tool_name == "request_selective_undo":

@@ -332,7 +332,7 @@ approved_host_enabled = false
 
 ADB を自動で使う場合、PATH から見つかった同名ファイルは使いません。作業領域、`data_dir`、Sandbox の一時領域の外にある実行ファイルを、絶対パスと SHA-256 の組み合わせで設定してください。設定がない場合は、機能を有効にしていても実行を拒否します。
 
-Automatic Git も PATH から実行ファイルを探して信用することはありません。作業領域、`data_dir`、Sandbox の一時領域の外にある実際の Git 実行ファイルを、絶対パスと SHA-256 の組み合わせで指定します。Git for Windows の `cmd\git.exe` やインストール先の `bin\git.exe` は別の実行ファイルへ渡すだけのものの場合があるため、確認対象には使いません。64 ビット版では通常 `mingw64\bin\git.exe` を指定します。パスとハッシュを設定しただけでは利用できず、先に Sandbox の実機検証、続けて `verify-git-broker` を明示的に実行する必要があります。
+Automatic Git も PATH から実行ファイルを探して信用することはありません。作業領域、`data_dir`、Sandbox の一時領域の外にある実際の Git 実行ファイルを、絶対パスと SHA-256 の組み合わせで指定します。Git for Windows の `cmd\git.exe` やインストール先の `bin\git.exe` は別の実行ファイルへ渡すだけのものの場合があるため、確認対象には使いません。64 ビット版では通常 `mingw64\bin\git.exe` を指定します。パスとハッシュを設定しただけでは利用できず、先に LocalMCP の自動 lifecycle で Sandbox が `verified` になること、続けて `verify-git-broker` を明示的に実行することが必要です。
 
 ```powershell
 $gitPath = 'C:\Program Files\Git\mingw64\bin\git.exe'
@@ -346,6 +346,7 @@ git_executable_sha256 = "ここを64桁のSHA-256へ置換"
 
 ```powershell
 $env:LOCAL_MCP_CONFIG = 'C:\path\to\config.local.toml'
+# 必要な場合だけ、diagnostics／強制再検証として実行します。
 .\.venv\Scripts\python.exe -m windows_local_mcp.cli verify-codex-sandbox
 .\.venv\Scripts\python.exe -m windows_local_mcp.cli verify-git-broker
 ```
@@ -406,6 +407,8 @@ ADB helper は設定済み path、SHA-256、file identity を正規化時と wor
 
 バイナリのダウンロード転送は、開始時に元ファイルの前後同一性と SHA-256 を確認した不変スナップショットを制御領域へ固定し、各チャンクでは必要範囲だけを読み取ります。アップロード転送は開始時に申告済み全容量を予約するため、チャンクごとのデータ領域全走査を行いません。別々の転送は並行できますが、同一転送内のオフセット順序、fsync、完了時の全体 SHA-256、元ファイルと出力先の同時変更検知は維持します。監査は転送開始を親操作、各チャンクを SHA-256 付きの永続イベントとして記録し、チャンク数に比例するタイムライン行と同期書き込みを抑えます。
 
+転送 manifest は `preparing`、`open`、`completed`、`committed`、`cancelled`、`expired`、`failed` を区別します。`max_open_transfers` は upload／download 共通で `preparing` と `open` だけを数えます。download の最後のチャンクを正常に返すと自動で `completed` になり、0 byte download は begin 完了時に `completed` になります。`completed` の manifest と不変スナップショットは直ちに削除せず、通常の artifact retention まで保持するため、最後の応答が失われても同じ有効なチャンクを再取得できます。中断した `open` transfer は `artifact_transfer_cancel` で `cancelled` にでき、同じ cancel の再実行は同じ結果を返します。期限切れは `expired`、永続 payload の同一性破損は `failed` となり、いずれの終端状態も admission 枠を使用しません。通常の入力誤りは transfer を失敗扱いにせず、修正して再試行できます。
+
 ## 構造化ファイル
 
 - **DOCX**: paragraph／run、検索置換、表、header/footer、style、section、page 設定、metadata。通常文書は文書ライブラリで処理します。追跡変更、コメント、macro、埋め込み object、データ連動 Custom XML などがある文書でも、電子署名がなく、操作が `replace_text` または `metadata_set` に限定される場合は、対象 XML 部分だけを書き換えて未対応部分を保持します。それ以外の操作は拒否します。
@@ -430,9 +433,11 @@ Approved Host は runtime immutability、LocalSystem-owned Job Object／monitor�
 
 Live verification は各 property を `verified`、`failed`、`unverified` の三値で保存します。`failed` は実際の probe が境界脱出を観測した場合だけ、`unverified` は起動失敗、タイムアウト、listener または probe 環境の準備失敗、出力を測定できない場合に使います。current v1 の一般 Codex Sandbox route では workspace 内 `protected_information_read` と LAN access を受容済み残存 risk として分離します。これらの failure／unverified は隠さず保持しますが、それだけでは一般 route を unavailable にしません。Automatic Git はこの例外を継承しません。一般 source-workspace read/write、workspace 外 user/protected read、control-plane、Internet、loopback、termination、resource bound、WMI／CIM brokered process creation denial 等の必須境界は引き続き fail closed です。Approved Host へ自動移行しません。
 
-live marker は schema v5 です。launcher／helper の canonical path、content SHA-256、Windows stable file identity、size、実際の version、Authenticode の Valid status・leaf signer subject・leaf certificate thumbprint に加え、実際に import された WFP Guard module 群の canonical path／SHA-256／stable file identity／size、Guard version、policy generation、Sandbox account、Windows product／build／UBR／architecture、WFP read-back identity を結合します。mtime は補助的な drift signal であり、単独では security identity として扱いません。`isolation_context_digest` はさらに workspace の実体、保護名・拒否 directory、`sandbox_dependency_readable_paths`、Sandbox policy generation、process 数・process-tree memory 上限、scratch 上限、許可環境変数などを結合します。これらを変更した場合、marker は stale として拒否され、通常 operation は live verification や UAC probe を自動実行しません。明示的に `verify-codex-sandbox` を再実行してください。v1～v4 marker から v5 を推測・移行しません。
+live marker は schema v5 です。launcher／helper の canonical path、content SHA-256、Windows stable file identity、size、実際の version、Authenticode の Valid status・leaf signer subject・leaf certificate thumbprint に加え、実際に import された WFP Guard module 群の canonical path／SHA-256／stable file identity／size、Guard version、policy generation、Sandbox account、Windows product／build／UBR／architecture、WFP read-back identity を結合します。mtime は補助的な drift signal であり、単独では security identity として扱いません。`isolation_context_digest` はさらに workspace の物理 identity、保護名・拒否 directory、`sandbox_dependency_readable_paths`、Sandbox policy generation、process 数・process-tree memory 上限、scratch 上限、許可環境変数などを結合します。v1～v4 marker から v5 を推測・移行しません。
 
-通常の Sandbox／Automatic Git 起動は WFP を読み取って確認するだけで、UAC、live verification、object 再構築を自動実行しません。static non-persistent WFP fixed object が再起動や BFE restart で消失した場合、読取不能の場合、または marker と異なる場合は child を起動せず、`verify-codex-sandbox` の明示実行を案内します。明示 verifier だけが verification unit の最初に exact missing object の再構築を1回試行でき、その後の各 probe は非昇格で complete read-back します。途中消失、不一致、conflicting object、marker identity 不一致は追加 UAC を表示せず fail closed にします。
+通常の LocalMCP 起動では、まず現在の backend と `isolation_context_digest` に対して marker を検査します。有効で TTL 内ならその marker を再利用し、単なる再起動では full verification を行いません。missing、stale、schema 非互換、backend／isolation／policy identity 不一致、TTL 超過の場合だけ、Broker／filesystem／structured processing／audit／binary transfer／rollback の起動を待たせず、Sandbox 状態を `verifying` として同じ hardened verifier を背景実行します。成功するまで Sandbox child は起動せず、失敗または未検証でも Approved Host へ自動移行しません。
+
+自動 verifier は `data_dir` の process-shared lock を使い、lock 取得後に marker を再確認するため、複数 startup／client が同じ identity の full probe を重複実行しません。lock は OS file lock なので process crash／power loss 後に解放されます。失敗・timeout・launcher／listener／measurement failure は identity-bound attempt state として記録し、既定 300 秒の cooldown 中は自動再試行しません。backend、helper、workspace physical identity、設定、policy generation 等が変わって identity digest が変われば、新しい環境として再試行できます。
 
 Sandbox account から `Win32_Process.Create` を含む WMI／CIM brokered process creation が拒否されることを live verification で確認し、`brokered_process_creation_denied=true` を必須 evidence とします。この check が欠損または false の marker は route eligible ではありません。これにより Job 外 process を使った termination／process／memory bound の迂回を current mandatory boundary として扱います。
 
@@ -447,11 +452,11 @@ max_sandbox_processes = 64
 max_sandbox_memory_bytes = 4294967296
 ```
 
-Windows の公式 npm global install はセットアップから自動解決できます。PATH 上の `codex.ps1`、`codex.cmd`、`codex` は package の場所を知るための locator にすぎず、trusted executable として実行しません。`@openai/codex` の package manifest と Windows architecture に基づいて、同梱された native `codex.exe` と `codex-code-mode-host.exe` を特定し、既存の Authenticode、SHA-256、安定ファイル識別、helper、version 検証を通過した場合だけ `approved_sandbox_codex_path` へ絶対 path を保存します。署名または依存関係を確定できない場合は Sandbox を利用可能とは表示せず、実行時も fail closed です。Desktop 版、standalone 版、明示した trusted path の探索は従来どおり保持します。backend を解決できても、この PC の Windows 境界を確認する `verify-codex-sandbox` は別途必要です。
+Windows の公式 npm global install はセットアップから自動解決できます。PATH 上の `codex.ps1`、`codex.cmd`、`codex` は package の場所を知るための locator にすぎず、trusted executable として実行しません。`@openai/codex` の package manifest と Windows architecture に基づいて、同梱された native `codex.exe` と `codex-code-mode-host.exe` を特定し、既存の Authenticode、SHA-256、安定ファイル識別、helper、version 検証を通過した場合だけ `approved_sandbox_codex_path` へ絶対 path を保存します。署名または依存関係を確定できない場合は Sandbox を利用可能とは表示せず、実行時も fail closed です。Desktop 版、standalone 版、明示した trusted path の探索は従来どおり保持します。通常は手動 verify は不要で、backend を解決できても有効 marker がない場合は LocalMCP が Sandbox だけを背景再検証します。
 
 WLMCP は `codex sandbox` 専用 entrypoint を argv で起動し、agent／model API は使用しません。launcher と helper の path、署名、hash、file identity を承認と実行時に検証します。
 
-Sandbox 起動直前には、この PC のコンピューター名で完全修飾した `CodexSandboxOffline` の SID を Windows から解決し、返された参照ドメインがこの PC の物理 NetBIOS 名と一致すること、`SID_NAME_USE` が `SidTypeUser`（1）であることを確認します。単純名から信頼ドメインへ広がる解決や、ユーザー以外の SID は受け入れません。そのうえで ALE_AUTH_CONNECT_V4／V6 の loopback BLOCK を direct WFP で全項目 read-back します。Guard の sublayer は現在の App Isolation sublayer より高い weight を必要とし、object は static、non-dynamic、non-persistent です。正しい既存 object は再利用し、不一致、消失、検証不能時は Sandbox を起動せず、Approved Host へ移行しません。WFP 変更は明示的な `verify-codex-sandbox` の先頭だけが許可し、通常起動や同じ verifier の後続 probe は昇格しません。通常権限側は、`runas` が返した process handle の PID の実体が固定の `.venv\Scripts\python.exe` であることを確認します。named pipe が報告する接続元 PID はその同一 launcher、またはその直接の子 process に限り、直接の子 process を受け入れる場合も実体が `sys.base_prefix\python.exe` の base Python executable と一致することを確認します。UAC で継承されない環境変数へ依存せず、起動した管理者 Guard 本人からの read-back 証拠だけを受理します。BLOCK は各 Sandbox の終了、timeout、launcher failure、Job Object 違反では削除しません。Windows 再起動または BFE 停止後は通常起動を停止し、明示 verifier で再検証します。WLMCP server／worker 自体は通常権限のままです。
+Sandbox 起動直前には、この PC のコンピューター名で完全修飾した `CodexSandboxOffline` の SID を Windows から解決し、返された参照ドメインがこの PC の物理 NetBIOS 名と一致すること、`SID_NAME_USE` が `SidTypeUser`（1）であることを確認します。単純名から信頼ドメインへ広がる解決や、ユーザー以外の SID は受け入れません。そのうえで ALE_AUTH_CONNECT_V4／V6 の loopback BLOCK を direct WFP で全項目 read-back します。Guard の sublayer は現在の App Isolation sublayer より高い weight を必要とし、object は static、non-dynamic、non-persistent です。正しい既存 object は再利用し、不一致、消失、検証不能時は Sandbox を起動せず、Approved Host へ移行しません。WFP の exact missing object の再構築は、手動または自動のどちらでも同じ verification unit の先頭で1回だけ許可し、同じ verifier の後続 probe は昇格しません。通常権限側は、`runas` が返した process handle の PID の実体が固定の `.venv\Scripts\python.exe` であることを確認します。named pipe が報告する接続元 PID はその同一 launcher、またはその直接の子 process に限り、直接の子 process を受け入れる場合も実体が `sys.base_prefix\python.exe` の base Python executable と一致することを確認します。UAC で継承されない環境変数へ依存せず、起動した管理者 Guard 本人からの read-back 証拠だけを受理します。BLOCK は各 Sandbox の終了、timeout、launcher failure、Job Object 違反では削除しません。Windows 再起動または BFE 停止後は marker が stale になり、次の LocalMCP 起動で Sandbox 限定の自動再検証対象になります。WLMCP server／worker 自体は通常権限のままです。
 
 明示的な管理者メンテナンスだけは次の固定コマンドを使用できます。通常の worker 経路から cleanup は呼び出されません。
 
@@ -472,7 +477,9 @@ $env:LOCAL_MCP_CONFIG = 'C:\path\to\config.local.toml'
 .\.venv\Scripts\python.exe -m windows_local_mcp.cli verify-codex-sandbox
 ```
 
-検証結果は `filesystem_read`、`filesystem_write`、`protected_information_read`、`internet`、`lan`、`loopback`、`descendant_containment`、`termination`、`resource_bound` の property と、必須 check `brokered_process_creation_denied` を保存します。schema v5 以外、必須 identity／check field が欠けた marker、現在の実体に結合しない marker は受理しません。`available` は依存関係と起動前提、`windows_live_verified` は OS 境界の実測、`execution_route_available` は必須 route property を満たして実行可能かを別々に示します。`approved_sandbox_require_live_verification=false` で実行条件を回避することはできません。
+この手動コマンドは diagnostics／forced reverification 用として残ります。自動経路と同じ source ACL、WFP、filesystem、network、descendant、termination、resource、brokered-process の検証中核を使用し、cooldown を無視して強制再検証します。
+
+検証結果は `filesystem_read`、`filesystem_write`、`protected_information_read`、`internet`、`lan`、`loopback`、`descendant_containment`、`termination`、`resource_bound` の property と、必須 check `brokered_process_creation_denied` を保存します。schema v5 以外、必須 identity／check field が欠けた marker、現在の実体に結合しない marker は受理しません。`available` は依存関係と起動前提、`windows_live_verified` は OS 境界の実測、`execution_route_available` は必須 route property を満たして実行可能かを別々に示します。`session_info` はさらに `live_verification_status`、`last_verified_at`、`last_verification_attempt_at`、`live_verification_stale_reason`、`verification_failure_reason` を表示します。`approved_sandbox_require_live_verification=false` で実行条件を回避することはできません。
 
 検証器は親・child・grandchild の filesystem／network 境界に加え、process 数上限と process-tree memory 上限の超過、違反時の全子孫停止、終了状態回収、brokered process creation denial まで実測します。独立 probe が例外になった場合、その probe を `unverified` として残し、安全に続行できる残りの probe を継続します。一般 source workspace read/write、workspace 外 read、control-plane、Internet、loopback、WMI/CIM process creation denial 等の mandatory check は fail closed します。一方、workspace 内 `protected_information_read` と対応する child／grandchild protected-information denial、LAN access は一般 Codex Sandbox route の受容済み残存 risk として `failed`／`unverified` を保持・表示したまま route 判定から分離します。Automatic Git は全 property の `verified` を要求します。その他の必須境界が成立する場合に限り一般 Sandbox 経路を利用でき、利用できない場合も Approved Host へ自動移行しません。
 
@@ -586,12 +593,14 @@ workspace、data directory、scratch directory は、文字列上の重なりだ
 | `approved_sandbox_windows_mode` | 現行のサンプル値は `elevated`。Sandbox の起動準備を示す値で、任意コマンドを管理者権限で実行する意味ではありません |
 | `approved_sandbox_permission_profile` | サンプル値は `:workspace`。実際の権限は `sandbox-state` と OS 検証で判定します |
 | `approved_sandbox_require_live_verification` | `true` のままにします。実機検証を設定で省略することはできません |
+| `sandbox_live_verification_ttl_seconds` | 有効 marker の再利用期間。既定 604800 秒（7日）を超えると Sandbox 限定の自動再検証対象になります |
+| `sandbox_live_verification_retry_cooldown_seconds` | 同一 identity で failed／unverified だった自動検証の再試行間隔。既定 300 秒。手動強制検証には適用しません |
 | `child_environment_allowlist` | 子プロセスへ渡す環境変数名の明示的な許可リスト |
 | `sandbox_dependency_readable_paths` | Sandbox から読む必要がある、workspace 外の依存先の明示的なパス |
 | `adb_emulator_only` | `true` の場合、ADB の対象をエミュレーターに限定します |
 | `adb_allowed_serials` | ADB で使用できるシリアルの許可リスト。空の場合でも任意端末の列挙を許可する意味ではありません |
 
-Git は `git.exe` の場所とハッシュを設定しただけでは使えません。まず `verify-codex-sandbox`、続けて `verify-git-broker` を実行し、現在の PC、runtime、Sandbox policy、Git runtime に結び付いた marker を作成します。
+Git は `git.exe` の場所とハッシュを設定しただけでは使えません。LocalMCP 起動後に Codex Sandbox が `verified` であることを確認し、続けて `verify-git-broker` を明示実行して、現在の PC、runtime、Sandbox policy、Git runtime に結び付いた Git-specific marker を作成します。
 
 ADB は任意コマンドを実行する機能ではありません。`adb_read` は `-s SERIAL` を必須とし、許可された固定形式の状態確認、画面サイズ、密度、電池、表示、window／activity、許可された `getprop`、screenshot だけを扱います。`adb devices` による端末一覧の取得や、シリアルを省略した操作は自動経路では許可しません。
 
@@ -652,7 +661,7 @@ Approved Host の導入・復旧は、通常の editable checkout を起動す�
 | 画像 | `get_image` |
 | 構造化ファイル | `structured_file_inspect`、`structured_file_apply` |
 | ZIP | `zip_entry_read`、`zip_entry_extract`、`zip_extract_many` |
-| 大きなファイルの送受信 | `artifact_download_begin`／`artifact_download_chunk`、`artifact_upload_begin`／`artifact_upload_chunk`／`artifact_upload_commit` |
+| 大きなファイルの送受信 | `artifact_download_begin`／`artifact_download_chunk`、`artifact_upload_begin`／`artifact_upload_chunk`／`artifact_upload_commit`、`artifact_transfer_cancel` |
 | 固定範囲の読み取り・書き込み | `execute_readonly`、`execute_workspace_write` |
 | Git と ADB | `git_info`、`adb_read`、`get_adb_screenshot` |
 | 非同期 operation | `poll_job`、`stop_job` |

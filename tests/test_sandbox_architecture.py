@@ -4,6 +4,7 @@ import json
 import subprocess
 import sys
 import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,7 @@ from windows_local_mcp.sandbox_backend import (
     CodexSandboxBackend,
     build_codex_sandbox_argv,
     codex_sandbox_effective_policy,
+    codex_sandbox_live_verification_status,
     codex_sandbox_state,
     guard_and_launch_codex_sandbox,
     isolation_context_digest,
@@ -33,7 +35,7 @@ from windows_local_mcp.sandbox_live_verify import (
     _protected_information_canary_path,
 )
 from windows_local_mcp.sandbox_live_verify import _run as run_live_probe
-from windows_local_mcp.util import canonical_json, sha256_text
+from windows_local_mcp.util import canonical_json, sha256_text, utc_now_iso
 from windows_local_mcp.wfp_guard import (
     GuardVerification,
     SandboxAccountIdentity,
@@ -125,6 +127,7 @@ def _valid_live_marker(
     return {
         "version": SANDBOX_LIVE_MARKER_VERSION,
         "passed": True,
+        "verified_at": utc_now_iso(),
         "backend_digest": sha256_text(canonical_json(backend.as_dict())),
         "backend_version": backend.version,
         "isolation_context_digest": sha256_text(canonical_json(context)),
@@ -140,6 +143,106 @@ def _valid_live_marker(
             name: {"status": "verified"} for name in SANDBOX_SECURITY_PROPERTIES
         },
     }
+
+
+def test_live_marker_ttl_is_part_of_route_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    backend = _test_backend()
+    monkeypatch.setattr(
+        "windows_local_mcp.sandbox_backend.resolve_sandbox_account_identity",
+        _account_identity,
+    )
+    verified_at = datetime(2026, 9, 1, tzinfo=UTC)
+    evidence = _valid_live_marker(settings, backend)
+    evidence["verified_at"] = verified_at.isoformat()
+    marker = settings.data_dir / "control-plane" / "sandbox-live-verification.json"
+    marker.write_text(canonical_json(evidence), encoding="utf-8")
+
+    valid = codex_sandbox_live_verification_status(
+        settings,
+        backend,
+        now=verified_at + timedelta(seconds=settings.sandbox_live_verification_ttl_seconds),
+    )
+    expired = codex_sandbox_live_verification_status(
+        settings,
+        backend,
+        now=verified_at
+        + timedelta(seconds=settings.sandbox_live_verification_ttl_seconds + 1),
+    )
+
+    assert valid["status"] == "verified"
+    assert expired["status"] == "stale"
+    assert expired["stale_reason"] == "verification_ttl_expired"
+
+
+def test_schema_incompatible_marker_is_stale_even_if_it_claims_verifying(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    marker = settings.data_dir / "control-plane" / "sandbox-live-verification.json"
+    marker.write_text(
+        canonical_json(
+            {
+                "version": SANDBOX_LIVE_MARKER_VERSION - 1,
+                "verification_status": "verifying",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    inspection = codex_sandbox_live_verification_status(settings, _test_backend())
+
+    assert inspection["status"] == "stale"
+    assert inspection["stale_reason"] == "marker_schema_incompatible"
+
+
+def test_terminal_marker_preserves_specific_verification_failure_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    backend = _test_backend()
+    monkeypatch.setattr(
+        "windows_local_mcp.sandbox_backend.resolve_sandbox_account_identity",
+        _account_identity,
+    )
+    evidence = _valid_live_marker(settings, backend)
+    evidence["checks"] = {"brokered_process_creation_denied": None}
+    evidence["verification_status"] = "unverified"
+    evidence["verification_failure_reason"] = "listener preparation timed out"
+    marker = settings.data_dir / "control-plane" / "sandbox-live-verification.json"
+    marker.write_text(canonical_json(evidence), encoding="utf-8")
+
+    inspection = codex_sandbox_live_verification_status(settings, backend)
+
+    assert inspection["status"] == "unverified"
+    assert inspection["last_verified_at"] is None
+    assert inspection["failure_reason"] == "listener preparation timed out"
+
+
+def test_terminal_unverified_marker_does_not_become_stale_when_identity_measurement_failed(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    marker = settings.data_dir / "control-plane" / "sandbox-live-verification.json"
+    marker.write_text(
+        canonical_json(
+            {
+                "version": SANDBOX_LIVE_MARKER_VERSION,
+                "verification_status": "unverified",
+                "verification_failure_reason": "WFP read-back unavailable",
+                "attempted_at": utc_now_iso(),
+                "passed": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    inspection = codex_sandbox_live_verification_status(settings, _test_backend())
+
+    assert inspection["status"] == "unverified"
+    assert inspection["failure_reason"] == "WFP read-back unavailable"
 
 
 def test_guard_preflight_succeeds_before_codex_launch(
@@ -603,6 +706,7 @@ def test_live_marker_is_stale_after_security_context_changes(
     original_dependencies = list(settings.sandbox_dependency_readable_paths)
     original_processes = settings.max_sandbox_processes
     original_memory = settings.max_sandbox_memory_bytes
+    original_ttl = settings.sandbox_live_verification_ttl_seconds
     changes = (
         lambda: settings.blocked_file_names.append("changed-security-name"),
         lambda: settings.sandbox_dependency_readable_paths.append(
@@ -610,12 +714,14 @@ def test_live_marker_is_stale_after_security_context_changes(
         ),
         lambda: setattr(settings, "max_sandbox_processes", original_processes + 1),
         lambda: setattr(settings, "max_sandbox_memory_bytes", original_memory + 1),
+        lambda: setattr(settings, "sandbox_live_verification_ttl_seconds", original_ttl + 1),
     )
     for change in changes:
         settings.blocked_file_names = list(original_blocked)
         settings.sandbox_dependency_readable_paths = list(original_dependencies)
         settings.max_sandbox_processes = original_processes
         settings.max_sandbox_memory_bytes = original_memory
+        settings.sandbox_live_verification_ttl_seconds = original_ttl
         change()
         with pytest.raises(ApprovedSandboxUnavailable, match="missing, failed, or stale"):
             require_codex_sandbox_live_verification(settings, backend)
@@ -624,6 +730,7 @@ def test_live_marker_is_stale_after_security_context_changes(
     settings.sandbox_dependency_readable_paths = list(original_dependencies)
     settings.max_sandbox_processes = original_processes
     settings.max_sandbox_memory_bytes = original_memory
+    settings.sandbox_live_verification_ttl_seconds = original_ttl
     assert isolation_context_digest(settings, backend) == original_digest
 
 

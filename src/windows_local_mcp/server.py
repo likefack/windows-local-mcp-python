@@ -39,6 +39,7 @@ from .control_plane import (
 from .control_plane_guard import assert_control_plane_healthy
 from .executor import Executor
 from .git_snapshot import capture_git_snapshot
+from .high_level_mutation import plan_exact_text_edits
 from .paths import (
     PathIdentity,
     Workspace,
@@ -52,13 +53,14 @@ from .resources import NamedControlPlaneLock, WorkspaceExecutionLock, enforce_da
 from .risk import command_risk_facts
 from .runtime_immutability import assert_approved_host_runtime_immutable
 from .sandbox_backend import (
-    SANDBOX_LIVE_MARKER_VERSION,
     SANDBOX_SECURITY_PROPERTIES,
+    ApprovedSandboxUnavailable,
     codex_sandbox_effective_policy,
-    isolation_context_digest,
+    codex_sandbox_live_verification_status,
     require_codex_sandbox_live_verification,
     resolve_codex_sandbox_backend,
 )
+from .sandbox_live_verification_lifecycle import SandboxLiveVerificationLifecycle
 from .structured_files import infer_format, read_zip_entries, read_zip_entry
 from .structured_files import inspect as inspect_structured
 from .structured_files import transform as transform_structured
@@ -74,11 +76,14 @@ from .util import (
 )
 from .workspace_history import (
     WorkspaceMutationError,
+    begin_filesystem_primitive_transaction,
     begin_single_file_write_transaction,
+    build_workspace_target,
     build_workspace_target_from_bytes,
     capture_workspace_state,
     checkpoint_manifest_digest,
     checkpoint_scope,
+    checkpoint_state,
     compare_workspace_states,
     describe_workspace_restore,
     finalize_workspace_transaction,
@@ -86,6 +91,8 @@ from .workspace_history import (
     prepare_selective_undo,
     restore_workspace_state,
     rollback_applied_workspace_transaction,
+    rollback_filesystem_primitive_transaction,
+    update_filesystem_primitive_transaction,
     update_single_file_write_transaction,
     verify_checkpoint_integrity,
     workspace_recovery_required,
@@ -103,10 +110,17 @@ APPROVAL_REQUEST = ToolAnnotations(
 CONTROL = ToolAnnotations(
     readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False
 )
+IDEMPOTENT_CONTROL = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False
+)
 
 
 class NonUtf8TextError(ValueError, ToolError):
     """Expected text/binary route error that is safe to surface to the MCP model."""
+
+
+class TransferIntegrityError(RuntimeError):
+    """A durable transfer artifact no longer matches its persisted manifest."""
 
 
 class Runtime:
@@ -117,6 +131,12 @@ class Runtime:
         self.audit = AuditStore(self.settings)
         self.policy = CommandPolicy(self.settings, self.workspace)
         self.executor = Executor(self.settings, self.audit)
+        self.sandbox_live_verification = SandboxLiveVerificationLifecycle(self.settings)
+
+    def start_sandbox_live_verification(self) -> bool:
+        """Start Sandbox-only recovery without delaying the MCP/Broker transport."""
+
+        return self.sandbox_live_verification.start()
 
 
 runtime = Runtime()
@@ -347,6 +367,15 @@ def _codex_sandbox_capability() -> dict[str, Any]:
         "dependency_available": False,
         "live_verified": False,
         "windows_live_verified": False,
+        "live_verification_status": "unverified",
+        "last_verified_at": None,
+        "live_verified_at": None,
+        "last_verification_attempt_at": None,
+        "live_verification_stale": False,
+        "live_verification_stale_reason": None,
+        "verification_failure_reason": None,
+        "automatic_verification_deferred": False,
+        "verification_retry_after_seconds": 0,
         "properties": {
             name: {"status": "unverified"} for name in SANDBOX_SECURITY_PROPERTIES
         },
@@ -363,25 +392,37 @@ def _codex_sandbox_capability() -> dict[str, Any]:
             key: backend[key]
             for key in ("name", "provenance", "signature_status", "signer_subject")
         }
-        marker = runtime.settings.data_dir / "control-plane" / "sandbox-live-verification.json"
-        if marker.is_file():
-            evidence = json.loads(marker.read_text(encoding="utf-8"))
-            if (
-                evidence.get("version") == SANDBOX_LIVE_MARKER_VERSION
-                and evidence.get("backend_digest") == sha256_text(canonical_json(backend))
-                and evidence.get("isolation_context_digest")
-                == isolation_context_digest(runtime.settings, resolved)
-                and evidence.get("backend_version") == resolved.version
-                and isinstance(evidence.get("guard_implementation"), dict)
-                and isinstance(evidence.get("sandbox_account_identity"), dict)
-                and isinstance(evidence.get("wfp_guard_binding"), dict)
-                and isinstance(evidence.get("windows_os_identity"), dict)
-                and isinstance(evidence.get("properties"), dict)
-            ):
-                status["properties"] = evidence["properties"]
-                status["live_verified_at"] = evidence.get("verified_at")
-            else:
-                status["live_verification_stale"] = True
+        inspection = codex_sandbox_live_verification_status(runtime.settings, resolved)
+        evidence = inspection.get("evidence")
+        lifecycle = runtime.sandbox_live_verification.snapshot()
+        live_status = str(inspection.get("status", "unverified"))
+        if live_status != "verified" and lifecycle.get("status") == "verifying":
+            live_status = "verifying"
+        elif live_status == "verifying" and lifecycle.get("status") in {
+            "failed",
+            "unverified",
+        }:
+            live_status = str(lifecycle["status"])
+        status["live_verification_status"] = live_status
+        status["last_verified_at"] = inspection.get("last_verified_at")
+        status["live_verified_at"] = inspection.get("last_verified_at")
+        status["last_verification_attempt_at"] = (
+            lifecycle.get("last_verification_attempt_at")
+            or inspection.get("last_verification_attempt_at")
+        )
+        status["live_verification_stale"] = inspection.get("status") == "stale"
+        status["live_verification_stale_reason"] = inspection.get("stale_reason")
+        status["verification_failure_reason"] = (
+            lifecycle.get("failure_reason") or inspection.get("failure_reason")
+        )
+        status["automatic_verification_deferred"] = bool(
+            lifecycle.get("automatic_verification_deferred")
+        )
+        status["verification_retry_after_seconds"] = int(
+            lifecycle.get("retry_after_seconds") or 0
+        )
+        if isinstance(evidence, dict) and isinstance(evidence.get("properties"), dict):
+            status["properties"] = evidence["properties"]
     except Exception as error:  # noqa: BLE001 - availability must never break session_info
         status["unavailable_reason"] = redact_text(f"{type(error).__name__}: {error}")
         return status
@@ -1469,6 +1510,17 @@ def _transfer_file_identity(path: Path) -> dict[str, int]:
     }
 
 
+_TRANSFER_ADMISSION_STATES = {"preparing", "open"}
+_TRANSFER_TERMINAL_STATES = {
+    "expired",
+    "failed",
+    "completed",
+    "cancelled",
+    "committed",
+}
+_TRANSFER_KNOWN_STATES = _TRANSFER_ADMISSION_STATES | _TRANSFER_TERMINAL_STATES
+
+
 def _validated_transfer_payload(
     root: Path,
     manifest: dict[str, Any],
@@ -1477,12 +1529,12 @@ def _validated_transfer_payload(
 ) -> Path:
     payload = root / "payload.bin"
     if not payload.exists() or _is_reparse(payload) or not payload.is_file():
-        raise RuntimeError("transfer payload has an unsafe file identity")
+        raise TransferIntegrityError("transfer payload has an unsafe file identity")
     details = payload.stat()
     if details.st_nlink > 1 or details.st_size != int(manifest["bytes"]):
-        raise RuntimeError("transfer payload does not match its declared byte identity")
+        raise TransferIntegrityError("transfer payload does not match its declared byte identity")
     if immutable and _transfer_file_identity(payload) != manifest.get("payload_identity"):
-        raise RuntimeError("download snapshot changed after transfer begin")
+        raise TransferIntegrityError("download snapshot changed after transfer begin")
     return payload
 
 
@@ -1506,7 +1558,7 @@ def _admit_transfer() -> None:
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 continue
-            if manifest.get("state") in {"preparing", "open"}:
+            if manifest.get("state") in _TRANSFER_ADMISSION_STATES:
                 try:
                     created = datetime.fromisoformat(str(manifest["created_at"]))
                 except (KeyError, TypeError, ValueError):
@@ -1527,11 +1579,12 @@ def _admit_transfer() -> None:
                             open_count += 1
                             continue
                         current["state"] = "expired"
+                        current["expired_at"] = utc_now_iso()
                         _write_transfer_manifest(manifest_path.parent, current)
                     continue
                 open_count += 1
-                if open_count >= runtime.settings.max_open_transfers:
-                    raise RuntimeError("open binary transfer admission limit reached")
+    if open_count >= runtime.settings.max_open_transfers:
+        raise RuntimeError("open binary transfer admission limit reached")
 
 
 def _write_transfer_manifest(root: Path, manifest: dict[str, Any]) -> None:
@@ -1540,6 +1593,7 @@ def _write_transfer_manifest(root: Path, manifest: dict[str, Any]) -> None:
         with tempfile.NamedTemporaryFile(mode="wb", delete=False, dir=root) as output:
             output.write(canonical_json(manifest).encode("utf-8"))
             output.flush()
+            os.fsync(output.fileno())
             temporary = Path(output.name)
         os.replace(temporary, root / "manifest.json")
         temporary = None
@@ -1548,7 +1602,14 @@ def _write_transfer_manifest(root: Path, manifest: dict[str, Any]) -> None:
             temporary.unlink(missing_ok=True)
 
 
-def _load_transfer(transfer_id: str, expected_direction: str) -> tuple[Path, dict[str, Any]]:
+def _load_transfer(
+    transfer_id: str,
+    expected_direction: str | None,
+    *,
+    allowed_states: set[str] | None = None,
+    expire_active: bool = True,
+) -> tuple[Path, dict[str, Any]]:
+    """Load and validate one transfer manifest under its caller's lifecycle lock."""
     root = _transfer_root(transfer_id)
     transfer_root = runtime.settings.data_dir / "binary-transfers"
     if _is_reparse(transfer_root) or not transfer_root.is_dir():
@@ -1568,14 +1629,81 @@ def _load_transfer(transfer_id: str, expected_direction: str) -> tuple[Path, dic
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("version") not in {1, 2, 3, 4}:
         raise RuntimeError("transfer session version is unsupported")
-    if manifest.get("direction") != expected_direction or manifest.get("state") != "open":
-        raise RuntimeError("transfer session is not open for this operation")
-    created = datetime.fromisoformat(str(manifest["created_at"]))
-    if datetime.now(UTC) - created > timedelta(seconds=runtime.settings.approval_request_ttl_seconds):
+    direction = manifest.get("direction")
+    if direction not in {"download", "upload"} or (
+        expected_direction is not None and direction != expected_direction
+    ):
+        raise RuntimeError("transfer session direction is invalid")
+    state = manifest.get("state")
+    if state not in _TRANSFER_KNOWN_STATES:
+        raise RuntimeError("transfer session state is invalid")
+    try:
+        created = datetime.fromisoformat(str(manifest["created_at"]))
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError("binary transfer manifest has invalid lifetime binding") from error
+    if (
+        expire_active
+        and state in _TRANSFER_ADMISSION_STATES
+        and datetime.now(UTC) - created
+        > timedelta(seconds=runtime.settings.approval_request_ttl_seconds)
+    ):
         manifest["state"] = "expired"
+        manifest["expired_at"] = utc_now_iso()
         _write_transfer_manifest(root, manifest)
-        raise RuntimeError("transfer session expired")
+        state = "expired"
+    allowed = {"open"} if allowed_states is None else allowed_states
+    if state not in allowed:
+        if state == "expired":
+            raise RuntimeError("transfer session expired")
+        if allowed == {"open"}:
+            raise RuntimeError("transfer session is not open for this operation")
+        raise RuntimeError("transfer session is not available for this operation")
     return root, manifest
+
+
+def _mark_transfer_failed(
+    transfer_id: str,
+    error: Exception,
+    *,
+    allowed_states: set[str] | None = None,
+) -> dict[str, Any] | None:
+    """Persist a terminal failure without overriding a concurrent terminal decision."""
+    try:
+        with NamedControlPlaneLock(runtime.settings, f"transfer-{transfer_id}"):
+            root, manifest = _load_transfer(
+                transfer_id,
+                None,
+                allowed_states=_TRANSFER_KNOWN_STATES,
+                expire_active=False,
+            )
+            expected = (
+                _TRANSFER_ADMISSION_STATES | {"completed"}
+                if allowed_states is None
+                else allowed_states
+            )
+            if manifest.get("state") not in expected:
+                return manifest
+            manifest["state"] = "failed"
+            manifest["failed_at"] = utc_now_iso()
+            manifest["error"] = f"{type(error).__name__}: {error}"[:2000]
+            _write_transfer_manifest(root, manifest)
+            return manifest
+    except (FileNotFoundError, OSError, ValueError, RuntimeError):
+        # The original transfer error is the useful client-facing failure. If its durable
+        # manifest disappeared or became unreadable, do not mask it with a best-effort update.
+        return None
+
+
+def _complete_download_locked(
+    root: Path,
+    manifest: dict[str, Any],
+) -> dict[str, Any]:
+    """Move an open download to completed while retaining its immutable snapshot."""
+    if manifest.get("state") == "open":
+        manifest["state"] = "completed"
+        manifest["completed_at"] = utc_now_iso()
+        _write_transfer_manifest(root, manifest)
+    return manifest
 
 
 def _write_upload_chunk_locked(
@@ -1676,23 +1804,38 @@ def artifact_download_begin(path: str, chunk_bytes: int | None = None) -> dict[s
                 raise RuntimeError("download snapshot verification failed")
             manifest.update(
                 {
-                    "state": "open",
+                    # A zero-byte snapshot has no chunk to acknowledge. Terminalize it before
+                    # returning so it never consumes an admission slot.
+                    "state": "completed" if snapshot_bytes == 0 else "open",
                     "bytes": snapshot_bytes,
                     "sha256": snapshot_sha,
                     "payload_identity": _transfer_file_identity(snapshot),
                 }
             )
+            if snapshot_bytes == 0:
+                manifest["completed_at"] = utc_now_iso()
             with NamedControlPlaneLock(runtime.settings, f"transfer-{transfer_id}"):
                 current_manifest = json.loads(
                     (root / "manifest.json").read_text(encoding="utf-8")
                 )
                 if current_manifest.get("state") != "preparing":
-                    raise RuntimeError("download transfer expired while preparing snapshot")
+                    raise RuntimeError("download transfer was terminalized while preparing snapshot")
                 _write_transfer_manifest(root, manifest)
-        except Exception:
-            with NamedControlPlaneLock(runtime.settings, "binary-transfer"):
-                if root.exists():
-                    shutil.rmtree(root)
+        except Exception as error:
+            # Once the durable preparing manifest exists, preserve it as a terminal failure. This
+            # releases admission without deleting evidence or leaving an ambiguous open session.
+            if transfer_id is not None:
+                terminal = _mark_transfer_failed(
+                    transfer_id,
+                    error,
+                    allowed_states={"preparing", "open"},
+                )
+                if terminal is None and root is not None:
+                    # A failure before a valid manifest exists has no durable lifecycle record.
+                    # Remove only this freshly generated UUID directory so quota is not stranded.
+                    with NamedControlPlaneLock(runtime.settings, "binary-transfer"):
+                        if root.exists():
+                            shutil.rmtree(root)
             raise
         result = {"transfer_id": transfer_id, "path": manifest["path"], "bytes": snapshot_bytes, "sha256": manifest["sha256"], "chunk_bytes": chunk, "chunk_count": (snapshot_bytes + chunk - 1) // chunk, "execution_path": "transfer"}
         try:
@@ -1702,10 +1845,14 @@ def artifact_download_begin(path: str, chunk_bytes: int | None = None) -> dict[s
                 result=result,
                 operation_id=transfer_operation_id,
             )
-        except Exception:
-            with NamedControlPlaneLock(runtime.settings, "binary-transfer"):
-                if root.exists():
-                    shutil.rmtree(root)
+        except Exception as error:
+            # The client never received the fresh transfer id, so retaining an active session
+            # would make the slot unreachable. Preserve a terminal manifest instead.
+            _mark_transfer_failed(
+                transfer_id,
+                error,
+                allowed_states={"open", "completed"},
+            )
             raise
         return result
     except Exception as error:
@@ -1718,43 +1865,58 @@ def artifact_download_chunk(transfer_id: str, offset: int) -> dict[str, Any]:
     """Read one base64 chunk from the immutable, hash-bound download snapshot."""
     request = {"transfer_id": transfer_id, "offset": offset}
     try:
-        root, manifest = _load_transfer(transfer_id, "download")
-        if not isinstance(offset, int) or offset < 0 or offset % int(manifest["chunk_bytes"]) != 0:
-            raise ValueError("offset must be a non-negative chunk boundary")
-        size = int(manifest["bytes"])
-        if offset >= size:
-            raise ValueError("offset is outside the source file")
-        if manifest["version"] >= 3:
-            snapshot = _validated_transfer_payload(root, manifest, immutable=True)
-            with snapshot.open("rb") as input_file:
-                input_file.seek(offset)
-                payload = input_file.read(int(manifest["chunk_bytes"]))
-            expected_bytes = min(int(manifest["chunk_bytes"]), size - offset)
-            if len(payload) != expected_bytes:
-                raise RuntimeError("download snapshot changed during chunk read")
-        else:
-            source = runtime.workspace.resolve_existing(
-                str(manifest["path"]), allow_directory=False
-            )
-            source_identity = runtime.workspace.identity(source)
-            if (
-                source_identity is None
-                or source_identity.size != size
-                or size > runtime.settings.max_structured_file_bytes
-            ):
-                raise RuntimeError("source changed during transfer; begin a new download")
-            data = read_verified_bytes(source, runtime.settings.max_structured_file_bytes)
-            if len(data) != size or sha256_bytes(data) != manifest["sha256"]:
-                raise RuntimeError("source changed during transfer; begin a new download")
-            payload = data[offset : offset + int(manifest["chunk_bytes"])]
-        result = {"transfer_id": transfer_id, "offset": offset, "bytes": len(payload), "base64": base64.b64encode(payload).decode("ascii"), "next_offset": offset + len(payload), "complete": offset + len(payload) == size, "sha256": sha256_bytes(payload)}
-        _log_transfer_event(
-            manifest=manifest,
-            tool_name="artifact_download_chunk",
-            request=request,
-            result={key: value for key, value in result.items() if key != "base64"},
-        )
-        return result
+        with NamedControlPlaneLock(runtime.settings, f"transfer-{transfer_id}"):
+                root, manifest = _load_transfer(
+                    transfer_id,
+                    "download",
+                    allowed_states={"open", "completed"},
+                )
+                if not isinstance(offset, int) or offset < 0 or offset % int(manifest["chunk_bytes"]) != 0:
+                    raise ValueError("offset must be a non-negative chunk boundary")
+                size = int(manifest["bytes"])
+                if size == 0 or offset >= size:
+                    raise ValueError("offset is outside the source file")
+                if manifest["version"] >= 3:
+                    snapshot = _validated_transfer_payload(root, manifest, immutable=True)
+                    with snapshot.open("rb") as input_file:
+                        input_file.seek(offset)
+                        payload = input_file.read(int(manifest["chunk_bytes"]))
+                    expected_bytes = min(int(manifest["chunk_bytes"]), size - offset)
+                    if len(payload) != expected_bytes:
+                        raise TransferIntegrityError("download snapshot changed during chunk read")
+                else:
+                    source = runtime.workspace.resolve_existing(
+                        str(manifest["path"]), allow_directory=False
+                    )
+                    source_identity = runtime.workspace.identity(source)
+                    if (
+                        source_identity is None
+                        or source_identity.size != size
+                        or size > runtime.settings.max_structured_file_bytes
+                    ):
+                        raise TransferIntegrityError(
+                            "source changed during transfer; begin a new download"
+                        )
+                    data = read_verified_bytes(source, runtime.settings.max_structured_file_bytes)
+                    if len(data) != size or sha256_bytes(data) != manifest["sha256"]:
+                        raise TransferIntegrityError(
+                            "source changed during transfer; begin a new download"
+                        )
+                    payload = data[offset : offset + int(manifest["chunk_bytes"])]
+                result = {"transfer_id": transfer_id, "offset": offset, "bytes": len(payload), "base64": base64.b64encode(payload).decode("ascii"), "next_offset": offset + len(payload), "complete": offset + len(payload) == size, "sha256": sha256_bytes(payload)}
+                if result["complete"] and manifest.get("state") == "open":
+                    manifest = _complete_download_locked(root, manifest)
+                _log_transfer_event(
+                    manifest=manifest,
+                    tool_name="artifact_download_chunk",
+                    request=request,
+                    result={key: value for key, value in result.items() if key != "base64"},
+                )
+                return result
+    except TransferIntegrityError as error:
+        _mark_transfer_failed(transfer_id, error)
+        _audit_rejection("artifact_download_chunk", request, error)
+        raise
     except Exception as error:
         _audit_rejection("artifact_download_chunk", request, error)
         raise
@@ -1788,15 +1950,25 @@ def artifact_upload_begin(
             ) != expected_sha256:
                 raise RuntimeError("expected_sha256 mismatch; target is stale or concurrently modified")
         source_binding = None
-        if source_transfer_id is not None:
-            _source_root, source_manifest = _load_transfer(source_transfer_id, "download")
-            source_binding = {
-                "path": source_manifest["path"],
-                "sha256": source_manifest["sha256"],
-                "bytes": source_manifest["bytes"],
-            }
         transfer_operation_id = str(uuid.uuid4())
         with NamedControlPlaneLock(runtime.settings, "binary-transfer"):
+            # Keep a source binding and the new upload admission decision in one lifecycle
+            # critical section. A completed download remains a valid immutable source binding;
+            # an open source may be cancelled before this section and is then rejected.
+            if source_transfer_id is not None:
+                with NamedControlPlaneLock(
+                    runtime.settings, f"transfer-{source_transfer_id}"
+                ):
+                    _source_root, source_manifest = _load_transfer(
+                        source_transfer_id,
+                        "download",
+                        allowed_states={"open", "completed"},
+                    )
+                    source_binding = {
+                        "path": source_manifest["path"],
+                        "sha256": source_manifest["sha256"],
+                        "bytes": source_manifest["bytes"],
+                    }
             _admit_transfer()
             enforce_data_quota(runtime.settings, incoming_bytes=total_bytes + 4096)
             transfer_id = str(uuid.uuid4())
@@ -1822,10 +1994,8 @@ def artifact_upload_begin(
                 tier="broker",
                 operation_id=transfer_operation_id,
             )
-        except Exception:
-            with NamedControlPlaneLock(runtime.settings, "binary-transfer"):
-                if root.exists():
-                    shutil.rmtree(root)
+        except Exception as error:
+            _mark_transfer_failed(transfer_id, error, allowed_states={"open"})
             raise
         return result
     except Exception as error:
@@ -1844,22 +2014,11 @@ def artifact_upload_chunk(transfer_id: str, offset: int, base64_chunk: str) -> d
             raise ValueError("base64_chunk must be valid base64") from error
         if not payload or len(payload) > runtime.settings.max_transfer_chunk_bytes:
             raise ValueError("upload chunk is outside the configured bound")
-        root, initial_manifest = _load_transfer(transfer_id, "upload")
-        if initial_manifest["version"] >= 4:
-            with NamedControlPlaneLock(runtime.settings, f"transfer-{transfer_id}"):
-                root, manifest = _load_transfer(transfer_id, "upload")
-                manifest = _write_upload_chunk_locked(
-                    root, manifest, offset=offset, payload=payload
-                )
-        else:
-            with (
-                NamedControlPlaneLock(runtime.settings, "binary-transfer"),
-                NamedControlPlaneLock(runtime.settings, f"transfer-{transfer_id}"),
-            ):
-                root, manifest = _load_transfer(transfer_id, "upload")
-                manifest = _write_upload_chunk_locked(
-                    root, manifest, offset=offset, payload=payload
-                )
+        with NamedControlPlaneLock(runtime.settings, f"transfer-{transfer_id}"):
+            root, manifest = _load_transfer(transfer_id, "upload")
+            manifest = _write_upload_chunk_locked(
+                root, manifest, offset=offset, payload=payload
+            )
         result = {"transfer_id": transfer_id, "received": manifest["received"], "complete": manifest["received"] == manifest["bytes"], "chunk_sha256": sha256_bytes(payload)}
         _log_transfer_event(
             manifest=manifest,
@@ -1873,6 +2032,10 @@ def artifact_upload_chunk(transfer_id: str, offset: int, base64_chunk: str) -> d
             result=result,
         )
         return result
+    except TransferIntegrityError as error:
+        _mark_transfer_failed(transfer_id, error)
+        _audit_rejection("artifact_upload_chunk", {"transfer_id": transfer_id, "offset": offset}, error)
+        raise
     except Exception as error:
         _audit_rejection("artifact_upload_chunk", {"transfer_id": transfer_id, "offset": offset}, error)
         raise
@@ -1884,42 +2047,86 @@ def artifact_upload_commit(transfer_id: str, reason: str = "") -> dict[str, Any]
     request = {"transfer_id": transfer_id, "reason": reason}
     try:
         with NamedControlPlaneLock(runtime.settings, f"transfer-{transfer_id}"):
-            root, manifest = _load_transfer(transfer_id, "upload")
-            if int(manifest["received"]) != int(manifest["bytes"]):
-                raise RuntimeError("upload is incomplete and cannot be committed")
-            payload_path = _validated_transfer_payload(root, manifest, immutable=False)
-            payload = payload_path.read_bytes()
-            if len(payload) != int(manifest["bytes"]) or sha256_bytes(payload) != manifest["sha256"]:
-                raise RuntimeError("staged upload does not match declared byte identity")
+                root, manifest = _load_transfer(transfer_id, "upload")
+                if int(manifest["received"]) != int(manifest["bytes"]):
+                    # An incomplete upload is a normal client workflow error. Keep it open so
+                    # the caller can send the missing chunk rather than terminalizing it.
+                    raise RuntimeError("upload is incomplete and cannot be committed")
+                payload_path = _validated_transfer_payload(root, manifest, immutable=False)
+                payload = payload_path.read_bytes()
+                if len(payload) != int(manifest["bytes"]) or sha256_bytes(payload) != manifest["sha256"]:
+                    raise TransferIntegrityError("staged upload does not match declared byte identity")
 
-            def apply(_: bytes) -> tuple[bytes, dict[str, Any]]:
-                return payload, {
-                    "execution_path": "transfer",
-                    "transfer_id": transfer_id,
-                    "artifact_kind": "opaque_binary",
-                    "embedded_code_executed": False,
-                }
+                def apply(_: bytes) -> tuple[bytes, dict[str, Any]]:
+                    return payload, {
+                        "execution_path": "transfer",
+                        "transfer_id": transfer_id,
+                        "artifact_kind": "opaque_binary",
+                        "embedded_code_executed": False,
+                    }
 
-            source_binding = manifest.get("source_binding")
-            source_bindings: tuple[tuple[str, str], ...] = ()
-            if source_binding is not None:
-                source_bindings = ((str(source_binding["path"]), str(source_binding["sha256"])),)
-            result = _atomic_binary_mutation(
-                tool_name="artifact_upload_commit",
-                path=str(manifest["path"]),
-                expected_sha256=manifest.get("expected_sha256"),
-                reason=reason,
-                request_summary={"transfer_id": transfer_id, "declared_bytes": manifest["bytes"], "declared_sha256": manifest["sha256"]},
-                transform=apply,
-                allow_create=True,
-                require_expected_for_existing=True,
-                source_bindings=source_bindings,
-            )
-            manifest["state"] = "committed"
-            _write_transfer_manifest(root, manifest)
-            return result
+                source_binding = manifest.get("source_binding")
+                source_bindings: tuple[tuple[str, str], ...] = ()
+                if source_binding is not None:
+                    source_bindings = ((str(source_binding["path"]), str(source_binding["sha256"])),)
+                result = _atomic_binary_mutation(
+                    tool_name="artifact_upload_commit",
+                    path=str(manifest["path"]),
+                    expected_sha256=manifest.get("expected_sha256"),
+                    reason=reason,
+                    request_summary={"transfer_id": transfer_id, "declared_bytes": manifest["bytes"], "declared_sha256": manifest["sha256"]},
+                    transform=apply,
+                    allow_create=True,
+                    require_expected_for_existing=True,
+                    source_bindings=source_bindings,
+                )
+                manifest["state"] = "committed"
+                manifest["committed_at"] = utc_now_iso()
+                _write_transfer_manifest(root, manifest)
+                return result
+    except TransferIntegrityError as error:
+        _mark_transfer_failed(transfer_id, error)
+        _audit_rejection("artifact_upload_commit", request, error)
+        raise
     except Exception as error:
         _audit_rejection("artifact_upload_commit", request, error)
+        raise
+
+
+@mcp.tool(annotations=IDEMPOTENT_CONTROL)
+def artifact_transfer_cancel(transfer_id: str, reason: str = "") -> dict[str, Any]:
+    """Explicitly release an open upload or download while retaining its terminal manifest."""
+    request = {"transfer_id": transfer_id, "reason": reason}
+    try:
+        _require_filesystem()
+        with NamedControlPlaneLock(runtime.settings, f"transfer-{transfer_id}"):
+                root, manifest = _load_transfer(
+                    transfer_id,
+                    None,
+                    allowed_states=_TRANSFER_KNOWN_STATES,
+                )
+                if manifest["state"] in _TRANSFER_ADMISSION_STATES:
+                    manifest["state"] = "cancelled"
+                    manifest["cancelled_at"] = utc_now_iso()
+                    if reason:
+                        manifest["cancel_reason"] = reason[: runtime.settings.max_reason_characters]
+                    _write_transfer_manifest(root, manifest)
+                result = {
+                    "transfer_id": transfer_id,
+                    "direction": manifest["direction"],
+                    "state": manifest["state"],
+                    "status": manifest["state"],
+                    "cancelled": manifest["state"] == "cancelled",
+                }
+                _log_transfer_event(
+                    manifest=manifest,
+                    tool_name="artifact_transfer_cancel",
+                    request=request,
+                    result=result,
+                )
+                return result
+    except Exception as error:
+        _audit_rejection("artifact_transfer_cancel", request, error)
         raise
 
 
@@ -2211,6 +2418,859 @@ def write_file(
                     runtime.settings, operation_id
                 )
             runtime.audit.add_event(operation_id, "failed", {"error": str(error)[:1000]})
+        raise
+
+
+def _identity_summary(identity: PathIdentity | None) -> dict[str, int] | None:
+    if identity is None:
+        return None
+    result = {
+        "device": identity.device,
+        "inode": identity.inode,
+        "size": identity.size,
+        "modified_ns": identity.modified_ns,
+    }
+    if identity.windows_volume_serial is not None:
+        result["windows_volume_serial"] = identity.windows_volume_serial
+    if identity.windows_file_index is not None:
+        result["windows_file_index"] = identity.windows_file_index
+    return result
+
+
+def _run_filesystem_primitive(
+    *,
+    tool_name: str,
+    request: dict[str, Any],
+    checkpoint_paths: set[str],
+    build_target: Any,
+    commit: Any,
+    post_verify: Any | None = None,
+) -> dict[str, Any]:
+    """Run one fixed filesystem effect through checkpoint, journal, and recovery."""
+
+    operation_id: str | None = None
+    journal_started = False
+    recovered = False
+    try:
+        _require_filesystem()
+        _require_workspace_mutation_ready()
+        reason = request.get("reason", "")
+        if not isinstance(reason, str) or len(reason) > runtime.settings.max_reason_characters:
+            raise ValueError("reason exceeds max_reason_characters")
+        operation_id = runtime.audit.create_operation(
+            tool_name=tool_name,
+            tier="broker",
+            status="running",
+            cwd=str(runtime.settings.workspace_root),
+            request=_safe_request(request),
+        )
+        pre_workspace = capture_workspace_state(
+            runtime.settings,
+            operation_id,
+            "before",
+            paths=checkpoint_paths,
+        )
+        runtime.audit.update_operation(
+            operation_id, pre_workspace_path=pre_workspace.manifest_path
+        )
+        target_manifest = build_target(operation_id, pre_workspace.manifest_path)
+        target_state = checkpoint_state(runtime.settings, target_manifest)
+        begin_filesystem_primitive_transaction(
+            runtime.settings,
+            operation_id,
+            before_manifest=pre_workspace.manifest_path,
+            target_manifest=target_manifest,
+            changed_paths=checkpoint_paths,
+            operation_type=tool_name,
+        )
+        journal_started = True
+        runtime.audit.add_event(
+            operation_id,
+            "filesystem_primitive_commit_started",
+            {"operation_type": tool_name, "path_count": len(checkpoint_paths)},
+        )
+        mutation_result = commit()
+        if post_verify is not None:
+            post_verify(mutation_result)
+        post_workspace = capture_workspace_state(
+            runtime.settings,
+            operation_id,
+            "after",
+            paths=checkpoint_paths,
+        )
+        post_state = checkpoint_state(runtime.settings, post_workspace.manifest_path)
+        if post_state != target_state:
+            raise RuntimeError("filesystem primitive postcondition does not match target manifest")
+        workspace_change = compare_workspace_states(
+            runtime.settings,
+            pre_workspace.manifest_path,
+            post_workspace.manifest_path,
+            operation_id,
+        )
+        result = {
+            "operation_id": operation_id,
+            "status": "succeeded",
+            "operation_type": tool_name,
+            "execution_path": "broker_direct",
+            "transaction": "windows_txf" if os.name == "nt" else "portable_test_fallback",
+            "rollback_state": "complete",
+            **mutation_result,
+            **workspace_change,
+        }
+        update_filesystem_primitive_transaction(
+            runtime.settings, operation_id, state="applied_verified"
+        )
+        runtime.audit.transition_operation(
+            operation_id,
+            from_statuses={"running"},
+            status="succeeded",
+            finished_at=utc_now_iso(),
+            diff_path=str(workspace_change["diff_path"]),
+            pre_workspace_path=pre_workspace.manifest_path,
+            post_workspace_path=post_workspace.manifest_path,
+            rollback_state="complete",
+            result_json=canonical_json(_safe_request(result)),
+        )
+        finalize_workspace_transaction(runtime.settings, operation_id)
+        runtime.audit.add_event(
+            operation_id,
+            "filesystem_primitive_committed",
+            _safe_request(result),
+        )
+        return result
+    except Exception as error:
+        raised: Exception = error
+        if operation_id is not None and journal_started:
+            try:
+                rollback_filesystem_primitive_transaction(runtime.settings, operation_id)
+                recovered = True
+                runtime.audit.update_operation(
+                    operation_id, rollback_state="failed_recovered"
+                )
+                raised = WorkspaceMutationError(
+                    f"{tool_name} failed; starting state recovered: {error}",
+                    recovery_state="failed_recovered",
+                    journal_path=str(
+                        runtime.settings.data_dir
+                        / "workspace-history"
+                        / "transactions"
+                        / operation_id
+                        / "journal.json"
+                    ),
+                )
+            except Exception as recovery_error:  # noqa: BLE001 - recovery must contain every failure
+                update_filesystem_primitive_transaction(
+                    runtime.settings,
+                    operation_id,
+                    state="recovery_required",
+                    error=recovery_error,
+                )
+                runtime.audit.update_operation(
+                    operation_id, rollback_state="recovery_required"
+                )
+                raised = WorkspaceMutationError(
+                    f"{tool_name} failed and automatic recovery could not be proven safe",
+                    recovery_state="recovery_required",
+                    journal_path=str(
+                        runtime.settings.data_dir
+                        / "workspace-history"
+                        / "transactions"
+                        / operation_id
+                        / "journal.json"
+                    ),
+                )
+        if operation_id is None:
+            _audit_rejection(tool_name, _safe_request(request), raised)
+        else:
+            transitioned = runtime.audit.transition_operation(
+                operation_id,
+                from_statuses={"running"},
+                status="failed",
+                finished_at=utc_now_iso(),
+                error=f"{type(raised).__name__}: {raised}",
+            )
+            if transitioned and recovered:
+                mark_workspace_transaction_audit_reconciled(
+                    runtime.settings, operation_id
+                )
+            runtime.audit.add_event(
+                operation_id,
+                "filesystem_primitive_failed",
+                {
+                    "failure_reason": str(raised)[:1000],
+                    "fallback_attempted": False,
+                },
+            )
+        if raised is error:
+            raise
+        raise raised from error
+
+
+@mcp.tool(annotations=LOCAL_WRITE)
+def move_file(
+    source_path: str,
+    destination_path: str,
+    expected_source_sha256: str,
+    reason: str = "",
+) -> dict[str, Any]:
+    """Atomically rename one identity-bound file without destination overwrite."""
+
+    request_input = {
+        "source_path": source_path,
+        "destination_path": destination_path,
+        "expected_source_sha256": expected_source_sha256,
+        "reason": reason,
+        "overwrite_policy": "deny",
+    }
+    delegated = False
+    try:
+        _require_filesystem()
+        _require_workspace_mutation_ready()
+        if os.path.normpath(source_path) == os.path.normpath(destination_path):
+            raise ValueError("source_path and destination_path must not be identical")
+        source = runtime.workspace.resolve_for_write(source_path)
+        destination = runtime.workspace.resolve_for_write(destination_path)
+        with WorkspaceExecutionLock(runtime.settings, targets=(source, destination)):
+            source = runtime.workspace.resolve_for_write(source_path)
+            destination = runtime.workspace.resolve_for_write(destination_path)
+            source_identity = runtime.workspace.identity(source)
+            source_parent_identity = runtime.workspace.identity(source.parent)
+            destination_parent_identity = runtime.workspace.identity(destination.parent)
+            if (
+                source_identity is None
+                or source_parent_identity is None
+                or destination_parent_identity is None
+            ):
+                raise FileNotFoundError("move source or destination parent is unavailable")
+            source_bytes = read_verified_path_bytes(
+                source, runtime.settings.max_backup_bytes
+            )
+            source_sha = sha256_bytes(source_bytes)
+            if source_sha != expected_source_sha256:
+                raise RuntimeError("expected_source_sha256 mismatch")
+            destination_identity = runtime.workspace.identity(destination)
+            case_only = (
+                os.name == "nt"
+                and os.path.normcase(str(source)) == os.path.normcase(str(destination))
+                and str(source) != str(destination)
+            )
+            if destination_identity is not None and (
+                not case_only or destination_identity != source_identity
+            ):
+                raise FileExistsError("move destination already exists")
+            source_relative = runtime.workspace.relative(source)
+            destination_relative = runtime.workspace.relative_lexical(destination)
+            checkpoint_paths = {source_relative, destination_relative}
+            request = {
+                **request_input,
+                "source_path": source_relative,
+                "destination_path": destination_relative,
+                "before_source_sha256": source_sha,
+                "before_source_identity": _identity_summary(source_identity),
+                "before_destination_identity": _identity_summary(destination_identity),
+                "case_only_rename": case_only,
+            }
+
+            def build_target(operation_id: str, before: str) -> str:
+                return build_workspace_target(
+                    runtime.settings,
+                    operation_id,
+                    before,
+                    changes={destination_relative: source_bytes},
+                    deletions={source_relative},
+                )
+
+            def commit() -> dict[str, Any]:
+                native = runtime.workspace.commit_move(
+                    source,
+                    destination,
+                    source_parent_identity=source_parent_identity,
+                    destination_parent_identity=destination_parent_identity,
+                    source_identity=source_identity,
+                    expected_source_sha256=source_sha,
+                )
+                return {
+                    "source_path": source_relative,
+                    "destination_path": destination_relative,
+                    "before_source_sha256": source_sha,
+                    "after_destination_sha256": source_sha,
+                    "after_destination_native_identity": {
+                        "volume_serial": native[0],
+                        "file_index": native[1],
+                    },
+                    "overwrite_policy": "deny",
+                    "case_only_rename": case_only,
+                }
+
+            delegated = True
+            return _run_filesystem_primitive(
+                tool_name="move_file",
+                request=request,
+                checkpoint_paths=checkpoint_paths,
+                build_target=build_target,
+                commit=commit,
+            )
+    except Exception as error:
+        if not delegated:
+            _audit_rejection("move_file", _safe_request(request_input), error)
+        raise
+
+
+@mcp.tool(annotations=LOCAL_WRITE)
+def copy_file(
+    source_path: str,
+    destination_path: str,
+    expected_source_sha256: str,
+    reason: str = "",
+) -> dict[str, Any]:
+    """Publish a byte-exact copy at a destination that must be absent."""
+
+    request_input = {
+        "source_path": source_path,
+        "destination_path": destination_path,
+        "expected_source_sha256": expected_source_sha256,
+        "reason": reason,
+        "overwrite_policy": "deny",
+    }
+    source: Path | None = None
+    delegated = False
+    try:
+        _require_filesystem()
+        _require_workspace_mutation_ready()
+        source = runtime.workspace.resolve_existing(
+            source_path, allow_directory=False, access="read", readable=True
+        )
+        destination = runtime.workspace.resolve_for_write(destination_path)
+        with WorkspaceExecutionLock(runtime.settings, targets=(source, destination)):
+            release_verified_hold(source)
+            source = runtime.workspace.resolve_existing(
+                source_path, allow_directory=False, access="read", readable=True
+            )
+            destination = runtime.workspace.resolve_for_write(destination_path)
+            if destination.exists():
+                raise FileExistsError("copy destination already exists")
+            source_identity = runtime.workspace.identity(source)
+            source_parent_identity = runtime.workspace.identity(source.parent)
+            destination_parent_identity = runtime.workspace.identity(destination.parent)
+            if (
+                source_identity is None
+                or source_parent_identity is None
+                or destination_parent_identity is None
+            ):
+                raise RuntimeError("copy source or destination parent disappeared")
+            source_bytes = read_verified_bytes(
+                source, runtime.settings.max_backup_bytes
+            )
+            source_sha = sha256_bytes(source_bytes)
+            if source_sha != expected_source_sha256:
+                raise RuntimeError("expected_source_sha256 mismatch")
+            source_relative = runtime.workspace.relative(source)
+            destination_relative = runtime.workspace.relative(destination)
+            if source_relative.casefold() == destination_relative.casefold():
+                raise ValueError("copy source and destination must not alias")
+            enforce_data_quota(runtime.settings, incoming_bytes=len(source_bytes))
+            request = {
+                **request_input,
+                "source_path": source_relative,
+                "destination_path": destination_relative,
+                "before_source_sha256": source_sha,
+                "before_source_identity": _identity_summary(source_identity),
+                "before_destination_identity": None,
+            }
+
+            def build_target(operation_id: str, before: str) -> str:
+                return build_workspace_target(
+                    runtime.settings,
+                    operation_id,
+                    before,
+                    changes={destination_relative: source_bytes},
+                )
+
+            def commit() -> dict[str, Any]:
+                native = runtime.workspace.commit_copy(
+                    source,
+                    destination,
+                    source_parent_identity=source_parent_identity,
+                    destination_parent_identity=destination_parent_identity,
+                    source_identity=source_identity,
+                    expected_source_sha256=source_sha,
+                    max_bytes=runtime.settings.max_backup_bytes,
+                )
+                return {
+                    "source_path": source_relative,
+                    "destination_path": destination_relative,
+                    "source_sha256": source_sha,
+                    "destination_sha256": source_sha,
+                    "destination_native_identity": {
+                        "volume_serial": native[0],
+                        "file_index": native[1],
+                    },
+                    "copied_bytes": len(source_bytes),
+                    "metadata_policy": "content_only",
+                    "overwrite_policy": "deny",
+                }
+
+            def post_verify(_result: dict[str, Any]) -> None:
+                if runtime.workspace.identity(source) != source_identity:
+                    raise RuntimeError("copy source identity changed before completion")
+
+            delegated = True
+            return _run_filesystem_primitive(
+                tool_name="copy_file",
+                request=request,
+                checkpoint_paths={destination_relative},
+                build_target=build_target,
+                commit=commit,
+                post_verify=post_verify,
+            )
+    except Exception as error:
+        if not delegated:
+            _audit_rejection("copy_file", _safe_request(request_input), error)
+        raise
+    finally:
+        if source is not None:
+            release_verified_hold(source)
+
+
+@mcp.tool(annotations=LOCAL_WRITE)
+def delete_file(path: str, expected_sha256: str, reason: str = "") -> dict[str, Any]:
+    """Delete one CAS-bound regular file; an absent target is a failure."""
+
+    request_input = {"path": path, "expected_sha256": expected_sha256, "reason": reason}
+    delegated = False
+    try:
+        _require_filesystem()
+        _require_workspace_mutation_ready()
+        target = runtime.workspace.resolve_for_write(path)
+        with WorkspaceExecutionLock(runtime.settings, target=target):
+            target = runtime.workspace.resolve_for_write(path)
+            target_identity = runtime.workspace.identity(target)
+            parent_identity = runtime.workspace.identity(target.parent)
+            if target_identity is None or parent_identity is None:
+                raise FileNotFoundError("delete target is absent")
+            before = read_verified_path_bytes(target, runtime.settings.max_backup_bytes)
+            before_sha = sha256_bytes(before)
+            if before_sha != expected_sha256:
+                raise RuntimeError("expected_sha256 mismatch")
+            relative = runtime.workspace.relative(target)
+            request = {
+                **request_input,
+                "path": relative,
+                "before_sha256": before_sha,
+                "before_identity": _identity_summary(target_identity),
+                "already_absent_policy": "fail",
+            }
+
+            def build_target(operation_id: str, before_manifest: str) -> str:
+                return build_workspace_target(
+                    runtime.settings,
+                    operation_id,
+                    before_manifest,
+                    deletions={relative},
+                )
+
+            def commit() -> dict[str, Any]:
+                runtime.workspace.commit_delete(
+                    target,
+                    parent_identity=parent_identity,
+                    target_identity=target_identity,
+                    expected_sha256=before_sha,
+                )
+                return {
+                    "path": relative,
+                    "before_sha256": before_sha,
+                    "after_sha256": None,
+                    "deleted_identity": _identity_summary(target_identity),
+                    "already_absent_policy": "fail",
+                }
+
+            delegated = True
+            return _run_filesystem_primitive(
+                tool_name="delete_file",
+                request=request,
+                checkpoint_paths={relative},
+                build_target=build_target,
+                commit=commit,
+            )
+    except Exception as error:
+        if not delegated:
+            _audit_rejection("delete_file", _safe_request(request_input), error)
+        raise
+
+
+@mcp.tool(annotations=LOCAL_WRITE)
+def make_directory(path: str, parents: bool = False, reason: str = "") -> dict[str, Any]:
+    """Create one bounded directory chain; existing final directories are rejected."""
+
+    request_input = {"path": path, "parents": parents, "reason": reason}
+    delegated = False
+    try:
+        _require_filesystem()
+        _require_workspace_mutation_ready()
+        if not isinstance(parents, bool):
+            raise TypeError("parents must be a boolean")
+        target = runtime.workspace.resolve_directory_target(path, parents=parents)
+        missing: list[Path] = []
+        current = target
+        while current != runtime.workspace.root and not current.exists():
+            missing.append(current)
+            current = current.parent
+        if target.exists():
+            raise FileExistsError("directory already exists")
+        missing.reverse()
+        if not missing:
+            raise RuntimeError("directory creation has no bounded mutation")
+        if len(missing) > runtime.settings.approval_manifest_max_files:
+            raise ValueError("directory chain exceeds approval_manifest_max_files")
+        parent_identity = runtime.workspace.identity(current)
+        if parent_identity is None:
+            raise RuntimeError("nearest directory parent disappeared")
+        relative_paths = {runtime.workspace.relative(item) for item in missing}
+        with WorkspaceExecutionLock(runtime.settings, targets=tuple(missing)):
+            target = runtime.workspace.resolve_directory_target(path, parents=parents)
+            if any(item.exists() for item in missing):
+                raise FileExistsError("directory target changed during validation")
+            current_identity = runtime.workspace.identity(current)
+            if current_identity != parent_identity:
+                raise RuntimeError("directory parent changed during validation")
+            request = {
+                **request_input,
+                "path": runtime.workspace.relative(target),
+                "created_directories": sorted(relative_paths),
+                "parent_identity": _identity_summary(parent_identity),
+                "existing_directory_policy": "fail",
+            }
+
+            def build_target(operation_id: str, before: str) -> str:
+                return build_workspace_target(
+                    runtime.settings,
+                    operation_id,
+                    before,
+                    directory_additions=relative_paths,
+                )
+
+            def commit() -> dict[str, Any]:
+                created = runtime.workspace.commit_directories(
+                    target,
+                    parents=parents,
+                    parent_identity=parent_identity,
+                )
+                created_relative = [runtime.workspace.relative(item) for item in created]
+                if set(created_relative) != relative_paths:
+                    raise RuntimeError("directory transaction created an unexpected path set")
+                return {
+                    "path": runtime.workspace.relative(target),
+                    "parents": parents,
+                    "created_directories": sorted(created_relative),
+                    "existing_directory_policy": "fail",
+                }
+
+            delegated = True
+            return _run_filesystem_primitive(
+                tool_name="make_directory",
+                request=request,
+                checkpoint_paths=relative_paths,
+                build_target=build_target,
+                commit=commit,
+            )
+    except Exception as error:
+        if not delegated:
+            _audit_rejection("make_directory", _safe_request(request_input), error)
+        raise
+
+
+@mcp.tool(annotations=LOCAL_WRITE)
+def text_file_apply(
+    path: str,
+    expected_sha256: str,
+    old_text: str,
+    new_text: str,
+    reason: str = "",
+) -> dict[str, Any]:
+    """Apply one unambiguous exact UTF-8 replacement without resending the whole file."""
+
+    return _workspace_apply_text_edits(
+        tool_name="text_file_apply",
+        edits=[
+            {
+                "path": path,
+                "expected_sha256": expected_sha256,
+                "replacements": [{"old_text": old_text, "new_text": new_text}],
+            }
+        ],
+        reason=reason,
+    )
+
+
+@mcp.tool(annotations=LOCAL_WRITE)
+def workspace_apply(edits: list[dict[str, Any]], reason: str = "") -> dict[str, Any]:
+    """Apply exact UTF-8 replacements across files as one recoverable logical transaction."""
+
+    return _workspace_apply_text_edits(
+        tool_name="workspace_apply",
+        edits=edits,
+        reason=reason,
+    )
+
+
+def _workspace_apply_text_edits(
+    *, tool_name: str, edits: list[dict[str, Any]], reason: str
+) -> dict[str, Any]:
+    """Run a bounded multi-file edit through the existing workspace restore transaction."""
+
+    operation_id: str | None = None
+    journal_failed_recovered = False
+    request_input = {
+        "reason": reason,
+        "edit_count": len(edits) if isinstance(edits, list) else None,
+        "paths": [item.get("path") for item in edits if isinstance(item, dict)]
+        if isinstance(edits, list)
+        else [],
+    }
+    try:
+        _require_filesystem()
+        _require_workspace_mutation_ready()
+        if not isinstance(reason, str) or len(reason) > runtime.settings.max_reason_characters:
+            raise ValueError("reason exceeds max_reason_characters")
+        if not isinstance(edits, list) or not edits:
+            raise ValueError("edits must contain at least one text edit")
+        if len(edits) > runtime.settings.max_high_level_files:
+            raise ValueError("edit file count exceeds max_high_level_files")
+
+        # Resolve only enough to select the existing deterministic cross-process lock slots.
+        # All content and CAS validation is repeated while those slots are held.
+        targets = tuple(
+            runtime.workspace.resolve_existing(
+                str(item.get("path", "")),
+                allow_directory=False,
+                access="write",
+                hold_identity=False,
+            )
+            for item in edits
+            if isinstance(item, dict)
+        )
+        if len(targets) != len(edits):
+            raise TypeError("each edit must be an object")
+
+        operation_id = runtime.audit.create_operation(
+            tool_name=tool_name,
+            tier="broker",
+            status="running",
+            cwd=str(runtime.settings.workspace_root),
+            request=_safe_request(
+                {
+                    "high_level_operation": tool_name,
+                    "reason": reason,
+                    "edit_count": len(edits),
+                    "paths": [runtime.workspace.relative(target) for target in targets],
+                }
+            ),
+        )
+        runtime.audit.add_event(operation_id, "high_level_lock_wait", {"targets": len(targets)})
+        with WorkspaceExecutionLock(runtime.settings, targets=targets):
+            _require_workspace_mutation_ready()
+            runtime.audit.add_event(operation_id, "high_level_lock_acquired", {"targets": len(targets)})
+
+            def read_current(path_value: str) -> bytes:
+                source = runtime.workspace.resolve_existing(
+                    path_value,
+                    allow_directory=False,
+                    access="write",
+                    readable=True,
+                )
+                try:
+                    return read_verified_bytes(source, runtime.settings.max_text_file_bytes)
+                finally:
+                    release_verified_hold(source)
+
+            runtime.audit.add_event(operation_id, "high_level_preflight_started", {})
+            plans = plan_exact_text_edits(
+                edits,
+                read_file=read_current,
+                max_files=runtime.settings.max_high_level_files,
+                max_read_bytes=runtime.settings.max_text_file_bytes,
+                max_write_bytes=runtime.settings.max_write_bytes,
+                max_total_bytes=runtime.settings.max_high_level_total_bytes,
+            )
+            relative_paths = {
+                runtime.workspace.relative(
+                    runtime.workspace.resolve_existing(
+                        plan.path,
+                        allow_directory=False,
+                        access="write",
+                        hold_identity=False,
+                    )
+                )
+                for plan in plans
+            }
+            runtime.audit.add_event(
+                operation_id,
+                "high_level_preflight_completed",
+                {
+                    "files": len(plans),
+                    "before_bytes": sum(len(plan.before) for plan in plans),
+                    "after_bytes": sum(len(plan.after) for plan in plans),
+                },
+            )
+            pre_workspace = capture_workspace_state(
+                runtime.settings,
+                operation_id,
+                "before",
+                paths=relative_paths,
+            )
+            runtime.audit.update_operation(
+                operation_id, pre_workspace_path=pre_workspace.manifest_path
+            )
+            runtime.audit.add_event(
+                operation_id,
+                "high_level_checkpoint_completed",
+                {"stage": "before", "files": pre_workspace.file_count},
+            )
+            changes = {
+                runtime.workspace.relative(target): plan.after
+                for target, plan in zip(targets, plans, strict=True)
+            }
+            target_manifest = build_workspace_target_from_bytes(
+                runtime.settings,
+                operation_id,
+                pre_workspace.manifest_path,
+                changes,
+            )
+            runtime.audit.add_event(
+                operation_id,
+                "high_level_transaction_staged",
+                {"files": len(changes)},
+            )
+            restore_workspace_state(
+                runtime.settings,
+                pre_workspace.manifest_path,
+                target_manifest,
+                operation_id=operation_id,
+            )
+            try:
+                runtime.audit.add_event(
+                    operation_id,
+                    "high_level_verification_started",
+                    {"files": len(changes)},
+                )
+                post_workspace = capture_workspace_state(
+                    runtime.settings,
+                    operation_id,
+                    "after",
+                    paths=relative_paths,
+                )
+                post_hashes = verify_checkpoint_integrity(
+                    runtime.settings, post_workspace.manifest_path
+                )
+                expected_after = {
+                    relative: sha256_bytes(data) for relative, data in changes.items()
+                }
+                if post_hashes != expected_after:
+                    raise RuntimeError("workspace_apply verification did not match the staged target")
+                workspace_change = compare_workspace_states(
+                    runtime.settings,
+                    pre_workspace.manifest_path,
+                    post_workspace.manifest_path,
+                    operation_id,
+                )
+                file_results = [
+                    {
+                        "path": runtime.workspace.relative(target),
+                        "before_sha256": sha256_bytes(plan.before),
+                        "after_sha256": sha256_bytes(plan.after),
+                        "before_bytes": len(plan.before),
+                        "after_bytes": len(plan.after),
+                        "replacement_count": plan.replacement_count,
+                    }
+                    for target, plan in zip(targets, plans, strict=True)
+                ]
+                result = {
+                    "operation_id": operation_id,
+                    "status": "succeeded",
+                    "high_level_operation": tool_name,
+                    "execution_route": "broker_direct",
+                    "transaction": "workspace_restore",
+                    "files": file_results,
+                    "rollback_state": "complete",
+                    **workspace_change,
+                }
+                runtime.audit.transition_operation(
+                    operation_id,
+                    from_statuses={"running"},
+                    status="succeeded",
+                    finished_at=utc_now_iso(),
+                    diff_path=str(workspace_change["diff_path"]),
+                    pre_workspace_path=pre_workspace.manifest_path,
+                    post_workspace_path=post_workspace.manifest_path,
+                    rollback_state="complete",
+                    result_json=canonical_json(_safe_request(result)),
+                )
+                finalize_workspace_transaction(runtime.settings, operation_id)
+                runtime.audit.add_event(
+                    operation_id,
+                    "high_level_operation_committed",
+                    {"files": len(file_results), "rollback_state": "complete"},
+                )
+                return result
+            except Exception as post_error:
+                try:
+                    rollback_applied_workspace_transaction(runtime.settings, operation_id)
+                    journal_failed_recovered = True
+                    runtime.audit.update_operation(
+                        operation_id,
+                        rollback_state="failed_recovered",
+                        pre_workspace_path=pre_workspace.manifest_path,
+                    )
+                    runtime.audit.add_event(
+                        operation_id,
+                        "high_level_automatic_recovery_completed",
+                        {"rollback_state": "failed_recovered"},
+                    )
+                except WorkspaceMutationError as recovery_error:
+                    runtime.audit.update_operation(
+                        operation_id,
+                        rollback_state=recovery_error.recovery_state,
+                        pre_workspace_path=pre_workspace.manifest_path,
+                    )
+                    runtime.audit.add_event(
+                        operation_id,
+                        "high_level_automatic_recovery_failed",
+                        {"rollback_state": recovery_error.recovery_state},
+                    )
+                    raise
+                raise WorkspaceMutationError(
+                    f"{tool_name} failed after mutation; starting state recovered: {post_error}",
+                    recovery_state="failed_recovered",
+                    journal_path=str(
+                        runtime.settings.data_dir
+                        / "workspace-history"
+                        / "transactions"
+                        / operation_id
+                        / "journal.json"
+                    ),
+                ) from post_error
+    except Exception as error:
+        if operation_id is None:
+            _audit_rejection(tool_name, _safe_request(request_input), error)
+        else:
+            transitioned = runtime.audit.transition_operation(
+                operation_id,
+                from_statuses={"running"},
+                status="failed",
+                finished_at=utc_now_iso(),
+                error=f"{type(error).__name__}: {error}",
+            )
+            if transitioned and journal_failed_recovered:
+                mark_workspace_transaction_audit_reconciled(runtime.settings, operation_id)
+            runtime.audit.add_event(
+                operation_id,
+                "high_level_operation_failed",
+                {
+                    "error": str(error)[:1000],
+                    "fallback_attempted": False,
+                    "mutation_fallback_forbidden": True,
+                },
+            )
         raise
 
 
@@ -2552,6 +3612,8 @@ def _request_approved_command(
                     "network access is genuinely required"
                 )
             resolved_backend = resolve_codex_sandbox_backend(runtime.settings)
+            # 実行可否は process-local thread 状態ではなく、原子的に更新される
+            # durable marker を実行直前に再検証して決める。
             require_codex_sandbox_live_verification(runtime.settings, resolved_backend)
             backend = resolved_backend.as_dict()
             sandbox_policy = codex_sandbox_effective_policy(workspace_write=workspace_write)
@@ -2967,6 +4029,7 @@ def _workspace_mutation_risk(
 
 
 def main() -> None:
+    runtime.start_sandbox_live_verification()
     transport = os.environ.get("LOCAL_MCP_TRANSPORT", "stdio").strip().casefold()
     if transport == "stdio":
         mcp.run()

@@ -12,6 +12,7 @@ from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from ctypes import create_unicode_buffer, get_last_error, wintypes
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -648,6 +649,7 @@ def sandbox_isolation_context(
         "sandbox_dependency_readable_paths": stable_paths(
             settings.sandbox_dependency_readable_paths
         ),
+        "live_verification_ttl_seconds": settings.sandbox_live_verification_ttl_seconds,
         "max_sandbox_scratch_bytes": settings.max_sandbox_scratch_bytes,
         "wlmcp_isolation_policy_version": backend.isolation_policy_version,
         "process_count_limit": backend.max_processes,
@@ -763,6 +765,184 @@ def sandbox_live_verification_route_eligible(evidence: dict[str, Any]) -> bool:
     return all(checks.get(name) is True for name in _MANDATORY_DESCENDANT_CHECKS)
 
 
+def _parse_live_verification_time(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(UTC)
+
+
+def _live_verification_failure_reason(evidence: dict[str, Any]) -> str | None:
+    properties = evidence.get("properties")
+    if isinstance(properties, dict):
+        failed = sorted(
+            name
+            for name, item in properties.items()
+            if isinstance(item, dict) and item.get("status") == "failed"
+        )
+        if failed:
+            return "security boundary failed: " + ", ".join(failed)
+    persisted_reason = evidence.get("verification_failure_reason")
+    if isinstance(persisted_reason, str) and persisted_reason:
+        return persisted_reason[:2000]
+    diagnostics = evidence.get("diagnostics")
+    if isinstance(diagnostics, dict):
+        reason = diagnostics.get("verification_error")
+        if isinstance(reason, str) and reason:
+            return reason[:2000]
+    return None
+
+
+def _has_failed_live_property(evidence: dict[str, Any]) -> bool:
+    properties = evidence.get("properties")
+    return isinstance(properties, dict) and any(
+        isinstance(item, dict) and item.get("status") == "failed"
+        for item in properties.values()
+    )
+
+
+def codex_sandbox_live_verification_status(
+    settings: Settings,
+    backend: CodexSandboxBackend,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Durable marker を実行可否とは独立した lifecycle 状態へ分類する。"""
+
+    marker = settings.data_dir / "control-plane" / "sandbox-live-verification.json"
+    base: dict[str, Any] = {
+        "status": "missing",
+        "evidence": None,
+        "last_verified_at": None,
+        "last_verification_attempt_at": None,
+        "stale_reason": None,
+        "failure_reason": None,
+    }
+    try:
+        evidence = json.loads(marker.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return base
+    except (OSError, ValueError) as error:
+        return {
+            **base,
+            "status": "stale",
+            "stale_reason": f"marker_unreadable_or_invalid: {type(error).__name__}",
+        }
+    if not isinstance(evidence, dict):
+        return {**base, "status": "stale", "stale_reason": "marker_payload_not_object"}
+    result = {
+        **base,
+        "evidence": evidence,
+        "last_verified_at": (
+            evidence.get("verified_at")
+            if evidence.get("verification_status") == "verified"
+            else None
+        ),
+        "last_verification_attempt_at": evidence.get("attempted_at")
+        or evidence.get("verified_at"),
+    }
+    if evidence.get("version") != SANDBOX_LIVE_MARKER_VERSION:
+        return {**result, "status": "stale", "stale_reason": "marker_schema_incompatible"}
+    persisted_status = evidence.get("verification_status")
+    if persisted_status == "verifying":
+        return {**result, "status": "verifying"}
+    if persisted_status in {"failed", "unverified"}:
+        return {
+            **result,
+            "status": persisted_status,
+            "failure_reason": _live_verification_failure_reason(evidence)
+            or "required live properties remain unverified",
+        }
+    try:
+        context = sandbox_isolation_context(settings, backend)
+        guard_implementation = context.get("wfp_guard_implementation")
+        os_identity = context.get("windows_os_identity")
+        account_identity = resolve_sandbox_account_identity().as_dict()
+    except (OSError, PermissionError, RuntimeError, ValueError, WfpGuardError) as error:
+        return {
+            **result,
+            "status": "stale",
+            "stale_reason": f"current_isolation_identity_unavailable: {type(error).__name__}",
+        }
+    if not isinstance(guard_implementation, dict) or not isinstance(os_identity, dict):
+        return {**result, "status": "stale", "stale_reason": "current_identity_incomplete"}
+    expected_isolation_digest = sha256_text(canonical_json(context))
+    wfp_binding = evidence.get("wfp_guard_binding")
+    identity_checks = (
+        (
+            "backend_identity_mismatch",
+            evidence.get("backend_digest")
+            == sha256_text(canonical_json(backend.as_dict())),
+        ),
+        ("backend_version_mismatch", evidence.get("backend_version") == backend.version),
+        (
+            "isolation_context_mismatch",
+            evidence.get("isolation_context_digest") == expected_isolation_digest,
+        ),
+        (
+            "guard_implementation_mismatch",
+            evidence.get("guard_implementation_digest")
+            == guard_implementation.get("digest")
+            and evidence.get("guard_implementation") == guard_implementation,
+        ),
+        (
+            "windows_os_identity_mismatch",
+            evidence.get("windows_os_identity_digest")
+            == sha256_text(canonical_json(os_identity))
+            and evidence.get("windows_os_identity") == os_identity,
+        ),
+        (
+            "sandbox_account_identity_mismatch",
+            evidence.get("sandbox_account_identity") == account_identity,
+        ),
+        (
+            "wfp_guard_binding_mismatch",
+            isinstance(wfp_binding, dict)
+            and wfp_binding.get("guard_version") == GUARD_VERSION
+            and wfp_binding.get("policy_generation") == GUARD_POLICY_GENERATION
+            and wfp_binding.get("sandbox_account_identity") == account_identity
+            and evidence.get("wfp_guard_binding_digest")
+            == sha256_text(canonical_json(wfp_binding)),
+        ),
+    )
+    for reason, matches in identity_checks:
+        if not matches:
+            return {**result, "status": "stale", "stale_reason": reason}
+
+    verified_at = _parse_live_verification_time(evidence.get("verified_at"))
+    if verified_at is None:
+        return {**result, "status": "stale", "stale_reason": "verified_at_invalid"}
+    current = now or datetime.now(UTC)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=UTC)
+    current = current.astimezone(UTC)
+    if verified_at > current + timedelta(minutes=5):
+        return {**result, "status": "stale", "stale_reason": "verified_at_in_future"}
+    if current - verified_at > timedelta(
+        seconds=settings.sandbox_live_verification_ttl_seconds
+    ):
+        return {**result, "status": "stale", "stale_reason": "verification_ttl_expired"}
+
+    if sandbox_live_verification_route_eligible(evidence):
+        return {
+            **result,
+            "status": "verified",
+            "last_verified_at": evidence.get("verified_at"),
+        }
+    failure_reason = _live_verification_failure_reason(evidence)
+    inferred_status = "failed" if _has_failed_live_property(evidence) else "unverified"
+    return {
+        **result,
+        "status": inferred_status,
+        "failure_reason": failure_reason or "required live properties remain unverified",
+    }
+
+
 def require_codex_sandbox_live_verification(
     settings: Settings, backend: CodexSandboxBackend
 ) -> dict[str, Any]:
@@ -771,56 +951,17 @@ def require_codex_sandbox_live_verification(
         raise ApprovedSandboxUnavailable(
             "Codex Sandbox live verification cannot be disabled by local configuration"
         )
-    marker = settings.data_dir / "control-plane" / "sandbox-live-verification.json"
-    try:
-        evidence = json.loads(marker.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as error:
+    inspection = codex_sandbox_live_verification_status(settings, backend)
+    evidence = inspection.get("evidence")
+    if inspection.get("status") != "verified" or not isinstance(evidence, dict):
+        status = inspection.get("status", "unavailable")
+        reason = inspection.get("stale_reason") or inspection.get("failure_reason")
+        details = f"status={status}"
+        if isinstance(reason, str) and reason:
+            details += f"; reason={reason}"
         raise ApprovedSandboxUnavailable(
-            "Codex Sandbox has not completed Windows live verification for this profile"
-        ) from error
-    try:
-        context = sandbox_isolation_context(settings, backend)
-        expected_isolation_digest = sha256_text(canonical_json(context))
-    except (OSError, PermissionError, RuntimeError, ValueError) as error:
-        raise ApprovedSandboxUnavailable(
-            "Codex Sandbox isolation context could not be resolved"
-        ) from error
-    guard_implementation = context.get("wfp_guard_implementation")
-    os_identity = context.get("windows_os_identity")
-    if not isinstance(guard_implementation, dict) or not isinstance(os_identity, dict):
-        raise ApprovedSandboxUnavailable(
-            "Codex Sandbox isolation context is missing C7 identity fields"
-        )
-    try:
-        account_identity = resolve_sandbox_account_identity().as_dict()
-    except WfpGuardError as error:
-        raise ApprovedSandboxUnavailable(
-            "Codex Sandbox account identity could not be resolved"
-        ) from error
-    wfp_binding = evidence.get("wfp_guard_binding")
-    if (
-        evidence.get("version") != SANDBOX_LIVE_MARKER_VERSION
-        or evidence.get("backend_digest")
-        != sha256_text(canonical_json(backend.as_dict()))
-        or evidence.get("backend_version") != backend.version
-        or evidence.get("isolation_context_digest") != expected_isolation_digest
-        or evidence.get("guard_implementation_digest")
-        != guard_implementation.get("digest")
-        or evidence.get("guard_implementation") != guard_implementation
-        or evidence.get("windows_os_identity_digest")
-        != sha256_text(canonical_json(os_identity))
-        or evidence.get("windows_os_identity") != os_identity
-        or evidence.get("sandbox_account_identity") != account_identity
-        or not isinstance(wfp_binding, dict)
-        or wfp_binding.get("guard_version") != GUARD_VERSION
-        or wfp_binding.get("policy_generation") != GUARD_POLICY_GENERATION
-        or wfp_binding.get("sandbox_account_identity") != account_identity
-        or evidence.get("wfp_guard_binding_digest")
-        != sha256_text(canonical_json(wfp_binding))
-        or not sandbox_live_verification_route_eligible(evidence)
-    ):
-        raise ApprovedSandboxUnavailable(
-            "Codex Sandbox live verification is missing, failed, or stale for this backend"
+            "Codex Sandbox live verification is missing, failed, or stale for this backend "
+            f"({details})"
         )
     return evidence
 

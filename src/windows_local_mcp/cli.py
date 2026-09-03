@@ -51,12 +51,24 @@ def main() -> None:
         return
 
     if args.command == "verify-codex-sandbox":
-        from .sandbox_backend import sandbox_live_verification_route_eligible
-        from .sandbox_live_verify_hardened import verify_codex_sandbox_live
+        from .sandbox_backend import (
+            codex_sandbox_live_verification_status,
+            resolve_codex_sandbox_backend,
+        )
+        from .sandbox_live_verification_lifecycle import (
+            ensure_codex_sandbox_live_verification,
+        )
 
-        result = verify_codex_sandbox_live(load_settings())
-        route_eligible = sandbox_live_verification_route_eligible(result)
+        settings = load_settings()
+        lifecycle = ensure_codex_sandbox_live_verification(settings, force=True)
+        inspection = codex_sandbox_live_verification_status(
+            settings, resolve_codex_sandbox_backend(settings)
+        )
+        evidence = inspection.get("evidence")
+        result = dict(evidence) if isinstance(evidence, dict) else {}
+        route_eligible = inspection.get("status") == "verified"
         result["route_eligible"] = route_eligible
+        result["lifecycle"] = lifecycle
         print(json.dumps(result, ensure_ascii=False, indent=2))
         if not route_eligible:
             raise SystemExit(1)
@@ -86,6 +98,7 @@ def main() -> None:
 
         register_context_export_tools(mcp, context_export_config, runtime)
         register_context_read_tools(mcp, context_read_config, runtime)
+        runtime.start_sandbox_live_verification()
         # stdout は MCP frame 専用なので、人向けの起動案内は stderr にだけ出します。
         print(
             "Windows Local MCP の起動に成功しました。ChatGPT からの接続を待っています。",

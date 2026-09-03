@@ -15,7 +15,11 @@ from typing import Any, Self
 
 from .config import Settings
 from .windows_transaction import (
+    transactional_copy_file,
+    transactional_create_directories,
     transactional_delete,
+    transactional_move_file,
+    transactional_remove_directory,
     transactional_write_bytes,
     windows_file_identity,
 )
@@ -593,12 +597,44 @@ class Workspace:
             self._check_inside(current.resolve(strict=True))
         return current.resolve(strict=True)
 
+    def resolve_directory_target(self, user_path: str, *, parents: bool) -> Path:
+        """Validate a fixed directory-create target without mutating the workspace."""
+
+        self.validate_windows_syntax(user_path)
+        lexical = self.root / user_path
+        self._check_inside(lexical.resolve(strict=False))
+        self._check_access(lexical, access="write")
+        current = self.root
+        missing_seen = False
+        parts = lexical.relative_to(self.root).parts
+        for index, part in enumerate(parts):
+            current /= part
+            if current.exists():
+                if missing_seen:
+                    raise RuntimeError(f"directory chain changed during validation: {current}")
+                self._reject_reparse_chain(current)
+                if not current.is_dir():
+                    raise NotADirectoryError(f"directory path collides with a file: {current}")
+                self._check_inside(current.resolve(strict=True))
+                continue
+            missing_seen = True
+            if not parents and index != len(parts) - 1:
+                raise FileNotFoundError(f"directory parent does not exist: {lexical.parent}")
+        return lexical
+
     def relative(self, path: Path) -> str:
         resolved = path.resolve(strict=False)
         self._check_inside(resolved)
         # Workspace-relative identifiers are persisted in manifests and journals, so keep
         # one platform-independent spelling even when the server runs on Windows.
         return resolved.relative_to(self.root).as_posix() or "."
+
+    def relative_lexical(self, path: Path) -> str:
+        """Return a validated relative spelling without losing a case-only rename target."""
+
+        absolute = Path(os.path.abspath(path))
+        self._check_inside(absolute.resolve(strict=False))
+        return absolute.relative_to(self.root).as_posix() or "."
 
     def is_hidden(self, path: Path) -> bool:
         try:
@@ -613,7 +649,7 @@ class Workspace:
         info = path.stat()
         windows_volume_serial = None
         windows_file_index = None
-        if os.name == "nt" and path.is_file():
+        if os.name == "nt":
             native = windows_file_identity(Path(str(path)))
             windows_volume_serial = native.volume_serial
             windows_file_index = native.file_index
@@ -625,6 +661,17 @@ class Workspace:
             windows_volume_serial,
             windows_file_index,
         )
+
+    @staticmethod
+    def _native_identity(identity: PathIdentity) -> tuple[int, int]:
+        if os.name == "nt":
+            if (
+                identity.windows_volume_serial is None
+                or identity.windows_file_index is None
+            ):
+                raise RuntimeError("Windows path has no stable transactional identity")
+            return identity.windows_volume_serial, identity.windows_file_index
+        return identity.device, identity.inode
 
     def revalidate_for_replace(
         self,
@@ -765,6 +812,96 @@ class Workspace:
             target_identity=target_identity,
         )
         actual_target.unlink()
+
+    def commit_move(
+        self,
+        source: Path,
+        destination: Path,
+        *,
+        source_parent_identity: PathIdentity,
+        destination_parent_identity: PathIdentity,
+        source_identity: PathIdentity,
+        expected_source_sha256: str,
+    ) -> tuple[int, int]:
+        """Atomically rename one CAS-bound regular file without overwriting."""
+
+        actual_source = Path(str(source))
+        actual_destination = Path(str(destination))
+        release_write_intent_hold(source)
+        release_write_intent_hold(destination)
+        committed = transactional_move_file(
+            actual_source,
+            actual_destination,
+            expected_source_identity=self._native_identity(source_identity),
+            expected_source_size=source_identity.size,
+            expected_source_sha256=expected_source_sha256,
+            expected_source_parent_identity=self._native_identity(source_parent_identity),
+            expected_destination_parent_identity=self._native_identity(
+                destination_parent_identity
+            ),
+        )
+        return committed.volume_serial, committed.file_index
+
+    def commit_copy(
+        self,
+        source: Path,
+        destination: Path,
+        *,
+        source_parent_identity: PathIdentity,
+        destination_parent_identity: PathIdentity,
+        source_identity: PathIdentity,
+        expected_source_sha256: str,
+        max_bytes: int,
+    ) -> tuple[int, int]:
+        """Transactionally publish a byte-exact copy at an absent destination."""
+
+        actual_destination = Path(str(destination))
+        release_write_intent_hold(destination)
+        committed = transactional_copy_file(
+            Path(str(source)),
+            actual_destination,
+            expected_source_identity=self._native_identity(source_identity),
+            expected_source_size=source_identity.size,
+            expected_source_sha256=expected_source_sha256,
+            expected_source_parent_identity=self._native_identity(source_parent_identity),
+            expected_destination_parent_identity=self._native_identity(
+                destination_parent_identity
+            ),
+            max_bytes=max_bytes,
+        )
+        return committed.volume_serial, committed.file_index
+
+    def commit_directories(
+        self,
+        target: Path,
+        *,
+        parents: bool,
+        parent_identity: PathIdentity,
+    ) -> tuple[Path, ...]:
+        """Create the validated missing directory chain as one transaction."""
+
+        return transactional_create_directories(
+            Path(str(target)),
+            parents=parents,
+            exist_ok=False,
+            expected_parent_identity=self._native_identity(parent_identity),
+        )
+
+    def commit_remove_directory(
+        self,
+        target: Path,
+        *,
+        parent_identity: PathIdentity,
+        target_identity: PathIdentity,
+    ) -> None:
+        """Remove one identity-bound empty directory without recursive effects."""
+
+        release_verified_hold(target)
+        transactional_remove_directory(
+            Path(str(target)),
+            expected_identity=self._native_identity(target_identity),
+            expected_parent_identity=self._native_identity(parent_identity),
+        )
 
     @contextmanager
     def lock_target(self, target: Path) -> Iterator[None]:

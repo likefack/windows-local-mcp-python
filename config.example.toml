@@ -48,6 +48,9 @@ approved_sandbox_windows_mode = "elevated"
 approved_sandbox_permission_profile = ":workspace"
 # false への変更は、Sandbox を有効にしたまま検証を回避する設定として起動時に拒否されます。
 approved_sandbox_require_live_verification = true
+# 有効 marker の再利用期間と、同一 identity の失敗・未検証に対する自動再試行間隔です。
+sandbox_live_verification_ttl_seconds = 604800
+sandbox_live_verification_retry_cooldown_seconds = 300
 
 # Automatic ADB is fail-closed: an empty allowlist authorizes no target.
 # Add only the fixed trusted emulator serials that automatic reads may reach.
@@ -80,6 +83,11 @@ max_image_pixels = 40000000
 max_output_bytes_per_stream = 16777216
 max_data_dir_bytes = 536870912
 max_directory_entries = 3000
+max_high_level_files = 64
+max_high_level_total_bytes = 16777216
+max_workspace_tree_depth = 8
+max_workspace_search_results = 500
+max_one_shot_artifact_bytes = 262144
 # Per-Codex-Sandbox Windows Job Object limits. The process limit and committed-memory
 # limit apply to the launcher and the complete descendant tree.
 max_sandbox_processes = 64

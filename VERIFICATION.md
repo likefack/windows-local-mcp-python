@@ -1,5 +1,32 @@
 # 検証記録
 
+## 2026-09-03 Codex Sandbox live verification の自動復旧 lifecycle
+
+### 原因と変更
+
+- 既存実装は schema v5 marker の backend／helper／WFP Guard／Windows／account／physical roots／保護対象／依存読取 path／環境変数／policy generation／scratch／process／memory binding と実行直前 gate を持っていたが、通常 LocalMCP startup から hardened verifier を呼ぶ lifecycle がなかった。このため missing／stale marker は再起動後も fail closed のまま、手動 `verify-codex-sandbox` が必要だった。
+- server startup から daemon lifecycle を開始し、Broker transport readiness を待たせずに marker を検査する。有効 marker は TTL 内で再利用し、missing／stale／schema incompatible／backend identity mismatch／isolation context mismatch／policy generation mismatch／TTL expiry だけを自動検証対象にした。
+- process-shared OS file lock の取得後に marker を再検査し、同一 identity の重複 full probe を防ぐ。OS が process 終了時に lock を解放するため、process crash／power loss で永続 lock は残らない。failed／unverified／途中終了は別の identity-bound attempt state に保存し、同一 identity の自動 retry は cooldown する。
+- 自動／手動は同じ hardened verifier を使用する。forced verification 開始時は既存 marker を `verifying` へ置換し、base probe の暫定結果は marker へ公開せず、必須 `brokered_process_creation_denied` を含む全 phase 完了後だけ最終 marker を atomic／fsync 保存する。
+- `session_info` に `live_verification_status`、`last_verified_at`、`last_verification_attempt_at`、`live_verification_stale_reason`、`verification_failure_reason`、cooldown 情報を追加した。既存の `available`、`live_verified`、`windows_live_verified`、`execution_route_available` は維持する。
+
+### 自動回帰
+
+- lifecycle 専用は 11 件 pass。valid marker の restart reuse、missing／stale success、failed／unverified、同時 startup、verifier crash と OS lock 解放、cooldown、identity 変更、manual force、non-blocking background startup、CLI と自動経路の共通 core を確認した。
+- Sandbox 関連 8 ファイルは `78 passed`。schema／identity／TTL、mandatory property、residual-risk policy、terminal status、source ACL、brokered-process、scratch retention を含む。
+- request gate の実行直前 marker 再検証は `2 passed`。process-local lifecycle が checking 中でも有効 marker を不必要に止めず、durable marker が verifying の場合は fail closed し、Approved Host を呼ばない。
+- config は `16 passed, 2 skipped`。`compileall -q src/windows_local_mcp` と今回の security-critical source／test の Ruff は pass。
+- repository 全体 pytest は 53% で 2 failure を記録後、Windows process／handle 系ケースが長時間進行しなかったため中断した。最初の failure を個別化すると `test_approved_host_allows_legitimate_descendant_to_finish` が期待 `succeeded` に対して既存の `running` となり、今回変更していない Approved Host 統合経路だった（そこまで `36 passed`）。制限環境の `test_server_operations.py` には `sc.exe exited with 5` による 8 failure があるが、今回の request gate 2件は通常 Windows user 文脈で pass した。したがってリポジトリ全体を green とは扱わない。
+
+### Windows 実機と Tunnel の境界
+
+- 通常 Windows user 文脈で、専用 workspace／config／data／scratch を互いに分離した canary profile を使用した。installed Codex Desktop backend `0.152.1`、OpenAI Authenticode、launcher/helper hash と stable file identity の解決は成功した。
+- marker missing の LocalMCP startup では、最初の `session_info` が `broker.available=true`、`live_verification_status=verifying`、`execution_route_available=false` を返した。server／Broker は probe 完了を待たずに応答した。
+- 実 probe は `WfpGuardError: FwpmSubLayerGetByKey0 failed with WFP status 0x00000005` で `unverified` になった。`failed` へ誤分類せず、Sandbox route だけを閉じ、Broker は `available=true` のまま維持した。既存 WFP object が unreadable な状態を missing と推測して昇格 repair する変更は行っていない。
+- 同一 identity の直後再起動では `retry_after_seconds=224`、`last_verified_at=null`、`last_verification_attempt_at` 不変となり、full probe を再実行しなかった。これにより実 Windows 上で cooldown と verification-storm 抑制を確認した。
+- A の「全 property verified」、B の有効 marker 再利用、C の stale marker から成功 marker 更新、ローカル承認後の実 Sandbox command は、上記 WFP read-back failure のため未達である。security boundary を弱めた synthetic marker や Approved Host fallback では代替していない。D の unverified／Sandbox-only fail-closed／Broker 継続は実機確認済み。
+- Secure MCP Tunnel／ChatGPT E2E は実施していない。Windows local E2E と別の未検証項目として残す。
+
 ## 2026-08-31 Approval UI Live Activity の人間向け表示
 
 ### 実装と自動回帰

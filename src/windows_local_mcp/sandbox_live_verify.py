@@ -57,7 +57,10 @@ def _sandbox_verification_serialized(function: Any) -> Any:
 def _write_evidence(marker: Path, result: dict[str, Any]) -> None:
     temporary_marker = marker.with_name(f".{marker.name}.{uuid.uuid4().hex}.tmp")
     try:
-        temporary_marker.write_text(canonical_json(result), encoding="utf-8")
+        with temporary_marker.open("x", encoding="utf-8", newline="\n") as output:
+            output.write(canonical_json(result))
+            output.flush()
+            os.fsync(output.fileno())
         os.replace(temporary_marker, marker)
     finally:
         temporary_marker.unlink(missing_ok=True)
@@ -968,7 +971,9 @@ def _memory_limit_probe(
 
 
 @_sandbox_verification_serialized
-def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
+def verify_codex_sandbox_live(
+    settings: Settings, *, persist_evidence: bool = True
+) -> dict[str, Any]:
     """Exercise the installed Windows sandbox; only complete success creates valid evidence."""
     backend = resolve_codex_sandbox_backend(settings)
     assert settings.sandbox_scratch_dir is not None
@@ -1600,7 +1605,8 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
                 "diagnostics": diagnostics,
                 "probe_diagnostics": probe_diagnostics,
             }
-            _write_evidence(marker, result)
+            if persist_evidence:
+                _write_evidence(marker, result)
             return result
     except Exception as error:  # noqa: BLE001 - unavailable evidence must be durable and explicit
         _set_check(
@@ -1629,7 +1635,8 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
             "diagnostics": diagnostics,
             "probe_diagnostics": probe_diagnostics,
         }
-        _write_evidence(marker, result)
+        if persist_evidence:
+            _write_evidence(marker, result)
         return result
     finally:
         for path in (

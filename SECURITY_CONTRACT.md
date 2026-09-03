@@ -219,19 +219,31 @@ Guard module は verification から child 起動まで置換・書込みを拒�
 Codex launcher と adjacent helper は canonical path、content SHA-256、Windows stable file identity、size、
 実際の version、Authenticode の `Valid` status、leaf signer subject、leaf certificate thumbprint に結合します。
 さらに Windows product、build、UBR、native architecture、Sandbox account identity、WFP read-back identity を
-marker に結合し、現在値と異なれば marker を stale として通常 operation を停止します。通常 operation は
-stale marker を理由に live verification を自動実行せず、`verify-codex-sandbox` の明示実行を必要とします。
+marker に結合し、現在値と異なれば marker を stale として Sandbox operation を停止します。個別 operation は
+stale marker を理由に live verification、UAC、repair を開始せず、全必須 property が verified になるまで fail closed します。
 `Win32_Process.Create` を含む WMI／CIM brokered process creation は explicit denial probe の成功を必須とし、
 `brokered_process_creation_denied` が欠損または false の evidence は route eligible としません。
 
-WFP の static non-persistent fixed object は reboot や BFE restart で消失し得ます。通常の Sandbox／Automatic Git
-operation は UAC 昇格、live verification、または object 再構築を自動実行しません。起動直前の complete read-back で
-missing、unreadable、または mismatch を検出した場合は child を起動せず、`verify-codex-sandbox` の明示実行を要求します。
-明示 verifier だけが、同一 verification unit の最初に、marker v5 の Guard、policy、backend、account、OS identity が
-現在値と一致する文脈で exact missing object の再構築を1回試行できます。その場合も
+LocalMCP startup lifecycle は Broker／filesystem／structured processing／audit／binary transfer／rollback を先に
+利用可能にし、Codex Sandbox marker を独立して検査します。marker が current identity と TTL に対して有効なら再利用し、
+単なる LocalMCP restart では full verification を行いません。missing、stale、schema incompatible、backend／isolation／
+policy identity mismatch、TTL expiry の場合だけ Sandbox 状態を `verifying` として背景検証します。検証中、failed、
+unverified のいずれでも Sandbox child を起動せず、Approved Host へ自動 fallback しません。
+
+WFP の static non-persistent fixed object は reboot や BFE restart で消失し得ます。起動直前の complete read-back で
+missing、unreadable、または mismatch を検出した個別 operation は child を起動しません。startup の自動 verifier と、
+diagnostics／forced reverification 用の手動 `verify-codex-sandbox` は同一の security-critical core を使用し、
+同一 verification unit の最初に exact missing object の再構築を1回だけ試行できます。その場合も
 `ensure → complete read-back → probe ごとの complete read-back → child launch` の順序を崩しません。途中で object が
 消失した場合や、既存 object の security-relevant field 不一致、conflicting object、marker identity 不一致、または
 read-back 不能は追加昇格せず fail closed とします。
+
+自動 verification は `data_dir` の named process-shared OS file lock で直列化し、lock 取得後に marker を再検査します。
+process crash／power loss では OS が lock を解放し、永続 lock を security decision に使用しません。failed／unverified／
+途中終了は current identity digest、`last_attempt_at`、bounded failure reason とともに durable に保存し、同一 identity の
+自動 retry は bounded cooldown に従います。backend、helper、workspace physical identity、isolation context、policy generation
+等が変われば新しい identity として再試行できます。attempt state は Sandbox を available に昇格させる証拠には使わず、
+route eligibility は schema v5 live marker と全 required property の再検証だけで決めます。
 
 Sandbox route の必須境界は少なくとも次です。
 
@@ -301,6 +313,7 @@ guaranteed された根拠にはせず、general Sandbox の受容済み残存 r
 - 排他範囲は correctness と conflict detection を満たすために必要な範囲へ限定することを原則とします。
   より広い lock が安全性のため必要な場合は許容しますが、性能上の問題は L とリリース判定で別途扱います。
 - 並列化や高速化のために stale／concurrent change detection を弱めません。
+- Binary transfer の admission は upload／download 共通で `preparing`／`open` だけを数え、正常完了、commit、cancel、expiry、永続 payload identity failure の終端状態は枠を解放します。download の terminal response loss に備えて `completed` manifest と immutable snapshot は retention まで保持し、同じ有効な chunk retryだけを許可します。`artifact_transfer_cancel` は workspace を変更せず active transfer を冪等に終端化し、既存の SHA-256、byte count、offset、path、source binding、atomic commit、quota、TTL、durable manifest 検証を迂回しません。
 
 ### H. Transaction／recovery
 

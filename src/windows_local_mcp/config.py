@@ -58,6 +58,17 @@ class Settings(BaseModel):
     retention_days: int = Field(default=14, ge=1, le=3650)
     retention_max_operations: int = Field(default=2000, ge=10, le=1_000_000)
     max_directory_entries: int = Field(default=3000, ge=1, le=100000)
+    # High-level operations reuse the normal file and transaction boundaries, with additional
+    # request-wide caps so one MCP call cannot amplify into an unbounded traversal or mutation.
+    max_high_level_files: int = Field(default=64, ge=1, le=1000)
+    max_high_level_total_bytes: int = Field(
+        default=16 * 1024 * 1024, ge=1024, le=256 * 1024 * 1024
+    )
+    max_workspace_tree_depth: int = Field(default=8, ge=0, le=64)
+    max_workspace_search_results: int = Field(default=500, ge=1, le=10000)
+    max_one_shot_artifact_bytes: int = Field(
+        default=256 * 1024, ge=1024, le=4 * 1024 * 1024
+    )
     max_image_bytes: int = Field(default=10 * 1024 * 1024, ge=1024)
     # Structured binary files are deliberately bounded separately from source-text writes.
     max_structured_file_bytes: int = Field(default=64 * 1024 * 1024, ge=1024)
@@ -147,6 +158,13 @@ class Settings(BaseModel):
     approved_sandbox_windows_mode: Literal["elevated"] = "elevated"
     approved_sandbox_permission_profile: Literal[":workspace"] = ":workspace"
     approved_sandbox_require_live_verification: bool = True
+    # 有効な marker は通常再起動で再利用し、失敗した自動 probe は同一 identity で抑制する。
+    sandbox_live_verification_ttl_seconds: int = Field(
+        default=7 * 24 * 60 * 60, ge=60, le=31 * 24 * 60 * 60
+    )
+    sandbox_live_verification_retry_cooldown_seconds: int = Field(
+        default=5 * 60, ge=0, le=24 * 60 * 60
+    )
     approved_host_enabled: bool = True
 
     _config_selection_source: str = PrivateAttr(default="direct_settings")

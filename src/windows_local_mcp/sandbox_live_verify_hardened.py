@@ -6,8 +6,10 @@ from typing import Any
 
 from .config import Settings
 from .sandbox_backend import (
+    SANDBOX_LIVE_MARKER_VERSION,
     hold_codex_sandbox_backend,
     resolve_codex_sandbox_backend,
+    sandbox_live_verification_route_eligible,
 )
 from .sandbox_brokered_process import (
     brokered_process_probe_command,
@@ -22,11 +24,40 @@ from .sandbox_live_verify import (
     verify_codex_sandbox_live as _base_verify_codex_sandbox_live,
 )
 from .sandbox_source_acl import ensure_source_workspace_read_deny
-from .util import canonical_json, sha256_text
+from .util import canonical_json, sha256_text, utc_now_iso
 from .wfp_guard import resolve_sandbox_account_identity
 
 _BROKERED_CHECK = "brokered_process_creation_denied"
 _BROKERED_PROPERTIES = ("termination", "resource_bound")
+
+
+def _finalize_verification_status(result: dict[str, Any], attempted_at: str) -> None:
+    properties = result.get("properties")
+    failed = (
+        sorted(
+            name
+            for name, item in properties.items()
+            if isinstance(item, dict) and item.get("status") == "failed"
+        )
+        if isinstance(properties, dict)
+        else []
+    )
+    result["attempted_at"] = attempted_at
+    if sandbox_live_verification_route_eligible(result):
+        result["verification_status"] = "verified"
+        result["verification_failure_reason"] = None
+    elif failed:
+        result["verification_status"] = "failed"
+        result["verification_failure_reason"] = (
+            "security boundary failed: " + ", ".join(failed)
+        )
+    else:
+        result["verification_status"] = "unverified"
+        diagnostics = result.get("diagnostics")
+        reason = diagnostics.get("verification_error") if isinstance(diagnostics, dict) else None
+        result["verification_failure_reason"] = (
+            reason if isinstance(reason, str) and reason else "required live properties unverified"
+        )
 
 
 def _apply_brokered_process_result(
@@ -111,13 +142,29 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
     if base is None:
         raise RuntimeError("base Sandbox verifier cannot be invoked under the shared lock")
 
+    marker = settings.data_dir / "control-plane" / "sandbox-live-verification.json"
+    attempted_at = utc_now_iso()
+    # 検証中は既存の有効 marker も置き換え、全必須 probe 完了前の実行を防ぐ。
+    _write_evidence(
+        marker,
+        {
+            "version": SANDBOX_LIVE_MARKER_VERSION,
+            "attempted_at": attempted_at,
+            "verification_status": "verifying",
+            "passed": False,
+        },
+    )
+
     account = resolve_sandbox_account_identity()
     source_guard_before = ensure_source_workspace_read_deny(
         settings.workspace_root, account.sid
     )
-    result = base(settings)
+    # brokered-process probe 前の暫定結果を別 process が有効 marker として読まないようにする。
+    result = base(settings, persist_evidence=False)
     marker_account = result.get("sandbox_account_identity")
-    if not isinstance(marker_account, dict) or marker_account.get("sid") != account.sid:
+    # 基礎 probe が identity 測定前に失敗した場合は、その unverified 診断を保持する。
+    # identity を実測できた場合だけ、ACL 設定前後の置換を明示的に拒否する。
+    if isinstance(marker_account, dict) and marker_account.get("sid") != account.sid:
         raise RuntimeError(
             "Codex Sandbox account changed after source-workspace ACL provisioning"
         )
@@ -138,7 +185,7 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
             source_guard_before.get("added")
         )
         result["source_workspace_read_acl_guard"] = source_guard_after
-        marker = settings.data_dir / "control-plane" / "sandbox-live-verification.json"
+        _finalize_verification_status(result, attempted_at)
         _write_evidence(marker, result)
         return result
 
@@ -193,6 +240,6 @@ def verify_codex_sandbox_live(settings: Settings) -> dict[str, Any]:
         source_guard_before.get("added")
     )
     result["source_workspace_read_acl_guard"] = source_guard_after
-    marker = settings.data_dir / "control-plane" / "sandbox-live-verification.json"
+    _finalize_verification_status(result, attempted_at)
     _write_evidence(marker, result)
     return result

@@ -16,7 +16,8 @@ from .paths import Workspace, read_verified_bytes, read_verified_path_bytes
 from .resources import NamedControlPlaneLock, directory_size, enforce_data_quota
 from .util import canonical_json, sha256_bytes, utc_now_iso
 
-_MANIFEST_VERSION = 2
+_MANIFEST_VERSION = 3
+_DIRECTORY_STATE = "directory"
 _JOURNAL_TERMINAL = {"complete", "failed_recovered", "failed_preflight"}
 
 
@@ -26,6 +27,7 @@ class WorkspaceState:
     files_dir: str
     file_count: int
     total_bytes: int
+    directory_count: int = 0
 
 
 class WorkspaceMutationError(RuntimeError):
@@ -63,6 +65,7 @@ def capture_workspace_state(
     base.mkdir(parents=True, exist_ok=False)
     try:
         entries: list[dict[str, Any]] = []
+        directory_entries: list[dict[str, str]] = []
         total = 0
         initial_data_bytes = directory_size(
             settings.data_dir, stop_after=settings.max_data_dir_bytes
@@ -92,7 +95,7 @@ def capture_workspace_state(
                             "reason": "policy_write_denied_directory",
                         }
                     )
-                elif candidate.is_symlink():
+                elif workspace._is_reparse(candidate):
                     excluded.append(
                         {
                             "path": candidate.relative_to(settings.workspace_root).as_posix(),
@@ -102,6 +105,13 @@ def capture_workspace_state(
                 else:
                     retained_dirs.append(name)
             dirs[:] = retained_dirs
+            for name in retained_dirs:
+                relative_directory = (root_path / name).relative_to(
+                    settings.workspace_root
+                ).as_posix()
+                directory_entries.append({"path": relative_directory})
+                if len(entries) + len(directory_entries) > settings.approval_manifest_max_files:
+                    raise ValueError("workspace history exceeds approval_manifest_max_files")
             for name in sorted(files, key=str.casefold):
                 source = root_path / name
                 relative = source.relative_to(settings.workspace_root)
@@ -137,7 +147,7 @@ def capture_workspace_state(
                         f"{type(error).__name__}: {error}"
                     ) from error
                 total += len(data)
-                if len(entries) + 1 > settings.approval_manifest_max_files:
+                if len(entries) + len(directory_entries) + 1 > settings.approval_manifest_max_files:
                     raise ValueError("workspace history exceeds approval_manifest_max_files")
                 if total > settings.approval_manifest_max_bytes:
                     raise ValueError("workspace history exceeds approval_manifest_max_bytes")
@@ -156,6 +166,7 @@ def capture_workspace_state(
             "operation_id": operation_id,
             "stage": stage,
             "files": entries,
+            "directories": directory_entries,
             "excluded": excluded,
             "capture_complete": True,
             "scope": {"kind": "workspace"},
@@ -163,7 +174,13 @@ def capture_workspace_state(
         manifest_path = base / "manifest.json"
         _write_json_atomic(manifest_path, payload)
         enforce_data_quota(settings)
-        return WorkspaceState(str(manifest_path), str(_blob_root(settings)), len(entries), total)
+        return WorkspaceState(
+            str(manifest_path),
+            str(_blob_root(settings)),
+            len(entries),
+            total,
+            len(directory_entries),
+        )
     except Exception:
         shutil.rmtree(base, ignore_errors=True)
         raise
@@ -184,18 +201,30 @@ def _capture_scoped_workspace_state(
     base.mkdir(parents=True, exist_ok=False)
     try:
         entries: list[dict[str, Any]] = []
+        directory_entries: list[dict[str, str]] = []
+        represented_paths: set[str] = set()
         total = 0
         initial_data_bytes = directory_size(
             settings.data_dir, stop_after=settings.max_data_dir_bytes
         )
         workspace = Workspace(settings)
         for relative in normalized_paths:
-            destination = workspace.resolve_planned_write(relative)
-            if not destination.exists():
+            try:
+                verified = workspace.resolve_existing(
+                    relative, allow_directory=True, access="write", readable=True
+                )
+            except FileNotFoundError:
+                workspace.resolve_planned_write(relative)
                 continue
-            verified = workspace.resolve_existing(
-                relative, allow_directory=False, access="write", readable=True
-            )
+            actual_relative = _actual_workspace_relative(workspace, verified)
+            if actual_relative in represented_paths:
+                continue
+            represented_paths.add(actual_relative)
+            if verified.is_dir():
+                directory_entries.append({"path": actual_relative})
+                if len(entries) + len(directory_entries) > settings.approval_manifest_max_files:
+                    raise ValueError("workspace history exceeds approval_manifest_max_files")
+                continue
             parent_identity = workspace.identity(verified.parent)
             target_identity = workspace.identity(verified)
             if parent_identity is None or target_identity is None:
@@ -214,7 +243,7 @@ def _capture_scoped_workspace_state(
             if target_identity.size != len(data):
                 raise RuntimeError(f"scoped checkpoint target changed while read: {relative}")
             total += len(data)
-            if len(entries) + 1 > settings.approval_manifest_max_files:
+            if len(entries) + len(directory_entries) + 1 > settings.approval_manifest_max_files:
                 raise ValueError("workspace history exceeds approval_manifest_max_files")
             if total > settings.approval_manifest_max_bytes:
                 raise ValueError("workspace history exceeds approval_manifest_max_bytes")
@@ -222,7 +251,7 @@ def _capture_scoped_workspace_state(
             _store_blob(settings, digest, data, initial_data_bytes)
             entries.append(
                 {
-                    "path": relative,
+                    "path": actual_relative,
                     "size": len(data),
                     "sha256": digest,
                     "blob": digest,
@@ -233,6 +262,7 @@ def _capture_scoped_workspace_state(
             "operation_id": operation_id,
             "stage": stage,
             "files": entries,
+            "directories": directory_entries,
             "excluded": [],
             "capture_complete": True,
             "scope": {"kind": "paths", "paths": normalized_paths},
@@ -241,7 +271,11 @@ def _capture_scoped_workspace_state(
         _write_json_atomic(manifest_path, payload)
         enforce_data_quota(settings)
         return WorkspaceState(
-            str(manifest_path), str(_blob_root(settings)), len(entries), total
+            str(manifest_path),
+            str(_blob_root(settings)),
+            len(entries),
+            total,
+            len(directory_entries),
         )
     except Exception:
         shutil.rmtree(base, ignore_errors=True)
@@ -259,6 +293,26 @@ def _validated_relative_path(value: str) -> str:
     return normalized
 
 
+def _actual_workspace_relative(workspace: Workspace, verified: Path) -> str:
+    """Return the namespace spelling of an identity-held final component on Windows."""
+
+    if os.name != "nt":
+        return workspace.relative(verified)
+    expected = workspace.identity(verified)
+    with os.scandir(verified.parent) as entries:
+        matches = [
+            entry.name
+            for entry in entries
+            if entry.name.casefold() == verified.name.casefold()
+        ]
+    if len(matches) != 1:
+        raise RuntimeError("workspace path casing is ambiguous during checkpoint capture")
+    candidate = verified.parent / matches[0]
+    if workspace.identity(candidate) != expected:
+        raise RuntimeError("workspace path identity changed during casing capture")
+    return workspace.relative(candidate)
+
+
 def compare_workspace_states(
     settings: Settings, before_path: str, after_path: str, operation_id: str
 ) -> dict[str, Any]:
@@ -267,17 +321,21 @@ def compare_workspace_states(
     scope = _require_matching_scope(before, after)
     before_map = _entry_map(before)
     after_map = _entry_map(after)
-    changed = sorted(
+    changed_files = sorted(
         path
         for path in before_map.keys() | after_map.keys()
         if _entry_digest(before_map.get(path)) != _entry_digest(after_map.get(path))
     )
+    before_directories = _directory_set(before)
+    after_directories = _directory_set(after)
+    changed_directories = sorted(before_directories ^ after_directories)
+    changed = sorted(set(changed_files) | set(changed_directories))
     added_lines = removed_lines = 0
     chunks: list[str] = []
     limit = settings.max_diff_bytes
     diff_bytes = 0
     truncated = False
-    for relative in changed:
+    for relative in changed_files:
         old = _entry_bytes(settings, Path(before_path), before_map.get(relative))
         new = _entry_bytes(settings, Path(after_path), after_map.get(relative))
         try:
@@ -314,8 +372,11 @@ def compare_workspace_states(
     diff_path = settings.data_dir / "diffs" / f"{operation_id}.diff"
     diff_path.write_text("".join(chunks), encoding="utf-8")
     return {
-        "changed_files": changed,
-        "changed_file_count": len(changed),
+        "changed_files": changed_files,
+        "changed_file_count": len(changed_files),
+        "changed_directories": changed_directories,
+        "changed_directory_count": len(changed_directories),
+        "changed_paths": changed,
         "added_lines": added_lines,
         "removed_lines": removed_lines,
         "diff_path": str(diff_path),
@@ -335,6 +396,17 @@ def verify_checkpoint_integrity(settings: Settings, manifest_path: str) -> dict[
             raise RuntimeError(f"checkpoint integrity verification failed: {relative}")
         verified[relative] = digest
     return verified
+
+
+def checkpoint_state(settings: Settings, manifest_path: str) -> dict[str, str]:
+    """Return the verified file/directory state used by CAS and recovery."""
+
+    manifest = _load_manifest(settings, manifest_path)
+    files = verify_checkpoint_integrity(settings, manifest_path)
+    return {
+        **{path: f"file:{digest}" for path, digest in files.items()},
+        **{path: _DIRECTORY_STATE for path in _directory_set(manifest)},
+    }
 
 
 def checkpoint_manifest_digest(settings: Settings, manifest_path: str) -> str:
@@ -383,15 +455,15 @@ def restore_workspace_state(
         target_manifest = _load_manifest(settings, target_path)
         scope = _require_matching_scope(expected_manifest, target_manifest)
         scope_paths = _scope_paths(scope)
-        expected_map = verify_checkpoint_integrity(settings, expected_path)
-        target_map = verify_checkpoint_integrity(settings, target_path)
+        expected_map = checkpoint_state(settings, expected_path)
+        target_map = checkpoint_state(settings, target_path)
         current = capture_workspace_state(
             settings,
             transaction_id,
             "transaction-before",
             paths=scope_paths,
         )
-        current_map = verify_checkpoint_integrity(settings, current.manifest_path)
+        current_map = checkpoint_state(settings, current.manifest_path)
         if expected_map != current_map:
             conflicts = sorted(
                 path
@@ -432,8 +504,8 @@ def restore_workspace_state(
             journal_path=journal_path,
             expected_hashes=expected_map,
         )
-        final_map = _scan_current_hashes(settings, scope_paths)
-        intended_map = _hash_map(target_manifest)
+        final_map = _scan_current_state(settings, scope_paths)
+        intended_map = _state_map(target_manifest)
         if final_map != intended_map:
             raise RuntimeError("post-restore workspace verification did not match target")
     except BaseException as apply_error:  # noqa: BLE001 - journal abrupt Python interruption too
@@ -446,9 +518,9 @@ def restore_workspace_state(
             if current is None:
                 raise RuntimeError("transaction start state is unavailable")
             verify_checkpoint_integrity(settings, current.manifest_path)
-            target_hashes = verify_checkpoint_integrity(settings, target_path)
-            current_hashes = verify_checkpoint_integrity(settings, current.manifest_path)
-            live_hashes = _scan_current_hashes(settings, scope_paths)
+            target_hashes = checkpoint_state(settings, target_path)
+            current_hashes = checkpoint_state(settings, current.manifest_path)
+            live_hashes = _scan_current_state(settings, scope_paths)
             changed_paths = {str(item) for item in journal.get("changed_paths") or []}
             conflicts = sorted(
                 relative
@@ -466,7 +538,7 @@ def restore_workspace_state(
                 current.manifest_path,
                 only_paths=changed_paths,
             )
-            recovered_hashes = _scan_current_hashes(settings, scope_paths)
+            recovered_hashes = _scan_current_state(settings, scope_paths)
             recovery_mismatches = sorted(
                 relative
                 for relative in changed_paths
@@ -508,9 +580,13 @@ def restore_workspace_state(
     scope = _require_matching_scope(current_manifest, target_manifest)
     target_map = _entry_map(target_manifest)
     current_map = _entry_map(current_manifest)
+    target_directories = _directory_set(target_manifest)
+    current_directories = _directory_set(current_manifest)
     return {
         "restored_files": sorted(target_map),
         "removed_files": sorted(current_map.keys() - target_map.keys()),
+        "restored_directories": sorted(target_directories),
+        "removed_directories": sorted(current_directories - target_directories),
         "transaction_journal": str(journal_path),
         "failure_atomicity": "best_effort_with_automatic_recovery",
         "rollback_scope": scope,
@@ -540,13 +616,13 @@ def rollback_applied_workspace_transaction(
     target_path = str(journal.get("target_manifest") or "")
     if not before_path or not target_path:
         raise RuntimeError("workspace transaction has incomplete recovery bindings")
-    before = verify_checkpoint_integrity(settings, before_path)
-    target = verify_checkpoint_integrity(settings, target_path)
+    before = checkpoint_state(settings, before_path)
+    target = checkpoint_state(settings, target_path)
     before_manifest = _load_manifest(settings, before_path)
     target_manifest = _load_manifest(settings, target_path)
     scope = _require_matching_scope(before_manifest, target_manifest)
     scope_paths = _scope_paths(scope)
-    current = _scan_current_hashes(settings, scope_paths)
+    current = _scan_current_state(settings, scope_paths)
     changed = {str(item) for item in journal.get("changed_paths") or []}
     conflicts = sorted(
         relative
@@ -570,7 +646,7 @@ def rollback_applied_workspace_transaction(
             journal_path=str(journal_path),
         )
     _apply_manifest(settings, before_path, only_paths=changed)
-    recovered = _scan_current_hashes(settings, scope_paths)
+    recovered = _scan_current_state(settings, scope_paths)
     mismatches = sorted(
         relative for relative in changed if recovered.get(relative) != before.get(relative)
     )
@@ -628,11 +704,16 @@ def prepare_selective_undo(
     )
     verify_checkpoint_integrity(settings, current.manifest_path)
     current_manifest = _load_manifest(settings, current.manifest_path)
-    desired, conflicts, automatic_merges = _selective_target(
+    desired, desired_directories, conflicts, automatic_merges = _selective_target(
         settings, Path(before_path), before, Path(after_path), after, current_manifest
     )
     target_path = _write_generated_manifest(
-        settings, operation_id, "undo-preview-target", desired, scope=scope
+        settings,
+        operation_id,
+        "undo-preview-target",
+        desired,
+        scope=scope,
+        directories=desired_directories,
     )
     preview = _restore_summary(current_manifest, _load_manifest(settings, target_path))
     preview.update(
@@ -674,12 +755,18 @@ def describe_current_workspace_restore(
     """Describe a restore against the live workspace within the target checkpoint scope."""
     target = _load_manifest(settings, target_path)
     scope = _manifest_scope(target)
-    current_hashes = _scan_current_hashes(settings, _scope_paths(scope))
+    current_state = _scan_current_state(settings, _scope_paths(scope))
     current = {
         "scope": scope,
         "files": [
-            {"path": relative, "sha256": digest}
-            for relative, digest in sorted(current_hashes.items())
+            {"path": relative, "sha256": state.removeprefix("file:")}
+            for relative, state in sorted(current_state.items())
+            if state.startswith("file:")
+        ],
+        "directories": [
+            {"path": relative}
+            for relative, state in sorted(current_state.items())
+            if state == _DIRECTORY_STATE
         ],
     }
     result = _restore_summary(current, target)
@@ -709,6 +796,7 @@ def build_workspace_target_from_bytes(
     scope = _manifest_scope(expected)
     scope_paths = _scope_paths(scope)
     entries = dict(_entry_map(expected))
+    directories = set(_directory_set(expected))
     workspace = Workspace(settings)
     initial_size = directory_size(settings.data_dir)
     for relative in deletions or set():
@@ -734,12 +822,75 @@ def build_workspace_target_from_bytes(
             "sha256": digest,
             "blob": digest,
         }
+        directories.discard(normalized)
     return _write_generated_manifest(
         settings,
         operation_id,
         "staged-workspace-write-target",
         entries,
         scope=scope,
+        directories=directories,
+    )
+
+
+@_cas_serialized
+def build_workspace_target(
+    settings: Settings,
+    operation_id: str,
+    expected_manifest_path: str,
+    *,
+    changes: dict[str, bytes] | None = None,
+    deletions: set[str] | None = None,
+    directory_additions: set[str] | None = None,
+    directory_deletions: set[str] | None = None,
+) -> str:
+    """Build a bounded file/directory target manifest for a fixed Broker mutation."""
+
+    expected = _load_manifest(settings, expected_manifest_path)
+    scope = _manifest_scope(expected)
+    scope_paths = _scope_paths(scope)
+    entries = dict(_entry_map(expected))
+    directories = set(_directory_set(expected))
+    initial_size = directory_size(settings.data_dir)
+
+    def normalize(relative: str) -> str:
+        normalized = PureWindowsPath(_validated_relative_path(relative)).as_posix()
+        if scope_paths is not None and normalized not in scope_paths:
+            raise ValueError("workspace target change falls outside checkpoint scope")
+        return normalized
+
+    for relative in deletions or set():
+        normalized = normalize(relative)
+        entries.pop(normalized, None)
+    for relative in directory_deletions or set():
+        normalized = normalize(relative)
+        directories.discard(normalized)
+    for relative, data in (changes or {}).items():
+        if not isinstance(data, bytes):
+            raise TypeError("workspace target file content must be bytes")
+        normalized = normalize(relative)
+        digest = sha256_bytes(data)
+        _store_blob(settings, digest, data, initial_size)
+        entries[normalized] = {
+            "path": normalized,
+            "size": len(data),
+            "sha256": digest,
+            "blob": digest,
+        }
+        directories.discard(normalized)
+    for relative in directory_additions or set():
+        normalized = normalize(relative)
+        if normalized in entries:
+            raise ValueError("workspace target path cannot be both file and directory")
+        directories.add(normalized)
+
+    return _write_generated_manifest(
+        settings,
+        operation_id,
+        "staged-workspace-target",
+        entries,
+        scope=scope,
+        directories=directories,
     )
 
 
@@ -792,7 +943,7 @@ def recover_incomplete_workspace_transaction(
             raise RuntimeError("staged journal has no before checkpoint")
         verify_checkpoint_integrity(settings, before_path)
         before_scope = _manifest_scope(_load_manifest(settings, before_path))
-        _scan_current_hashes(settings, _scope_paths(before_scope))
+        _scan_current_state(settings, _scope_paths(before_scope))
         journal.update(state="failed_preflight", reconciled_at=utc_now_iso())
         _write_json_atomic(journal_path, journal)
         return journal
@@ -800,9 +951,9 @@ def recover_incomplete_workspace_transaction(
         target_path = str(journal.get("target_manifest") or "")
         if not target_path:
             raise RuntimeError("applied journal has no target checkpoint")
-        target = verify_checkpoint_integrity(settings, target_path)
+        target = checkpoint_state(settings, target_path)
         target_scope = _manifest_scope(_load_manifest(settings, target_path))
-        if _scan_current_hashes(settings, _scope_paths(target_scope)) != target:
+        if _scan_current_state(settings, _scope_paths(target_scope)) != target:
             raise RuntimeError("applied workspace no longer matches its verified target")
         return journal
     if state not in {"applying", "recovering"}:
@@ -846,13 +997,13 @@ def recover_incomplete_workspace_transaction(
         return journal
     if not before_path or not target_path:
         raise RuntimeError("interrupted workspace transaction has no recovery manifests")
-    before = verify_checkpoint_integrity(settings, before_path)
-    target = verify_checkpoint_integrity(settings, target_path)
+    before = checkpoint_state(settings, before_path)
+    target = checkpoint_state(settings, target_path)
     before_manifest = _load_manifest(settings, before_path)
     target_manifest = _load_manifest(settings, target_path)
     scope = _require_matching_scope(before_manifest, target_manifest)
     scope_paths = _scope_paths(scope)
-    current = _scan_current_hashes(settings, scope_paths)
+    current = _scan_current_state(settings, scope_paths)
     changed = set(journal.get("changed_paths") or [])
     all_paths = before.keys() | target.keys() | current.keys()
     unexpected = [
@@ -871,7 +1022,7 @@ def recover_incomplete_workspace_transaction(
         )
     verify_checkpoint_integrity(settings, before_path)
     _apply_manifest(settings, before_path, only_paths=changed)
-    if _scan_current_hashes(settings, scope_paths) != before:
+    if _scan_current_state(settings, scope_paths) != before:
         raise RuntimeError("automatic interrupted-transaction recovery verification failed")
     journal.update(state="failed_recovered", recovered_at=utc_now_iso())
     _write_json_atomic(journal_path, journal)
@@ -950,6 +1101,99 @@ def begin_single_file_write_transaction(
     return str(journal_path)
 
 
+def begin_filesystem_primitive_transaction(
+    settings: Settings,
+    operation_id: str,
+    *,
+    before_manifest: str,
+    target_manifest: str,
+    changed_paths: set[str],
+    operation_type: str,
+) -> str:
+    """Persist recovery bindings before one closed-world filesystem primitive commits."""
+
+    if operation_type not in {"move_file", "copy_file", "delete_file", "make_directory"}:
+        raise ValueError("unsupported filesystem primitive transaction type")
+    if not changed_paths:
+        raise ValueError("filesystem primitive transaction requires a bounded path set")
+    before = _load_manifest(settings, before_manifest)
+    target = _load_manifest(settings, target_manifest)
+    scope = _require_matching_scope(before, target)
+    allowed = _scope_paths(scope)
+    normalized = sorted({_validated_relative_path(path) for path in changed_paths})
+    if allowed is not None and not set(normalized).issubset(allowed):
+        raise ValueError("filesystem primitive transaction exceeds checkpoint scope")
+    transaction = _transaction_root(settings, operation_id)
+    transaction.mkdir(parents=True, exist_ok=False)
+    journal_path = transaction / "journal.json"
+    _write_json_atomic(
+        journal_path,
+        {
+            "version": 1,
+            "operation_id": operation_id,
+            "kind": "filesystem_primitive",
+            "operation_type": operation_type,
+            "state": "applying",
+            "created_at": utc_now_iso(),
+            "before_manifest": str(Path(before_manifest).resolve(strict=True)),
+            "target_manifest": str(Path(target_manifest).resolve(strict=True)),
+            "changed_paths": normalized,
+            "applied_paths": [],
+        },
+    )
+    return str(journal_path)
+
+
+def update_filesystem_primitive_transaction(
+    settings: Settings,
+    operation_id: str,
+    *,
+    state: str,
+    error: BaseException | None = None,
+) -> str:
+    if state not in {"applied_verified", "failed_recovered", "recovery_required"}:
+        raise ValueError("invalid filesystem primitive transaction state")
+    journal_path = _transaction_root(settings, operation_id) / "journal.json"
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    if journal.get("kind") != "filesystem_primitive":
+        raise RuntimeError("workspace transaction is not a filesystem primitive")
+    journal["state"] = state
+    journal[f"{state}_at"] = utc_now_iso()
+    if error is not None:
+        journal["recovery_error"] = f"{type(error).__name__}: {error}"[:2000]
+    _write_json_atomic(journal_path, journal)
+    return str(journal_path)
+
+
+def rollback_filesystem_primitive_transaction(
+    settings: Settings, operation_id: str
+) -> dict[str, Any]:
+    """Recover a primitive only when every changed path is still before/after-bound."""
+
+    journal_path = _transaction_root(settings, operation_id) / "journal.json"
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    if journal.get("kind") != "filesystem_primitive":
+        raise RuntimeError("workspace transaction is not a filesystem primitive")
+    state = str(journal.get("state") or "")
+    if state == "applied_verified":
+        return rollback_applied_workspace_transaction(settings, operation_id)
+    if state not in {"applying", "recovering"}:
+        raise RuntimeError("filesystem primitive transaction is not recoverable")
+    recovered = recover_incomplete_workspace_transaction(
+        settings, {**journal, "journal_path": str(journal_path)}
+    )
+    if recovered.get("state") != "failed_recovered":
+        raise RuntimeError("filesystem primitive recovery did not reach a terminal state")
+    return {
+        "rollback_state": "failed_recovered",
+        "recovered_paths": sorted(str(item) for item in journal.get("changed_paths") or []),
+        "transaction_journal": str(journal_path),
+        "rollback_scope": checkpoint_scope(
+            settings, str(journal.get("before_manifest") or "")
+        ),
+    }
+
+
 def update_single_file_write_transaction(
     settings: Settings,
     operation_id: str,
@@ -981,29 +1225,51 @@ def _selective_target(
     after_path: Path,
     after: dict[str, Any],
     current: dict[str, Any],
-) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], list[str]]:
+) -> tuple[
+    dict[str, dict[str, Any]],
+    set[str],
+    list[dict[str, Any]],
+    list[str],
+]:
     before_map = _entry_map(before)
     after_map = _entry_map(after)
     current_map = dict(_entry_map(current))
     desired = dict(current_map)
+    before_directories = _directory_set(before)
+    after_directories = _directory_set(after)
+    current_directories = _directory_set(current)
+    desired_directories = set(current_directories)
+    before_state = _state_map(before)
+    after_state = _state_map(after)
+    current_state = _state_map(current)
     conflicts: list[dict[str, Any]] = []
     automatic_merges: list[str] = []
     for relative in _changed_paths(before, after):
         old_entry = before_map.get(relative)
         operation_entry = after_map.get(relative)
         current_entry = current_map.get(relative)
-        old_digest = _entry_digest(old_entry)
-        operation_digest = _entry_digest(operation_entry)
-        current_digest = _entry_digest(current_entry)
+        old_digest = before_state.get(relative)
+        operation_digest = after_state.get(relative)
+        current_digest = current_state.get(relative)
         if current_digest == old_digest:
             continue
         if current_digest == operation_digest:
+            desired.pop(relative, None)
+            desired_directories.discard(relative)
             if old_entry is None:
-                desired.pop(relative, None)
+                if relative in before_directories:
+                    desired_directories.add(relative)
             else:
                 desired[relative] = old_entry
             continue
-        if old_entry is None or operation_entry is None or current_entry is None:
+        if (
+            relative in before_directories
+            or relative in after_directories
+            or relative in current_directories
+            or old_entry is None
+            or operation_entry is None
+            or current_entry is None
+        ):
             conflicts.append(
                 _conflict(
                     relative,
@@ -1059,7 +1325,7 @@ def _selective_target(
             "blob": digest,
         }
         automatic_merges.append(relative)
-    return desired, conflicts, automatic_merges
+    return desired, desired_directories, conflicts, automatic_merges
 
 
 def _reverse_text_change(before: str, after: str, current: str) -> str | None:
@@ -1096,15 +1362,32 @@ def _restore_summary(expected: dict[str, Any], target: dict[str, Any]) -> dict[s
     expected_map = _entry_map(expected)
     target_map = _entry_map(target)
     changed = _changed_paths(expected, target)
+    changed_files = sorted(
+        path
+        for path in changed
+        if path in expected_map or path in target_map
+    )
     created = sorted(target_map.keys() - expected_map.keys())
     deleted = sorted(expected_map.keys() - target_map.keys())
-    restored = sorted(set(changed) - set(created) - set(deleted))
+    restored = sorted(set(changed_files) - set(created) - set(deleted))
+    expected_directories = _directory_set(expected)
+    target_directories = _directory_set(target)
+    created_directories = sorted(target_directories - expected_directories)
+    deleted_directories = sorted(expected_directories - target_directories)
     return {
-        "files_that_would_change": changed,
-        "changed_file_count": len(changed),
+        "files_that_would_change": changed_files,
+        "changed_file_count": len(changed_files),
         "created_files": created,
         "restored_files": restored,
         "deleted_files": deleted,
+        "directories_that_would_change": sorted(
+            set(created_directories) | set(deleted_directories)
+        ),
+        "changed_directory_count": len(
+            set(created_directories) | set(deleted_directories)
+        ),
+        "created_directories": created_directories,
+        "deleted_directories": deleted_directories,
         "creates_files": bool(created),
         "restores_files": bool(restored),
         "deletes_files": bool(deleted),
@@ -1124,23 +1407,33 @@ def _apply_manifest(
 ) -> None:
     manifest = _load_manifest(settings, manifest_path)
     target_map = _entry_map(manifest)
+    target_directories = _directory_set(manifest)
     scope_paths = _scope_paths(_manifest_scope(manifest))
-    current = _scan_current_hashes(settings, scope_paths)
-    if expected_hashes is not None and current != expected_hashes:
+    current_state = _scan_current_state(settings, scope_paths)
+    if expected_hashes is not None and current_state != expected_hashes:
         raise RuntimeError("workspace changed during restore staging")
     changed = (
         only_paths
         if only_paths is not None
-        else set(current.keys()) | set(target_map.keys())
+        else set(current_state) | set(target_map) | target_directories
     )
     workspace = Workspace(settings)
 
-    for relative in sorted((set(current) - set(target_map)) & changed, reverse=True):
+    current_files = {
+        path: state.removeprefix("file:")
+        for path, state in current_state.items()
+        if state.startswith("file:")
+    }
+    current_directories = {
+        path for path, state in current_state.items() if state == _DIRECTORY_STATE
+    }
+
+    for relative in sorted((set(current_files) - set(target_map)) & changed, reverse=True):
         destination = workspace.resolve_for_write(relative)
-        _verify_destination_digest(destination, current.get(relative), relative)
+        _verify_destination_digest(destination, current_files.get(relative), relative)
         parent_identity = workspace.identity(destination.parent)
         target_identity = workspace.identity(destination)
-        expected = current.get(relative)
+        expected = current_files.get(relative)
         if parent_identity is None or target_identity is None or expected is None:
             raise RuntimeError(f"restore delete target changed before commit: {relative}")
         workspace.commit_delete(
@@ -1149,6 +1442,33 @@ def _apply_manifest(
             target_identity=target_identity,
             expected_sha256=expected,
         )
+        _journal_applied(journal, journal_path, relative)
+
+    # A directory-to-file lifecycle change is permitted only when the directory is empty.
+    for relative in sorted(
+        (current_directories & set(target_map) & changed),
+        key=lambda item: item.count("/"),
+        reverse=True,
+    ):
+        directory = workspace.resolve_directory(relative, access="write")
+        parent_identity = workspace.identity(directory.parent)
+        target_identity = workspace.identity(directory)
+        if parent_identity is None or target_identity is None:
+            raise RuntimeError(f"restore directory changed before commit: {relative}")
+        workspace.commit_remove_directory(
+            directory,
+            parent_identity=parent_identity,
+            target_identity=target_identity,
+        )
+        _journal_applied(journal, journal_path, relative)
+
+    # Create directory targets before restoring files below them. Existing directories are
+    # preserved; only paths represented by the target manifest are introduced.
+    for relative in sorted(
+        (target_directories - current_directories) & changed,
+        key=lambda item: item.count("/"),
+    ):
+        workspace.ensure_directory_for_write(relative)
         _journal_applied(journal, journal_path, relative)
 
     for relative in sorted(set(target_map) & changed):
@@ -1181,7 +1501,7 @@ def _apply_manifest(
         target_identity = workspace.identity(destination)
         if parent_identity is None:
             raise RuntimeError(f"restore parent disappeared: {relative}")
-        expected = current.get(relative)
+        expected = current_files.get(relative)
         _verify_destination_digest(destination, expected, relative)
         workspace.commit_bytes(
             destination,
@@ -1189,6 +1509,25 @@ def _apply_manifest(
             parent_identity=parent_identity,
             target_identity=target_identity,
             expected_sha256=expected if target_identity is not None else None,
+        )
+        _journal_applied(journal, journal_path, relative)
+
+    # Directory removal is deliberately non-recursive. Later files or subdirectories turn the
+    # lifecycle change into a conflict instead of being destroyed by rollback or selective Undo.
+    for relative in sorted(
+        (current_directories - target_directories) & changed,
+        key=lambda item: item.count("/"),
+        reverse=True,
+    ):
+        candidate = workspace.resolve_directory(relative, access="write")
+        parent_identity = workspace.identity(candidate.parent)
+        target_identity = workspace.identity(candidate)
+        if parent_identity is None or target_identity is None:
+            raise RuntimeError(f"restore directory changed before commit: {relative}")
+        workspace.commit_remove_directory(
+            candidate,
+            parent_identity=parent_identity,
+            target_identity=target_identity,
         )
         _journal_applied(journal, journal_path, relative)
 
@@ -1204,7 +1543,15 @@ def _remove_created_directories(settings: Settings, directories: object) -> None
     ):
         try:
             directory = workspace.resolve_directory(relative, access="write")
-            directory.rmdir()
+            parent_identity = workspace.identity(directory.parent)
+            target_identity = workspace.identity(directory)
+            if parent_identity is None or target_identity is None:
+                raise RuntimeError("created directory identity is unavailable")
+            workspace.commit_remove_directory(
+                directory,
+                parent_identity=parent_identity,
+                target_identity=target_identity,
+            )
         except FileNotFoundError:
             continue
         except OSError as error:
@@ -1216,17 +1563,32 @@ def _remove_created_directories(settings: Settings, directories: object) -> None
 def _scan_current_hashes(
     settings: Settings, paths: set[str] | None = None
 ) -> dict[str, str]:
+    return {
+        path: state.removeprefix("file:")
+        for path, state in _scan_current_state(settings, paths).items()
+        if state.startswith("file:")
+    }
+
+
+def _scan_current_state(
+    settings: Settings, paths: set[str] | None = None
+) -> dict[str, str]:
     workspace = Workspace(settings)
     if paths is not None:
         result: dict[str, str] = {}
         for relative in sorted(paths):
             normalized = _validated_relative_path(relative)
-            candidate = workspace.resolve_planned_write(normalized)
-            if not candidate.exists():
+            try:
+                verified = workspace.resolve_existing(
+                    normalized, allow_directory=True, access="write", readable=True
+                )
+            except FileNotFoundError:
+                workspace.resolve_planned_write(normalized)
                 continue
-            verified = workspace.resolve_existing(
-                normalized, allow_directory=False, access="write", readable=True
-            )
+            actual_relative = _actual_workspace_relative(workspace, verified)
+            if verified.is_dir():
+                result[actual_relative] = _DIRECTORY_STATE
+                continue
             details = verified.stat()
             if not verified.is_file() or details.st_nlink > 1:
                 raise PermissionError(
@@ -1244,7 +1606,7 @@ def _scan_current_hashes(
                 parent_identity=parent_identity,
                 target_identity=before_identity,
             )
-            result[normalized] = sha256_bytes(data)
+            result[actual_relative] = f"file:{sha256_bytes(data)}"
         return result
     denied = {name.casefold() for name in settings.write_denied_directories}
     blocked = {name.casefold() for name in settings.blocked_file_names}
@@ -1263,8 +1625,14 @@ def _scan_current_hashes(
         dirs[:] = [
             name
             for name in dirs
-            if name.casefold() not in denied and not (root_path / name).is_symlink()
+            if name.casefold() not in denied
+            and not workspace._is_reparse(root_path / name)
         ]
+        for name in dirs:
+            relative_directory = (root_path / name).relative_to(
+                settings.workspace_root
+            ).as_posix()
+            result[relative_directory] = _DIRECTORY_STATE
         for name in files:
             relative = (root_path / name).relative_to(settings.workspace_root)
             folded = name.casefold()
@@ -1278,8 +1646,11 @@ def _scan_current_hashes(
                 )
                 if not path.is_file() or path.stat().st_nlink > 1:
                     continue
-                result[relative.as_posix()] = sha256_bytes(
-                    read_verified_bytes(path, settings.approval_manifest_max_bytes)
+                result[relative.as_posix()] = (
+                    "file:"
+                    + sha256_bytes(
+                        read_verified_bytes(path, settings.approval_manifest_max_bytes)
+                    )
                 )
             except (FileNotFoundError, OSError, PermissionError, ValueError) as error:
                 raise RuntimeError(
@@ -1362,9 +1733,34 @@ def _load_manifest(settings: Settings, path: str) -> dict[str, Any]:
         ):
             raise ValueError(f"invalid workspace history entry: {relative}")
         seen.add(relative)
+    directories = manifest.get("directories", [])
+    if not isinstance(directories, list):
+        raise TypeError("invalid workspace history directory manifest")
+    directory_seen: set[str] = set()
+    normalized_directories: list[dict[str, str]] = []
+    for item in directories:
+        if not isinstance(item, dict) or set(item) != {"path"}:
+            raise TypeError("invalid workspace history directory entry")
+        relative = str(item.get("path", ""))
+        pure = PurePosixPath(relative)
+        Workspace.validate_windows_syntax(relative)
+        if (
+            not relative
+            or "\\" in relative
+            or pure.as_posix() != relative
+            or pure.is_absolute()
+            or ".." in pure.parts
+            or relative in directory_seen
+            or relative in seen
+        ):
+            raise ValueError(f"invalid workspace history directory entry: {relative}")
+        directory_seen.add(relative)
+        normalized_directories.append({"path": relative})
+    manifest["directories"] = normalized_directories
     scope = _manifest_scope(manifest)
     scoped_paths = _scope_paths(scope)
-    if scoped_paths is not None and not seen.issubset(scoped_paths):
+    represented = seen | directory_seen
+    if scoped_paths is not None and not represented.issubset(scoped_paths):
         raise ValueError("workspace history entry falls outside its declared checkpoint scope")
     manifest["scope"] = scope
     manifest["_manifest_path"] = str(resolved)
@@ -1403,12 +1799,26 @@ def _entry_map(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {str(item["path"]): item for item in manifest["files"]}
 
 
+def _directory_set(manifest: dict[str, Any]) -> set[str]:
+    return {str(item["path"]) for item in manifest.get("directories", [])}
+
+
 def _hash_map(manifest: dict[str, Any]) -> dict[str, str]:
     return {path: str(entry["sha256"]) for path, entry in _entry_map(manifest).items()}
 
 
 def _entry_digest(entry: dict[str, Any] | None) -> str | None:
     return None if entry is None else str(entry["sha256"])
+
+
+def _state_map(manifest: dict[str, Any]) -> dict[str, str]:
+    return {
+        **{
+            path: f"file:{entry['sha256']}"
+            for path, entry in _entry_map(manifest).items()
+        },
+        **{path: _DIRECTORY_STATE for path in _directory_set(manifest)},
+    }
 
 
 def _entry_source(settings: Settings, manifest_path: Path, entry: dict[str, Any]) -> Path:
@@ -1431,12 +1841,12 @@ def _entry_bytes(
 
 
 def _changed_paths(before: dict[str, Any], after: dict[str, Any]) -> list[str]:
-    before_map = _entry_map(before)
-    after_map = _entry_map(after)
+    before_map = _state_map(before)
+    after_map = _state_map(after)
     return sorted(
         path
         for path in before_map.keys() | after_map.keys()
-        if _entry_digest(before_map.get(path)) != _entry_digest(after_map.get(path))
+        if before_map.get(path) != after_map.get(path)
     )
 
 
@@ -1447,6 +1857,7 @@ def _write_generated_manifest(
     entries: dict[str, dict[str, Any]],
     *,
     scope: dict[str, Any] | None = None,
+    directories: set[str] | None = None,
 ) -> str:
     base = _operation_root(settings, operation_id) / stage
     base.mkdir(parents=True, exist_ok=False)
@@ -1458,6 +1869,9 @@ def _write_generated_manifest(
             "operation_id": operation_id,
             "stage": stage,
             "files": [entries[key] for key in sorted(entries)],
+            "directories": [
+                {"path": relative} for relative in sorted(directories or set())
+            ],
             "excluded": [],
             "capture_complete": True,
             "scope": scope or {"kind": "workspace"},

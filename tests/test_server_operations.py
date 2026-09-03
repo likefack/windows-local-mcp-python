@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from windows_local_mcp.sandbox_backend import CodexSandboxBackend
+from windows_local_mcp.sandbox_backend import ApprovedSandboxUnavailable, CodexSandboxBackend
 from windows_local_mcp.util import sha256_bytes
 
 
@@ -299,6 +299,11 @@ def test_sandbox_is_snapshot_only_and_host_rejects_project_code_loaders(
         "require_codex_sandbox_live_verification",
         lambda _settings, _backend: {"version": 2, "passed": True},
     )
+    monkeypatch.setattr(
+        server.runtime.sandbox_live_verification,
+        "snapshot",
+        lambda: {"status": "verifying"},
+    )
 
     sandbox = server.request_sandbox_command(
         [sys.executable, "-c", "print('sandbox')"],
@@ -365,6 +370,94 @@ def test_sandbox_dependency_availability_is_separate_from_live_verified_route(
     assert status["execution_route_available"] is False
     assert status["windows_live_verified"] is False
     assert "property evidence is incomplete" in status["execution_unavailable_reason"]
+
+
+def test_session_info_exposes_live_verification_reason_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, _ = load_server(tmp_path, monkeypatch)
+    codex = tmp_path / "trusted" / "codex.exe"
+    codex.parent.mkdir()
+    codex.write_bytes(b"fake installed codex")
+    backend = CodexSandboxBackend(
+        executable=str(codex.resolve()),
+        executable_sha256="a" * 64,
+        executable_size=codex.stat().st_size,
+        executable_mtime_ns=codex.stat().st_mtime_ns,
+        windows_mode="elevated",
+        permission_profile=":workspace",
+        provenance="mock",
+        signature_status="Valid",
+        signer_subject="OpenAI",
+        signer_thumbprint="b" * 40,
+        helpers=(),
+    )
+    monkeypatch.setattr(server, "resolve_codex_sandbox_backend", lambda _settings: backend)
+    monkeypatch.setattr(
+        server,
+        "codex_sandbox_live_verification_status",
+        lambda _settings, _backend: {
+            "status": "stale",
+            "evidence": None,
+            "last_verified_at": "2026-09-01T00:00:00+00:00",
+            "last_verification_attempt_at": "2026-09-02T00:00:00+00:00",
+            "stale_reason": "isolation_context_mismatch",
+            "failure_reason": None,
+        },
+    )
+    monkeypatch.setattr(
+        server,
+        "require_codex_sandbox_live_verification",
+        lambda _settings, _backend: (_ for _ in ()).throw(
+            RuntimeError("stale route")
+        ),
+    )
+
+    status = server._codex_sandbox_capability()
+
+    assert status["live_verification_status"] == "stale"
+    assert status["last_verified_at"] == "2026-09-01T00:00:00+00:00"
+    assert status["last_verification_attempt_at"] == "2026-09-02T00:00:00+00:00"
+    assert status["live_verification_stale"] is True
+    assert status["live_verification_stale_reason"] == "isolation_context_mismatch"
+    assert status["execution_route_available"] is False
+
+
+def test_sandbox_request_during_verification_fails_closed_without_host_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, _ = load_server(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        server.runtime.sandbox_live_verification,
+        "snapshot",
+        lambda: {"status": "verifying"},
+    )
+    backend = object()
+    monkeypatch.setattr(
+        server, "resolve_codex_sandbox_backend", lambda _settings: backend
+    )
+    monkeypatch.setattr(
+        server,
+        "require_codex_sandbox_live_verification",
+        lambda _settings, _backend: (_ for _ in ()).throw(
+            ApprovedSandboxUnavailable(
+                "Codex Sandbox live verification is currently verifying"
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        server,
+        "request_host_command",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Approved Host fallback must not be attempted")
+        ),
+    )
+
+    with pytest.raises(ApprovedSandboxUnavailable, match="currently verifying"):
+        server.request_sandbox_command(
+            [sys.executable, "-c", "print('sandbox')"],
+            reason="verification-race regression",
+        )
 
 
 def test_approved_host_capability_does_not_preflight_when_disabled(

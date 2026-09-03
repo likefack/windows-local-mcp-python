@@ -13,7 +13,7 @@ from windows_local_mcp.sandbox_backend import (
     sandbox_isolation_context,
     sandbox_live_verification_route_eligible,
 )
-from windows_local_mcp.util import canonical_json, sha256_text
+from windows_local_mcp.util import canonical_json, sha256_text, utc_now_iso
 from windows_local_mcp.wfp_guard import (
     GUARD_POLICY_GENERATION,
     GUARD_VERSION,
@@ -110,6 +110,7 @@ def _accepted_residual_risk_evidence(
     return {
         "version": 5,
         "passed": False,
+        "verified_at": utc_now_iso(),
         "backend_digest": sha256_text(canonical_json(backend.as_dict())),
         "backend_version": backend.version,
         "isolation_context_digest": sha256_text(canonical_json(context)),
