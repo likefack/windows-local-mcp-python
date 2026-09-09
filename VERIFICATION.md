@@ -1,29 +1,76 @@
 # 検証記録
 
+## 2026-09-09 WFP 読み取り権限と Sandbox 復旧
+
+- 通常 Windows user で App Isolation サブレイヤーの `FwpmSubLayerGetByKey0` が `0x00000005` を返すことを再現。管理者では同一 object が読み取り可能で、正しい provider／weight 7 を確認した。独自 Guard のサブレイヤーと IPv4／IPv6 フィルターは欠損していた。
+- 完全 policy 検証後、正確な欠損だけを構築し、固定4個の object へ実行者 SID の `FWPM_ACTRL_READ=0x80` だけを追加する明示的セットアップを実装した。Windows SDK `10.0.26100.0/um/fwpmu.h` の権限値を照合。既存 ACE／拒否／所有者を保持した DACL 読み戻しが成功し、通常ユーザーの全 WFP 読み戻しも成功した。
+- WFP／CLI／実装 identity 関連 `56 passed`、worker／Sandbox lifecycle／architecture 関連 `73 passed`、対象 Ruff 成功。最初の広い試験は既存 `.dev-tmp/pytest/default` の削除拒否で fixture 初期化に失敗したため、権限を変更せず専用の `.dev-tmp/pytest/wfp-read-regression` で再実行した。全リポジトリ試験の成功は主張しない。
+- 通常 Windows host から実際の LocalMCP 設定で `verify-codex-sandbox` を実行し、2026-09-09 17:52 JST に `verification_status=verified`、`route_eligible=true` を確認。全9 property と `brokered_process_creation_denied`、通常 command／Python child／scratch write が成功。Codex 内に入れ子で起動した結果ではない。
+- 接続中 MCP の `session_info` でも `execution_route_available=true`、`windows_live_verified=true`、`live_verification_status=verified`、失敗理由なしを確認した。読み取り権限設定や単体テストだけを隔離の実証として扱っていない。
+- 元の `cmd.exe /c echo sandbox-test-ok` を MCP の Sandbox 要求として再申請できた。`poll_approval` は HTTP 504 となったため、ローカル監査 DB を読み取り専用で照合し、`pending_approval`／`approval_status=pending`／実行結果なしを確認した。この追加の承認付き MCP command E2E は未完了であり、実行成功とは記録しない。
+- 検証対象は Codex backend `0.153.4`、Windows build `26200.9445`（amd64）。Guard 実装 digest は `bd430d3a15467d05f8a2cdfc35a8871b4c988813640c794e3a09067d5c747114`。この記録を別の runtime や設定へ流用しない。
+- ローカル診断の原本は `.dev-tmp/wfp-access/normal.json`、`admin.json`、`prepare.json`、`live-verification.json`。この PC と検証時の runtime／設定 identity に限定した結果であり、Windows／backend 更新、WFP／policy 変更、marker 期限切れでは再検証する。
+- 原因・設定範囲・初回設定と通常確認の手順は [WFP 読み取り権限](docs/WFP_READ_ACCESS.md) を参照。安全条件の緩和や Host への自動移行はない。
+
+## 2026-09-09 Audit の処理段階別時間計測
+
+- 同期 Broker の全体時間と最大128段階を `perf_counter_ns()` で計測し、Audit の nullable
+  `timing_json` 列へ終了時に保存する。既存 DB 移行、失敗段階、復旧、Activity の非汚染を検証した。
+- 広い関連回帰は `182 passed, 2 skipped, 2 deselected`。既存 Audit event 保存も計測した後の
+  最終関連確認は `71 passed`、計測専用は `16 passed`。対象 Ruff、compileall、差分空白検査は成功。
+- 分離した Windows transaction 競合テスト2件は、計測を完全に無効にした対照でも失敗した。
+  全リポジトリの合格とは扱わない。途中に検出した traceback／HANDLE 保持による move 回帰は修正済み。
+- 各12回の外部 latency 中央値は read `42.419 → 53.770 ms`、write `189.944 → 208.139 ms`。
+  特に短い read の追加負荷は無視できない。実測 write 1件は total `220.073 ms`、
+  before／after checkpoint 約72 ms、既存 Audit 保存約44 ms。約16 ms は独立 phase 未付与。
+- schema、移行、試験範囲、未検証事項、全ファイル一覧と実測内訳は
+  [Audit 処理時間診断の検証記録](docs/AUDIT_PERFORMANCE_VERIFICATION.md) を参照。
+  仕様は [Audit の処理時間診断](docs/AUDIT_PERFORMANCE.md)。
+
+## 2026-09-08 Binary transfer admission lifecycle
+
+### 原因と修正
+
+- 修正前は `artifact_download_chunk` が最後の byte を返して `complete=true` になっても durable manifest が `open` のままで、upload／download 共通の `max_open_transfers` 枠を TTL まで消費していた。
+- download の terminal chunk と 0 byte begin を `completed` へ自動遷移させ、`preparing`／`open` だけを admission 対象とした。中断 transfer には冪等な `artifact_transfer_cancel` を追加し、`completed` snapshot は応答消失時の同一 chunk retry のため保持する。
+- 追加レビューで、bounded audit retention により begin の親 operation が snapshot より先に削除されると、終端 retry の event 追加が外部キー違反になり得ることを確認した。親 operation の存在確認と event 追加を一つの SQL 文にし、親が既にない場合は独立した監査 operation を作るよう修正した。
+
+### 自動回帰
+
+- 最新作業ツリーで binary lifecycle、transfer timeline、artifact fast path、audit をまとめて実行し、`24 passed, 1 skipped`。
+- skip は制限された Codex Desktop 文脈で `sc.exe query WindowsLocalMCPApprovedHost` が exit 5 となった公開 MCP stdio 試験であり、Secure MCP Tunnel／ChatGPT E2E の成功証拠にはしない。
+- 監査親 operation 削除後の terminal chunk retry が byte-exact に成功し、新しい独立 audit operation が残る回帰を追加した。別視点の読み取り専用レビューでも、対象差分に具体的な迂回、監査欠落、通常挙動の回帰、テストの偽陽性は確認されなかった。
+- 本件の変更ファイルに対する Ruff と `git diff --check` は pass。リポジトリ全体 pytest は 53% で約90秒進捗が止まったため中断し、中断前にも複数 failure があった。最初の failure を `-x` で個別化すると `test_real_config_selection_survives_worker_context_round_trip` が制限環境の SCM query（`sc.exe exited with 5`）で fail closed しており、binary transfer 経路ではなかった。したがって作業ツリー全体を green とは扱わない。
+
+### Windows 実機と Tunnel の境界
+
+- この作業では ChatGPT／Secure MCP Tunnel／実 Windows LocalMCP を通る再試験を実施していない。修正後 runtime に結合した `download begin → terminal chunk → 複数回反復 → upload begin/chunk/commit → SHA-256 一致` は未検証であり、`Windows E2E verified` とは記録しない。
+
 ## 2026-09-03 Codex Sandbox live verification の自動復旧 lifecycle
 
 ### 原因と変更
 
-- 既存実装は schema v5 marker の backend／helper／WFP Guard／Windows／account／physical roots／保護対象／依存読取 path／環境変数／policy generation／scratch／process／memory binding と実行直前 gate を持っていたが、通常 LocalMCP startup から hardened verifier を呼ぶ lifecycle がなかった。このため missing／stale marker は再起動後も fail closed のまま、手動 `verify-codex-sandbox` が必要だった。
+- 既存実装は schema v5 marker の backend／helper／WFP Guard／Windows／account／physical roots／保護対象／依存読取 path／環境変数／policy generation／scratch／process／memory binding と実行直前 gate を持っていたが、通常 LocalMCP startup から hardened verifier を呼ぶ lifecycle がなかった。このため missing／stale marker は再起動後も fail closed のまま、手動 `verify-codex-sandbox` が必要だった。変更後のmarkerは lifecycle状態を必須にしたschema v6であり、旧v5は自動再検証対象になる。
 - server startup から daemon lifecycle を開始し、Broker transport readiness を待たせずに marker を検査する。有効 marker は TTL 内で再利用し、missing／stale／schema incompatible／backend identity mismatch／isolation context mismatch／policy generation mismatch／TTL expiry だけを自動検証対象にした。
-- process-shared OS file lock の取得後に marker を再検査し、同一 identity の重複 full probe を防ぐ。OS が process 終了時に lock を解放するため、process crash／power loss で永続 lock は残らない。failed／unverified／途中終了は別の identity-bound attempt state に保存し、同一 identity の自動 retry は cooldown する。
+- process-shared OS file lock の取得後に marker を再検査し、同一 identity の重複 full probe を防ぐ。実行経路も同じlockをmarker再確認からchild生成完了まで保持し、preflight後にmarkerを再読込するため、検証開始、marker置換、TTL切れとの起動競合はfail closedになる。OS が process 終了時に lock を解放するため、process crash／power loss で永続 lock は残らない。failed／unverified／途中終了は別の identity-bound attempt state に保存し、同一 identity の自動 retry は cooldown する。retry identityにはcurrent Sandbox accountとWFP bindingのread-back結果も含め、境界実体の変更時は直前の失敗cooldownを引き継がない。
 - 自動／手動は同じ hardened verifier を使用する。forced verification 開始時は既存 marker を `verifying` へ置換し、base probe の暫定結果は marker へ公開せず、必須 `brokered_process_creation_denied` を含む全 phase 完了後だけ最終 marker を atomic／fsync 保存する。
 - `session_info` に `live_verification_status`、`last_verified_at`、`last_verification_attempt_at`、`live_verification_stale_reason`、`verification_failure_reason`、cooldown 情報を追加した。既存の `available`、`live_verified`、`windows_live_verified`、`execution_route_available` は維持する。
 
 ### 自動回帰
 
-- lifecycle 専用は 11 件 pass。valid marker の restart reuse、missing／stale success、failed／unverified、同時 startup、verifier crash と OS lock 解放、cooldown、identity 変更、manual force、non-blocking background startup、CLI と自動経路の共通 core を確認した。
-- Sandbox 関連 8 ファイルは `78 passed`。schema／identity／TTL、mandatory property、residual-risk policy、terminal status、source ACL、brokered-process、scratch retention を含む。
+- lifecycle 専用は 14 件 pass。valid marker の restart reuse、missing／stale success、failed／unverified、同時 startup、verifier crash と OS lock 解放、cooldown、backend／Sandbox account／WFP identity 変更、未来時刻の attempt state が cooldown を設定上限より延長しないこと、manual force、non-blocking background startup、CLI と自動経路の共通 core を確認した。
+- Sandbox 関連 8 ファイルは `85 passed`。schema v6と必須lifecycle状態、identity／TTL、検証lockとpreflight後marker再確認、mandatory property、residual-risk policy、terminal status、source ACL、brokered-process、scratch retention を含む。
 - request gate の実行直前 marker 再検証は `2 passed`。process-local lifecycle が checking 中でも有効 marker を不必要に止めず、durable marker が verifying の場合は fail closed し、Approved Host を呼ばない。
 - config は `16 passed, 2 skipped`。`compileall -q src/windows_local_mcp` と今回の security-critical source／test の Ruff は pass。
 - repository 全体 pytest は 53% で 2 failure を記録後、Windows process／handle 系ケースが長時間進行しなかったため中断した。最初の failure を個別化すると `test_approved_host_allows_legitimate_descendant_to_finish` が期待 `succeeded` に対して既存の `running` となり、今回変更していない Approved Host 統合経路だった（そこまで `36 passed`）。制限環境の `test_server_operations.py` には `sc.exe exited with 5` による 8 failure があるが、今回の request gate 2件は通常 Windows user 文脈で pass した。したがってリポジトリ全体を green とは扱わない。
 
 ### Windows 実機と Tunnel の境界
 
-- 通常 Windows user 文脈で、専用 workspace／config／data／scratch を互いに分離した canary profile を使用した。installed Codex Desktop backend `0.152.1`、OpenAI Authenticode、launcher/helper hash と stable file identity の解決は成功した。
+- 通常 Windows user 文脈で、専用 workspace／config／data／scratch を互いに分離した canary profile を使用した。2026-09-09 JSTの再確認ではinstalled Codex Desktop backend `0.153.4`、OpenAI Authenticode、launcher/helper hash と stable file identity の解決は成功した。
 - marker missing の LocalMCP startup では、最初の `session_info` が `broker.available=true`、`live_verification_status=verifying`、`execution_route_available=false` を返した。server／Broker は probe 完了を待たずに応答した。
 - 実 probe は `WfpGuardError: FwpmSubLayerGetByKey0 failed with WFP status 0x00000005` で `unverified` になった。`failed` へ誤分類せず、Sandbox route だけを閉じ、Broker は `available=true` のまま維持した。既存 WFP object が unreadable な状態を missing と推測して昇格 repair する変更は行っていない。
-- 同一 identity の直後再起動では `retry_after_seconds=224`、`last_verified_at=null`、`last_verification_attempt_at` 不変となり、full probe を再実行しなかった。これにより実 Windows 上で cooldown と verification-storm 抑制を確認した。
+- schema v6変更後の同一 identity の直後再起動では `retry_after_seconds=254`、`last_verified_at=null`、`last_verification_attempt_at` 不変となり、full probe を再実行しなかった。これにより実 Windows 上で cooldown と verification-storm 抑制を再確認した。
+- cooldown中の同じserverへ実際に`request_sandbox_command`を送ると、`ApprovedSandboxUnavailable`（`status=unverified`と同じWFP failure reason）でchild生成・承認登録前に拒否された。canary configでは`approved_host_enabled=false`であり、Host fallbackは発生していない。
 - A の「全 property verified」、B の有効 marker 再利用、C の stale marker から成功 marker 更新、ローカル承認後の実 Sandbox command は、上記 WFP read-back failure のため未達である。security boundary を弱めた synthetic marker や Approved Host fallback では代替していない。D の unverified／Sandbox-only fail-closed／Broker 継続は実機確認済み。
 - Secure MCP Tunnel／ChatGPT E2E は実施していない。Windows local E2E と別の未検証項目として残す。
 

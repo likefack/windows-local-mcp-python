@@ -18,6 +18,7 @@ _IMPLEMENTATION_MODULES = (
     "windows_local_mcp.wfp_guard",
     "windows_local_mcp.wfp_guard_identity",
     "windows_local_mcp.wfp_guard_runtime",
+    "windows_local_mcp.wfp_read_access",
     "windows_local_mcp.windows_wfp",
 )
 

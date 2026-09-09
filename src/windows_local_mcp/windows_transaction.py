@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .performance_trace import timed_phase
+
 _GENERIC_READ = 0x80000000
 _GENERIC_WRITE = 0x40000000
 _DELETE = 0x00010000
@@ -216,6 +218,7 @@ def windows_file_identity(path: Path) -> WindowsFileIdentity:
         kernel32.CloseHandle(handle)
 
 
+@timed_phase("identity_validation")
 def _validate_regular_identity(
     handle: Any,
     *,
@@ -249,6 +252,7 @@ def _seek_start(handle: Any) -> None:
         _raise_last_error("SetFilePointerEx")
 
 
+@timed_phase("hash_validation")
 def _hash_handle(handle: Any, *, max_bytes: int) -> tuple[str, int]:
     if max_bytes < 0:
         raise ValueError("max_bytes must be non-negative")
@@ -269,6 +273,7 @@ def _hash_handle(handle: Any, *, max_bytes: int) -> tuple[str, int]:
         digest.update(buffer.raw[: read.value])
 
 
+@timed_phase("staging")
 def _write_handle(handle: Any, data: bytes) -> None:
     kernel32 = _kernel32()
     _seek_start(handle)
@@ -288,6 +293,7 @@ def _write_handle(handle: Any, data: bytes) -> None:
         _raise_last_error("FlushFileBuffers")
 
 
+@timed_phase("transaction_prepare")
 def _create_transaction(description: str) -> Any:
     transaction = _ktm().CreateTransaction(
         None,
@@ -303,6 +309,7 @@ def _create_transaction(description: str) -> Any:
     return transaction
 
 
+@timed_phase("transaction_open")
 def _open_transacted(
     path: Path,
     transaction: Any,
@@ -370,6 +377,7 @@ def _open_transacted_directory(
     )
 
 
+@timed_phase("transaction_finish")
 def _finish_transaction(transaction: Any, *, commit: bool) -> None:
     ktm = _ktm()
     if commit:
@@ -399,6 +407,7 @@ def _path_exists(path: Path) -> bool:
     return True
 
 
+@timed_phase("cas_recheck")
 def _validate_source_snapshot(
     handle: Any,
     *,
@@ -436,6 +445,7 @@ def _validate_source_snapshot(
     return after
 
 
+@timed_phase("source_read")
 def _read_handle(handle: Any, *, max_bytes: int) -> bytes:
     """Read a bounded byte sequence from a validated Windows HANDLE."""
 

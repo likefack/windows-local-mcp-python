@@ -30,6 +30,10 @@ READ_TOOLS = frozenset(
     {
         "list_directory",
         "read_file",
+        "read_files",
+        "workspace_search",
+        "workspace_tree",
+        "artifact_download",
         "get_image",
         "git_info",
         "structured_file_inspect",
@@ -48,7 +52,16 @@ STRUCTURED_EDIT_TOOLS = frozenset(
     }
 )
 MUTATION_TOOLS = frozenset(
-    {"write_file", "move_file", "copy_file", "delete_file", "make_directory"}
+    {
+        "write_file",
+        "text_file_apply",
+        "workspace_apply",
+        "artifact_upload",
+        "move_file",
+        "copy_file",
+        "delete_file",
+        "make_directory",
+    }
 )
 COMMAND_TOOLS = frozenset(
     {
@@ -94,6 +107,7 @@ META_TOOLS = frozenset(
         "audit_get",
         "activity_timeline",
         "activity_get",
+        "operation_report",
         "timeline_cli",
         "context_read_info",
         "context_export_info",
@@ -350,6 +364,12 @@ def _detail(
         action = f"{format_name}を編集" if format_name else "構造化ファイルを編集"
         return f"{action} {path}".strip()
     if tool in MUTATION_TOOLS:
+        if tool in {"text_file_apply", "workspace_apply"}:
+            paths = request.get("paths")
+            count = request.get("edit_count")
+            first = _safe_text(paths[0]) if isinstance(paths, list) and paths else ""
+            suffix = f" ほか{count - 1}件" if isinstance(count, int) and count > 1 else ""
+            return f"テキストを編集 {first}{suffix}".strip()
         if tool == "move_file":
             source = _safe_text(request.get("source_path"))
             destination = _safe_text(request.get("destination_path"))
@@ -374,6 +394,14 @@ def _detail(
         return f"フォルダーを読み取り {path}".strip()
     if tool == "read_file":
         return f"ファイルを読み取り {path}".strip()
+    if tool == "read_files":
+        paths = request.get("paths")
+        count = len(paths) if isinstance(paths, list) else 0
+        return f"複数ファイルを読み取り {count}件".strip()
+    if tool == "workspace_search":
+        return f"workspaceを検索 {path}".strip()
+    if tool == "workspace_tree":
+        return f"フォルダー構造を読み取り {path}".strip()
     if tool == "get_image":
         return f"画像を読み取り {path}".strip()
     if tool == "git_info":

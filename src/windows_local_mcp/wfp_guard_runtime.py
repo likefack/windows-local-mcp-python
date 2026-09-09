@@ -557,7 +557,12 @@ def _elevated_main(pipe_name: str, *, include_integration_evidence: bool = False
                 )
                 if not is_administrator:
                     raise WfpGuardError("WFP Guard elevation was not established")
-                verification = ensure_codex_loopback_block(new_windows_wfp_api())
+                # 再構築した固定 object は、通常権限の後続 probe からも読み取れる必要がある。
+                from .wfp_read_access import prepare_current_operator_read_access
+
+                api = new_windows_wfp_api()
+                prepare_current_operator_read_access(api)
+                verification = verify_codex_loopback_block(api)
                 implementation = capture_wfp_guard_implementation_identity()
                 payload = {
                     "ok": True,
@@ -606,6 +611,14 @@ def main(argv: list[str] | None = None) -> int:
         if not _is_administrator():
             raise SystemExit("Run maintenance ensure from an Administrator PowerShell")
         print(canonical_json(ensure_codex_loopback_block(new_windows_wfp_api()).as_dict()))
+        return 0
+    if arguments == ["--maintenance-prepare-read-access"]:
+        # 不明な read-back エラーからは自動で呼ばず、管理者が明示的に実行する。
+        if not _is_administrator():
+            raise SystemExit("Run read-access setup from an Administrator PowerShell")
+        from .wfp_read_access import prepare_current_operator_read_access
+
+        print(canonical_json(prepare_current_operator_read_access(new_windows_wfp_api())))
         return 0
     if arguments == ["--maintenance-cleanup"]:
         if not _is_administrator():

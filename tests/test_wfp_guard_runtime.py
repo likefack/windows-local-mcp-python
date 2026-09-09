@@ -372,6 +372,8 @@ def test_existing_guard_state_mismatch_never_uses_silent_repair(
 def test_elevated_main_does_not_require_inherited_environment(
     monkeypatch: pytest.MonkeyPatch, inherited_auth: str | None
 ) -> None:
+    from windows_local_mcp import wfp_read_access
+
     sent: list[bytes] = []
 
     class FakeClient:
@@ -392,6 +394,8 @@ def test_elevated_main_does_not_require_inherited_environment(
     monkeypatch.setattr(runtime, "_is_administrator", lambda: True)
     monkeypatch.setattr(runtime, "new_windows_wfp_api", lambda: object())
     monkeypatch.setattr(runtime, "ensure_codex_loopback_block", lambda _api: _verification())
+    monkeypatch.setattr(wfp_read_access, "prepare_current_operator_read_access", lambda _api: {})
+    monkeypatch.setattr(runtime, "verify_codex_loopback_block", lambda _api: _verification())
     monkeypatch.setattr(
         runtime,
         "capture_wfp_guard_implementation_identity",
@@ -441,3 +445,37 @@ def test_named_pipe_reports_actual_client_process_id() -> None:
         if child.poll() is None:
             child.kill()
             child.wait(timeout=10)
+
+
+def test_read_access_setup_requires_explicit_administrator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from windows_local_mcp import wfp_read_access
+
+    def forbidden(_api: object) -> dict:
+        raise AssertionError("non-administrator must not prepare WFP permissions")
+
+    monkeypatch.setattr(runtime, "_is_administrator", lambda: False)
+    monkeypatch.setattr(wfp_read_access, "prepare_current_operator_read_access", forbidden)
+    with pytest.raises(SystemExit, match="Administrator"):
+        runtime.main(["--maintenance-prepare-read-access"])
+
+
+def test_read_access_setup_is_explicit_and_reports_result(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    from windows_local_mcp import wfp_read_access
+
+    api = object()
+    calls: list[object] = []
+
+    def prepare(value: object) -> dict:
+        calls.append(value)
+        return {"prepared": True}
+
+    monkeypatch.setattr(runtime, "_is_administrator", lambda: True)
+    monkeypatch.setattr(runtime, "new_windows_wfp_api", lambda: api)
+    monkeypatch.setattr(wfp_read_access, "prepare_current_operator_read_access", prepare)
+    assert runtime.main(["--maintenance-prepare-read-access"]) == 0
+    assert calls == [api]
+    assert json.loads(capsys.readouterr().out) == {"prepared": True}

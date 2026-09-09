@@ -209,6 +209,13 @@ def test_real_stdio_tools_list_and_file_round_trip(tmp_path: Path) -> None:
                 "session_info",
                 "write_file",
                 "read_file",
+                "workspace_tree",
+                "workspace_search",
+                "read_files",
+                "text_file_apply",
+                "workspace_apply",
+                "artifact_download",
+                "artifact_upload",
                 "git_info",
                 "execute_readonly",
                 "execute_workspace_write",
@@ -218,13 +225,18 @@ def test_real_stdio_tools_list_and_file_round_trip(tmp_path: Path) -> None:
                 "audit_get",
                 "activity_timeline",
                 "activity_get",
+                "operation_report",
                 "request_workspace_rollback",
                 "request_selective_undo",
             } <= tools.keys()
             assert {"execute", "start_command", "execute_approved"}.isdisjoint(tools.keys())
 
             assert tools["read_file"].annotations.read_only_hint is True
+            assert tools["workspace_search"].annotations.read_only_hint is True
+            assert tools["operation_report"].annotations.read_only_hint is True
             assert tools["write_file"].annotations.destructive_hint is True
+            assert tools["workspace_apply"].annotations.destructive_hint is True
+            assert tools["artifact_upload"].annotations.destructive_hint is True
 
             readonly = tools["execute_readonly"].annotations
             assert readonly.read_only_hint is True

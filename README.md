@@ -405,7 +405,7 @@ Automatic Git repository projection の byte limit は configured `max_sandbox_s
 
 ADB helper は設定済み path、SHA-256、file identity を正規化時と worker 実行直前に再検証し、Windows では child の終了まで実行ファイルを差し替え不能な共有モードで保持します。ADB の自動処理は allowlist 済み emulator serial を明示する固定読み取りだけで、`adb devices` による未許可 device の列挙は行いません。
 
-バイナリのダウンロード転送は、開始時に元ファイルの前後同一性と SHA-256 を確認した不変スナップショットを制御領域へ固定し、各チャンクでは必要範囲だけを読み取ります。アップロード転送は開始時に申告済み全容量を予約するため、チャンクごとのデータ領域全走査を行いません。別々の転送は並行できますが、同一転送内のオフセット順序、fsync、完了時の全体 SHA-256、元ファイルと出力先の同時変更検知は維持します。監査は転送開始を親操作、各チャンクを SHA-256 付きの永続イベントとして記録し、チャンク数に比例するタイムライン行と同期書き込みを抑えます。
+バイナリのダウンロード転送は、開始時に元ファイルの前後同一性と SHA-256 を確認した不変スナップショットを制御領域へ固定し、各チャンクでは必要範囲だけを読み取ります。アップロード転送は開始時に申告済み全容量を予約するため、チャンクごとのデータ領域全走査を行いません。別々の転送は並行できますが、同一転送内のオフセット順序、fsync、完了時の全体 SHA-256、元ファイルと出力先の同時変更検知は維持します。監査は転送開始を親操作、各チャンクを SHA-256 付きの永続イベントとして記録し、チャンク数に比例するタイムライン行と同期書き込みを抑えます。監査の保存上限により親操作が転送スナップショットより先に削除された場合、保持中の終端再試行は独立した監査操作へ記録し、外部キー失敗で正当な再試行を壊しません。
 
 転送 manifest は `preparing`、`open`、`completed`、`committed`、`cancelled`、`expired`、`failed` を区別します。`max_open_transfers` は upload／download 共通で `preparing` と `open` だけを数えます。download の最後のチャンクを正常に返すと自動で `completed` になり、0 byte download は begin 完了時に `completed` になります。`completed` の manifest と不変スナップショットは直ちに削除せず、通常の artifact retention まで保持するため、最後の応答が失われても同じ有効なチャンクを再取得できます。中断した `open` transfer は `artifact_transfer_cancel` で `cancelled` にでき、同じ cancel の再実行は同じ結果を返します。期限切れは `expired`、永続 payload の同一性破損は `failed` となり、いずれの終端状態も admission 枠を使用しません。通常の入力誤りは transfer を失敗扱いにせず、修正して再試行できます。
 
@@ -433,7 +433,7 @@ Approved Host は runtime immutability、LocalSystem-owned Job Object／monitor�
 
 Live verification は各 property を `verified`、`failed`、`unverified` の三値で保存します。`failed` は実際の probe が境界脱出を観測した場合だけ、`unverified` は起動失敗、タイムアウト、listener または probe 環境の準備失敗、出力を測定できない場合に使います。current v1 の一般 Codex Sandbox route では workspace 内 `protected_information_read` と LAN access を受容済み残存 risk として分離します。これらの failure／unverified は隠さず保持しますが、それだけでは一般 route を unavailable にしません。Automatic Git はこの例外を継承しません。一般 source-workspace read/write、workspace 外 user/protected read、control-plane、Internet、loopback、termination、resource bound、WMI／CIM brokered process creation denial 等の必須境界は引き続き fail closed です。Approved Host へ自動移行しません。
 
-live marker は schema v5 です。launcher／helper の canonical path、content SHA-256、Windows stable file identity、size、実際の version、Authenticode の Valid status・leaf signer subject・leaf certificate thumbprint に加え、実際に import された WFP Guard module 群の canonical path／SHA-256／stable file identity／size、Guard version、policy generation、Sandbox account、Windows product／build／UBR／architecture、WFP read-back identity を結合します。mtime は補助的な drift signal であり、単独では security identity として扱いません。`isolation_context_digest` はさらに workspace の物理 identity、保護名・拒否 directory、`sandbox_dependency_readable_paths`、Sandbox policy generation、process 数・process-tree memory 上限、scratch 上限、許可環境変数などを結合します。v1～v4 marker から v5 を推測・移行しません。
+live marker は schema v6 です。launcher／helper の canonical path、content SHA-256、Windows stable file identity、size、実際の version、Authenticode の Valid status・leaf signer subject・leaf certificate thumbprint に加え、実際に import された WFP Guard module 群の canonical path／SHA-256／stable file identity／size、Guard version、policy generation、Sandbox account、Windows product／build／UBR／architecture、WFP read-back identity を結合します。mtime は補助的な drift signal であり、単独では security identity として扱いません。`isolation_context_digest` はさらに workspace の物理 identity、保護名・拒否 directory、`sandbox_dependency_readable_paths`、Sandbox policy generation、process 数・process-tree memory 上限、scratch 上限、許可環境変数などを結合します。v1～v5 marker から v6 を推測・移行しません。
 
 通常の LocalMCP 起動では、まず現在の backend と `isolation_context_digest` に対して marker を検査します。有効で TTL 内ならその marker を再利用し、単なる再起動では full verification を行いません。missing、stale、schema 非互換、backend／isolation／policy identity 不一致、TTL 超過の場合だけ、Broker／filesystem／structured processing／audit／binary transfer／rollback の起動を待たせず、Sandbox 状態を `verifying` として同じ hardened verifier を背景実行します。成功するまで Sandbox child は起動せず、失敗または未検証でも Approved Host へ自動移行しません。
 
@@ -466,6 +466,8 @@ Sandbox 起動直前には、この PC のコンピューター名で完全修�
 .\.venv\Scripts\python.exe -m windows_local_mcp.wfp_guard_runtime --maintenance-cleanup
 ```
 
+`FwpmSubLayerGetByKey0 ... 0x00000005` が発生する場合は、WFP の固定 object を通常ユーザーが読み取れない可能性があります。初回の読み取り権限設定と、その後の通常権限での確認は [WFP 読み取り権限の復旧手順](docs/WFP_READ_ACCESS.md) を参照してください。検証の省略や LocalMCP 全体の管理者起動では回避しません。
+
 起動時には legacy profile 名だけに依存せず、source workspace の read deny、operation 固有 scratch の write、明示した依存 root の read、保護名の deny、network restricted を含む `sandbox-state` を Codex CLI へ渡します。さらに launcher を一時停止状態で起動し、Windows Job Object へ割り当ててから再開します。Job Object は launcher を含む子孫全体の process 数、commit memory、終了時 kill を OS で強制します。上限違反は job 全体を停止し、WLMCP は子孫が 0 になったことと終了状態を回収できたことを確認します。
 
 Sandbox staging は `.env` 等の保護対象と、`.venv`、`node_modules`、`build`、`__pycache__` 等の生成・依存 tree を一律 copy しません。必要な外部依存は `sandbox_dependency_readable_paths` 等の明示的で検証可能な入力として扱い、暗黙に source workspace を参照させません。source-workspace deny と protected-information direct-read probe は defense-in-depth として維持しますが、staging exclusion や deny policy の設定だけを workspace 内 secret の完全遮断保証とは扱いません。direct-read probe が `failed`／`unverified` の場合も、その結果を一般 Codex Sandbox route の受容済み残存 risk として保持・表示します。
@@ -479,7 +481,9 @@ $env:LOCAL_MCP_CONFIG = 'C:\path\to\config.local.toml'
 
 この手動コマンドは diagnostics／forced reverification 用として残ります。自動経路と同じ source ACL、WFP、filesystem、network、descendant、termination、resource、brokered-process の検証中核を使用し、cooldown を無視して強制再検証します。
 
-検証結果は `filesystem_read`、`filesystem_write`、`protected_information_read`、`internet`、`lan`、`loopback`、`descendant_containment`、`termination`、`resource_bound` の property と、必須 check `brokered_process_creation_denied` を保存します。schema v5 以外、必須 identity／check field が欠けた marker、現在の実体に結合しない marker は受理しません。`available` は依存関係と起動前提、`windows_live_verified` は OS 境界の実測、`execution_route_available` は必須 route property を満たして実行可能かを別々に示します。`session_info` はさらに `live_verification_status`、`last_verified_at`、`last_verification_attempt_at`、`live_verification_stale_reason`、`verification_failure_reason` を表示します。`approved_sandbox_require_live_verification=false` で実行条件を回避することはできません。
+自動検証とSandbox child生成は同じprocess-shared lockで直列化されます。実行側はpreflight後にもmarkerを再確認するため、検証開始、marker置換、TTL切れと競合した要求はfail closedとなり、Approved Hostへ自動移行しません。失敗cooldownのidentityにはbackend／isolation contextだけでなくcurrent Sandbox accountとWFP read-back bindingも含むため、境界実体が変わった場合は新しいidentityとして再試行できます。
+
+検証結果は `filesystem_read`、`filesystem_write`、`protected_information_read`、`internet`、`lan`、`loopback`、`descendant_containment`、`termination`、`resource_bound` の property と、必須 check `brokered_process_creation_denied` を保存します。schema v6 以外、`verification_status=verified` ではない marker、必須 identity／check field が欠けた marker、現在の実体に結合しない marker は受理しません。`available` は依存関係と起動前提、`windows_live_verified` は OS 境界の実測、`execution_route_available` は必須 route property を満たして実行可能かを別々に示します。`session_info` はさらに `live_verification_status`、`last_verified_at`、`last_verification_attempt_at`、`live_verification_stale_reason`、`verification_failure_reason` を表示します。`approved_sandbox_require_live_verification=false` で実行条件を回避することはできません。
 
 検証器は親・child・grandchild の filesystem／network 境界に加え、process 数上限と process-tree memory 上限の超過、違反時の全子孫停止、終了状態回収、brokered process creation denial まで実測します。独立 probe が例外になった場合、その probe を `unverified` として残し、安全に続行できる残りの probe を継続します。一般 source workspace read/write、workspace 外 read、control-plane、Internet、loopback、WMI/CIM process creation denial 等の mandatory check は fail closed します。一方、workspace 内 `protected_information_read` と対応する child／grandchild protected-information denial、LAN access は一般 Codex Sandbox route の受容済み残存 risk として `failed`／`unverified` を保持・表示したまま route 判定から分離します。Automatic Git は全 property の `verified` を要求します。その他の必須境界が成立する場合に限り一般 Sandbox 経路を利用でき、利用できない場合も Approved Host へ自動移行しません。
 
@@ -496,6 +500,12 @@ $env:LOCAL_MCP_CONFIG = 'C:\path\to\config.local.toml'
 
 Audit、Activity Monitor、Timeline、承認画面の Live Activity は、同じ記録を別の目的で扱います。
 
+Audit は機械解析・詳細診断のため、同期 Broker 操作の全体時間と処理段階ごとの時間を
+`audit_get` の `timings` に記録します。通常監視の Live Activity／Timeline には内部段階の行を
+追加しません。計測は日時差ではなく単調増加時計を使い、失敗や復旧中の処理も対象にします。
+計測区間、保存上限、既存 DB の移行、欠損値の意味は [Audit の処理時間診断](docs/AUDIT_PERFORMANCE.md)
+を参照してください。
+
 | 表示・記録 | 役割 |
 | --- | --- |
 | Audit | operation ID、tool、route、status、approval、request／result、rollback／recoveryなどを含む完全な技術監査証跡 |
@@ -503,7 +513,7 @@ Audit、Activity Monitor、Timeline、承認画面の Live Activity は、同じ
 | `activity_timeline`／`activity_get` | 過去operationの軽量一覧と、必要時のbounded preview／diff／event／詳細 |
 | Approval UI Live Activity | 現在PC上で何をしているか、成功・失敗・拒否・転送・Undo／rollbackを人間向けに表示 |
 
-Live Activityは、ファイルの読み取り／編集、構造化ファイル処理、コマンド、artifactの送受信、重要な失敗や拒否、承認待ち、Undo／rollbackを表示します。artifactのbegin／chunk／commitは可能な範囲で一つの転送として扱います。`audit_list`、`audit_get`、`activity_timeline`、`activity_get`、`session_info`、poll等の監査・診断・metadata取得は、通常のLive Activityを埋めないよう意図的に表示しません。技術詳細は`activity_get`と`audit_get`で確認してください。Live Activityは観測用であり、承認、policy、checkpoint、transaction、rollbackその他のsecurity decisionの根拠にはなりません。
+Live Activityは、ファイルの読み取り／編集、構造化ファイル処理、コマンド、artifactの送受信、重要な失敗や拒否、承認待ち、Undo／rollbackを表示します。`workspace_apply` などの高水準操作は、preflight、個別ファイル処理、検証、復旧を内部イベントとして記録しつつ、トップレベルでは一つの操作として表示します。artifactのbegin／chunk／commitは可能な範囲で一つの転送として扱います。`audit_list`、`audit_get`、`activity_timeline`、`activity_get`、`operation_report`、`session_info`、poll等の監査・診断・metadata取得は、通常のLive Activityを埋めないよう意図的に表示しません。技術詳細は`operation_report`、`activity_get`、`audit_get`で確認してください。Live Activityは観測用であり、承認、policy、checkpoint、transaction、rollbackその他のsecurity decisionの根拠にはなりません。
 
 checkpoint で戻せるのは、記録対象になった通常の作業ファイルです。`.git`、Windows のアクセス権、端末、ネットワーク、外部サービス、別のプログラムが行った変更は戻せません。選択的な Undo は独立したテキスト変更に使えますが、バイナリファイルや判断できない競合では停止します。
 
@@ -626,6 +636,9 @@ Approved Host の導入・復旧は、通常の editable checkout を起動す�
 | 項目 | 基準値 |
 | --- | ---: |
 | `max_text_file_bytes`／`max_write_bytes` | 2 MiB／2 MiB |
+| `max_high_level_files`／`max_high_level_total_bytes` | 64 ファイル／16 MiB |
+| `max_workspace_tree_depth`／`max_workspace_search_results` | 8 階層／500 件 |
+| `max_one_shot_artifact_bytes` | 256 KiB |
 | `max_diff_bytes`／`max_backup_bytes` | 4 MiB／16 MiB |
 | `max_image_bytes`／`max_structured_file_bytes` | 10 MiB／64 MiB |
 | `max_transfer_chunk_bytes` | 512 KiB |
@@ -657,22 +670,29 @@ Approved Host の導入・復旧は、通常の editable checkout を起動す�
 | 用途 | 主なツール |
 | --- | --- |
 | 接続先と capability の確認 | `session_info` |
-| フォルダーと UTF-8 テキスト | `list_directory`、`read_file`、`write_file` |
+| フォルダーと UTF-8 テキスト | `workspace_tree`、`workspace_search`、`read_files`、`text_file_apply`、`workspace_apply`。特殊ケースには `list_directory`、`read_file`、`write_file` |
 | 画像 | `get_image` |
 | 構造化ファイル | `structured_file_inspect`、`structured_file_apply` |
 | ZIP | `zip_entry_read`、`zip_entry_extract`、`zip_extract_many` |
+| 小さなファイルの1回送受信 | `artifact_download`、`artifact_upload` |
 | 大きなファイルの送受信 | `artifact_download_begin`／`artifact_download_chunk`、`artifact_upload_begin`／`artifact_upload_chunk`／`artifact_upload_commit`、`artifact_transfer_cancel` |
 | 固定範囲の読み取り・書き込み | `execute_readonly`、`execute_workspace_write` |
 | Git と ADB | `git_info`、`adb_read`、`get_adb_screenshot` |
 | 非同期 operation | `poll_job`、`stop_job` |
 | Sandbox／Host の承認 | `request_sandbox_command`、`request_host_command`、`poll_approval` |
-| 監査と活動履歴 | `audit_list`、`audit_get`、`activity_timeline`、`activity_get` |
+| 監査と活動履歴 | `operation_report`、`audit_list`、`audit_get`、`activity_timeline`、`activity_get` |
 | 変更の復旧 | `request_workspace_rollback`、`request_selective_undo` |
 | 外部文脈 | `context_read_info`、`context_search`、`context_read`、`context_export_info`、`export_context` |
 
 `read_file` は UTF-8 テキスト専用です。UTF-8 として復号できないファイルは内容を置換・変換せずに拒否し、バイナリファイルの場合は byte-exact な `artifact_download_begin`／`artifact_download_chunk` を案内します。
 
-`write_file`、構造化編集、artifact commit、既知 entry の ZIP 展開などは、対象 manifest と競合検査を持つ transaction として扱われます。置換後に処理が失敗しても開始状態への自動復旧と監査の終端化が完了した場合は、後続の workspace mutation を継続できます。復旧できない場合や第三者変更を識別できない場合だけ `recovery_required` のまま停止します。任意コードの出力先を事前に閉じられない場合は、より広い checkpoint と Sandbox 境界が必要になります。
+`workspace_tree` と `workspace_search` は再帰走査を Broker 内で完結させ、`read_files` は複数の UTF-8 ファイルを一度に返します。いずれも既存の workspace／reparse／verified-handle 境界を使い、depth、entry、file、byte、result の上限を適用します。
+
+`text_file_apply` は expected SHA-256 に一致する UTF-8 ファイルで、対象文字列がちょうど1回現れる場合だけ完全一致置換を行います。`workspace_apply` は全対象の CAS と置換を先に検証し、対象ごとの既存 lock を決定的な順序で保持したまま、一つの checkpoint／transaction／operation ID でまとめて確定します。mutation 開始後に低水準ツールへ自動 fallback せず、失敗時は `failed_recovered` または `recovery_required` として終端化します。
+
+`artifact_download` と `artifact_upload` は `max_one_shot_artifact_bytes` 以内だけを対象とする byte-exact な1回経路です。SHA-256、既存ファイル置換時の CAS、checkpoint、transaction、rollback は従来経路と同じです。上限を超える場合は巨大な応答を生成せず、既存の chunk 転送ツールを案内します。
+
+`write_file`、構造化編集、artifact commit、既知 entry の ZIP 展開などは、対象 manifest と競合検査を持つ transaction として扱われます。置換後に処理が失敗しても開始状態への自動復旧と監査の終端化が完了した場合は、後続の workspace mutation を継続できます。復旧できない場合や第三者変更を識別できない場合だけ `recovery_required` のまま停止します。高水準ツールから Codex Sandbox または Approved Host へ暗黙に移行しません。任意コードの出力先を事前に閉じられない場合は、より広い checkpoint と Sandbox 境界が必要になります。
 
 ## 現行仕様を確認するときの見方
 

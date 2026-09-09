@@ -34,7 +34,7 @@ current v1 では `protected_information_read` と LAN access の 2 property を
 受容済み残存 risk とします。
 
 2026-08-27 改訂では、Codex Sandbox account から WMI／CIM 等を経由して Job 外 process を生成する経路を
-termination／resource-bound の必須境界として扱い、live verification marker を schema v5 へ更新します。
+termination／resource-bound の必須境界として扱い、live verification marker を schema v6 へ更新します。
 `Win32_Process.Create` を含む brokered process creation の denial が実測されない marker は route eligibility を
 満たしません。
 
@@ -210,8 +210,8 @@ OS 境界の安全性を証明した意味には使いません。`Windows live-
 `verified` と表示するには、同一の launcher、helper、version、署名、hash、policy generation に
 対して、その property を実機で確認します。
 
-Live verification marker は schema v5 のみを受理します。v1～v4 または必須 field が欠けた marker から
-identity を推測・移行しません。v5 は、実際に import された WFP Guard module の canonical path、
+Live verification marker は schema v6 のみを受理します。v1～v5、`verification_status=verified` ではない marker、または必須 field が欠けた marker から
+identity を推測・移行しません。v6 は、実際に import された WFP Guard module の canonical path、
 content SHA-256、Windows handle から取得した volume serial number と file index、size、Guard version、
 policy generation に結合します。mtime は補助的な drift signal であり、単独では trust anchor にしません。
 Guard module は verification から child 起動まで置換・書込みを拒否する handle を保持します。
@@ -239,11 +239,13 @@ diagnostics／forced reverification 用の手動 `verify-codex-sandbox` は同�
 read-back 不能は追加昇格せず fail closed とします。
 
 自動 verification は `data_dir` の named process-shared OS file lock で直列化し、lock 取得後に marker を再検査します。
+Sandbox実行側も同じlockをmarker再確認からchild生成完了まで保持し、preflight後にmarkerを再読込します。これにより
+verification開始、marker置換、TTL切れとchild起動の競合を許可せず、再確認に失敗したoperationだけをfail closedにします。
 process crash／power loss では OS が lock を解放し、永続 lock を security decision に使用しません。failed／unverified／
 途中終了は current identity digest、`last_attempt_at`、bounded failure reason とともに durable に保存し、同一 identity の
 自動 retry は bounded cooldown に従います。backend、helper、workspace physical identity、isolation context、policy generation
-等が変われば新しい identity として再試行できます。attempt state は Sandbox を available に昇格させる証拠には使わず、
-route eligibility は schema v5 live marker と全 required property の再検証だけで決めます。
+に加え、current Sandbox accountまたはWFP read-back bindingが変われば新しい identity として再試行できます。attempt state は Sandbox を available に昇格させる証拠には使わず、
+route eligibility は schema v6 live marker と全 required property の再検証だけで決めます。
 
 Sandbox route の必須境界は少なくとも次です。
 
@@ -313,7 +315,8 @@ guaranteed された根拠にはせず、general Sandbox の受容済み残存 r
 - 排他範囲は correctness と conflict detection を満たすために必要な範囲へ限定することを原則とします。
   より広い lock が安全性のため必要な場合は許容しますが、性能上の問題は L とリリース判定で別途扱います。
 - 並列化や高速化のために stale／concurrent change detection を弱めません。
-- Binary transfer の admission は upload／download 共通で `preparing`／`open` だけを数え、正常完了、commit、cancel、expiry、永続 payload identity failure の終端状態は枠を解放します。download の terminal response loss に備えて `completed` manifest と immutable snapshot は retention まで保持し、同じ有効な chunk retryだけを許可します。`artifact_transfer_cancel` は workspace を変更せず active transfer を冪等に終端化し、既存の SHA-256、byte count、offset、path、source binding、atomic commit、quota、TTL、durable manifest 検証を迂回しません。
+- 高水準の workspace 操作も既存の `Workspace` path／reparse 検証、verified handle、CAS、target-scoped lock を使用します。`workspace_apply` は全対象の precondition を mutation 前に確認し、対象 slot と thread lock を決定的順序で transaction 完了まで保持します。無関係な target や read-only operation を workspace-wide に直列化しません。
+- Binary transfer の admission は upload／download 共通で `preparing`／`open` だけを数え、正常完了、commit、cancel、expiry、永続 payload identity failure の終端状態は枠を解放します。download の terminal response loss に備えて `completed` manifest と immutable snapshot は retention まで保持し、同じ有効な chunk retryだけを許可します。`artifact_transfer_cancel` は workspace を変更せず active transfer を冪等に終端化し、既存の SHA-256、byte count、offset、path、source binding、atomic commit、quota、TTL、durable manifest 検証を迂回しません。bounded audit retention が転送 snapshot より先に親 operation を削除した場合も、保持中の正当な retry／cancel は独立 operation として監査し、監査を省略したり外部キー失敗で lifecycle を破綻させたりしません。
 
 ### H. Transaction／recovery
 
@@ -321,6 +324,7 @@ guaranteed された根拠にはせず、general Sandbox の受容済み残存 r
   post-write 検証を使用します。
 - crash、timeout、cancel、復旧失敗時に第三者の新しい変更を自動上書きしません。
 - 安全な復旧を完了できない場合は `recovery_required` として mutation を fail closed します。
+- 高水準 mutation は一つの logical operation／transaction として監査し、mutation 開始後の例外を理由に低水準 mutation を再実行しません。Codex Sandbox または Approved Host への暗黙の fallback も行いません。
 - hardware power loss の全 timing に対する完全 ACID は保証しません。
 
 ### I. Binary artifact boundary
@@ -330,6 +334,7 @@ guaranteed された根拠にはせず、general Sandbox の受容済み残存 r
 - local source から container result への workflow は source identity binding を必須にし、source が変化した
   result の反映を拒否します。
 - target replacement は expected destination identity へ結合します。
+- one-shot artifact 経路は設定済み byte 上限以内だけを扱い、同じ SHA-256、CAS、verified read、transaction／rollback 保証を使います。上限超過は mutation または巨大 response の前に拒否し、既存の chunked transfer を明示します。
 - macro／embedded code の bytes を保存する能力と、それを実行する能力を分離します。
 - chunk 読み取りごとに source 全体を再読込／再hash する計算量は許容しません。transfer 開始時に固定した
   immutable snapshot または同等の単純な source binding を使用し、必要な整合性確認は開始時、終了時、

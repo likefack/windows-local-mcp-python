@@ -11,8 +11,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-import pytest
 import anyio
+import pytest
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
@@ -24,6 +24,7 @@ def load_server(
     monkeypatch: pytest.MonkeyPatch,
     *,
     max_open_transfers: int = 2,
+    retention_max_operations: int = 1000,
 ) -> tuple[Any, Path, Path]:
     """Load an isolated server while bypassing only the external Approved Host health state."""
 
@@ -41,6 +42,7 @@ def load_server(
                 "max_structured_file_bytes = 1048576",
                 "max_transfer_chunk_bytes = 4096",
                 f"max_open_transfers = {max_open_transfers}",
+                f"retention_max_operations = {retention_max_operations}",
             ]
         ),
         encoding="utf-8",
@@ -84,6 +86,38 @@ def test_completed_download_releases_slot_and_terminal_chunk_retry_is_stable(
     assert server.artifact_download_chunk(transfer["transfer_id"], 4096) == terminal
     replacement = server.artifact_download_begin("source.bin")
     assert replacement["transfer_id"] != transfer["transfer_id"]
+
+
+def test_terminal_chunk_retry_remains_audited_after_parent_operation_is_pruned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server, workspace, _config = load_server(
+        tmp_path,
+        monkeypatch,
+        max_open_transfers=1,
+        retention_max_operations=10,
+    )
+    payload = b"retained-snapshot"
+    (workspace / "source.bin").write_bytes(payload)
+    transfer = server.artifact_download_begin("source.bin")
+    terminal = server.artifact_download_chunk(transfer["transfer_id"], 0)
+    parent_operation_id = transfer["operation_id"]
+
+    # Operation retention and transfer snapshot retention are deliberately separate.
+    for index in range(11):
+        server._log_simple(
+            tool_name="retention-fixture",
+            request={"index": index},
+            result={"status": "succeeded"},
+        )
+    server.runtime.audit._prune_database()
+    with pytest.raises(KeyError, match="operation not found"):
+        server.runtime.audit.get_operation(parent_operation_id)
+
+    assert server.artifact_download_chunk(transfer["transfer_id"], 0) == terminal
+    fallback = server.runtime.audit.list_operations(limit=1)[0]
+    assert fallback["tool_name"] == "artifact_download_chunk"
+    assert fallback["status"] == "succeeded"
 
 
 def test_repeated_completed_downloads_do_not_exhaust_shared_pool_and_upload_commits(

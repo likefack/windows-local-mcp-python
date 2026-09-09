@@ -1,16 +1,23 @@
 from __future__ import annotations
 
+import json
+import multiprocessing
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from windows_local_mcp.config import Settings
+from windows_local_mcp.resources import NamedControlPlaneLock
 from windows_local_mcp.sandbox_live_verification_lifecycle import (
     SandboxLiveVerificationLifecycle,
+    automatic_verification_identity_digest,
     ensure_codex_sandbox_live_verification,
 )
 
@@ -26,6 +33,20 @@ def _settings(tmp_path: Path, *, cooldown: int = 300) -> Settings:
     )
     settings.ensure_directories()
     return settings
+
+
+def _crash_while_holding_verification_lock(
+    workspace: str, data_dir: str, ready: Any
+) -> None:
+    settings = Settings(
+        workspace_root=Path(workspace),
+        data_dir=Path(data_dir),
+        protect_data_dir_acl=False,
+    )
+    settings.ensure_directories()
+    with NamedControlPlaneLock(settings, "sandbox-verification", timeout=2):
+        ready.set()
+        os._exit(7)
 
 
 def _install_fake_boundary(
@@ -163,6 +184,25 @@ def test_probe_crash_releases_lock_and_force_retry_uses_same_core(
     assert calls == 2
 
 
+def test_process_crash_releases_verification_file_lock(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    context = multiprocessing.get_context("spawn")
+    ready = context.Event()
+    process = context.Process(
+        target=_crash_while_holding_verification_lock,
+        args=(str(settings.workspace_root), str(settings.data_dir), ready),
+    )
+
+    process.start()
+    assert ready.wait(timeout=10)
+    process.join(timeout=10)
+    assert process.exitcode == 7
+
+    # lock file が残っても、OS lock は process 終了時に解放される。
+    with NamedControlPlaneLock(settings, "sandbox-verification", timeout=2):
+        pass
+
+
 def test_failure_cooldown_prevents_storm_but_new_identity_retries(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -185,6 +225,59 @@ def test_failure_cooldown_prevents_storm_but_new_identity_retries(
     assert cooled["action"] == "cooldown"
     assert cooled["automatic_verification_deferred"] is True
     assert changed["full_verification_performed"] is True
+    assert calls == 2
+
+
+def test_retry_identity_changes_with_account_or_wfp_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    backend = SimpleNamespace(as_dict=lambda: {"backend": "fixed"})
+    state = {"account": "account-a", "wfp": "binding-a"}
+    module = "windows_local_mcp.sandbox_live_verification_lifecycle"
+    monkeypatch.setattr(f"{module}.isolation_context_digest", lambda *_args: "context")
+    monkeypatch.setattr(
+        f"{module}._current_retry_boundary_identity",
+        lambda: {
+            "sandbox_account": state["account"],
+            "wfp_guard_binding": state["wfp"],
+        },
+    )
+
+    original = automatic_verification_identity_digest(settings, backend)
+    state["account"] = "account-b"
+    changed_account = automatic_verification_identity_digest(settings, backend)
+    state.update(account="account-a", wfp="binding-b")
+    changed_wfp = automatic_verification_identity_digest(settings, backend)
+
+    assert changed_account != original
+    assert changed_wfp != original
+
+
+def test_future_attempt_timestamp_cannot_extend_cooldown_indefinitely(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path, cooldown=300)
+    state: dict[str, object] = {"status": "missing", "identity": "identity-a"}
+    calls = 0
+
+    def verify(_settings):
+        nonlocal calls
+        calls += 1
+        state.update(status="unverified", failure_reason="measurement unavailable")
+
+    _install_fake_boundary(monkeypatch, state, verify)
+    ensure_codex_sandbox_live_verification(settings)
+    attempt_path = (
+        settings.data_dir / "control-plane" / "sandbox-live-verification-attempt.json"
+    )
+    attempt = json.loads(attempt_path.read_text(encoding="utf-8"))
+    attempt["last_attempt_at"] = (datetime.now(UTC) + timedelta(days=365)).isoformat()
+    attempt_path.write_text(json.dumps(attempt), encoding="utf-8")
+
+    retried = ensure_codex_sandbox_live_verification(settings)
+
+    assert retried["full_verification_performed"] is True
     assert calls == 2
 
 
@@ -256,7 +349,10 @@ def test_manual_cli_forces_the_same_managed_verifier(
     monkeypatch.setattr(
         backend_module,
         "codex_sandbox_live_verification_status",
-        lambda _settings, _backend: {"status": "verified", "evidence": {"version": 5}},
+        lambda _settings, _backend: {
+            "status": "verified",
+            "evidence": {"version": 6},
+        },
     )
     monkeypatch.setattr("sys.argv", ["windows-local-mcp", "verify-codex-sandbox"])
 

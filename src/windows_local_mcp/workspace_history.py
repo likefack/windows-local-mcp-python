@@ -13,6 +13,7 @@ from typing import Any
 
 from .config import Settings
 from .paths import Workspace, read_verified_bytes, read_verified_path_bytes
+from .performance_trace import timed_phase
 from .resources import NamedControlPlaneLock, directory_size, enforce_data_quota
 from .util import canonical_json, sha256_bytes, utc_now_iso
 
@@ -47,6 +48,7 @@ def _cas_serialized(function: Any) -> Any:
 
 
 @_cas_serialized
+@timed_phase("checkpoint_capture")
 def capture_workspace_state(
     settings: Settings,
     operation_id: str,
@@ -313,6 +315,7 @@ def _actual_workspace_relative(workspace: Workspace, verified: Path) -> str:
     return workspace.relative(candidate)
 
 
+@timed_phase("diff_generation")
 def compare_workspace_states(
     settings: Settings, before_path: str, after_path: str, operation_id: str
 ) -> dict[str, Any]:
@@ -384,6 +387,7 @@ def compare_workspace_states(
     }
 
 
+@timed_phase("checkpoint_verification")
 def verify_checkpoint_integrity(settings: Settings, manifest_path: str) -> dict[str, str]:
     """Re-hash every content object that may be used for a restore."""
     manifest = _load_manifest(settings, manifest_path)
@@ -421,6 +425,7 @@ def checkpoint_scope(settings: Settings, manifest_path: str) -> dict[str, Any]:
     return _manifest_scope(_load_manifest(settings, manifest_path))
 
 
+@timed_phase("transactional_commit")
 def restore_workspace_state(
     settings: Settings,
     expected_path: str,
@@ -593,6 +598,7 @@ def restore_workspace_state(
     }
 
 
+@timed_phase("rollback_finalization")
 def finalize_workspace_transaction(settings: Settings, operation_id: str) -> None:
     journal_path = _transaction_root(settings, operation_id) / "journal.json"
     journal = json.loads(journal_path.read_text(encoding="utf-8"))
@@ -604,6 +610,7 @@ def finalize_workspace_transaction(settings: Settings, operation_id: str) -> Non
     _write_json_atomic(journal_path, journal)
 
 
+@timed_phase("rollback_recovery")
 def rollback_applied_workspace_transaction(
     settings: Settings, operation_id: str
 ) -> dict[str, Any]:
@@ -920,6 +927,7 @@ def incomplete_workspace_transactions(settings: Settings) -> list[dict[str, Any]
     return result
 
 
+@timed_phase("rollback_recovery")
 def recover_incomplete_workspace_transaction(
     settings: Settings, journal: dict[str, Any]
 ) -> dict[str, Any]:
@@ -1071,6 +1079,7 @@ def record_workspace_recovery_required(
     return str(journal_path)
 
 
+@timed_phase("transaction_prepare")
 def begin_single_file_write_transaction(
     settings: Settings,
     operation_id: str,
@@ -1101,6 +1110,7 @@ def begin_single_file_write_transaction(
     return str(journal_path)
 
 
+@timed_phase("transaction_prepare")
 def begin_filesystem_primitive_transaction(
     settings: Settings,
     operation_id: str,
@@ -1144,6 +1154,7 @@ def begin_filesystem_primitive_transaction(
     return str(journal_path)
 
 
+@timed_phase("rollback_metadata_finalization")
 def update_filesystem_primitive_transaction(
     settings: Settings,
     operation_id: str,
@@ -1165,6 +1176,7 @@ def update_filesystem_primitive_transaction(
     return str(journal_path)
 
 
+@timed_phase("rollback_recovery")
 def rollback_filesystem_primitive_transaction(
     settings: Settings, operation_id: str
 ) -> dict[str, Any]:
@@ -1194,6 +1206,7 @@ def rollback_filesystem_primitive_transaction(
     }
 
 
+@timed_phase("rollback_metadata_finalization")
 def update_single_file_write_transaction(
     settings: Settings,
     operation_id: str,
@@ -1395,6 +1408,7 @@ def _restore_summary(expected: dict[str, Any], target: dict[str, Any]) -> dict[s
     }
 
 
+@timed_phase("atomic_replacement")
 def _apply_manifest(
     settings: Settings,
     manifest_path: str,
@@ -1660,6 +1674,7 @@ def _scan_current_state(
     return result
 
 
+@timed_phase("cas_recheck")
 def _verify_destination_digest(path: Path, expected: str | None, relative: str) -> None:
     if path.exists():
         size = path.stat().st_size
@@ -1669,6 +1684,7 @@ def _verify_destination_digest(path: Path, expected: str | None, relative: str) 
         raise RuntimeError(f"workspace file disappeared during restore: {relative}")
 
 
+@timed_phase("staging")
 def _stage_manifest_files(
     settings: Settings, manifest_path: str, changed: list[str], destination: Path
 ) -> None:
@@ -1687,6 +1703,7 @@ def _stage_manifest_files(
         shutil.copyfile(_entry_source(settings, Path(manifest_path), entry), target)
 
 
+@timed_phase("hash_validation")
 def _verify_staged_files(
     manifest: dict[str, Any], staged_root: Path, changed: list[str]
 ) -> None:

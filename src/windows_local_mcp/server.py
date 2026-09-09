@@ -9,6 +9,7 @@ import shutil
 import stat
 import tempfile
 import uuid
+from contextlib import ExitStack
 from datetime import UTC, datetime, timedelta
 from itertools import islice
 from pathlib import Path, PureWindowsPath
@@ -25,6 +26,11 @@ from .approval import (
     settings_digest,
 )
 from .approved_host_policy import assert_approved_host_authority_available
+from .artifact_fast_path import (
+    check_one_shot_size,
+    decode_one_shot_upload,
+    encode_one_shot_download,
+)
 from .audit import AuditStore
 from .command_traits import (
     SafeExecutionKind,
@@ -40,6 +46,10 @@ from .control_plane_guard import assert_control_plane_healthy
 from .executor import Executor
 from .git_snapshot import capture_git_snapshot
 from .high_level_mutation import plan_exact_text_edits
+from .high_level_read import read_files as read_files_high_level
+from .high_level_read import workspace_search as workspace_search_high_level
+from .high_level_read import workspace_tree as workspace_tree_high_level
+from .operation_report import build_operation_report
 from .paths import (
     PathIdentity,
     Workspace,
@@ -47,6 +57,7 @@ from .paths import (
     read_verified_path_bytes,
     release_verified_hold,
 )
+from .performance_trace import phase, timed_phase, traced_operation
 from .policy import CommandPolicy, NormalizedCommand, approved_request_hash
 from .redaction import redact_command_args, redact_text
 from .resources import NamedControlPlaneLock, WorkspaceExecutionLock, enforce_data_quota
@@ -54,7 +65,6 @@ from .risk import command_risk_facts
 from .runtime_immutability import assert_approved_host_runtime_immutable
 from .sandbox_backend import (
     SANDBOX_SECURITY_PROPERTIES,
-    ApprovedSandboxUnavailable,
     codex_sandbox_effective_policy,
     codex_sandbox_live_verification_status,
     require_codex_sandbox_live_verification,
@@ -191,6 +201,7 @@ def _redacted_normalized(normalized: NormalizedCommand) -> dict[str, Any]:
     return payload
 
 
+@timed_phase("audit_result_persistence")
 def _log_simple(
     *,
     tool_name: str,
@@ -227,15 +238,19 @@ def _log_transfer_event(
 ) -> None:
     operation_id = manifest.get("operation_id")
     if isinstance(operation_id, str):
-        runtime.audit.add_event(
+        retained = runtime.audit.add_event_if_operation_exists(
             operation_id,
             tool_name,
             {"request": _safe_request(request), "result": _safe_request(result)},
         )
-        return
+        if retained:
+            return
+        # Transfer snapshots can outlive bounded operation history. Keep the retry
+        # auditable without requiring the pruned parent row to be resurrected.
     _log_simple(tool_name=tool_name, request=request, result=result)
 
 
+@timed_phase("audit_result_persistence")
 def _audit_rejection(tool_name: str, request: dict[str, Any], error: Exception) -> None:
     operation_id = runtime.audit.create_operation(
         tool_name=tool_name,
@@ -249,12 +264,14 @@ def _audit_rejection(tool_name: str, request: dict[str, Any], error: Exception) 
     runtime.audit.add_event(operation_id, "rejected", {"error": message[:1000]})
 
 
+@timed_phase("request_validation")
 def _require_filesystem() -> None:
     assert_control_plane_healthy(runtime.settings)
     if not runtime.settings.filesystem_enabled:
         raise PermissionError("filesystem capability is disabled")
 
 
+@timed_phase("request_validation")
 def _require_workspace_mutation_ready() -> None:
     if workspace_recovery_required(runtime.settings):
         raise RuntimeError(
@@ -284,6 +301,7 @@ def _same_committed_identity(
     return (current.device, current.inode) == (committed.device, committed.inode)
 
 
+@timed_phase("post_write_verification")
 def _hold_committed_target(
     path: str,
     expected: bytes,
@@ -306,6 +324,7 @@ def _hold_committed_target(
         raise
 
 
+@timed_phase("rollback_recovery")
 def _recover_single_file_commit(
     path: str,
     *,
@@ -704,6 +723,7 @@ def session_info() -> dict[str, Any]:
 
 
 @mcp.tool(annotations=READ_ONLY)
+@traced_operation
 def list_directory(path: str = ".") -> dict[str, Any]:
     """List non-hidden entries in a workspace directory."""
     request = {"path": path}
@@ -748,6 +768,7 @@ def _directory_entry_type(entry: os.DirEntry[str]) -> str:
 
 
 @mcp.tool(annotations=READ_ONLY)
+@traced_operation
 def read_file(
     path: str, start_line: int | None = None, end_line: int | None = None
 ) -> dict[str, Any]:
@@ -758,7 +779,8 @@ def read_file(
         file_path = runtime.workspace.resolve_existing(path, allow_directory=False)
         raw = read_verified_bytes(file_path, runtime.settings.max_text_file_bytes)
         try:
-            text = raw.decode("utf-8")
+            with phase("decode_parse"):
+                text = raw.decode("utf-8")
         except UnicodeDecodeError:
             # Keep the text API strict while directing opaque bytes to the byte-exact path.
             raise NonUtf8TextError(
@@ -767,22 +789,25 @@ def read_file(
         lines = text.splitlines()
         start = 1 if start_line is None else max(1, start_line)
         end = len(lines) if end_line is None else min(len(lines), max(start, end_line))
-        result = {
-            "path": runtime.workspace.relative(file_path),
-            "sha256": sha256_bytes(raw),
-            "raw_bytes": len(raw),
-            "newline": (
-                "mixed"
-                if "\r\n" in text and "\n" in text.replace("\r\n", "")
-                else "crlf"
-                if "\r\n" in text
-                else "lf"
-            ),
-            "start_line": start,
-            "end_line": end,
-            "total_lines": len(lines),
-            "content": "\n".join(lines[start - 1 : end]),
-        }
+        with phase("source_hash"):
+            source_digest = sha256_bytes(raw)
+        with phase("result_serialization"):
+            result = {
+                "path": runtime.workspace.relative(file_path),
+                "sha256": source_digest,
+                "raw_bytes": len(raw),
+                "newline": (
+                    "mixed"
+                    if "\r\n" in text and "\n" in text.replace("\r\n", "")
+                    else "crlf"
+                    if "\r\n" in text
+                    else "lf"
+                ),
+                "start_line": start,
+                "end_line": end,
+                "total_lines": len(lines),
+                "content": "\n".join(lines[start - 1 : end]),
+            }
         result["operation_id"] = _log_simple(
             tool_name="read_file",
             request=request,
@@ -795,6 +820,141 @@ def read_file(
 
 
 @mcp.tool(annotations=READ_ONLY)
+@traced_operation
+def workspace_tree(
+    path: str = ".",
+    max_depth: int | None = 3,
+    max_entries: int | None = None,
+) -> dict[str, Any]:
+    """Return one bounded workspace directory tree without model-side recursion."""
+
+    request = {"path": path, "max_depth": max_depth, "max_entries": max_entries}
+    try:
+        _require_filesystem()
+        result = workspace_tree_high_level(
+            runtime.workspace,
+            runtime.settings,
+            path,
+            max_depth=max_depth,
+            max_entries=max_entries,
+        )
+        result["operation_id"] = _log_simple(
+            tool_name="workspace_tree",
+            request=request,
+            result={
+                "path": result["path"],
+                "entry_count": result["entry_count"],
+                "scanned_entry_count": result["scanned_entry_count"],
+                "max_depth": result["max_depth"],
+            },
+        )
+        return result
+    except Exception as error:
+        _audit_rejection("workspace_tree", request, error)
+        raise
+
+
+@mcp.tool(annotations=READ_ONLY)
+@traced_operation
+def workspace_search(
+    path: str,
+    query: str,
+    file_glob: str | None = None,
+    case_sensitive: bool = False,
+    max_depth: int | None = None,
+    max_entries: int | None = None,
+    max_files: int | None = None,
+    max_results: int | None = None,
+    max_total_bytes: int | None = None,
+) -> dict[str, Any]:
+    """Search bounded UTF-8 workspace files using literal text matching."""
+
+    request = {
+        "path": path,
+        "query": query,
+        "file_glob": file_glob,
+        "case_sensitive": case_sensitive,
+        "max_depth": max_depth,
+        "max_entries": max_entries,
+        "max_files": max_files,
+        "max_results": max_results,
+        "max_total_bytes": max_total_bytes,
+    }
+    try:
+        _require_filesystem()
+        result = workspace_search_high_level(
+            runtime.workspace,
+            runtime.settings,
+            path,
+            query,
+            file_glob=file_glob,
+            case_sensitive=case_sensitive,
+            max_depth=max_depth,
+            max_entries=max_entries,
+            max_files=max_files,
+            max_results=max_results,
+            max_total_bytes=max_total_bytes,
+        )
+        result["operation_id"] = _log_simple(
+            tool_name="workspace_search",
+            request=request,
+            result={key: value for key, value in result.items() if key != "matches"},
+        )
+        return result
+    except Exception as error:
+        _audit_rejection("workspace_search", request, error)
+        raise
+
+
+@mcp.tool(annotations=READ_ONLY)
+@traced_operation
+def read_files(
+    paths: list[str],
+    max_files: int | None = None,
+    max_total_bytes: int | None = None,
+    start_line: int | None = None,
+    end_line: int | None = None,
+) -> dict[str, Any]:
+    """Read several bounded UTF-8 files in one logical MCP operation."""
+
+    request = {
+        "paths": paths,
+        "max_files": max_files,
+        "max_total_bytes": max_total_bytes,
+        "start_line": start_line,
+        "end_line": end_line,
+    }
+    try:
+        _require_filesystem()
+        result = read_files_high_level(
+            runtime.workspace,
+            runtime.settings,
+            paths,
+            max_files=max_files,
+            max_total_bytes=max_total_bytes,
+            start_line=start_line,
+            end_line=end_line,
+        )
+        result["operation_id"] = _log_simple(
+            tool_name="read_files",
+            request=request,
+            result={
+                "file_count": result["file_count"],
+                "total_bytes": result["total_bytes"],
+                "files": [
+                    {key: value for key, value in item.items() if key != "content"}
+                    for item in result["files"]
+                ],
+            },
+        )
+        return result
+    except Exception as error:
+        _audit_rejection("read_files", request, error)
+        raise
+
+
+@mcp.tool(annotations=READ_ONLY)
+@traced_operation
 def get_image(path: str) -> Image:
     """Return one bounded image from the workspace."""
     request = {"path": path}
@@ -879,11 +1039,14 @@ def _atomic_binary_mutation(
                 )
             else:
                 before = b""
-            before_sha = sha256_bytes(before)
-            if target.exists() and require_expected_for_existing and expected_sha256 is None:
-                raise ValueError("expected_sha256 is required when replacing an existing file")
-            if expected_sha256 is not None and expected_sha256 != before_sha:
-                raise RuntimeError("expected_sha256 mismatch; source is stale or concurrently modified")
+            with phase("source_hash"):
+                before_sha = sha256_bytes(before)
+            with phase("cas_recheck"):
+                if target.exists() and require_expected_for_existing and expected_sha256 is None:
+                    raise ValueError("expected_sha256 is required when replacing an existing file")
+            with phase("cas_recheck"):
+                if expected_sha256 is not None and expected_sha256 != before_sha:
+                    raise RuntimeError("expected_sha256 mismatch; source is stale or concurrently modified")
 
             _verify_binary_source_bindings(source_bindings)
 
@@ -892,7 +1055,8 @@ def _atomic_binary_mutation(
                 raise TypeError("binary mutation transform must return bytes")
             if len(after) > runtime.settings.max_structured_file_bytes:
                 raise ValueError("result exceeds max_structured_file_bytes")
-            after_sha = sha256_bytes(after)
+            with phase("after_hash"):
+                after_sha = sha256_bytes(after)
             request = {
                 "path": runtime.workspace.relative(target),
                 "expected_sha256": expected_sha256,
@@ -910,12 +1074,13 @@ def _atomic_binary_mutation(
             )
             relative_target = runtime.workspace.relative(target)
             checkpoint_paths = {relative_target}
-            pre_workspace = capture_workspace_state(
-                runtime.settings,
-                operation_id,
-                "before",
-                paths=checkpoint_paths,
-            )
+            with phase("checkpoint_before"):
+                pre_workspace = capture_workspace_state(
+                    runtime.settings,
+                    operation_id,
+                    "before",
+                    paths=checkpoint_paths,
+                )
             runtime.audit.update_operation(operation_id, pre_workspace_path=pre_workspace.manifest_path)
             begin_single_file_write_transaction(
                 runtime.settings,
@@ -932,24 +1097,26 @@ def _atomic_binary_mutation(
             committed_target: Path | None = None
             try:
                 _verify_binary_source_bindings(source_bindings)
-                committed_native = runtime.workspace.commit_bytes(
-                    target,
-                    after,
-                    parent_identity=parent_identity,
-                    target_identity=target_identity,
-                    expected_sha256=before_sha if target_identity is not None else None,
-                )
+                with phase("transactional_commit"):
+                    committed_native = runtime.workspace.commit_bytes(
+                        target,
+                        after,
+                        parent_identity=parent_identity,
+                        target_identity=target_identity,
+                        expected_sha256=before_sha if target_identity is not None else None,
+                    )
                 workspace_changed = True
                 committed_target, committed_identity = _hold_committed_target(
                     path, after, committed_native
                 )
                 _verify_binary_source_bindings(independent_source_bindings)
-                post_workspace = capture_workspace_state(
-                    runtime.settings,
-                    operation_id,
-                    "after",
-                    paths=checkpoint_paths,
-                )
+                with phase("checkpoint_after"):
+                    post_workspace = capture_workspace_state(
+                        runtime.settings,
+                        operation_id,
+                        "after",
+                        paths=checkpoint_paths,
+                    )
                 post_hashes = verify_checkpoint_integrity(
                     runtime.settings, post_workspace.manifest_path
                 )
@@ -961,19 +1128,20 @@ def _atomic_binary_mutation(
                     post_workspace.manifest_path,
                     operation_id,
                 )
-                result = {
-                    "operation_id": operation_id,
-                    "status": "succeeded",
-                    "execution_path": "broker_direct",
-                    "path": relative_target,
-                    "before_sha256": before_sha,
-                    "after_sha256": after_sha,
-                    "before_bytes": len(before),
-                    "after_bytes": len(after),
-                    "rollback_state": "complete",
-                    **semantic,
-                    **workspace_change,
-                }
+                with phase("result_serialization"):
+                    result = {
+                        "operation_id": operation_id,
+                        "status": "succeeded",
+                        "execution_path": "broker_direct",
+                        "path": relative_target,
+                        "before_sha256": before_sha,
+                        "after_sha256": after_sha,
+                        "before_bytes": len(before),
+                        "after_bytes": len(after),
+                        "rollback_state": "complete",
+                        **semantic,
+                        **workspace_change,
+                    }
                 update_single_file_write_transaction(
                     runtime.settings,
                     operation_id,
@@ -1103,6 +1271,7 @@ def _read_bounded_binary(
         return target, data, True
 
 
+@timed_phase("cas_recheck")
 def _verify_binary_source_bindings(bindings: tuple[tuple[str, str], ...]) -> None:
     for path, expected in bindings:
         source = runtime.workspace.resolve_existing(path, allow_directory=False)
@@ -1116,6 +1285,7 @@ def _verify_binary_source_bindings(bindings: tuple[tuple[str, str], ...]) -> Non
 
 
 @mcp.tool(annotations=READ_ONLY)
+@traced_operation
 def structured_file_inspect(
     path: str, format: str | None = None, range_ref: str | None = None
 ) -> dict[str, Any]:
@@ -1151,6 +1321,7 @@ def structured_file_inspect(
 
 
 @mcp.tool(annotations=LOCAL_WRITE)
+@traced_operation
 def structured_file_apply(
     path: str,
     operations: list[dict[str, Any]],
@@ -1176,23 +1347,29 @@ def structured_file_apply(
         distinct_output = PureWindowsPath(target_path).as_posix().casefold() != PureWindowsPath(
             path
         ).as_posix().casefold()
-        if distinct_output and kind not in {"image", "xlsx"}:
-            raise ValueError(
-                "output_path is currently supported only for XLSX and image transformations"
-            )
-        if distinct_output and infer_format(target_path) != kind:
-            raise ValueError("output_path extension must match the source structured format")
-        if not distinct_output and expected_output_sha256 is not None:
-            raise ValueError("expected_output_sha256 is only valid for a distinct output_path")
+        with phase("request_validation"):
+            if distinct_output and kind not in {"image", "xlsx"}:
+                raise ValueError(
+                    "output_path is currently supported only for XLSX and image transformations"
+                )
+        with phase("request_validation"):
+            if distinct_output and infer_format(target_path) != kind:
+                raise ValueError("output_path extension must match the source structured format")
+        with phase("cas_recheck"), phase("request_validation"):
+            if not distinct_output and expected_output_sha256 is not None:
+                raise ValueError("expected_output_sha256 is only valid for a distinct output_path")
         allow_create = kind in {"csv", "tsv", "zip"} and not distinct_output
         source_target, prepared_source, source_exists = _read_bounded_binary(
             path, allow_missing=allow_create
         )
-        prepared_sha = sha256_bytes(prepared_source)
-        if source_exists and expected_sha256 is None:
-            raise ValueError("expected_sha256 is required when replacing an existing file")
-        if expected_sha256 is not None and expected_sha256 != prepared_sha:
-            raise RuntimeError("expected_sha256 mismatch; source is stale or concurrently modified")
+        with phase("source_hash"):
+            prepared_sha = sha256_bytes(prepared_source)
+        with phase("cas_recheck"):
+            if source_exists and expected_sha256 is None:
+                raise ValueError("expected_sha256 is required when replacing an existing file")
+        with phase("cas_recheck"):
+            if expected_sha256 is not None and expected_sha256 != prepared_sha:
+                raise RuntimeError("expected_sha256 mismatch; source is stale or concurrently modified")
         if distinct_output:
             output_target, prepared_output, output_exists = _read_bounded_binary(
                 target_path, allow_missing=True
@@ -1201,17 +1378,19 @@ def structured_file_apply(
             # ``.`` or ``..`` components. Keep copy-on-edit unambiguous and fail closed.
             if output_target == source_target:
                 raise ValueError("output_path must resolve to a distinct file")
-            if output_exists and expected_output_sha256 is None:
-                raise ValueError(
-                    "expected_output_sha256 is required when replacing an existing output file"
-                )
-            if (
-                expected_output_sha256 is not None
-                and expected_output_sha256 != sha256_bytes(prepared_output)
-            ):
-                raise RuntimeError(
-                    "expected_output_sha256 mismatch; output is stale or concurrently modified"
-                )
+            with phase("cas_recheck"):
+                if output_exists and expected_output_sha256 is None:
+                    raise ValueError(
+                        "expected_output_sha256 is required when replacing an existing output file"
+                    )
+            with phase("cas_recheck"):
+                if (
+                    expected_output_sha256 is not None
+                    and expected_output_sha256 != sha256_bytes(prepared_output)
+                ):
+                    raise RuntimeError(
+                        "expected_output_sha256 mismatch; output is stale or concurrently modified"
+                    )
         output, semantic = transform_structured(
             prepared_source,
             path,
@@ -1222,8 +1401,9 @@ def structured_file_apply(
         )
 
         def apply(target_before: bytes) -> tuple[bytes, dict[str, Any]]:
-            if not distinct_output and target_before != prepared_source:
-                raise RuntimeError("source changed while the structured artifact was processed")
+            with phase("request_validation"):
+                if not distinct_output and target_before != prepared_source:
+                    raise RuntimeError("source changed while the structured artifact was processed")
             return output, semantic
 
         return _atomic_binary_mutation(
@@ -1250,6 +1430,7 @@ def structured_file_apply(
 
 
 @mcp.tool(annotations=READ_ONLY)
+@traced_operation
 def zip_entry_read(path: str, entry: str) -> dict[str, Any]:
     """Return one validated ZIP entry as a bounded base64 artifact payload."""
     request = {"path": path, "entry": entry}
@@ -1289,6 +1470,7 @@ def zip_entry_read(path: str, entry: str) -> dict[str, Any]:
 
 
 @mcp.tool(annotations=LOCAL_WRITE)
+@traced_operation
 def zip_entry_extract(
     path: str,
     entry: str,
@@ -1343,6 +1525,7 @@ def zip_entry_extract(
 
 
 @mcp.tool(annotations=LOCAL_WRITE)
+@traced_operation
 def zip_extract_many(
     path: str,
     output_directory: str,
@@ -1393,12 +1576,13 @@ def zip_extract_many(
             _require_workspace_mutation_ready()
             _verify_binary_source_bindings(((archive_relative, expected_archive_sha256),))
             checkpoint_paths = set(changes)
-            before = capture_workspace_state(
-                runtime.settings,
-                operation_id,
-                "before",
-                paths=checkpoint_paths,
-            )
+            with phase("checkpoint_before"):
+                before = capture_workspace_state(
+                    runtime.settings,
+                    operation_id,
+                    "before",
+                    paths=checkpoint_paths,
+                )
             target_manifest = build_workspace_target_from_bytes(
                 runtime.settings,
                 operation_id,
@@ -1429,26 +1613,28 @@ def zip_extract_many(
                         journal_path=str(recovered["transaction_journal"]),
                     ) from operation_error
                 raise
-            after = capture_workspace_state(
-                runtime.settings,
-                operation_id,
-                "after",
-                paths=checkpoint_paths,
-            )
+            with phase("checkpoint_after"):
+                after = capture_workspace_state(
+                    runtime.settings,
+                    operation_id,
+                    "after",
+                    paths=checkpoint_paths,
+                )
             workspace_change = compare_workspace_states(
                 runtime.settings, before.manifest_path, after.manifest_path, operation_id
             )
-            result = {
-                "operation_id": operation_id,
-                "status": "succeeded",
-                "execution_path": "broker_direct",
-                "archive_path": archive_relative,
-                "archive_sha256": expected_archive_sha256,
-                "extracted_files": sorted(changes),
-                "extracted_file_count": len(changes),
-                "rollback_state": "complete",
-                **workspace_change,
-            }
+            with phase("result_serialization"):
+                result = {
+                    "operation_id": operation_id,
+                    "status": "succeeded",
+                    "execution_path": "broker_direct",
+                    "archive_path": archive_relative,
+                    "archive_sha256": expected_archive_sha256,
+                    "extracted_files": sorted(changes),
+                    "extracted_file_count": len(changes),
+                    "rollback_state": "complete",
+                    **workspace_change,
+                }
             runtime.audit.transition_operation(
                 operation_id,
                 from_statuses={"running"},
@@ -1734,6 +1920,106 @@ def _write_upload_chunk_locked(
     manifest["received"] = offset + len(payload)
     _write_transfer_manifest(root, manifest)
     return manifest
+
+
+@mcp.tool(annotations=READ_ONLY)
+def artifact_download(path: str, expected_sha256: str | None = None) -> dict[str, Any]:
+    """Download one small byte-exact artifact in a single bounded MCP response."""
+
+    request = {"path": path, "expected_sha256": expected_sha256}
+    source: Path | None = None
+    try:
+        _require_filesystem()
+        source = runtime.workspace.resolve_existing(path, allow_directory=False)
+        identity = runtime.workspace.identity(source)
+        if identity is None:
+            raise FileNotFoundError(path)
+        check_one_shot_size(
+            identity.size,
+            max_bytes=runtime.settings.max_one_shot_artifact_bytes,
+            direction="download",
+        )
+        payload = read_verified_bytes(source, runtime.settings.max_one_shot_artifact_bytes)
+        result = encode_one_shot_download(
+            payload,
+            max_bytes=runtime.settings.max_one_shot_artifact_bytes,
+            path=runtime.workspace.relative(source),
+            expected_sha256=expected_sha256,
+        )
+        result["operation_id"] = _log_simple(
+            tool_name="artifact_download",
+            request=request,
+            result={key: value for key, value in result.items() if key != "base64"},
+        )
+        return result
+    except Exception as error:
+        _audit_rejection("artifact_download", request, error)
+        raise
+    finally:
+        if source is not None:
+            release_verified_hold(source)
+
+
+@mcp.tool(annotations=LOCAL_WRITE)
+def artifact_upload(
+    path: str,
+    base64_payload: str,
+    sha256: str,
+    expected_sha256: str | None = None,
+    reason: str = "",
+) -> dict[str, Any]:
+    """Validate and commit one small byte-exact artifact in a single MCP call."""
+
+    request = {
+        "path": path,
+        "sha256": sha256,
+        "expected_sha256": expected_sha256,
+        "reason": reason,
+        "base64_characters": len(base64_payload) if isinstance(base64_payload, str) else None,
+    }
+    try:
+        prepared = decode_one_shot_upload(
+            base64_payload,
+            max_bytes=runtime.settings.max_one_shot_artifact_bytes,
+            sha256=sha256,
+            expected_sha256=expected_sha256,
+        )
+        _require_filesystem()
+        _require_workspace_mutation_ready()
+        _target, current, exists = _read_bounded_binary(path, allow_missing=True)
+        if exists and expected_sha256 is None:
+            raise ValueError("expected_sha256 is required when replacing an existing file")
+        if expected_sha256 is not None and sha256_bytes(current) != expected_sha256:
+            raise RuntimeError("expected_sha256 mismatch; target is stale or concurrently modified")
+    except Exception as error:
+        _audit_rejection("artifact_upload", request, error)
+        raise
+
+    def apply(_: bytes) -> tuple[bytes, dict[str, Any]]:
+        return prepared.payload, {
+            "execution_path": "one_shot",
+            "transfer_mode": "one_shot",
+            "artifact_kind": "opaque_binary",
+            "embedded_code_executed": False,
+        }
+
+    # Once the transactional mutation path starts, no generic retry or lower-level fallback is
+    # attempted. Its existing journal and recovery state are returned unchanged on failure.
+    return _atomic_binary_mutation(
+        tool_name="artifact_upload",
+        path=path,
+        expected_sha256=prepared.expected_sha256,
+        reason=reason,
+        request_summary={
+            "declared_bytes": prepared.bytes,
+            "declared_sha256": prepared.sha256,
+            "transfer_mode": "one_shot",
+            "high_level_operation": "artifact_upload",
+        },
+        transform=apply,
+        allow_create=True,
+        require_expected_for_existing=True,
+    )
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -2042,6 +2328,7 @@ def artifact_upload_chunk(transfer_id: str, offset: int, base64_chunk: str) -> d
 
 
 @mcp.tool(annotations=LOCAL_WRITE)
+@traced_operation
 def artifact_upload_commit(transfer_id: str, reason: str = "") -> dict[str, Any]:
     """Verify a complete staged upload and atomically commit it with checkpoint and rollback."""
     request = {"transfer_id": transfer_id, "reason": reason}
@@ -2165,6 +2452,7 @@ def structured_file_upload_commit(transfer_id: str, reason: str = "") -> dict[st
 
 
 @mcp.tool(annotations=LOCAL_WRITE)
+@traced_operation
 def write_file(
     path: str,
     content: str,
@@ -2183,9 +2471,11 @@ def write_file(
     try:
         _require_filesystem()
         _require_workspace_mutation_ready()
-        content_bytes = content.encode("utf-8")
-        if len(content_bytes) > runtime.settings.max_write_bytes:
-            raise ValueError("write exceeds max_write_bytes")
+        with phase("output_encoding"):
+            content_bytes = content.encode("utf-8")
+        with phase("request_validation"):
+            if len(content_bytes) > runtime.settings.max_write_bytes:
+                raise ValueError("write exceeds max_write_bytes")
         target = runtime.workspace.resolve_for_write(path)
         with WorkspaceExecutionLock(
             runtime.settings, target=target
@@ -2212,14 +2502,18 @@ def write_file(
             if len(previous_bytes) > runtime.settings.max_backup_bytes:
                 raise ValueError("existing file exceeds max_backup_bytes")
             try:
-                previous_text = previous_bytes.decode("utf-8")
+                with phase("decode_parse"):
+                    previous_text = previous_bytes.decode("utf-8")
             except UnicodeDecodeError as error:
                 raise ValueError("existing file is not UTF-8 text") from error
-            before_sha = sha256_bytes(previous_bytes)
-            if target.exists() and expected_sha256 is None:
-                raise ValueError("expected_sha256 is required when replacing an existing file")
-            if expected_sha256 is not None and expected_sha256 != before_sha:
-                raise RuntimeError("expected_sha256 mismatch")
+            with phase("source_hash"):
+                before_sha = sha256_bytes(previous_bytes)
+            with phase("cas_recheck"):
+                if target.exists() and expected_sha256 is None:
+                    raise ValueError("expected_sha256 is required when replacing an existing file")
+            with phase("cas_recheck"):
+                if expected_sha256 is not None and expected_sha256 != before_sha:
+                    raise RuntimeError("expected_sha256 mismatch")
 
             request = {
                 "path": runtime.workspace.relative(target),
@@ -2237,12 +2531,13 @@ def write_file(
             )
             relative_target = runtime.workspace.relative(target)
             checkpoint_paths = {relative_target}
-            pre_workspace = capture_workspace_state(
-                runtime.settings,
-                operation_id,
-                "before",
-                paths=checkpoint_paths,
-            )
+            with phase("checkpoint_before"):
+                pre_workspace = capture_workspace_state(
+                    runtime.settings,
+                    operation_id,
+                    "before",
+                    paths=checkpoint_paths,
+                )
             runtime.audit.update_operation(
                 operation_id, pre_workspace_path=pre_workspace.manifest_path
             )
@@ -2275,13 +2570,14 @@ def write_file(
                 sha256_bytes(content_bytes),
             )
             try:
-                committed_native = runtime.workspace.commit_bytes(
-                    target,
-                    content_bytes,
-                    parent_identity=parent_identity,
-                    target_identity=target_identity,
-                    expected_sha256=before_sha if target_identity is not None else None,
-                )
+                with phase("transactional_commit"):
+                    committed_native = runtime.workspace.commit_bytes(
+                        target,
+                        content_bytes,
+                        parent_identity=parent_identity,
+                        target_identity=target_identity,
+                        expected_sha256=before_sha if target_identity is not None else None,
+                    )
                 workspace_changed = True
                 committed_target, committed_identity = _hold_committed_target(
                     path, content_bytes, committed_native
@@ -2298,29 +2594,32 @@ def write_file(
                 raise
 
             try:
-                after_sha = sha256_bytes(content_bytes)
-                post_workspace = capture_workspace_state(
-                    runtime.settings,
-                    operation_id,
-                    "after",
-                    paths=checkpoint_paths,
-                )
+                with phase("after_hash"):
+                    after_sha = sha256_bytes(content_bytes)
+                with phase("checkpoint_after"):
+                    post_workspace = capture_workspace_state(
+                        runtime.settings,
+                        operation_id,
+                        "after",
+                        paths=checkpoint_paths,
+                    )
                 post_hashes = verify_checkpoint_integrity(
                     runtime.settings, post_workspace.manifest_path
                 )
                 if post_hashes.get(relative_target) != after_sha:
                     raise RuntimeError("target changed before the post-write checkpoint")
-                result = {
-                    "operation_id": operation_id,
-                    "status": "succeeded",
-                    "path": relative_target,
-                    "before_sha256": before_sha,
-                    "after_sha256": after_sha,
-                    "diff_path": str(diff_path),
-                    "backup_path": backup_path,
-                    "added_lines": added,
-                    "removed_lines": removed,
-                }
+                with phase("result_serialization"):
+                    result = {
+                        "operation_id": operation_id,
+                        "status": "succeeded",
+                        "path": relative_target,
+                        "before_sha256": before_sha,
+                        "after_sha256": after_sha,
+                        "diff_path": str(diff_path),
+                        "backup_path": backup_path,
+                        "added_lines": added,
+                        "removed_lines": removed,
+                    }
                 workspace_change = compare_workspace_states(
                     runtime.settings,
                     pre_workspace.manifest_path,
@@ -2464,12 +2763,13 @@ def _run_filesystem_primitive(
             cwd=str(runtime.settings.workspace_root),
             request=_safe_request(request),
         )
-        pre_workspace = capture_workspace_state(
-            runtime.settings,
-            operation_id,
-            "before",
-            paths=checkpoint_paths,
-        )
+        with phase("checkpoint_before"):
+            pre_workspace = capture_workspace_state(
+                runtime.settings,
+                operation_id,
+                "before",
+                paths=checkpoint_paths,
+            )
         runtime.audit.update_operation(
             operation_id, pre_workspace_path=pre_workspace.manifest_path
         )
@@ -2492,12 +2792,13 @@ def _run_filesystem_primitive(
         mutation_result = commit()
         if post_verify is not None:
             post_verify(mutation_result)
-        post_workspace = capture_workspace_state(
-            runtime.settings,
-            operation_id,
-            "after",
-            paths=checkpoint_paths,
-        )
+        with phase("checkpoint_after"):
+            post_workspace = capture_workspace_state(
+                runtime.settings,
+                operation_id,
+                "after",
+                paths=checkpoint_paths,
+            )
         post_state = checkpoint_state(runtime.settings, post_workspace.manifest_path)
         if post_state != target_state:
             raise RuntimeError("filesystem primitive postcondition does not match target manifest")
@@ -2507,16 +2808,17 @@ def _run_filesystem_primitive(
             post_workspace.manifest_path,
             operation_id,
         )
-        result = {
-            "operation_id": operation_id,
-            "status": "succeeded",
-            "operation_type": tool_name,
-            "execution_path": "broker_direct",
-            "transaction": "windows_txf" if os.name == "nt" else "portable_test_fallback",
-            "rollback_state": "complete",
-            **mutation_result,
-            **workspace_change,
-        }
+        with phase("result_serialization"):
+            result = {
+                "operation_id": operation_id,
+                "status": "succeeded",
+                "operation_type": tool_name,
+                "execution_path": "broker_direct",
+                "transaction": "windows_txf" if os.name == "nt" else "portable_test_fallback",
+                "rollback_state": "complete",
+                **mutation_result,
+                **workspace_change,
+            }
         update_filesystem_primitive_transaction(
             runtime.settings, operation_id, state="applied_verified"
         )
@@ -2607,6 +2909,7 @@ def _run_filesystem_primitive(
 
 
 @mcp.tool(annotations=LOCAL_WRITE)
+@traced_operation
 def move_file(
     source_path: str,
     destination_path: str,
@@ -2645,7 +2948,8 @@ def move_file(
             source_bytes = read_verified_path_bytes(
                 source, runtime.settings.max_backup_bytes
             )
-            source_sha = sha256_bytes(source_bytes)
+            with phase("source_hash"):
+                source_sha = sha256_bytes(source_bytes)
             if source_sha != expected_source_sha256:
                 raise RuntimeError("expected_source_sha256 mismatch")
             destination_identity = runtime.workspace.identity(destination)
@@ -2717,6 +3021,7 @@ def move_file(
 
 
 @mcp.tool(annotations=LOCAL_WRITE)
+@traced_operation
 def copy_file(
     source_path: str,
     destination_path: str,
@@ -2761,7 +3066,8 @@ def copy_file(
             source_bytes = read_verified_bytes(
                 source, runtime.settings.max_backup_bytes
             )
-            source_sha = sha256_bytes(source_bytes)
+            with phase("source_hash"):
+                source_sha = sha256_bytes(source_bytes)
             if source_sha != expected_source_sha256:
                 raise RuntimeError("expected_source_sha256 mismatch")
             source_relative = runtime.workspace.relative(source)
@@ -2833,6 +3139,7 @@ def copy_file(
 
 
 @mcp.tool(annotations=LOCAL_WRITE)
+@traced_operation
 def delete_file(path: str, expected_sha256: str, reason: str = "") -> dict[str, Any]:
     """Delete one CAS-bound regular file; an absent target is a failure."""
 
@@ -2849,9 +3156,11 @@ def delete_file(path: str, expected_sha256: str, reason: str = "") -> dict[str, 
             if target_identity is None or parent_identity is None:
                 raise FileNotFoundError("delete target is absent")
             before = read_verified_path_bytes(target, runtime.settings.max_backup_bytes)
-            before_sha = sha256_bytes(before)
-            if before_sha != expected_sha256:
-                raise RuntimeError("expected_sha256 mismatch")
+            with phase("source_hash"):
+                before_sha = sha256_bytes(before)
+            with phase("cas_recheck"):
+                if before_sha != expected_sha256:
+                    raise RuntimeError("expected_sha256 mismatch")
             relative = runtime.workspace.relative(target)
             request = {
                 **request_input,
@@ -2899,6 +3208,7 @@ def delete_file(path: str, expected_sha256: str, reason: str = "") -> dict[str, 
 
 
 @mcp.tool(annotations=LOCAL_WRITE)
+@traced_operation
 def make_directory(path: str, parents: bool = False, reason: str = "") -> dict[str, Any]:
     """Create one bounded directory chain; existing final directories are rejected."""
 
@@ -2980,6 +3290,7 @@ def make_directory(path: str, parents: bool = False, reason: str = "") -> dict[s
 
 
 @mcp.tool(annotations=LOCAL_WRITE)
+@traced_operation
 def text_file_apply(
     path: str,
     expected_sha256: str,
@@ -3003,6 +3314,7 @@ def text_file_apply(
 
 
 @mcp.tool(annotations=LOCAL_WRITE)
+@traced_operation
 def workspace_apply(edits: list[dict[str, Any]], reason: str = "") -> dict[str, Any]:
     """Apply exact UTF-8 replacements across files as one recoverable logical transaction."""
 
@@ -3051,6 +3363,9 @@ def _workspace_apply_text_edits(
         )
         if len(targets) != len(edits):
             raise TypeError("each edit must be an object")
+        canonical_targets = {os.path.normcase(str(target)) for target in targets}
+        if len(canonical_targets) != len(targets):
+            raise ValueError("each workspace_apply target must resolve to a unique file")
 
         operation_id = runtime.audit.create_operation(
             tool_name=tool_name,
@@ -3067,7 +3382,9 @@ def _workspace_apply_text_edits(
             ),
         )
         runtime.audit.add_event(operation_id, "high_level_lock_wait", {"targets": len(targets)})
-        with WorkspaceExecutionLock(runtime.settings, targets=targets):
+        with WorkspaceExecutionLock(runtime.settings, targets=targets), ExitStack() as target_locks:
+            for target in sorted(targets, key=lambda item: os.path.normcase(str(item))):
+                target_locks.enter_context(runtime.workspace.lock_target(target))
             _require_workspace_mutation_ready()
             runtime.audit.add_event(operation_id, "high_level_lock_acquired", {"targets": len(targets)})
 
@@ -3112,12 +3429,13 @@ def _workspace_apply_text_edits(
                     "after_bytes": sum(len(plan.after) for plan in plans),
                 },
             )
-            pre_workspace = capture_workspace_state(
-                runtime.settings,
-                operation_id,
-                "before",
-                paths=relative_paths,
-            )
+            with phase("checkpoint_before"):
+                pre_workspace = capture_workspace_state(
+                    runtime.settings,
+                    operation_id,
+                    "before",
+                    paths=relative_paths,
+                )
             runtime.audit.update_operation(
                 operation_id, pre_workspace_path=pre_workspace.manifest_path
             )
@@ -3153,12 +3471,13 @@ def _workspace_apply_text_edits(
                     "high_level_verification_started",
                     {"files": len(changes)},
                 )
-                post_workspace = capture_workspace_state(
-                    runtime.settings,
-                    operation_id,
-                    "after",
-                    paths=relative_paths,
-                )
+                with phase("checkpoint_after"):
+                    post_workspace = capture_workspace_state(
+                        runtime.settings,
+                        operation_id,
+                        "after",
+                        paths=relative_paths,
+                    )
                 post_hashes = verify_checkpoint_integrity(
                     runtime.settings, post_workspace.manifest_path
                 )
@@ -3184,34 +3503,17 @@ def _workspace_apply_text_edits(
                     }
                     for target, plan in zip(targets, plans, strict=True)
                 ]
-                result = {
-                    "operation_id": operation_id,
-                    "status": "succeeded",
-                    "high_level_operation": tool_name,
-                    "execution_route": "broker_direct",
-                    "transaction": "workspace_restore",
-                    "files": file_results,
-                    "rollback_state": "complete",
-                    **workspace_change,
-                }
-                runtime.audit.transition_operation(
-                    operation_id,
-                    from_statuses={"running"},
-                    status="succeeded",
-                    finished_at=utc_now_iso(),
-                    diff_path=str(workspace_change["diff_path"]),
-                    pre_workspace_path=pre_workspace.manifest_path,
-                    post_workspace_path=post_workspace.manifest_path,
-                    rollback_state="complete",
-                    result_json=canonical_json(_safe_request(result)),
-                )
-                finalize_workspace_transaction(runtime.settings, operation_id)
-                runtime.audit.add_event(
-                    operation_id,
-                    "high_level_operation_committed",
-                    {"files": len(file_results), "rollback_state": "complete"},
-                )
-                return result
+                with phase("result_serialization"):
+                    result = {
+                        "operation_id": operation_id,
+                        "status": "succeeded",
+                        "high_level_operation": tool_name,
+                        "execution_route": "broker_direct",
+                        "transaction": "workspace_restore",
+                        "files": file_results,
+                        "rollback_state": "complete",
+                        **workspace_change,
+                    }
             except Exception as post_error:
                 try:
                     rollback_applied_workspace_transaction(runtime.settings, operation_id)
@@ -3249,6 +3551,24 @@ def _workspace_apply_text_edits(
                         / "journal.json"
                     ),
                 ) from post_error
+            runtime.audit.transition_operation(
+                operation_id,
+                from_statuses={"running"},
+                status="succeeded",
+                finished_at=utc_now_iso(),
+                diff_path=str(workspace_change["diff_path"]),
+                pre_workspace_path=pre_workspace.manifest_path,
+                post_workspace_path=post_workspace.manifest_path,
+                rollback_state="complete",
+                result_json=canonical_json(_safe_request(result)),
+            )
+            finalize_workspace_transaction(runtime.settings, operation_id)
+            runtime.audit.add_event(
+                operation_id,
+                "high_level_operation_committed",
+                {"files": len(file_results), "rollback_state": "complete"},
+            )
+            return result
     except Exception as error:
         if operation_id is None:
             _audit_rejection(tool_name, _safe_request(request_input), error)
@@ -3274,6 +3594,7 @@ def _workspace_apply_text_edits(
         raise
 
 
+@timed_phase("diff_generation")
 def _write_bounded_diff(
     *, previous_text: str, content: str, relative: str, destination: Path
 ) -> tuple[int, int, int]:
@@ -3821,6 +4142,29 @@ def activity_get(operation_id: str) -> dict[str, Any]:
         return result
     except Exception as error:
         _audit_rejection("activity_get", request, error)
+        raise
+
+
+@mcp.tool(annotations=READ_ONLY)
+def operation_report(operation_id: str, max_events: int = 100) -> dict[str, Any]:
+    """Return the usual audit, activity, approval, route, and rollback state in one call."""
+
+    request = {"operation_id": operation_id, "max_events": max_events}
+    try:
+        result = build_operation_report(
+            runtime.settings,
+            runtime.audit,
+            operation_id,
+            max_events=max_events,
+        )
+        _log_simple(
+            tool_name="operation_report",
+            request=request,
+            result={"accessed": operation_id, "status": result["status"]},
+        )
+        return result
+    except Exception as error:
+        _audit_rejection("operation_report", request, error)
         raise
 
 

@@ -9,6 +9,12 @@ from functools import wraps
 from typing import Any
 
 from .config import Settings
+from .performance_trace import (
+    current_trace,
+    decode_timing_payload,
+    encode_timing_payload,
+    timed_phase,
+)
 from .redaction import redact_text, redact_value
 from .resources import NamedControlPlaneLock, WorkspaceExecutionLock, prune_artifacts
 from .util import canonical_json, utc_now_iso
@@ -102,6 +108,7 @@ class AuditStore:
                     result_json TEXT,
                     error TEXT,
                     duration_ms INTEGER,
+                    timing_json TEXT,
                     pre_workspace_path TEXT,
                     post_workspace_path TEXT,
                     rollback_state TEXT,
@@ -132,6 +139,7 @@ class AuditStore:
                 row["name"] for row in db.execute("PRAGMA table_info(operations)").fetchall()
             }
             migrations = {
+                "timing_json": "TEXT",
                 "request_expires_at": "TEXT",
                 "approval_expires_at": "TEXT",
                 "claimed_at": "TEXT",
@@ -319,6 +327,7 @@ class AuditStore:
             else:
                 mark_workspace_transaction_audit_reconciled(self.settings, operation_id)
 
+    @timed_phase("audit_result_persistence")
     @_serialized_audit_mutation
     def create_operation(
         self,
@@ -371,8 +380,12 @@ class AuditStore:
                 """,
                 (operation_id, now, "created", canonical_json({"status": status})),
             )
+        trace = current_trace()
+        if trace is not None:
+            trace.bind(operation_id, self)
         return operation_id
 
+    @timed_phase("audit_result_persistence")
     @_serialized_audit_mutation
     def update_operation(self, operation_id: str, **fields: Any) -> None:
         if not fields:
@@ -385,6 +398,7 @@ class AuditStore:
             if cursor.rowcount != 1:
                 raise KeyError(f"operation not found: {operation_id}")
 
+    @timed_phase("audit_result_persistence")
     @_serialized_audit_mutation
     def transition_operation(
         self,
@@ -411,6 +425,8 @@ class AuditStore:
 
     def _prepare_update_fields(self, fields: dict[str, Any]) -> dict[str, Any]:
         fields = dict(fields)
+        if "timing_json" in fields:
+            raise ValueError("use persist_timings for diagnostic timing updates")
         if isinstance(fields.get("error"), str):
             fields["error"] = redact_text(str(fields["error"]))
         result_json = fields.get("result_json")
@@ -436,6 +452,28 @@ class AuditStore:
         return fields
 
     @_serialized_audit_mutation
+    def persist_timings(
+        self, operation_id: str, *, timing_json: str, duration_ms: int
+    ) -> None:
+        """Save bounded diagnostics without changing lifecycle timestamps or events."""
+        payload = decode_timing_payload(timing_json)
+        timing_json = encode_timing_payload(payload)
+        if type(duration_ms) is not int or duration_ms != payload["total_ns"] // 1_000_000:
+            raise ValueError("duration_ms does not match timing total")
+        size = len(timing_json.encode("utf-8"))
+        if size > self.settings.max_audit_record_bytes:
+            raise ValueError("audit timing exceeds max_audit_record_bytes")
+        self._ensure_audit_capacity(size + 4096)
+        with self._lock, self._connect() as db:
+            cursor = db.execute(
+                "UPDATE operations SET timing_json=?, duration_ms=? WHERE id=?",
+                (timing_json, duration_ms, operation_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"operation not found: {operation_id}")
+
+    @timed_phase("audit_result_persistence")
+    @_serialized_audit_mutation
     def add_event(
         self,
         operation_id: str,
@@ -456,6 +494,31 @@ class AuditStore:
                 """,
                 (operation_id, utc_now_iso(), event_type, payload_json),
             )
+
+    @timed_phase("audit_result_persistence")
+    @_serialized_audit_mutation
+    def add_event_if_operation_exists(
+        self,
+        operation_id: str,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+    ) -> bool:
+        """Append an event only while its retained parent operation still exists."""
+        payload_json = canonical_json(redact_value(payload or {}))
+        if len(payload_json.encode("utf-8")) > self.settings.max_audit_record_bytes:
+            payload_json = canonical_json(
+                {"truncated": True, "original_bytes": len(payload_json.encode("utf-8"))}
+            )
+        self._ensure_audit_capacity(len(payload_json.encode("utf-8")) + 4096)
+        with self._lock, self._connect() as db:
+            cursor = db.execute(
+                """
+                INSERT INTO events(operation_id, occurred_at, event_type, payload_json)
+                SELECT id, ?, ?, ? FROM operations WHERE id = ?
+                """,
+                (utc_now_iso(), event_type, payload_json, operation_id),
+            )
+            return cursor.rowcount == 1
 
     def _ensure_audit_capacity(self, incoming_bytes: int) -> None:
         """Keep long-lived audit/WAL growth inside a reserved share of data_dir."""
@@ -512,6 +575,8 @@ class AuditStore:
             if row is None:
                 raise KeyError(f"operation not found: {operation_id}")
             result = dict(row)
+            timing_json = result.pop("timing_json", None)
+            result["timings"] = decode_timing_payload(timing_json) if timing_json else None
             result["request"] = json.loads(result.pop("request_json"))
             if result.get("result_json"):
                 result["result"] = json.loads(result["result_json"])

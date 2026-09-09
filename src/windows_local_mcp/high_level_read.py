@@ -19,13 +19,10 @@ from typing import Any
 
 from .paths import Workspace, read_verified_bytes, release_verified_hold
 
-# These are request-level defaults, not new security policy.  The effective per-file
-# boundary always remains ``settings.max_text_file_bytes`` and traversal remains bounded
-# by ``settings.max_directory_entries``.
+# Request defaults remain below the configured ceilings. The effective per-file boundary
+# always remains ``settings.max_text_file_bytes``.
 _DEFAULT_READ_FILES = 32
 _DEFAULT_SEARCH_RESULTS = 100
-_MAX_TREE_DEPTH = 64
-_MAX_REQUEST_RESPONSE_BYTES = 32 * 1024 * 1024
 
 
 def _setting(settings: Any, name: str, default: int) -> int:
@@ -69,7 +66,7 @@ def _file_byte_limit(settings: Any) -> int:
 
 
 def _request_file_limit(settings: Any, requested: int | None) -> int:
-    configured = _setting(settings, "max_directory_entries", 3000)
+    configured = _setting(settings, "max_high_level_files", 64)
     default = min(_DEFAULT_READ_FILES, configured)
     return _request_limit(
         requested,
@@ -86,10 +83,11 @@ def _request_total_byte_limit(
     max_files: int,
 ) -> int:
     per_file = _file_byte_limit(settings)
-    # The request default is finite even when a caller supplies a permissive directory
-    # quota.  A caller may lower it, or raise it up to the safe per-file aggregate.
-    aggregate = per_file * max_files
-    default = min(aggregate, _MAX_REQUEST_RESPONSE_BYTES)
+    aggregate = min(
+        per_file * max_files,
+        _setting(settings, "max_high_level_total_bytes", 16 * 1024 * 1024),
+    )
+    default = aggregate
     return _request_limit(
         requested,
         name="max_total_bytes",
@@ -99,12 +97,13 @@ def _request_total_byte_limit(
     )
 
 
-def _validate_depth(value: int | None, *, default: int) -> int:
+def _validate_depth(settings: Any, value: int | None, *, default: int) -> int:
+    configured = _setting(settings, "max_workspace_tree_depth", 8)
     return _request_limit(
         value,
         name="max_depth",
-        default=default,
-        maximum=_MAX_TREE_DEPTH,
+        default=min(default, configured),
+        maximum=configured,
         allow_zero=True,
     )
 
@@ -233,7 +232,7 @@ def workspace_tree(
 ) -> dict[str, Any]:
     """Return a bounded directory tree without following reparse points."""
 
-    depth_limit = _validate_depth(max_depth, default=3)
+    depth_limit = _validate_depth(settings, max_depth, default=3)
     entry_limit = _directory_entry_limit(settings, max_entries)
     root, root_relative = _root_directory(workspace, path)
     pending: deque[tuple[Path, int]] = deque([(root, 0)])
@@ -339,14 +338,25 @@ def workspace_search(
     if not isinstance(case_sensitive, bool):
         raise TypeError("case_sensitive must be boolean")
     pattern = _validate_file_glob(file_glob)
-    depth_limit = _validate_depth(max_depth, default=_MAX_TREE_DEPTH)
+    depth_limit = _validate_depth(
+        settings,
+        max_depth,
+        default=_setting(settings, "max_workspace_tree_depth", 8),
+    )
     entry_limit = _directory_entry_limit(settings, max_entries)
     file_limit = _request_file_limit(settings, max_files)
     result_limit = _request_limit(
         max_results,
         name="max_results",
-        default=min(_DEFAULT_SEARCH_RESULTS, entry_limit),
-        maximum=entry_limit,
+        default=min(
+            _DEFAULT_SEARCH_RESULTS,
+            entry_limit,
+            _setting(settings, "max_workspace_search_results", 500),
+        ),
+        maximum=min(
+            entry_limit,
+            _setting(settings, "max_workspace_search_results", 500),
+        ),
     )
     total_limit = _request_total_byte_limit(settings, max_total_bytes, max_files=file_limit)
     root, root_relative = _root_directory(workspace, path)
@@ -503,6 +513,11 @@ def read_files(
         try:
             canonical = workspace.relative(checked)
             key = os.path.normcase(canonical)
+            identity = workspace.identity(checked)
+            if identity is None:
+                raise RuntimeError(f"workspace file disappeared: {canonical}")
+            if total_bytes + identity.size > total_limit:
+                raise ValueError("read_files total byte limit exceeded")
         finally:
             release_verified_hold(checked)
         if key in seen:

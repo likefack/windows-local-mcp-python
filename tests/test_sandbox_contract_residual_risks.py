@@ -6,6 +6,7 @@ import pytest
 
 from windows_local_mcp.config import Settings
 from windows_local_mcp.sandbox_backend import (
+    SANDBOX_LIVE_MARKER_VERSION,
     SANDBOX_SECURITY_PROPERTIES,
     ApprovedSandboxUnavailable,
     CodexSandboxBackend,
@@ -108,7 +109,8 @@ def _accepted_residual_risk_evidence(
         "test_binding": True,
     }
     return {
-        "version": 5,
+        "version": SANDBOX_LIVE_MARKER_VERSION,
+        "verification_status": "verified",
         "passed": False,
         "verified_at": utc_now_iso(),
         "backend_digest": sha256_text(canonical_json(backend.as_dict())),

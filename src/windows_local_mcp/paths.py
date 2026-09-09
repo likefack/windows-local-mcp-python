@@ -14,6 +14,7 @@ from pathlib import Path, PureWindowsPath
 from typing import Any, Self
 
 from .config import Settings
+from .performance_trace import timed_phase
 from .windows_transaction import (
     transactional_copy_file,
     transactional_create_directories,
@@ -217,6 +218,7 @@ def release_verified_hold(path: Path) -> None:
     _release_held_path(path)
 
 
+@timed_phase("source_read")
 def read_verified_bytes(path: Path, max_bytes: int) -> bytes:
     """Read workspace bytes from the exact file object validated on Windows."""
     if max_bytes < 0:
@@ -238,6 +240,7 @@ def read_verified_bytes(path: Path, max_bytes: int) -> bytes:
     return data
 
 
+@timed_phase("source_read")
 def read_verified_path_bytes(path: Path, max_bytes: int) -> bytes:
     """Validate and read one path through the same short-lived Windows file HANDLE."""
     verified = hold_verified_path(
@@ -351,6 +354,7 @@ def _windows_component_handles(
             kernel32.CloseHandle(handle)
 
 
+@timed_phase("identity_validation")
 def hold_verified_path(
     path: str | Path,
     *,
@@ -429,6 +433,7 @@ class Workspace:
         self._reject_reparse_chain(self.root)
 
     @staticmethod
+    @timed_phase("workspace_path_validation")
     def validate_windows_syntax(user_path: str) -> None:
         if not user_path or "\x00" in user_path:
             raise ValueError("path must be non-empty and contain no NUL")
@@ -492,6 +497,7 @@ class Workspace:
         if path.is_file() and path.stat().st_nlink > 1:
             raise PermissionError(f"files with multiple hard links are denied: {path}")
 
+    @timed_phase("path_validation")
     def resolve_existing(
         self,
         user_path: str,
@@ -538,6 +544,7 @@ class Workspace:
             raise NotADirectoryError(f"not a directory: {path}")
         return path
 
+    @timed_phase("path_validation")
     def resolve_for_write(self, user_path: str) -> Path:
         self.validate_windows_syntax(user_path)
         lexical = self.root / user_path
@@ -557,6 +564,7 @@ class Workspace:
             return _hold_write_target(target)
         return _MissingWritePath.attach(target)
 
+    @timed_phase("path_validation")
     def resolve_planned_write(self, user_path: str) -> Path:
         """Validate a future regular-file target without creating missing parents."""
         self.validate_windows_syntax(user_path)
@@ -597,6 +605,7 @@ class Workspace:
             self._check_inside(current.resolve(strict=True))
         return current.resolve(strict=True)
 
+    @timed_phase("path_validation")
     def resolve_directory_target(self, user_path: str, *, parents: bool) -> Path:
         """Validate a fixed directory-create target without mutating the workspace."""
 
@@ -643,6 +652,7 @@ class Workspace:
             return True
         return any(part.casefold() in self._hidden for part in parts)
 
+    @timed_phase("identity_validation")
     def identity(self, path: Path) -> PathIdentity | None:
         if not path.exists():
             return None
@@ -673,6 +683,7 @@ class Workspace:
             return identity.windows_volume_serial, identity.windows_file_index
         return identity.device, identity.inode
 
+    @timed_phase("cas_recheck")
     def revalidate_for_replace(
         self,
         target: Path,
@@ -699,6 +710,7 @@ class Workspace:
         release_write_intent_hold(fresh)
         release_write_intent_hold(target)
 
+    @timed_phase("transactional_commit")
     def commit_bytes(
         self,
         target: Path,
@@ -768,6 +780,7 @@ class Workspace:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
 
+    @timed_phase("transactional_commit")
     def commit_delete(
         self,
         target: Path,
@@ -813,6 +826,7 @@ class Workspace:
         )
         actual_target.unlink()
 
+    @timed_phase("transactional_commit")
     def commit_move(
         self,
         source: Path,
@@ -842,6 +856,7 @@ class Workspace:
         )
         return committed.volume_serial, committed.file_index
 
+    @timed_phase("transactional_commit")
     def commit_copy(
         self,
         source: Path,
@@ -871,6 +886,7 @@ class Workspace:
         )
         return committed.volume_serial, committed.file_index
 
+    @timed_phase("transactional_commit")
     def commit_directories(
         self,
         target: Path,
@@ -887,6 +903,7 @@ class Workspace:
             expected_parent_identity=self._native_identity(parent_identity),
         )
 
+    @timed_phase("transactional_commit")
     def commit_remove_directory(
         self,
         target: Path,

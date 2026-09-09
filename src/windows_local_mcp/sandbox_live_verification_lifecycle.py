@@ -19,9 +19,40 @@ from .sandbox_backend import (
 from .sandbox_live_verify import _write_evidence
 from .sandbox_live_verify_hardened import verify_codex_sandbox_live
 from .util import canonical_json, sha256_text, utc_now_iso
+from .wfp_guard import (
+    WfpGuardError,
+    guard_verification_binding,
+    new_windows_wfp_api,
+    resolve_sandbox_account_identity,
+    verify_codex_loopback_block,
+)
 
 _ATTEMPT_STATE_VERSION = 1
 _AUTOMATIC_LOCK_TIMEOUT_SECONDS = 15 * 60
+
+
+def _current_retry_boundary_identity() -> dict[str, Any]:
+    """Capture live identities whose change should bypass a previous cooldown."""
+
+    try:
+        account: dict[str, Any] = {
+            "status": "available",
+            "identity": resolve_sandbox_account_identity().as_dict(),
+        }
+    except (OSError, PermissionError, RuntimeError, ValueError, WfpGuardError) as error:
+        # Failure details can contain unstable host text. The exception type is enough to
+        # distinguish a readable identity from an unavailable measurement without storms.
+        account = {"status": "unavailable", "error_type": type(error).__name__}
+
+    try:
+        verification = verify_codex_loopback_block(new_windows_wfp_api())
+        wfp_binding: dict[str, Any] = {
+            "status": "available",
+            "binding": guard_verification_binding(verification),
+        }
+    except (OSError, PermissionError, RuntimeError, ValueError, WfpGuardError) as error:
+        wfp_binding = {"status": "unavailable", "error_type": type(error).__name__}
+    return {"sandbox_account": account, "wfp_guard_binding": wfp_binding}
 
 
 def automatic_verification_identity_digest(
@@ -35,6 +66,7 @@ def automatic_verification_identity_digest(
                 "marker_version": SANDBOX_LIVE_MARKER_VERSION,
                 "backend_digest": sha256_text(canonical_json(backend.as_dict())),
                 "isolation_context_digest": isolation_context_digest(settings, backend),
+                "live_control_identity": _current_retry_boundary_identity(),
                 "retry_cooldown_seconds": (
                     settings.sandbox_live_verification_retry_cooldown_seconds
                 ),
@@ -92,10 +124,14 @@ def _cooldown_remaining_seconds(
     attempted_at = _parse_time(attempt.get("last_attempt_at"))
     if attempted_at is None:
         return 0
+    # 破損した state や大幅な時計巻き戻りで cooldown が設定上限を超えて残らないようにする。
+    if attempted_at > now + timedelta(minutes=5):
+        return 0
     retry_at = attempted_at + timedelta(
         seconds=settings.sandbox_live_verification_retry_cooldown_seconds
     )
-    return max(0, int((retry_at - now).total_seconds() + 0.999))
+    remaining = max(0, int((retry_at - now).total_seconds() + 0.999))
+    return min(settings.sandbox_live_verification_retry_cooldown_seconds, remaining)
 
 
 def _outcome(

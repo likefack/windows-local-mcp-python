@@ -25,6 +25,7 @@ from xml.etree import ElementTree
 from xml.parsers import expat
 
 from .config import Settings
+from .performance_trace import timed_phase
 from .util import sha256_bytes
 
 _FORMATS = {"docx", "xlsx", "csv", "tsv", "zip", "image"}
@@ -49,6 +50,7 @@ class StructuredFileError(ValueError):
     """A safe, user-actionable rejection of a structured file request."""
 
 
+@timed_phase("request_validation")
 def infer_format(path: str, requested: str | None = None) -> str:
     suffix = PureWindowsPath(path).suffix.casefold()
     if requested is not None:
@@ -313,6 +315,7 @@ def _archive_member_matches(
             tail = window[-overlap:]
 
 
+@timed_phase("decode_parse")
 def _parse_package_xml(data: bytes, label: str) -> ElementTree.Element:
     try:
         return ElementTree.fromstring(data)
@@ -320,10 +323,12 @@ def _parse_package_xml(data: bytes, label: str) -> ElementTree.Element:
         raise StructuredFileError(f"invalid {label} XML") from error
 
 
+@timed_phase("output_encoding")
 def _serialize_package_xml(root: ElementTree.Element) -> bytes:
     return ElementTree.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
+@timed_phase("output_encoding")
 def _rewrite_package(data: bytes, replacements: dict[str, bytes]) -> bytes:
     """Rewrite selected OPC parts while preserving every other ZIP member payload and metadata."""
     try:
@@ -1793,6 +1798,7 @@ def _preflight_csv(data: bytes, kind: str, settings: Settings) -> None:
         raise StructuredFileError("invalid CSV/TSV structure") from error
 
 
+@timed_phase("decode_parse")
 def _parse_csv(data: bytes, kind: str, settings: Settings) -> CsvDocument:
     _preflight_csv(data, kind, settings)
     if len(data) > settings.max_structured_file_bytes:
@@ -2027,6 +2033,7 @@ def _inspect_zip(data: bytes, settings: Settings) -> dict[str, Any]:
         archive.close()
 
 
+@timed_phase("decode_parse")
 def read_zip_entry(data: bytes, name: str, settings: Settings) -> bytes:
     """Return one prevalidated entry without writing it anywhere."""
     safe_name = _safe_zip_name(name)
@@ -2043,6 +2050,7 @@ def read_zip_entry(data: bytes, name: str, settings: Settings) -> bytes:
         archive.close()
 
 
+@timed_phase("decode_parse")
 def read_zip_entries(
     data: bytes, names: list[str] | None, settings: Settings
 ) -> dict[str, bytes]:
@@ -2255,6 +2263,7 @@ def _transform_image(data: bytes, operations: list[Any], settings: Settings) -> 
         image.close()
 
 
+@timed_phase("decode_parse")
 def inspect(data: bytes, path: str, settings: Settings, *, format: str | None = None, range_ref: str | None = None) -> dict[str, Any]:
     _require_size(data, settings)
     kind = infer_format(path, format)
@@ -2267,6 +2276,7 @@ def inspect(data: bytes, path: str, settings: Settings, *, format: str | None = 
     return result
 
 
+@timed_phase("transform")
 def transform(
     data: bytes,
     path: str,

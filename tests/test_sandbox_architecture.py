@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -126,6 +127,7 @@ def _valid_live_marker(
     verification = _guard_verification()
     return {
         "version": SANDBOX_LIVE_MARKER_VERSION,
+        "verification_status": "verified",
         "passed": True,
         "verified_at": utc_now_iso(),
         "backend_digest": sha256_text(canonical_json(backend.as_dict())),
@@ -143,6 +145,34 @@ def _valid_live_marker(
             name: {"status": "verified"} for name in SANDBOX_SECURITY_PROPERTIES
         },
     }
+
+
+@pytest.mark.parametrize("persisted_status", [None, "unexpected-status"])
+def test_live_marker_requires_known_verified_lifecycle_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    persisted_status: str | None,
+) -> None:
+    settings = _settings(tmp_path)
+    backend = _test_backend()
+    evidence = _valid_live_marker(settings, backend)
+    if persisted_status is None:
+        evidence.pop("verification_status")
+    else:
+        evidence["verification_status"] = persisted_status
+    marker = settings.data_dir / "control-plane" / "sandbox-live-verification.json"
+    marker.write_text(canonical_json(evidence), encoding="utf-8")
+    monkeypatch.setattr(
+        "windows_local_mcp.sandbox_backend.resolve_sandbox_account_identity",
+        _account_identity,
+    )
+
+    inspection = codex_sandbox_live_verification_status(settings, backend)
+
+    assert inspection["status"] == "stale"
+    assert inspection["stale_reason"] == "verification_status_missing_or_invalid"
+    with pytest.raises(ApprovedSandboxUnavailable, match="missing, failed, or stale"):
+        require_codex_sandbox_live_verification(settings, backend)
 
 
 def test_live_marker_ttl_is_part_of_route_validation(
@@ -281,6 +311,57 @@ def test_guard_preflight_succeeds_before_codex_launch(
     assert guard["target_sid"] == "S-1-5-21-100-200-300-1004"
 
 
+def test_verification_lock_is_held_through_child_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    contender_started = threading.Event()
+    contender_acquired = threading.Event()
+    contender: threading.Thread | None = None
+    expected = (object(), object(), ["codex", "sandbox"])
+
+    monkeypatch.setattr(
+        "windows_local_mcp.wfp_guard_runtime.ensure_runtime_codex_loopback_guard",
+        _guard_verification,
+    )
+
+    def acquire_verification_lock() -> None:
+        from windows_local_mcp.resources import NamedControlPlaneLock
+
+        contender_started.set()
+        with NamedControlPlaneLock(settings, "sandbox-verification", timeout=2):
+            contender_acquired.set()
+
+    def launch(*_args: object, **_kwargs: object) -> tuple[object, object, list[str]]:
+        nonlocal contender
+        contender = threading.Thread(target=acquire_verification_lock)
+        contender.start()
+        assert contender_started.wait(timeout=1)
+        time.sleep(0.1)
+        assert not contender_acquired.is_set()
+        return expected
+
+    monkeypatch.setattr("windows_local_mcp.sandbox_backend.launch_codex_sandbox", launch)
+
+    result = guard_and_launch_codex_sandbox(
+        _test_backend(),
+        settings=settings,
+        command=[sys.executable, "-c", "pass"],
+        cwd=settings.workspace_root,
+        writable_roots=(),
+        environment={},
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    assert result[:3] == expected
+    assert contender_acquired.wait(timeout=2)
+    assert contender is not None
+    contender.join(timeout=2)
+    assert not contender.is_alive()
+
+
 def test_valid_marker_allows_missing_exact_guard_reconstruction_before_launch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -342,6 +423,67 @@ def test_valid_marker_allows_missing_exact_guard_reconstruction_before_launch(
         "brokered-preflight",
         "launch",
     ]
+
+
+def test_marker_replaced_during_preflight_never_starts_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _settings(tmp_path)
+    backend = _test_backend()
+    evidence = _valid_live_marker(settings, backend)
+    marker = settings.data_dir / "control-plane" / "sandbox-live-verification.json"
+    marker.write_text(canonical_json(evidence), encoding="utf-8")
+    launch_called = False
+
+    monkeypatch.setattr(
+        "windows_local_mcp.sandbox_backend.resolve_sandbox_account_identity",
+        _account_identity,
+    )
+    monkeypatch.setattr(
+        "windows_local_mcp.wfp_guard_runtime.ensure_runtime_codex_loopback_guard",
+        _guard_verification,
+    )
+
+    def replace_marker(*_args: object, **_kwargs: object) -> None:
+        marker.write_text(
+            canonical_json(
+                {
+                    "version": SANDBOX_LIVE_MARKER_VERSION,
+                    "verification_status": "verifying",
+                    "attempted_at": utc_now_iso(),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def forbidden_launch(*_args: object, **_kwargs: object) -> object:
+        nonlocal launch_called
+        launch_called = True
+        raise AssertionError("changed marker must stop child creation")
+
+    monkeypatch.setattr(
+        "windows_local_mcp.sandbox_backend._require_brokered_process_creation_denied",
+        replace_marker,
+    )
+    monkeypatch.setattr(
+        "windows_local_mcp.sandbox_backend.launch_codex_sandbox",
+        forbidden_launch,
+    )
+
+    with pytest.raises(ApprovedSandboxUnavailable, match="missing, failed, or stale"):
+        guard_and_launch_codex_sandbox(
+            backend,
+            settings=settings,
+            command=[sys.executable, "-c", "pass"],
+            cwd=settings.workspace_root,
+            writable_roots=(),
+            environment={},
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            expected_live_evidence=evidence,
+        )
+    assert launch_called is False
 
 
 @pytest.mark.parametrize(

@@ -18,6 +18,7 @@ from typing import Any
 
 from .child_env import build_command_environment, sanitize_executable_search_path
 from .config import Settings
+from .resources import NamedControlPlaneLock
 from .sandbox_brokered_process import (
     brokered_process_probe_command,
     classify_brokered_process_probe,
@@ -62,7 +63,7 @@ _NPM_PACKAGE_MANIFEST_MAX_BYTES = 1024 * 1024
 _WLMCP_ISOLATION_POLICY_VERSION = 3
 _SANDBOX_STATE_POLICY_VERSION = 2
 _SANDBOX_STATE_GLOB_SCAN_MAX_DEPTH = 64
-SANDBOX_LIVE_MARKER_VERSION = 5
+SANDBOX_LIVE_MARKER_VERSION = 6
 SANDBOX_SECURITY_PROPERTIES = (
     "filesystem_read",
     "filesystem_write",
@@ -858,6 +859,12 @@ def codex_sandbox_live_verification_status(
             "failure_reason": _live_verification_failure_reason(evidence)
             or "required live properties remain unverified",
         }
+    if persisted_status != "verified":
+        return {
+            **result,
+            "status": "stale",
+            "stale_reason": "verification_status_missing_or_invalid",
+        }
     try:
         context = sandbox_isolation_context(settings, backend)
         guard_implementation = context.get("wfp_guard_implementation")
@@ -1304,7 +1311,49 @@ def guard_and_launch_codex_sandbox(
 ) -> tuple[
     subprocess.Popen[Any], WindowsSandboxJob, list[str], dict[str, object]
 ]:
-    """Verify the fixed WFP Guard immediately before starting the Sandbox route."""
+    """Serialize live-marker verification through Sandbox child creation."""
+
+    try:
+        with NamedControlPlaneLock(settings, "sandbox-verification", timeout=180):
+            return _guard_and_launch_codex_sandbox_locked(
+                backend,
+                settings=settings,
+                command=command,
+                cwd=cwd,
+                writable_roots=writable_roots,
+                environment=environment,
+                stdin=stdin,
+                stdout=stdout,
+                stderr=stderr,
+                limits=limits,
+                on_guard_verified=on_guard_verified,
+                expected_live_evidence=expected_live_evidence,
+            )
+    except TimeoutError as error:
+        raise ApprovedSandboxUnavailable(
+            "Codex Sandbox live verification or another child-creation preflight "
+            "is still in progress"
+        ) from error
+
+
+def _guard_and_launch_codex_sandbox_locked(
+    backend: CodexSandboxBackend,
+    *,
+    settings: Settings,
+    command: list[str],
+    cwd: Path,
+    writable_roots: Sequence[Path],
+    environment: dict[str, str],
+    stdin: Any,
+    stdout: Any,
+    stderr: Any,
+    limits: WindowsJobLimits | None = None,
+    on_guard_verified: Callable[[dict[str, object]], None] | None = None,
+    expected_live_evidence: dict[str, Any] | None = None,
+) -> tuple[
+    subprocess.Popen[Any], WindowsSandboxJob, list[str], dict[str, object]
+]:
+    """Verify the fixed WFP Guard while the shared verification lock is held."""
 
     from .wfp_guard_runtime import ensure_runtime_codex_loopback_guard
 
@@ -1355,6 +1404,15 @@ def guard_and_launch_codex_sandbox(
         on_guard_verified(guard_payload)
     if expected_live_evidence is not None:
         _require_brokered_process_creation_denied(backend, settings=settings)
+        # The preflight can outlive a short TTL or overlap an out-of-band marker
+        # replacement. Re-read immediately before child creation and never rely on
+        # the earlier snapshot alone.
+        latest_evidence = require_codex_sandbox_live_verification(settings, backend)
+        if latest_evidence != expected_live_evidence:
+            raise ApprovedSandboxUnavailable(
+                "Codex Sandbox live marker changed during preflight; "
+                "run verify-codex-sandbox explicitly"
+            )
     process, job, argv = launch_codex_sandbox(
         backend,
         settings=settings,

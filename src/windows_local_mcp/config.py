@@ -64,7 +64,7 @@ class Settings(BaseModel):
     max_high_level_total_bytes: int = Field(
         default=16 * 1024 * 1024, ge=1024, le=256 * 1024 * 1024
     )
-    max_workspace_tree_depth: int = Field(default=8, ge=0, le=64)
+    max_workspace_tree_depth: int = Field(default=8, ge=1, le=64)
     max_workspace_search_results: int = Field(default=500, ge=1, le=10000)
     max_one_shot_artifact_bytes: int = Field(
         default=256 * 1024, ge=1024, le=4 * 1024 * 1024
