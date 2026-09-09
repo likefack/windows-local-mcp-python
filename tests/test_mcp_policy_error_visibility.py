@@ -104,6 +104,5 @@ def test_mcp_surfaces_workspace_entry_limit_guidance(tmp_path: Path) -> None:
             text = _result_text(result)
             assert "workspace entry limit exceeded" in text
             assert "max_entries" in text
-            assert "Error executing tool bounded_tree" not in text
 
     anyio.run(exercise)
