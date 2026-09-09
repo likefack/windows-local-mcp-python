@@ -7,6 +7,7 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 from windows_local_mcp.config import Settings
+from windows_local_mcp.high_level_read import workspace_tree
 from windows_local_mcp.paths import Workspace
 from windows_local_mcp.policy import CommandPolicy, SandboxRouteRequiredError
 
@@ -67,5 +68,42 @@ def test_mcp_surfaces_only_explicit_route_guidance() -> None:
             internal_text = _result_text(internal)
             assert "sensitive-internal-path-must-stay-masked" not in internal_text
             assert "Error executing tool internal_failure" in internal_text
+
+    anyio.run(exercise)
+
+
+def test_mcp_surfaces_workspace_entry_limit_guidance(tmp_path: Path) -> None:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "one.txt").write_text("one", encoding="utf-8")
+    (root / "two.txt").write_text("two", encoding="utf-8")
+    settings = Settings(
+        workspace_root=root,
+        data_dir=tmp_path / "data",
+        protect_data_dir_acl=False,
+        git_enabled=False,
+    )
+    settings.ensure_directories()
+    workspace = Workspace(settings)
+    server = MCPServer("workspace-limit-visibility-test")
+
+    @server.tool()
+    def bounded_tree(max_entries: int) -> dict[str, object]:
+        return workspace_tree(
+            workspace,
+            settings,
+            ".",
+            max_depth=1,
+            max_entries=max_entries,
+        )
+
+    async def exercise() -> None:
+        async with Client(server) as client:
+            result = await client.call_tool("bounded_tree", {"max_entries": 1})
+            assert result.is_error
+            text = _result_text(result)
+            assert "workspace entry limit exceeded" in text
+            assert "max_entries" in text
+            assert "Error executing tool bounded_tree" not in text
 
     anyio.run(exercise)
