@@ -1,0 +1,852 @@
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+
+def read(path: str) -> str:
+    return Path(path).read_text(encoding="utf-8")
+
+
+def write(path: str, text: str) -> None:
+    Path(path).write_text(text, encoding="utf-8", newline="\n")
+
+
+def replace_once(text: str, old: str, new: str, label: str) -> str:
+    count = text.count(old)
+    if count != 1:
+        raise RuntimeError(f"{label}: expected 1 exact match, found {count}")
+    return text.replace(old, new, 1)
+
+
+def regex_once(text: str, pattern: str, repl: str, label: str) -> str:
+    result, count = re.subn(pattern, repl, text, count=1, flags=re.S)
+    if count != 1:
+        raise RuntimeError(f"{label}: expected 1 regex match, found {count}")
+    return result
+
+
+# approval.py
+path = "src/windows_local_mcp/approval.py"
+text = read(path)
+text = regex_once(
+    text,
+    r"_CODE_LOADERS = \{\n(.*?)\n\}\n",
+    "PROJECT_CONTROLLED_CODE_LOADERS = frozenset(\n    {\n\\1\n    }\n)\n_CODE_LOADERS = PROJECT_CONTROLLED_CODE_LOADERS\n\n\ndef is_project_controlled_code_loader(program_key: str) -> bool:\n    return program_key in PROJECT_CONTROLLED_CODE_LOADERS\n",
+    "code loader classifier",
+)
+text = replace_once(
+    text,
+    "    normalized: NormalizedCommand,\n    workspace_write: bool = False,\n) -> tuple[NormalizedCommand, dict[str, Any], str]:",
+    "    normalized: NormalizedCommand,\n    workspace_write: bool = False,\n    snapshot_workspace: bool = False,\n) -> tuple[NormalizedCommand, dict[str, Any], str]:",
+    "prepare signature",
+)
+text = replace_once(
+    text,
+    '        "version": 2,\n        "operation_id": operation_id,',
+    '        "version": 3,\n        "operation_id": operation_id,',
+    "manifest version",
+)
+snapshot_branch = '''        if snapshot_workspace:
+            source_workspace = workspace.root
+            source_cwd = Path(normalized.cwd).resolve(strict=True)
+            relative_cwd = source_cwd.relative_to(source_workspace)
+            staged_workspace = stage_root / "workspace"
+            records = _copy_tree_bounded(
+                source=source_workspace,
+                destination=staged_workspace,
+                settings=settings,
+                workspace=workspace,
+                entry_budget=entry_budget,
+            )
+            staged_cwd = staged_workspace / relative_cwd
+            if not staged_cwd.is_dir():
+                raise RuntimeError("Sandbox snapshot does not contain the requested cwd")
+            manifest["mode"] = (
+                "staged-sandbox-workspace-write"
+                if workspace_write
+                else "staged-sandbox-workspace"
+            )
+            manifest["source_workspace"] = str(source_workspace)
+            manifest["staged_workspace"] = str(staged_workspace)
+            manifest["source_cwd"] = str(source_cwd)
+            manifest["staged_cwd"] = str(staged_cwd)
+            manifest["inputs"] = records
+            execution.cwd = str(staged_cwd)
+            execution.args = [
+                _rewrite_workspace_argument(value, source_workspace, staged_workspace)
+                for value in execution.args
+            ]
+            if normalized.program_key in {"dart", "flutter"}:
+                dependency_records = _stage_dart_package_dependencies(
+                    source_cwd=source_cwd,
+                    staged_cwd=staged_cwd,
+                    stage_root=stage_root,
+                    settings=settings,
+                    workspace=workspace,
+                    records=records,
+                    entry_budget=entry_budget,
+                )
+                records.extend(dependency_records)
+                manifest["inputs"] = records
+            _enforce_manifest_totals(records, settings)
+            manifest["source_workspace_binding"] = _broker_mutable_workspace_binding(
+                source=source_workspace,
+                settings=settings,
+                workspace=workspace,
+            )
+            root_text = str(source_workspace).casefold()
+            if any(root_text in value.casefold() for value in execution.args):
+                raise PermissionError(
+                    "embedded workspace paths cannot be safely rewritten for immutable execution"
+                )
+        elif normalized.program_key in _CODE_LOADERS:
+'''
+text = replace_once(
+    text,
+    "        if normalized.program_key in _CODE_LOADERS:\n",
+    snapshot_branch,
+    "snapshot branch",
+)
+text = replace_once(
+    text,
+    '    if manifest.get("version") != 2:\n',
+    '    if manifest.get("version") != 3:\n',
+    "verify manifest version",
+)
+text = replace_once(
+    text,
+    '    if manifest.get("mode") == "staged-workspace-write":\n',
+    '    if manifest.get("mode") in {\n        "staged-workspace-write",\n        "staged-sandbox-workspace-write",\n    }:\n',
+    "write verification modes",
+)
+text = replace_once(
+    text,
+    '    if manifest.get("mode") in {"staged-cwd", "staged-workspace-write"}:\n',
+    '    if manifest.get("mode") in {\n        "staged-cwd",\n        "staged-workspace-write",\n        "staged-sandbox-workspace",\n        "staged-sandbox-workspace-write",\n    }:\n',
+    "workspace binding modes",
+)
+materialize = '''@_approval_staging_serialized
+def materialize_execution_copy(
+    *, settings: Settings, operation_id: str, normalized: NormalizedCommand
+) -> NormalizedCommand:
+    """Create a disposable writable run tree from a verified immutable snapshot."""
+    manifest_root = (settings.data_dir / "approval-staging" / operation_id).resolve(strict=True)
+    manifest = json.loads((manifest_root / "manifest.json").read_text(encoding="utf-8"))
+    stage_root = Path(str(manifest["execution_staging_root"])).resolve(strict=True)
+    assert settings.sandbox_scratch_dir is not None
+    stage_root.relative_to((settings.sandbox_scratch_dir / "approval-inputs").resolve(strict=True))
+    immutable_cwd = Path(normalized.cwd).resolve(strict=True)
+    expected_cwd = Path(str(manifest.get("staged_cwd", stage_root / "cwd"))).resolve(
+        strict=True
+    )
+    if immutable_cwd != expected_cwd:
+        return normalized
+
+    _enforce_sandbox_scratch_quota(settings, admission=True)
+    run_root = settings.sandbox_scratch_dir / "runs" / operation_id
+    if run_root.exists():
+        shutil.rmtree(run_root)
+    run_root.mkdir(parents=True)
+    entry_budget = _EntryBudget(settings)
+    mode = str(manifest.get("mode", ""))
+    try:
+        if mode in {"staged-sandbox-workspace", "staged-sandbox-workspace-write"}:
+            immutable_workspace = Path(str(manifest["staged_workspace"])).resolve(strict=True)
+            immutable_workspace.relative_to(stage_root)
+            source_workspace = Path(str(manifest["source_workspace"])).resolve(strict=True)
+            source_cwd = Path(str(manifest["source_cwd"])).resolve(strict=True)
+            relative_cwd = source_cwd.relative_to(source_workspace)
+            run_workspace = run_root / "workspace"
+            _copy_external_tree_bounded(
+                source=immutable_workspace,
+                destination=run_workspace,
+                settings=settings,
+                entry_budget=entry_budget,
+                charge_data_dir=False,
+            )
+            _make_writable(run_workspace)
+            run_cwd = run_workspace / relative_cwd
+            if not run_cwd.is_dir():
+                raise RuntimeError("runtime workspace does not contain the approved cwd")
+            rewrite_source = immutable_workspace
+            rewrite_destination = run_workspace
+        else:
+            run_cwd = run_root / "cwd"
+            _copy_external_tree_bounded(
+                source=immutable_cwd,
+                destination=run_cwd,
+                settings=settings,
+                entry_budget=entry_budget,
+                charge_data_dir=False,
+            )
+            _make_writable(run_cwd)
+            rewrite_source = immutable_cwd
+            rewrite_destination = run_cwd
+
+        immutable_dependencies = stage_root / "dependencies"
+        if immutable_dependencies.exists():
+            run_dependencies = run_root / "dependencies"
+            _copy_external_tree_bounded(
+                source=immutable_dependencies,
+                destination=run_dependencies,
+                settings=settings,
+                entry_budget=entry_budget,
+                charge_data_dir=False,
+            )
+            package_config = run_cwd / ".dart_tool" / "package_config.json"
+            if package_config.exists():
+                payload = json.loads(package_config.read_text(encoding="utf-8"))
+                for item in payload.get("packages", []):
+                    root_uri = str(item.get("rootUri", ""))
+                    parsed = urlparse(root_uri)
+                    if parsed.scheme != "file":
+                        continue
+                    staged_dependency = Path(unquote(parsed.path.lstrip("/")))
+                    if os.name == "nt" and parsed.path.startswith("/"):
+                        staged_dependency = Path(unquote(parsed.path[1:]))
+                    staged_dependency = staged_dependency.resolve(strict=True)
+                    try:
+                        relative_dependency = staged_dependency.relative_to(
+                            immutable_dependencies.resolve(strict=True)
+                        )
+                    except ValueError:
+                        continue
+                    item["rootUri"] = (
+                        (run_dependencies / relative_dependency).as_uri().rstrip("/") + "/"
+                    )
+                package_config.write_text(canonical_json(payload), encoding="utf-8")
+        _enforce_sandbox_scratch_quota(settings)
+    except Exception:
+        shutil.rmtree(run_root, ignore_errors=True)
+        raise
+    result = normalized.model_copy(deep=True)
+    result.args = [
+        _rewrite_workspace_argument(value, rewrite_source, rewrite_destination)
+        for value in result.args
+    ]
+    result.cwd = str(run_cwd)
+    return result
+'''
+text = regex_once(
+    text,
+    r"@_approval_staging_serialized\ndef materialize_execution_copy\(.*?\n\ndef collect_staged_workspace_changes",
+    materialize + "\n\ndef collect_staged_workspace_changes",
+    "materialize function",
+)
+collect = '''def collect_staged_workspace_changes(
+    *, settings: Settings, operation_id: str, normalized: NormalizedCommand
+) -> tuple[dict[str, bytes], set[str]]:
+    """Validate a disposable run tree and return its closed-world workspace delta."""
+    stage_root = (settings.data_dir / "approval-staging" / operation_id).resolve(strict=True)
+    manifest = json.loads((stage_root / "manifest.json").read_text(encoding="utf-8"))
+    mode = str(manifest.get("mode", ""))
+    if mode not in {"staged-workspace-write", "staged-sandbox-workspace-write"}:
+        return {}, set()
+    assert settings.sandbox_scratch_dir is not None
+    runtime_root = (settings.sandbox_scratch_dir / "runs" / operation_id).resolve(strict=True)
+    normalized_cwd = Path(normalized.cwd).resolve(strict=True)
+    normalized_cwd.relative_to(runtime_root)
+
+    if mode == "staged-sandbox-workspace-write":
+        staged_base = Path(str(manifest["staged_workspace"])).resolve(strict=True)
+        source_base = Path(str(manifest["source_workspace"])).resolve(strict=True)
+        run_base = (runtime_root / "workspace").resolve(strict=True)
+    else:
+        staged_base = Path(str(manifest["staged_cwd"])).resolve(strict=True)
+        source_base = Path(str(manifest["source_cwd"])).resolve(strict=True)
+        run_base = normalized_cwd
+
+    records: dict[str, dict[str, Any]] = {}
+    for record in manifest.get("inputs", []):
+        staged_path = Path(str(record["staged_path"])).resolve(strict=True)
+        try:
+            relative = staged_path.relative_to(staged_base).as_posix()
+        except ValueError:
+            continue
+        records[relative] = record
+    runtime_entry_limit = max(128, settings.approval_manifest_max_files * 4)
+    runtime_scan = scan_directory_bounded(
+        run_base,
+        stop_after_bytes=settings.approval_manifest_max_bytes,
+        stop_after_entries=runtime_entry_limit,
+        collect_files=True,
+        reject_alternate_streams=True,
+        reject_reparse_points=True,
+    )
+    if runtime_scan.entry_count > runtime_entry_limit:
+        raise RuntimeError("sandbox processing created too many runtime filesystem entries")
+    if runtime_scan.total_bytes > settings.approval_manifest_max_bytes:
+        raise RuntimeError("sandbox outputs exceed approval_manifest_max_bytes")
+    actual_files = {path.relative_to(run_base).as_posix() for path in runtime_scan.files}
+    changes: dict[str, bytes] = {}
+    deletions: set[str] = set()
+    changed_bytes = 0
+    workspace = Workspace(settings)
+    for relative in sorted(actual_files):
+        candidate = (run_base / Path(relative)).resolve(strict=True)
+        candidate.relative_to(run_base)
+        if candidate.is_symlink() or candidate.stat().st_nlink > 1:
+            raise PermissionError("sandbox output contains an unsafe file")
+        size = candidate.stat().st_size
+        if size > settings.max_write_bytes:
+            raise ValueError(f"sandbox output exceeds max_write_bytes: {relative}")
+        changed_bytes += size
+        if changed_bytes > settings.approval_manifest_max_bytes:
+            raise ValueError("sandbox outputs exceed approval_manifest_max_bytes")
+        data = candidate.read_bytes()
+        record = records.get(relative)
+        if (
+            record is not None
+            and sha256_bytes(data) == record["sha256"]
+            and len(data) == int(record["size"])
+        ):
+            continue
+        source = source_base / Path(relative)
+        workspace_relative = source.relative_to(workspace.root).as_posix()
+        workspace.resolve_planned_write(workspace_relative)
+        changes[workspace_relative] = data
+    for relative in sorted(set(records) - actual_files):
+        source = source_base / Path(relative)
+        workspace_relative = source.relative_to(workspace.root).as_posix()
+        workspace.resolve_existing(workspace_relative, allow_directory=False, access="write")
+        deletions.add(workspace_relative)
+    return changes, deletions
+'''
+text = regex_once(
+    text,
+    r"def collect_staged_workspace_changes\(.*?\n\ndef _copy_tree_bounded",
+    collect + "\n\ndef _copy_tree_bounded",
+    "collect function",
+)
+write(path, text)
+
+# server.py
+path = "src/windows_local_mcp/server.py"
+text = read(path)
+text = replace_once(
+    text,
+    "from .approval import prepare_approval_bundle, settings_digest",
+    "from .approval import (\n    is_project_controlled_code_loader,\n    prepare_approval_bundle,\n    settings_digest,\n)",
+    "server approval import",
+)
+normalize = '''        normalized = runtime.policy.normalize_host(
+            command=command, cwd=cwd, network_expected=network_required
+        )
+'''
+normalize_guard = '''        normalized = runtime.policy.normalize_host(
+            command=command, cwd=cwd, network_expected=network_required
+        )
+        executable_path = Path(normalized.executable).resolve(strict=True)
+        assert runtime.settings.sandbox_scratch_dir is not None
+
+        def executable_inside(root: Path) -> bool:
+            try:
+                executable_path.relative_to(root.resolve(strict=True))
+                return True
+            except ValueError:
+                return False
+
+        if execution_tier == "approved_host" and (
+            is_project_controlled_code_loader(normalized.program_key)
+            or executable_inside(runtime.settings.workspace_root)
+        ):
+            raise PermissionError(
+                "project-controlled code is not eligible for Approved Host; "
+                "use request_sandbox_command"
+            )
+        if execution_tier == "codex_sandbox" and any(
+            executable_inside(root)
+            for root in (
+                runtime.settings.workspace_root,
+                runtime.settings.data_dir,
+                runtime.settings.sandbox_scratch_dir,
+            )
+        ):
+            raise PermissionError(
+                "Codex Sandbox primary executable must be a trusted toolchain outside "
+                "workspace_root, data_dir, and sandbox_scratch_dir"
+            )
+'''
+text = replace_once(text, normalize, normalize_guard, "approved request guard")
+text = replace_once(
+    text,
+    "                normalized=normalized,\n                workspace_write=workspace_write,\n            )",
+    "                normalized=normalized,\n                workspace_write=workspace_write,\n                snapshot_workspace=execution_tier == \"codex_sandbox\",\n            )",
+    "snapshot request flag",
+)
+write(path, text)
+
+# config.py
+path = "src/windows_local_mcp/config.py"
+text = read(path)
+text = replace_once(
+    text,
+    "                for protected in (root, data)\n",
+    "                for protected in (root, data, scratch)\n",
+    "dependency protected roots",
+)
+text = replace_once(
+    text,
+    '                    "sandbox_dependency_readable_paths cannot overlap workspace_root, data_dir, "\n                    "or an ancestor of either"\n',
+    '                    "sandbox_dependency_readable_paths cannot overlap workspace_root, data_dir, "\n                    "sandbox_scratch_dir, or an ancestor of those roots"\n',
+    "dependency overlap message",
+)
+write(path, text)
+
+# sandbox_backend.py
+path = "src/windows_local_mcp/sandbox_backend.py"
+text = read(path)
+text = replace_once(text, "_WLMCP_ISOLATION_POLICY_VERSION = 1", "_WLMCP_ISOLATION_POLICY_VERSION = 2", "isolation policy")
+text = replace_once(text, "_SANDBOX_STATE_POLICY_VERSION = 1", "_SANDBOX_STATE_POLICY_VERSION = 2", "state policy")
+text = replace_once(
+    text,
+    '_ACCEPTED_RESIDUAL_RISK_PROPERTIES = frozenset(\n    {"protected_information_read", "lan"}\n)',
+    '_ACCEPTED_RESIDUAL_RISK_PROPERTIES = frozenset({"lan"})',
+    "accepted residual risk",
+)
+text = replace_once(
+    text,
+    '    "filesystem_write",\n    "internet",',
+    '    "filesystem_write",\n    "protected_information_read",\n    "internet",',
+    "mandatory protected read",
+)
+text = replace_once(
+    text,
+    '    "child_source_workspace_write_denied",\n    "child_outside_user_read_denied",\n    "child_control_plane_read_denied",',
+    '    "child_source_workspace_read_denied",\n    "child_source_workspace_write_denied",\n    "child_outside_user_read_denied",\n    "child_protected_information_denied",\n    "child_control_plane_read_denied",',
+    "child mandatory checks",
+)
+text = replace_once(
+    text,
+    '    "grandchild_source_workspace_write_denied",\n    "grandchild_outside_user_read_denied",\n    "grandchild_control_plane_read_denied",',
+    '    "grandchild_source_workspace_read_denied",\n    "grandchild_source_workspace_write_denied",\n    "grandchild_outside_user_read_denied",\n    "grandchild_protected_information_denied",\n    "grandchild_control_plane_read_denied",',
+    "grandchild mandatory checks",
+)
+text = replace_once(
+    text,
+    '        "version": 2,\n        "backend": backend.as_dict(),',
+    '        "version": 3,\n        "backend": backend.as_dict(),',
+    "isolation context version",
+)
+text = replace_once(text, '            "filesystem_policy_generation": 1,', '            "filesystem_policy_generation": 2,', "filesystem generation")
+text = replace_once(
+    text,
+    '            "source_workspace": "requested read-only with protected-path deny-read rules",',
+    '            "source_workspace": "denied; execution uses only the approved snapshot/run projection",',
+    "effective source policy",
+)
+state_pattern = r'''    cwd = cwd\.resolve\(strict=True\)\n    workspace = settings\.workspace_root\.resolve\(strict=True\)\n    entries: list\[dict\[str, Any\]\] = \[\n        _special_filesystem_entry\("minimal", "read"\),\n        _path_filesystem_entry\(workspace, "read"\),\n    \]\n    readable_roots = \[\n        Path\(command\[0\]\)\.resolve\(strict=True\)\.parent,\n        \*\(path\.resolve\(strict=True\) for path in settings\.sandbox_dependency_readable_paths\),\n    \]\n    seen: set\[str\] = set\(\)\n    for path in \[\*readable_roots, \*\(root\.resolve\(strict=True\) for root in writable_roots\)\]:\n        folded = os\.path\.normcase\(str\(path\)\)\n        if folded in seen:\n            continue\n        seen\.add\(folded\)\n        entries\.append\(\n            _path_filesystem_entry\(\n                path,\n                "write"\n                if any\(path == root\.resolve\(strict=True\) for root in writable_roots\)\n                else "read",\n            \)\n        \)\n    entries\.extend\(_protected_read_entries\(settings, workspace\)\)'''
+state_repl = '''    cwd = cwd.resolve(strict=True)
+    workspace = settings.workspace_root.resolve(strict=True)
+    data_dir = settings.data_dir.resolve(strict=True)
+    assert settings.sandbox_scratch_dir is not None
+    scratch = settings.sandbox_scratch_dir.resolve(strict=True)
+    protected_roots = (workspace, data_dir, scratch)
+    entries: list[dict[str, Any]] = [
+        _special_filesystem_entry("minimal", "read"),
+        _path_filesystem_entry(workspace, "deny"),
+        _path_filesystem_entry(data_dir, "deny"),
+    ]
+    readable_roots = [
+        Path(command[0]).resolve(strict=True).parent,
+        *(path.resolve(strict=True) for path in settings.sandbox_dependency_readable_paths),
+    ]
+
+    def overlaps_protected(path: Path) -> bool:
+        for protected in protected_roots:
+            try:
+                path.relative_to(protected)
+                return True
+            except ValueError:
+                pass
+            try:
+                protected.relative_to(path)
+                return True
+            except ValueError:
+                pass
+        return False
+
+    for path in readable_roots:
+        if overlaps_protected(path):
+            raise ApprovedSandboxUnavailable(
+                f"Sandbox readable dependency overlaps a protected root: {path}"
+            )
+    seen: set[str] = set()
+    for path in [*readable_roots, *(root.resolve(strict=True) for root in writable_roots)]:
+        folded = os.path.normcase(str(path))
+        if folded in seen:
+            continue
+        seen.add(folded)
+        entries.append(
+            _path_filesystem_entry(
+                path,
+                "write"
+                if any(path == root.resolve(strict=True) for root in writable_roots)
+                else "read",
+            )
+        )'''
+text = regex_once(text, state_pattern, state_repl, "sandbox state capability")
+write(path, text)
+
+# sandbox_live_verify.py
+path = "src/windows_local_mcp/sandbox_live_verify.py"
+text = read(path)
+text = replace_once(
+    text,
+    '        "filesystem_read": (\n            "source_read",\n            "outside_user_read_denied",',
+    '        "filesystem_read": (\n            "source_workspace_read_denied",\n            "outside_user_read_denied",',
+    "filesystem read requirements",
+)
+text = replace_once(
+    text,
+    '            "child_source_workspace_write_denied",\n            "child_outside_user_read_denied",',
+    '            "child_source_workspace_read_denied",\n            "child_source_workspace_write_denied",\n            "child_outside_user_read_denied",',
+    "child source read requirement",
+)
+text = replace_once(
+    text,
+    '            "grandchild_source_workspace_write_denied",\n            "grandchild_outside_user_read_denied",',
+    '            "grandchild_source_workspace_read_denied",\n            "grandchild_source_workspace_write_denied",\n            "grandchild_outside_user_read_denied",',
+    "grandchild source read requirement",
+)
+text = replace_once(
+    text,
+    '    prepare_canary("source_read", source_canary, "source-readable-canary")',
+    '    prepare_canary(\n        "source_workspace_read_denied", source_canary, "source-readable-canary"\n    )',
+    "source canary name",
+)
+text = regex_once(
+    text,
+    r'''            if canary_ready\.get\("source_read"\):.*?            _set_check\(checks, check_reasons, "source_read", value, reason\)\n\n''',
+    "",
+    "remove source positive read",
+)
+text = replace_once(
+    text,
+    '            value, reason = denied_access_probe(\n                "source_workspace_write_denied", source_write_target, "write"\n            )',
+    '            value, reason = denied_access_probe(\n                "source_workspace_read_denied", source_canary, "read"\n            )\n            _set_check(\n                checks, check_reasons, "source_workspace_read_denied", value, reason\n            )\n            value, reason = denied_access_probe(\n                "source_workspace_write_denied", source_write_target, "write"\n            )',
+    "parent source read probe",
+)
+text = replace_once(
+    text,
+    '            descendant_check_names = (\n                "source_workspace_write_denied",',
+    '            descendant_check_names = (\n                "source_workspace_read_denied",\n                "source_workspace_write_denied",',
+    "descendant source read name",
+)
+text = replace_once(
+    text,
+    '                    filesystem = {\n                        "source_workspace_write_denied": ("write", str(write_target)),',
+    '                    filesystem = {\n                        "source_workspace_read_denied": ("read", str(source_canary)),\n                        "source_workspace_write_denied": ("write", str(write_target)),',
+    "descendant source read probe",
+)
+write(path, text)
+
+# tests/test_approval.py
+path = "tests/test_approval.py"
+text = read(path)
+marker = '''    with pytest.raises(RuntimeError, match="workspace behavior inputs changed"):
+        verify_approval_bundle(
+            settings=settings, operation_id="new-directory", expected_digest=digest
+        )
+'''
+extra = marker + '''
+
+def test_sandbox_snapshot_preserves_workspace_relative_siblings(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    app = settings.workspace_root / "app"
+    shared = settings.workspace_root / "shared"
+    app.mkdir()
+    shared.mkdir()
+    (app / "main.py").write_text("print('main')", encoding="utf-8")
+    (shared / "payload.py").write_text("print('shared')", encoding="utf-8")
+    command = make_command(make_executable(tmp_path), app, ["main.py"])
+
+    _, manifest, digest = prepare_approval_bundle(
+        settings=settings,
+        workspace=Workspace(settings),
+        operation_id="sandbox-workspace",
+        normalized=command,
+        snapshot_workspace=True,
+    )
+    assert manifest["mode"] == "staged-sandbox-workspace"
+    staged_workspace = Path(str(manifest["staged_workspace"]))
+    assert (staged_workspace / "app" / "main.py").is_file()
+    assert (staged_workspace / "shared" / "payload.py").is_file()
+
+    verified = verify_approval_bundle(
+        settings=settings,
+        operation_id="sandbox-workspace",
+        expected_digest=digest,
+    )
+    runtime = materialize_execution_copy(
+        settings=settings,
+        operation_id="sandbox-workspace",
+        normalized=verified,
+    )
+    run_cwd = Path(runtime.cwd)
+    run_workspace = run_cwd.parent
+    assert run_cwd.name == "app"
+    assert (run_workspace / "shared" / "payload.py").read_text(encoding="utf-8") == "print('shared')"
+
+
+def test_sandbox_workspace_write_collects_sibling_delta(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path)
+    app = settings.workspace_root / "app"
+    shared = settings.workspace_root / "shared"
+    app.mkdir()
+    shared.mkdir()
+    (app / "main.py").write_text("print('main')", encoding="utf-8")
+    (shared / "payload.txt").write_text("before", encoding="utf-8")
+    command = make_command(make_executable(tmp_path), app, ["main.py"])
+    _, _manifest, digest = prepare_approval_bundle(
+        settings=settings,
+        workspace=Workspace(settings),
+        operation_id="sandbox-workspace-write",
+        normalized=command,
+        workspace_write=True,
+        snapshot_workspace=True,
+    )
+    verified = verify_approval_bundle(
+        settings=settings,
+        operation_id="sandbox-workspace-write",
+        expected_digest=digest,
+    )
+    runtime = materialize_execution_copy(
+        settings=settings,
+        operation_id="sandbox-workspace-write",
+        normalized=verified,
+    )
+    run_workspace = Path(runtime.cwd).parent
+    (run_workspace / "shared" / "payload.txt").write_text("after", encoding="utf-8")
+    changes, deletions = collect_staged_workspace_changes(
+        settings=settings,
+        operation_id="sandbox-workspace-write",
+        normalized=runtime,
+    )
+    assert changes == {"shared/payload.txt": b"after"}
+    assert deletions == set()
+'''
+text = replace_once(text, marker, extra, "approval snapshot tests")
+write(path, text)
+
+# tests/test_sandbox_architecture.py
+path = "tests/test_sandbox_architecture.py"
+text = read(path)
+text = replace_once(
+    text,
+    '    assert {\n        "path": {"type": "path", "path": str(settings.workspace_root.resolve())},\n        "access": "read",\n    } in entries',
+    '    assert {\n        "path": {"type": "path", "path": str(settings.workspace_root.resolve())},\n        "access": "deny",\n    } in entries\n    assert not any(\n        entry.get("access") == "read"\n        and entry.get("path") == {\n            "type": "path",\n            "path": str(settings.workspace_root.resolve()),\n        }\n        for entry in entries\n    )',
+    "workspace deny state",
+)
+text = regex_once(
+    text,
+    r'''    patterns = \{.*?    assert all\(str\(Path\.home\(\)\) not in str\(entry\) for entry in entries\)''',
+    '    assert all(str(Path.home()) not in str(entry) for entry in entries)',
+    "obsolete protected globs",
+)
+text = replace_once(text, '            "source_read": True,', '            "source_workspace_read_denied": True,', "property source read")
+text += '''
+
+def test_sandbox_dependency_read_root_cannot_overlap_scratch(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    data = tmp_path / "data"
+    scratch = tmp_path / "scratch"
+    with pytest.raises(ValidationError, match="sandbox_scratch_dir"):
+        Settings(
+            workspace_root=workspace,
+            data_dir=data,
+            sandbox_scratch_dir=scratch,
+            sandbox_dependency_readable_paths=[scratch / "dependency"],
+            protect_data_dir_acl=False,
+        )
+'''
+write(path, text)
+
+# tests/test_server_operations.py
+path = "tests/test_server_operations.py"
+text = read(path)
+text = replace_once(
+    text,
+    "def test_approved_sandbox_and_host_are_distinct_requests(",
+    "def test_sandbox_is_snapshot_only_and_host_rejects_project_code_loaders(",
+    "server policy test name",
+)
+old_host = '''    assert sandbox_record["request"]["effective_sandbox_policy"]["network_policy"][
+        "internet"
+    ] == "deny"
+
+    host = server.request_host_command(
+        [sys.executable, "-c", "print('host')"],
+        reason="explicit host-only operation",
+    )
+    host_record = server.runtime.audit.get_operation(host["approval_id"])
+    assert host_record["tier"] == "approved_host"
+    assert host_record["request"]["sandbox_backend"] is None
+'''
+new_host = '''    assert sandbox_record["request"]["effective_sandbox_policy"]["network_policy"][
+        "internet"
+    ] == "deny"
+    assert sandbox_record["request"]["approval_manifest_summary"]["mode"] == (
+        "staged-sandbox-workspace"
+    )
+
+    with pytest.raises(PermissionError, match="request_sandbox_command"):
+        server.request_host_command(
+            [sys.executable, "-c", "print('host')"],
+            reason="project-controlled Python must stay in Sandbox",
+        )
+
+    workspace_executable = server.runtime.settings.workspace_root / "project-tool.exe"
+    workspace_executable.write_bytes(b"project executable")
+    with pytest.raises(PermissionError, match="trusted toolchain"):
+        server.request_sandbox_command(
+            [str(workspace_executable)],
+            reason="workspace executable must not become a Sandbox read capability",
+        )
+'''
+text = replace_once(text, old_host, new_host, "server policy assertions")
+write(path, text)
+
+# SECURITY_CONTRACT.md
+path = "SECURITY_CONTRACT.md"
+text = read(path)
+needle = "場合は本契約の Broker boundary を満たす metadata confinement と回帰／実機検証を先に要求します。\n"
+insert = needle + "\n同日追加改訂では、承認済み Codex Sandbox の open-ended／project-controlled execution を\nimmutable snapshot/run projection だけから実行する境界へ強化します。original `workspace_root` は\nSandbox parent／child／grandchild から read／write とも OS capability で到達不能であることを必須とし、\ntrusted toolchain と明示設定した external dependency だけを追加 read capability として許可します。\nApproved Host は同一 Windows user authority のためこの filesystem isolation を提供できず、project-controlled\ncode-loader または workspace 内 executable を Approved Host で実行しません。\n"
+text = replace_once(text, needle, insert, "contract revision")
+text = replace_once(
+    text,
+    "- source workspace を read-only と表示する場合、実効 OS capability でも write できない",
+    "- original source workspace を Sandbox parent／child／grandchild が read／write できない\n- project-controlled execution は承認済み immutable snapshot から作成した operation 固有 run projection だけを使用し、trusted toolchain と明示的 external dependency 以外の ambient filesystem read capability を持たない",
+    "contract source boundary",
+)
+text = regex_once(
+    text,
+    r"個人利用 v1 では、次の 2 点を明示的に受容する残存 risk とし、それ単独を理由に Sandbox route を\nunavailable にしません。\n\n- workspace 内に存在する `.env`、credential、secret 等の protected information を Sandbox process または\n  child／grandchild が直接読み取れる場合があること\n- Sandbox process または child／grandchild が LAN／private network 上の endpoint へ接続できる場合があること",
+    "個人利用 v1 では、Sandbox process または child／grandchild が LAN／private network 上の endpoint へ\n接続できる場合があることだけを明示的に受容する残存 risk とし、それ単独を理由に Sandbox route を\nunavailable にしません。source workspace／workspace 内 protected information の direct read は受容済み risk\nではなく必須遮断境界です。",
+    "contract residual risks",
+)
+text = replace_once(
+    text,
+    "- workspace 内 protected information は Sandbox staging へ自動追加しませんが、open-ended execution が\n  source workspace の実体を直接読める場合に `.env`、credential、secret の read denial が成立しないことを、\n  個人利用 v1 の受容済み残存 risk とします。この状態を「secret が Sandbox から読めない」と表示しません。",
+    "- workspace 内 protected information は Sandbox staging へ自動追加せず、original source workspace 自体を\n  parent／child／grandchild の実効 OS capability から read deny にします。snapshot に含めない protected file を\n  live workspace から補う経路は認めません。",
+    "contract protected info",
+)
+text = replace_once(
+    text,
+    "### E. Approved Host boundary\n\n- Codex Sandbox とは別の one-shot human approval を必要とします。\n",
+    "### E. Approved Host boundary\n\n- Codex Sandbox とは別の one-shot human approval を必要とします。\n- project-controlled code-loader と workspace 内 executable は Approved Host で受理せず、Codex Sandbox の snapshot-only route を要求します。\n",
+    "contract host restriction",
+)
+write(path, text)
+
+# SPEC.md
+path = "SPEC.md"
+text = read(path)
+text = regex_once(
+    text,
+    r"### Project-controlled tools\n\n.*?\n### ADB",
+    """### Project-controlled tools
+
+- Python、Node、PowerShell、Dart、Flutter、project scripts、plugins、tests、builds、formatting 等の project-controlled code-loader は Codex Sandbox 専用です。
+- Codex Sandbox は original `workspace_root` を filesystem capability として受け取りません。承認時に bounded な workspace projection を snapshot 化し、実行時は operation 固有の writable run copy だけを使用します。
+- trusted toolchain executable と `sandbox_dependency_readable_paths` で明示した workspace／data／scratch 外 dependency だけを追加 read root として許可します。
+- Approved Host は同一 Windows user authority のため source-workspace read isolation を保証できません。したがって project-controlled code-loader と workspace 内 executable は Host request で拒否します。Sandbox failure から Host への fallback はありません。
+
+### ADB""",
+    "spec project tools",
+)
+text = regex_once(
+    text,
+    r"### Execution lock policy\n\n.*?\n## 5\. Approval and immutable execution",
+    """### Execution lock policy
+
+Approved execution は承認時 snapshot の整合性確保と Broker mutation の defense-in-depth のため workspace-wide mutation lock を使用します。Codex Sandbox の実行中に original workspace を読めないことの主境界は、この cooperative lock ではなく Sandbox の実効 OS filesystem capability です。lock を知らない同一-user process が original workspace を変更しても、Sandbox child は変更後 bytes を参照できません。
+
+- snapshot／manifest 作成は workspace-wide lock 下で coherent input set を取得します。
+- Approved Sandbox／Approved Host は実行前 binding 検証から child／descendant 終了まで workspace-wide Broker mutation lock を保持します。
+- `write_file` は target slot を使用するため、workspace-wide approved execution と必ず競合します。
+- non-cooperating process に対する source isolation は Codex Sandbox の source-workspace deny で担保し、Approved Host には同じ保証を表示しません。
+
+## 5. Approval and immutable execution""",
+    "spec lock policy",
+)
+text = regex_once(
+    text,
+    r"### Snapshot mode\n\n.*?\n### Source-write mode",
+    """### Snapshot mode
+
+Codex Sandbox の open-ended execution は program 名の allowlist に依存せず、原則として bounded な workspace-wide snapshot projection から実行します。projection は original workspace の相対 layout と requested cwd を保持し、worker は immutable projection を検証後、operation 固有の writable `runs/<operation>/workspace` へ materialize します。
+
+- original `workspace_root` は Sandbox filesystem policy で parent／child／grandchildから read／write deny にする。
+- workspace-relative argv は snapshot/run projection へ書き換える。source absolute path が code 本文に残っていても original workspace は OS capability で読めない。
+- `.git`、`.env` 等の protected file、`.venv`、`node_modules`、`build`、`__pycache__` は ordinary snapshot へ自動追加しない。
+- Dart／Flutter の file package dependency は既存の bounded dependency staging と package-config rewrite を維持する。
+- trusted toolchain primary executable は workspace／data／scratch 外に置き、明示的 external dependency もこれら protected root と重ならないことを設定時と policy construction 時に検査する。
+- file count、byte count、scratch quota、reparse／hardlink／ADS 等の既存 bound を越える projection は fail closed にする。
+
+Sandbox filesystem policy generation の変更は live-verification context digest を変更し、旧 marker を stale にします。新 policy では `source_workspace_read_denied` と protected-information denial を親・child・grandchildで実測し、必須境界が成立しない installed backend では route を unavailable にします。
+
+### Source-write mode""",
+    "spec snapshot mode",
+)
+text = regex_once(
+    text,
+    r"### Source-write mode\n\n.*?\n### Expiry and one-shot semantics",
+    """### Source-write mode
+
+Codex Sandbox の `workspace_write=true` も original workspace 上では実行しません。同じ full snapshot projection の writable run copy を処理し、終了後に bounded output tree を検査して workspace-relative delta を抽出します。Broker は承認時 source binding と workspace-wide lock を保持したまま transaction／commit-time validation を通して delta を original workspace へ反映します。source workspace の追加・削除・content change が approval 後に発生した場合は commit 前に fail closed します。
+
+Approved Host の non-project-code-loader operation は real Windows user authority が必要な場合に限り別承認で利用できますが、Codex Sandbox と同じ source-read isolation を保証しません。
+
+### Expiry and one-shot semantics""",
+    "spec source-write mode",
+)
+write(path, text)
+
+# README.md
+path = "README.md"
+text = read(path)
+text = replace_once(
+    text,
+    "   - 任意コード、project script／plugin、test／build、一般コマンドなど、WLMCP だけで副作用を閉じにくい処理を実行します。\n   - 利用にはローカル承認と、この PC での Sandbox 実機検証成功が必要です。失敗時に Host へ自動移行しません。",
+    "   - 任意コード、project script／plugin、test／build、一般コマンドなど、WLMCP だけで副作用を閉じにくい処理を実行します。\n   - 承認済み workspace snapshot から作った operation 固有 run copy だけを project filesystem として使用し、original `workspace_root` は parent／child／grandchild から read／write とも拒否します。\n   - 利用にはローカル承認と、この PC での Sandbox 実機検証成功が必要です。失敗時に Host へ自動移行しません。",
+    "README Sandbox summary",
+)
+text = replace_once(
+    text,
+    "   - 実際の Windows ユーザー権限が必要な処理だけを、Sandbox とは別の承認で 1 回実行します。\n   - OS、ネットワーク、device、`.git`、外部サービス等への作用は workspace checkpoint だけでは戻せません。",
+    "   - 実際の Windows ユーザー権限が必要な処理だけを、Sandbox とは別の承認で 1 回実行します。\n   - project-controlled code-loader と workspace 内 executable は受理せず、`request_sandbox_command` を要求します。\n   - OS、ネットワーク、device、`.git`、外部サービス等への作用は workspace checkpoint だけでは戻せません。",
+    "README Host summary",
+)
+text = replace_once(
+    text,
+    "Live verificationは、各propertyを`verified`、`failed`、`unverified`の三値で保存します。`failed`は実際のprobeが境界脱出を観測した場合だけ、`unverified`は起動失敗、タイムアウト、listenerまたはprobe環境の準備失敗、出力を測定できない場合に使います。workspace内のprotected-information readとLAN accessは、個人利用v1の受容済み残存riskとして`failed`の事実を保持・表示しつつ、それ単独ではSandbox routeを利用不可にしません。その他の必須境界に`failed`または`unverified`があればrouteは利用不可のままであり、Approved Hostへ自動移行しません。",
+    "Live verificationは、各propertyを`verified`、`failed`、`unverified`の三値で保存します。`failed`は実際のprobeが境界脱出を観測した場合だけ、`unverified`は起動失敗、タイムアウト、listenerまたはprobe環境の準備失敗、出力を測定できない場合に使います。LAN accessだけを個人利用v1の受容済み残存riskとして分離します。original workspace の read/write denial と workspace 内 protected-information read denial は必須境界で、親・child・grandchildのいずれかで成立しなければSandbox routeは利用不可です。Approved Hostへ自動移行しません。",
+    "README residual risk",
+)
+text = replace_once(
+    text,
+    "検証器は親・child・grandchildのfilesystem／network境界に加え、process数上限とprocess-tree memory上限の超過、違反時の全子孫停止、終了状態回収まで実測します。独立probeが例外になった場合、そのprobeを `unverified` として残し、安全に続行できる残りのprobeを継続します。受容済み残存riskであるworkspace内のprotected-information readとLAN accessは、親・child・grandchildでの`failed`を保持・表示したままroute判定から分離します。それ以外の必須境界がすべて`verified`の場合に限りSandbox経路を利用でき、利用できない場合もApproved Hostへ自動移行しません。",
+    "検証器は親・child・grandchildのfilesystem／network境界に加え、process数上限とprocess-tree memory上限の超過、違反時の全子孫停止、終了状態回収まで実測します。独立probeが例外になった場合、そのprobeを `unverified` として残し、安全に続行できる残りのprobeを継続します。source workspace read/write と protected-information read の denial は親・child・grandchildすべてで必須です。LAN accessだけは受容済み残存riskとして`failed`を保持・表示したままroute判定から分離します。その他の必須境界がすべて`verified`の場合に限りSandbox経路を利用でき、利用できない場合もApproved Hostへ自動移行しません。",
+    "README verifier boundary",
+)
+write(path, text)
+
+# VERIFICATION.md
+path = "VERIFICATION.md"
+text = read(path)
+section = '''# 検証記録
+
+## 2026-08-26 Sandbox snapshot-only source isolation
+
+- Codex Sandbox の filesystem policy から original `workspace_root` の read capability を除去し、source workspace／`data_dir` を明示 deny、operation 固有 run projection だけを write root とする設計へ変更した。
+- open-ended Sandbox request は code-loader 名に依存せず bounded な full workspace projection を承認時に snapshot 化し、worker は immutable projection の検証後に writable run copy へ materialize する。workspace-relative cwd／sibling layout を維持する。
+- Approved Host は project-controlled code-loader と workspace 内 primary executable を request 時点で拒否する。
+- Sandbox isolation/state policy generation と isolation-context version を更新したため、旧 live-verification marker は意図的に stale になる。新 route は通常 Windows user 文脈で `verify-codex-sandbox` を再実行し、parent／child／grandchild の `source_workspace_read_denied`、source write denial、protected-information denialを含む必須 property が実測されるまで fail closed のままとする。
+- GitHub Hosted Windows で unit／integration／policy regression、Ruff、compileall を実行する。Hosted runner は installed production Codex Windows Sandbox の通常 user 実機境界ではないため、新しい source-read denial の OS-level 成立をそこで証明したとは扱わない。
+
+'''
+text = replace_once(text, "# 検証記録\n", section, "verification section")
+write(path, text)
