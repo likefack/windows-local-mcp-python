@@ -17,12 +17,18 @@ from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any
 
+from mcp.server.mcpserver.exceptions import ToolError
+
 from .paths import Workspace, read_verified_bytes, release_verified_hold
 
 # Request defaults remain below the configured ceilings. The effective per-file boundary
 # always remains ``settings.max_text_file_bytes``.
 _DEFAULT_READ_FILES = 32
 _DEFAULT_SEARCH_RESULTS = 100
+
+
+class WorkspaceEntryLimitExceededError(ValueError, ToolError):
+    """Traversal bound rejection that is intentionally safe to surface to MCP clients."""
 
 
 def _setting(settings: Any, name: str, default: int) -> int:
@@ -144,7 +150,9 @@ def _bounded_entries(directory: Path, remaining: int) -> list[os.DirEntry[str]]:
     """Read at most ``remaining + 1`` names so an entry-limit breach is fail closed."""
 
     if remaining < 0:
-        raise ValueError("workspace entry limit exceeded")
+        raise WorkspaceEntryLimitExceededError(
+            "workspace entry limit exceeded; increase max_entries or narrow path/max_depth"
+        )
     with os.scandir(directory) as scanner:
         entries: list[os.DirEntry[str]] = []
         for _ in range(remaining + 1):
@@ -153,7 +161,9 @@ def _bounded_entries(directory: Path, remaining: int) -> list[os.DirEntry[str]]:
                 break
             entries.append(entry)
     if len(entries) > remaining:
-        raise ValueError("workspace entry limit exceeded")
+        raise WorkspaceEntryLimitExceededError(
+            "workspace entry limit exceeded; increase max_entries or narrow path/max_depth"
+        )
     return sorted(entries, key=lambda item: item.name.casefold())
 
 
