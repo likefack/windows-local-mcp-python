@@ -158,6 +158,27 @@ Tunnel state は `server_runtime_kind=approved_host`、運用用 `run-server.ps1
 
 ## Windows live verification
 
+### 開発用環境を参照して利用できない場合
+
+`configured=true`／`enabled=true` でも、`runtime_preflight` が
+`Approved Host requires an immutable Python/WLMCP runtime` と開発フォルダーを示す場合は、
+接続中のサーバーが変更可能なコードを読み込んでいます。開発フォルダーの書き込み権限を
+取り上げたり、変更不能性の検査を省略したりせず、運用用実行環境へ接続先を変更します。
+
+1. Program Files 配下の既存環境と監視サービスを確認します。運用用コードが古い場合は、
+   active／recovery 状態がないことを確認し、管理者用インストーラーの `-Replace` で更新します。
+2. 通常ユーザーで変更不能性と認証付き authority preflight を検証します。
+3. Tunnel を停止し、設定ウィザードの運用 runtime 設定で接続先を変更して再起動します。
+4. 以前の承認画面が残っている場合は閉じ、インストール済み `run-approvals.ps1` を
+   サーバーと同じ config で起動します。画面の存在だけでは実行元の一致を確認できません。
+5. 接続経由の `session_info` で `available=true`／`execution_route_available=true`、
+   runtime／authority preflight の成功を確認します。その後、読み取り専用コマンドの
+   `request_host_command` が承認IDを発行し、本人のローカル承認後に完了することを確認します。
+
+実行環境の更新は Sandbox／Automatic Git の検証状態にも影響します。更新後は各経路を
+個別に確認し、再検証の失敗を Approved Host の成功で代替しません。
+preflight 成功と承認ID発行だけでは、承認後の実行・監視・異常終了・復旧の検証完了とはしません。
+
 ### Normal path
 
 通常 runtime user の非昇格 PowerShell から実行します。
