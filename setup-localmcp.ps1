@@ -1,7 +1,13 @@
-﻿[CmdletBinding()]
+﻿[CmdletBinding(DefaultParameterSetName = "Interactive")]
 param(
     # 回帰テストでは対話 UI を起動せず、設定関数だけを読み込みます。
-    [switch]$FunctionsOnly
+    [Parameter(ParameterSetName = "Functions")]
+    [switch]$FunctionsOnly,
+    # インストール済み運用環境と既存 Tunnel の結び付けだけを更新します。
+    [Parameter(Mandatory = $true, ParameterSetName = "Refresh")]
+    [switch]$RefreshApprovedHostTunnel,
+    [Parameter(ParameterSetName = "Refresh")]
+    [string]$Config = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -810,7 +816,8 @@ function Configure-ApprovedHostRuntimeForSetup {
         [Parameter(Mandatory = $true)][string]$PythonPath,
         [Parameter(Mandatory = $true)][string]$ConfigPath,
         [Parameter(Mandatory = $true)][object]$Context,
-        [AllowNull()][object]$TunnelState
+        [AllowNull()][object]$TunnelState,
+        [string]$InstallRoot = ""
     )
 
     Assert-TunnelNotRunning -State $TunnelState
@@ -821,9 +828,12 @@ function Configure-ApprovedHostRuntimeForSetup {
         throw "Approved Host 運用 runtime へ切り替えるには、Credential Manager を使用する managed Tunnel 設定が必要です。"
     }
 
-    $defaultInstallRoot = Join-Path $env:ProgramFiles "WindowsLocalMCP"
-    $inputRoot = (Read-Host "Approved Host の運用 runtime（空欄で $defaultInstallRoot）").Trim().Trim('"')
-    $installRoot = if ([string]::IsNullOrWhiteSpace($inputRoot)) { $defaultInstallRoot } else { [IO.Path]::GetFullPath($inputRoot) }
+    if ([string]::IsNullOrWhiteSpace($InstallRoot)) {
+        $defaultInstallRoot = Join-Path $env:ProgramFiles "WindowsLocalMCP"
+        $inputRoot = (Read-Host "Approved Host の運用 runtime（空欄で $defaultInstallRoot）").Trim().Trim('"')
+        $InstallRoot = if ([string]::IsNullOrWhiteSpace($inputRoot)) { $defaultInstallRoot } else { $inputRoot }
+    }
+    $installRoot = [IO.Path]::GetFullPath($InstallRoot)
     $candidateState = [PSCustomObject]@{
         server_runtime_kind = "approved_host"
         server_script_path = Join-Path $installRoot "run-server.ps1"
@@ -882,6 +892,34 @@ function Configure-ApprovedHostRuntimeForSetup {
     } finally {
         if ($null -ne $credential) { $credential.Dispose() }
     }
+}
+
+function Update-ApprovedHostTunnelForSetup {
+    param([string]$Config = "")
+
+    # 通常起動と同じ active config を使い、選択ファイルを書き換えません。
+    if ([string]::IsNullOrWhiteSpace($Config)) {
+        if (Test-Path -LiteralPath $SelectorPath -PathType Leaf) {
+            $Config = (Get-Content -Raw -Encoding UTF8 -LiteralPath $SelectorPath).Trim()
+        }
+        if ([string]::IsNullOrWhiteSpace($Config)) { $Config = $DefaultConfigPath }
+    }
+    if (-not (Test-Path -LiteralPath $Config -PathType Leaf)) {
+        throw "設定ファイルが見つかりません。-Config で既存 config.toml を指定してください。"
+    }
+    $resolvedConfig = (Resolve-Path -LiteralPath $Config).Path
+    $state = Get-TunnelStateForConfig -ConfigPath $resolvedConfig
+    if ($null -eq $state -or [string]$state.server_runtime_kind -ne "approved_host" -or
+        [string]::IsNullOrWhiteSpace([string]$state.server_script_path)) {
+        throw "Approved Host 運用 runtime を使用する既存 Tunnel 設定が必要です。初回設定は対話メニューで行ってください。"
+    }
+    Assert-TunnelNotRunning -State $state
+    $python = Find-Python
+    if ($null -eq $python) { throw "設定確認用の Python が見つかりません。" }
+    $context = Get-TunnelConfigContext -PythonPath $python.Path -ConfigPath $resolvedConfig
+    # 対話メニューと同じ runtime／authority／doctor 検証、保存・復元処理を通します。
+    Configure-ApprovedHostRuntimeForSetup -PythonPath $python.Path -ConfigPath $resolvedConfig `
+        -Context $context -TunnelState $state -InstallRoot (Split-Path -Parent ([string]$state.server_script_path))
 }
 
 function Read-DataDirectoryPath {
@@ -2161,6 +2199,15 @@ if ($FunctionsOnly) {
 }
 
 try {
+    if ($RefreshApprovedHostTunnel) {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+        if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            throw "接続設定の更新は、管理者ではない通常の PowerShell で実行してください。"
+        }
+        Update-ApprovedHostTunnelForSetup -Config $Config
+        exit 0
+    }
     Write-Title "Windows Local MCP セットアップ"
     Write-Host "この画面は、初回セットアップと現在の設定の確認・変更を行う入口です。"
     Write-Host "通常のサーバーは管理者権限で起動しません。"

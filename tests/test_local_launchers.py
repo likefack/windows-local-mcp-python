@@ -361,6 +361,30 @@ def test_run_launcher_delegates_selector_handling_to_powershell() -> None:
     assert "active-config.txt" not in script
     assert "run-server.ps1" not in script
     assert "start-localmcp.bat" not in script
+    assert "pause" in script
+    assert "WLMCP_NO_PAUSE" in script
+    assert 'if "%EXIT_CODE%"=="0" goto :startup_finished' in script
+    assert script.index("\n:startup_finished\n") < script.index("pause")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="cmd.exe launcher is Windows-only")
+def test_run_launcher_can_return_configuration_failure_without_pause(
+    tmp_path: Path,
+) -> None:
+    environment = os.environ.copy()
+    environment["LOCALAPPDATA"] = str(tmp_path / "local-app-data")
+    environment["WLMCP_NO_PAUSE"] = "1"
+    completed = subprocess.run(
+        ["cmd.exe", "/d", "/c", str(_REPOSITORY_ROOT / "run-localmcp.bat")],
+        cwd=_REPOSITORY_ROOT,
+        capture_output=True,
+        timeout=30,
+        check=False,
+        shell=False,
+        env=environment,
+    )
+    assert completed.returncode == 2
+    assert b"Windows Local MCP startup failed" in completed.stderr
 
 
 def test_setup_wizard_preserves_security_relevant_setup_contract() -> None:
@@ -455,6 +479,34 @@ def test_run_launcher_preserves_tunnel_fail_closed_and_direct_compatibility() ->
     assert "windows_local_mcp.activity_monitor" in script
     assert "二重起動を避けるため停止します" in script
     assert "Tunnel を迂回" not in script
+
+
+def test_run_launcher_reclick_accepts_only_verified_ready_tunnel() -> None:
+    script = (_REPOSITORY_ROOT / "run-localmcp.ps1").read_text(encoding="utf-8-sig")
+
+    mutex_busy = script.index("if (-not $hasMutex)")
+    mutex_owner = script.index("# 初回起動または mutex を安全に取得できた", mutex_busy)
+    busy_branch = script[mutex_busy:mutex_owner]
+
+    assert "Wait-TunnelReady" in busy_branch
+    assert "Get-TunnelProcessStatus" in busy_branch
+    assert '$ready.Ready -and $status.Status -eq "running"' in busy_branch
+    assert "Tunnel は既に起動済み" in busy_branch
+    assert '$existingTunnelPid = [int]$status.ProcessId' in busy_branch
+    assert "二重起動を避けるため停止します" in busy_branch
+    assert "Start-TunnelClientProcess" not in busy_branch
+    assert "Invoke-TunnelClientDoctor" not in busy_branch
+    assert "Get-TunnelCredentialSecure" not in busy_branch
+    assert script.index("if (-not $hasMutex)") < script.index("Invoke-TunnelClientDoctor")
+
+    attach_branch = script[script.index("if ($null -ne $existingTunnelPid)"):]
+    assert 'if ($env:WLMCP_NO_PAUSE -eq "1")' in attach_branch
+    assert "Start-LocalMcpActivityMonitor -PythonPath $pythonPath -ConfigPath $resolvedConfig -StdoutOnly" in attach_branch
+    assert 'if ($StdoutOnly) { $startInfo.Arguments += " --stdout-only" }' in script
+    assert "Start-LocalMcpApprovalUi" in attach_branch
+    assert "Wait-LocalMcpExistingTunnel -ProcessId $existingTunnelPid" in attach_branch
+    assert "WaitForExit(1000)" in script
+    assert 'throw "既存の Tunnel client は起動中ですが、ローカル ready 応答を確認できません。"' in script
 
 
 def test_stdio_startup_guidance_is_written_only_to_stderr() -> None:

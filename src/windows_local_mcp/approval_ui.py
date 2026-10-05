@@ -168,6 +168,8 @@ def run_approval_ui(settings: Settings | None = None) -> None:
         "Live activity: Read / Edited / Running / Finished / Approval / Uploaded / "
         "Downloaded / Failed / Rejected / Interrupted / Cancelled / Undone / Rolled back"
     )
+    print("局所変更は完全な差分、一括処理は変更件数・概要・所要時間を表示します。")
+    print("全変更: operation_changes(operation_id) / 操作の取り消し: request_selective_undo(operation_id)")
     print("Pending approvals: y=approve and run once, n=reject, s=skip, q=quit")
 
     stop_activity = threading.Event()

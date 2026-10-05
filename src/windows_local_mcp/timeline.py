@@ -17,6 +17,12 @@ _TRANSFER_CHUNK_EVENTS = {
 }
 
 
+def _change_count(result: Any, key: str, paths: list[Any]) -> int:
+    # 監査のパス一覧は件数上限で短縮される。実変更件数は別に記録した集計値を使う。
+    count = result.get(key) if isinstance(result, dict) else None
+    return count if type(count) is int and count >= 0 else len(paths)
+
+
 def _transfer_display_state(operation: dict[str, Any]) -> tuple[str, str | None, str]:
     """Derive the user-visible transfer lifecycle from durable chunk events.
 
@@ -116,6 +122,14 @@ def timeline_entry(settings: Settings, audit: AuditStore, operation_id: str) -> 
     display_status, display_finished_at, _display_time = _transfer_display_state(operation)
     entry = {
         "operation_id": operation["id"],
+        # 発行元は記録済みの値だけを返し、旧行を現在の接続情報で補完しない。
+        "session_id": operation.get("session_id"),
+        "server_instance_id": operation.get("server_instance_id"),
+        "origin_scope": operation.get("origin_scope"),
+        "client_name": operation.get("client_name"),
+        "client_version": operation.get("client_version"),
+        "request_id": operation.get("request_id"),
+        "task_id": operation.get("task_id"),
         "created_at": operation["created_at"],
         "finished_at": display_finished_at,
         "tool": operation["tool_name"],
@@ -131,12 +145,26 @@ def timeline_entry(settings: Settings, audit: AuditStore, operation_id: str) -> 
         "stdout_preview": result.get("stdout_preview", "") if isinstance(result, dict) else "",
         "stderr_preview": result.get("stderr_preview", "") if isinstance(result, dict) else "",
         "changed_files": changed,
-        "changed_file_count": len(changed),
+        "changed_file_count": _change_count(result, "changed_file_count", changed),
         "changed_directories": changed_directories,
-        "changed_directory_count": len(changed_directories),
+        "changed_directory_count": _change_count(
+            result, "changed_directory_count", changed_directories
+        ),
+        "changed_file_list_truncated": _change_count(result, "changed_file_count", changed) > len(changed),
+        "changed_directory_list_truncated": _change_count(
+            result, "changed_directory_count", changed_directories
+        ) > len(changed_directories),
         "added_lines": result.get("added_lines", 0) if isinstance(result, dict) else 0,
         "removed_lines": result.get("removed_lines", 0) if isinstance(result, dict) else 0,
         "unified_diff": _artifact_preview(settings, operation.get("diff_path")),
+        "diff_truncated": result.get("diff_truncated") if isinstance(result, dict) else None,
+        "change_details": {
+            "tool": "operation_changes",
+            "arguments": {"operation_id": operation_id},
+            "available": pre_available and post_available,
+            "paginated": True,
+            "source": "retained_checkpoints",
+        },
         "error": operation.get("error"),
         "rollback_state": operation.get("rollback_state") or "not_applicable",
         "point_in_time_rollback_available": post_available,
@@ -178,10 +206,20 @@ def timeline_entry(settings: Settings, audit: AuditStore, operation_id: str) -> 
     return entry
 
 
-def timeline_list(settings: Settings, audit: AuditStore, limit: int = 50) -> list[dict[str, Any]]:
+def timeline_list(
+    settings: Settings,
+    audit: AuditStore,
+    limit: int = 50,
+    *,
+    session_id: str | None = None,
+    task_id: str | None = None,
+) -> list[dict[str, Any]]:
     """Lightweight summaries; transfer events are loaded only to derive truthful lifecycle state."""
     result: list[dict[str, Any]] = []
-    for item in audit.list_operations(limit=max(1, min(limit, 200))):
+    # 絞り込みは件数制限より先に監査DBで適用する。
+    for item in audit.list_operations(
+        limit=max(1, min(limit, 200)), session_id=session_id, task_id=task_id
+    ):
         include_events = str(item.get("tool_name") or "") in _TRANSFER_CHUNK_EVENTS
         operation = audit.get_operation(str(item["id"]), include_events=include_events)
         request = operation.get("request") or {}
@@ -205,13 +243,22 @@ def timeline_list(settings: Settings, audit: AuditStore, limit: int = 50) -> lis
         result.append(
             {
                 "operation_id": operation["id"],
+                "session_id": operation.get("session_id"),
+                "server_instance_id": operation.get("server_instance_id"),
+                "origin_scope": operation.get("origin_scope"),
+                "client_name": operation.get("client_name"),
+                "client_version": operation.get("client_version"),
+                "request_id": operation.get("request_id"),
+                "task_id": operation.get("task_id"),
                 "time": display_time,
                 "tool": operation["tool_name"],
                 "operation_type": _operation_type(operation["tool_name"]),
                 "status": display_status,
                 "summary": _summary(request, display),
-                "changed_file_count": len(changed),
-                "changed_directory_count": len(changed_directories),
+                "changed_file_count": _change_count(payload, "changed_file_count", changed),
+                "changed_directory_count": _change_count(
+                    payload, "changed_directory_count", changed_directories
+                ),
                 "added_lines": payload.get("added_lines", 0)
                 if isinstance(payload, dict)
                 else 0,

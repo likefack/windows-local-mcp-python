@@ -16,6 +16,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator, model_validator
 
+from .attachment_import import validate_allowed_hosts
 from .child_env import normalize_extra_environment_names, sanitize_process_environment
 from .git_env import strip_git_ambient_environment
 from .tool_safety import capture_file_identity, hold_file_identity
@@ -73,6 +74,11 @@ class Settings(BaseModel):
     # Structured binary files are deliberately bounded separately from source-text writes.
     max_structured_file_bytes: int = Field(default=64 * 1024 * 1024, ge=1024)
     max_transfer_chunk_bytes: int = Field(default=512 * 1024, ge=4096, le=4 * 1024 * 1024)
+    # Active transfers have a separate lifetime from approval requests and retained artifacts.
+    binary_transfer_ttl_seconds: int = Field(default=1800, ge=30, le=86400)
+    # Only the local operator may pin exact file-service hosts; no implicit OpenAI wildcard.
+    attachment_import_allowed_hosts: list[str] = Field(default_factory=list, max_length=16)
+    attachment_import_timeout_seconds: int = Field(default=60, ge=1, le=300)
     max_zip_entries: int = Field(default=10000, ge=1, le=100000)
     max_zip_expanded_bytes: int = Field(default=256 * 1024 * 1024, ge=1024)
     max_structured_elements: int = Field(default=250000, ge=100, le=2000000)
@@ -243,6 +249,11 @@ class Settings(BaseModel):
             Path(os.path.expandvars(os.path.expanduser(str(item)))).resolve()
             for item in value
         ]
+
+    @field_validator("attachment_import_allowed_hosts")
+    @classmethod
+    def validate_attachment_hosts(cls, value: list[str]) -> list[str]:
+        return validate_allowed_hosts(value)
 
     @field_validator("adb_allowed_serials")
     @classmethod
@@ -554,8 +565,106 @@ def _ensure_control_plane_namespace(settings: Settings) -> bool:
         return False
 
 
+def _canonical_data_acl_records(
+    records: list[tuple[int, int, int, str]],
+    sid: str,
+    *,
+    sandbox_group_sid: str | None = None,
+) -> list[tuple[int, int, int, str]]:
+    """Validate equivalent grants and the narrowly supported extra read denials."""
+    full_control = 0x001F01FF
+    expected = sorted(
+        (0, flags, full_control, trustee) for trustee in ("S-1-5-18", sid) for flags in (0, 0x0B)
+    )
+    allows: list[tuple[int, int, int, str]] = []
+    denies: list[tuple[int, int, int, str]] = []
+    for kind, flags, mask, trustee in records:
+        if kind == 1 and not allows:
+            denies.append((kind, flags, mask, trustee))
+        elif kind == 0:
+            # OI|CI applies to both this directory and descendants. Splitting it
+            # preserves exactly the original self + inherit-only policy digest.
+            if flags == 0x03:
+                allows.extend((kind, value, mask, trustee) for value in (0, 0x0B))
+            else:
+                allows.append((kind, flags, mask, trustee))
+        else:
+            raise PermissionError("data_dir root contains an unsupported ACL entry or order")
+    if sorted(allows) != expected:
+        raise PermissionError("data_dir root ACL does not match the required policy")
+    if denies:
+        if not sandbox_group_sid or sandbox_group_sid in {sid, "S-1-5-18"}:
+            raise PermissionError("data_dir denial trustee is not the local Sandbox group")
+        expected_denies = [
+            (1, 0, 0x00120089, sandbox_group_sid),
+            (1, 0x0B, 0x80120089, sandbox_group_sid),
+        ]
+        if sorted(denies) != expected_denies:
+            raise PermissionError("data_dir root contains unsupported Sandbox denials")
+    return expected
+
+
+def _assert_local_sandbox_group_sid(sid_pointer: ctypes.c_void_p) -> None:
+    """Resolve a native ACE SID without trusting environment-provided account names."""
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    lookup = advapi32.LookupAccountSidW
+    lookup.argtypes = [
+        wintypes.LPCWSTR,
+        ctypes.c_void_p,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    lookup.restype = wintypes.BOOL
+    computer_name = kernel32.GetComputerNameW
+    computer_name.argtypes = [wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    computer_name.restype = wintypes.BOOL
+    computer = ctypes.create_unicode_buffer(256)
+    computer_size = wintypes.DWORD(len(computer))
+    if not computer_name(computer, ctypes.byref(computer_size)):
+        raise PermissionError("cannot verify the local Sandbox group computer")
+    name_size, domain_size, sid_use = wintypes.DWORD(), wintypes.DWORD(), wintypes.DWORD()
+    lookup(
+        None,
+        sid_pointer,
+        None,
+        ctypes.byref(name_size),
+        None,
+        ctypes.byref(domain_size),
+        ctypes.byref(sid_use),
+    )
+    if (
+        ctypes.get_last_error() != 122
+        or not (0 < name_size.value <= 32768)
+        or not (0 < domain_size.value <= 32768)
+    ):
+        raise PermissionError("cannot resolve the data_dir denial trustee")
+    name = ctypes.create_unicode_buffer(name_size.value)
+    domain = ctypes.create_unicode_buffer(domain_size.value)
+    if not lookup(
+        None,
+        sid_pointer,
+        name,
+        ctypes.byref(name_size),
+        domain,
+        ctypes.byref(domain_size),
+        ctypes.byref(sid_use),
+    ):
+        raise PermissionError("cannot resolve the data_dir denial trustee")
+    # SidTypeAlias=4 excludes similarly named users and domain groups.
+    if (
+        name.value.casefold() != "codexsandboxusers"
+        or domain.value.casefold() != computer.value.casefold()
+        or sid_use.value != 4
+    ):
+        raise PermissionError("data_dir denial trustee is not the local Sandbox group")
+
+
 def _required_windows_acl_digest(path: Path, sid: str) -> str:
-    """Return a stable digest only when the root DACL exactly matches our policy."""
+    """Hash the fixed grant policy while retaining verified extra Sandbox denials."""
     if os.name != "nt":
         raise RuntimeError("Windows ACL inspection requires native Windows")
 
@@ -644,12 +753,13 @@ def _required_windows_acl_digest(path: Path, sid: str) -> str:
             )
         protected = bool(int(control.value) & 0x1000)  # SE_DACL_PROTECTED
         records: list[tuple[int, int, int, str]] = []
+        sandbox_group_sid: str | None = None
         for index in range(int(dacl.contents.AceCount)):
             ace_pointer = ctypes.c_void_p()
             if not get_ace(dacl, index, ctypes.byref(ace_pointer)):
                 raise RuntimeError(f"GetAce failed: WinError {ctypes.get_last_error()}")
             header = ctypes.cast(ace_pointer, ctypes.POINTER(_ACE_HEADER)).contents
-            if int(header.AceType) != 0:  # ACCESS_ALLOWED_ACE_TYPE
+            if int(header.AceType) not in (0, 1):  # ACCESS_ALLOWED / ACCESS_DENIED
                 raise PermissionError("data_dir root contains an unsupported ACL entry")
             ace = ctypes.cast(ace_pointer, ctypes.POINTER(_ACCESS_ALLOWED_ACE)).contents
             sid_pointer = ctypes.c_void_p(
@@ -661,6 +771,11 @@ def _required_windows_acl_digest(path: Path, sid: str) -> str:
                     f"ConvertSidToStringSidW failed: WinError {ctypes.get_last_error()}"
                 )
             try:
+                if int(header.AceType) == 1:
+                    _assert_local_sandbox_group_sid(sid_pointer)
+                    if sandbox_group_sid not in (None, str(sid_text.value)):
+                        raise PermissionError("data_dir contains multiple denial trustees")
+                    sandbox_group_sid = str(sid_text.value)
                 records.append(
                     (
                         int(ace.Header.AceType),
@@ -674,20 +789,11 @@ def _required_windows_acl_digest(path: Path, sid: str) -> str:
     finally:
         local_free(descriptor)
 
-    full_control = 0x001F01FF
-    inherit_only = 0x01 | 0x02 | 0x08  # OBJECT/CONTAINER_INHERIT + INHERIT_ONLY
-    expected = sorted(
-        [
-            (0, 0, full_control, "S-1-5-18"),
-            (0, 0, full_control, sid),
-            (0, inherit_only, full_control, "S-1-5-18"),
-            (0, inherit_only, full_control, sid),
-        ]
-    )
-    if not protected or sorted(records) != expected:
+    if not protected:
         raise PermissionError("data_dir root ACL does not match the required policy")
+    canonical = _canonical_data_acl_records(records, sid, sandbox_group_sid=sandbox_group_sid)
     payload = json.dumps(
-        {"protected": protected, "aces": sorted(records)},
+        {"protected": protected, "aces": canonical},
         sort_keys=True,
         separators=(",", ":"),
     )

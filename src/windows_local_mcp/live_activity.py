@@ -1,7 +1,7 @@
 """Approval UI 用の人間向け Live Activity 投影。
 
 監査 DB は完全な技術記録を保持する一方、このモジュールは利用者が現在の処理を
-理解するための短い表示だけを作ります。ここで作る文字列はセキュリティ判断には
+理解するための概要と、局所操作の確定した変更差分を表示します。ここで作る文字列はセキュリティ判断には
 使わず、監査・承認・checkpoint・transaction の意味論にも触れません。
 """
 
@@ -9,15 +9,18 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from typing import Any
 
 from .audit import TERMINAL_STATUSES, AuditStore
+from .operation_changes import iter_operation_diff_lines
 from .redaction import redact_command_args, redact_text
 
 MAX_ACTIVITY_SUMMARY = 200
+DEFAULT_PROGRESS_INTERVAL_SECONDS = 5.0
 
 _BIDI_CONTROLS = frozenset(
     "\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
@@ -56,11 +59,32 @@ MUTATION_TOOLS = frozenset(
         "write_file",
         "text_file_apply",
         "workspace_apply",
+        "workspace_batch",
+        "workspace_replace",
+        "workspace_plan_apply",
         "artifact_upload",
+        "artifact_import_file",
         "move_file",
         "copy_file",
         "delete_file",
         "make_directory",
+    }
+)
+# 件数が一つでも、一括操作・構造化編集・コマンド・復元は概要だけを表示する。
+# 完全な内容は operation_changes から必要なときに取得できる。
+LOCAL_CHANGE_TOOLS = frozenset(
+    {
+        "write_file",
+        "text_file_apply",
+        "move_file",
+        "copy_file",
+        "delete_file",
+        "make_directory",
+        "artifact_upload",
+        "artifact_import_file",
+        "artifact_upload_commit",
+        "structured_file_upload_commit",
+        "zip_entry_extract",
     }
 )
 COMMAND_TOOLS = frozenset(
@@ -108,6 +132,7 @@ META_TOOLS = frozenset(
         "activity_timeline",
         "activity_get",
         "operation_report",
+        "operation_changes",
         "timeline_cli",
         "context_read_info",
         "context_export_info",
@@ -122,6 +147,34 @@ FORMAT_LABELS = {
     "tsv": "TSV",
     "zip": "ZIP",
     "image": "画像",
+}
+
+# 検証済みの操作識別子だけを日本語へ対応付ける。セル値、検索語、画像情報などの
+# 任意の要求本文を概要へ流さず、同じ種類の操作は件数でまとめる。
+STRUCTURED_OPERATION_LABELS = {
+    "cell_set": "セル設定", "table_cell_set": "表のセル設定", "range_set": "範囲設定",
+    "range_clear": "範囲消去", "range_copy": "範囲コピー", "range_fill": "範囲埋め込み",
+    "sheet_add": "シート追加", "sheet_remove": "シート削除", "sheet_rename": "シート名変更",
+    "sheet_copy": "シートコピー", "sheet_move": "シート移動",
+    "row_append": "行追加", "row_insert": "行挿入", "rows_insert": "行挿入",
+    "row_set": "行設定", "row_delete": "行削除", "rows_delete": "行削除",
+    "column_append": "列追加", "column_insert": "列挿入", "columns_insert": "列挿入",
+    "column_delete": "列削除", "columns_delete": "列削除",
+    "merge": "セル結合", "unmerge": "結合解除", "format_range": "範囲の書式変更",
+    "dimensions_set": "行列サイズ変更", "freeze_panes_set": "表示固定",
+    "autofilter_set": "フィルター設定", "validation_add": "入力規則追加",
+    "conditional_cell_is": "条件付き書式設定", "chart_add": "グラフ追加",
+    "page_setup_set": "ページ設定", "paragraph_append": "段落追加",
+    "paragraph_update": "段落変更", "paragraph_delete": "段落削除", "run_update": "文字書式変更",
+    "replace_text": "文字列置換", "table_add": "表追加", "table_row_add": "表の行追加",
+    "table_row_insert": "表の行挿入", "table_row_delete": "表の行削除",
+    "table_column_add": "表の列追加", "table_column_delete": "表の列削除",
+    "table_cell_format": "表の書式変更", "header_footer_append": "ヘッダー・フッター追加",
+    "header_footer_set": "ヘッダー・フッター設定", "style_update": "スタイル変更",
+    "metadata_set": "属性設定", "section_set": "セクション設定",
+    "entry_add": "ZIP項目追加", "entry_replace": "ZIP項目置換", "entry_delete": "ZIP項目削除",
+    "resize": "サイズ変更", "thumbnail": "縮小", "crop": "切り抜き", "rotate": "回転",
+    "flip": "反転", "convert": "形式変換", "quality": "画質設定", "metadata_remove": "属性削除",
 }
 
 STATUS_LABELS = {
@@ -141,6 +194,7 @@ def _is_terminal_control(character: str) -> bool:
     return (
         any(start <= codepoint <= end for start, end in _CONTROL_RANGES)
         or character in _BIDI_CONTROLS
+        or character in {"\u2028", "\u2029"}
         or 0xD800 <= codepoint <= 0xDFFF
     )
 
@@ -197,6 +251,123 @@ def _result(operation: Mapping[str, object]) -> Mapping[str, object]:
     except (TypeError, ValueError, UnicodeError):
         return {}
     return decoded if isinstance(decoded, Mapping) else {}
+
+
+def _nonnegative_int(value: object) -> int | None:
+    # 真偽値や異常に大きい入力を件数・時刻として表示しない。
+    return value if type(value) is int and 0 <= value <= 2**63 - 1 else None
+
+
+def _recovery_required(operation: Mapping[str, object]) -> bool:
+    result = _result(operation)
+    return any(
+        source.get(key) == "recovery_required"
+        for source in (operation, result)
+        for key in ("status", "rollback_state")
+    )
+
+
+def _confirmed_success(operation: Mapping[str, object]) -> bool:
+    return _status(operation) == "succeeded" and not _recovery_required(operation)
+
+
+def _structured_counts(operation: Mapping[str, object]) -> str:
+    if operation.get("tool_name") != "structured_file_apply":
+        return ""
+    operations = _request(operation).get("operations")
+    if not isinstance(operations, list):
+        return ""
+    counts: dict[str, int] = {}
+    for name in operations:
+        if isinstance(name, str) and name in STRUCTURED_OPERATION_LABELS:
+            label = STRUCTURED_OPERATION_LABELS[name]
+            counts[label] = counts.get(label, 0) + 1
+    return _truncate("/".join(f"{label}{count}件" for label, count in counts.items()), 80)
+
+
+def _summary_counts(operation: Mapping[str, object], *, terminal: bool) -> str:
+    """本文を参照せず、確定結果または実行予定の件数だけを要約する。"""
+
+    request = _request(operation)
+    result = _result(operation)
+    if terminal and not _confirmed_success(operation):
+        return "復旧の確認が必要" if _recovery_required(operation) else ""
+    parts: list[str] = []
+    structured = _structured_counts(operation)
+    if structured:
+        parts.append(f"{'操作' if terminal else '予定'}: {structured}")
+    if terminal and _operation_kind(operation) == "read":
+        count = _nonnegative_int(result.get("bytes"))
+        lines = _nonnegative_int(result.get("line_count"))
+        if count is not None:
+            parts.append(f"{count}バイト")
+        if lines is not None:
+            parts.append(f"{lines}行")
+        return " / ".join(parts)
+    if terminal:
+        files = _nonnegative_int(result.get("changed_file_count"))
+        directories = _nonnegative_int(result.get("changed_directory_count"))
+        if files == 0 and directories == 0:
+            parts.append("変更なし")
+        else:
+            if files is not None:
+                parts.append(f"変更{files}ファイル")
+            if directories:
+                parts.append(f"{directories}フォルダー")
+        nontext = _nonnegative_int(result.get("nontext_file_count"))
+        if nontext:
+            parts.append(f"非テキスト{nontext}ファイル")
+        added = _nonnegative_int(result.get("added_lines"))
+        removed = _nonnegative_int(result.get("removed_lines"))
+        if (added or removed) or (files and nontext != files and added is not None):
+            parts.append(f"追加{added or 0}行/削除{removed or 0}行")
+        before = _nonnegative_int(result.get("bytes_before", result.get("before_bytes")))
+        after = _nonnegative_int(result.get("bytes_after", result.get("after_bytes")))
+        if before is not None and after is not None:
+            parts.append(f"{before}→{after}バイト")
+        elif not parts:
+            count = _nonnegative_int(result.get("bytes"))
+            if count is not None:
+                parts.append(f"{count}バイト")
+    else:
+        # 実行中は予定と確定した変更件数を混同しない。
+        paths = request.get("paths")
+        count = len(paths) if isinstance(paths, list) else None
+        if count is not None:
+            parts.append(f"対象{count}ファイル")
+        edits = _nonnegative_int(request.get("edit_count"))
+        if edits is not None:
+            parts.append(f"予定{edits}件")
+    return " / ".join(parts)
+
+
+def _bounded_detail(detail: str, counts: str) -> str:
+    if not counts:
+        return _truncate(detail)
+    counts = _truncate(counts, MAX_ACTIVITY_SUMMARY - 20)
+    return f"{_truncate(detail, MAX_ACTIVITY_SUMMARY - len(counts) - 3)} | {counts}"
+
+
+def _datetime(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+    except (ValueError, OverflowError):
+        return None
+
+
+def _elapsed_between(start: object, end: object) -> int | None:
+    before, after = _datetime(start), _datetime(end)
+    if before is None or after is None:
+        return None
+    milliseconds = int((after - before).total_seconds() * 1000)
+    return _nonnegative_int(milliseconds)
+
+
+def _duration_text(milliseconds: int) -> str:
+    return f"{milliseconds} ms" if milliseconds < 1000 else f"{milliseconds / 1000:.3f}秒"
 
 
 def _safe_text(value: object, *, limit: int = MAX_ACTIVITY_SUMMARY) -> str:
@@ -364,10 +535,14 @@ def _detail(
         action = f"{format_name}を編集" if format_name else "構造化ファイルを編集"
         return f"{action} {path}".strip()
     if tool in MUTATION_TOOLS:
+        if tool in {"workspace_batch", "workspace_replace", "workspace_plan_apply"}:
+            if request.get("preview") is True:
+                return "ファイル変更の計画を確認"
+            return "ファイル操作を一括実行" if tool == "workspace_batch" else "ファイル変更を適用"
         if tool in {"text_file_apply", "workspace_apply"}:
             paths = request.get("paths")
             count = request.get("edit_count")
-            first = _safe_text(paths[0]) if isinstance(paths, list) and paths else ""
+            first = _safe_text(paths[0]) if isinstance(paths, list) and paths else path
             suffix = f" ほか{count - 1}件" if isinstance(count, int) and count > 1 else ""
             return f"テキストを編集 {first}{suffix}".strip()
         if tool == "move_file":
@@ -382,6 +557,8 @@ def _detail(
             return f"ファイルを削除 {path}".strip()
         if tool == "make_directory":
             return f"フォルダーを作成 {path}".strip()
+        if tool == "artifact_import_file":
+            return f"添付ファイルを取り込み {path}".strip()
         return f"ファイルを編集 {path}".strip()
     if tool in STRUCTURED_READ_TOOLS:
         action = f"{format_name}を読み取り" if format_name else "構造化ファイルを読み取り"
@@ -464,6 +641,36 @@ def _transfer_info(operation: Mapping[str, object]) -> tuple[str, int | None, li
     return transfer_id, total_bytes, chunks
 
 
+def _transfer_progress(operation: Mapping[str, object]) -> str:
+    """分割転送の確定済み範囲を数え、再送された同じ範囲は加算しない。"""
+
+    _transfer_id, total, chunks = _transfer_info(operation)
+    if total is None:
+        return ""
+    covered = 0
+    if "upload" in str(operation.get("tool_name") or ""):
+        # upload の received は転送全体の累積値。
+        for chunk in chunks:
+            received = _nonnegative_int(_event_result(chunk).get("received"))
+            if received is not None:
+                covered = max(covered, received)
+    else:
+        ranges: list[tuple[int, int]] = []
+        for chunk in chunks:
+            result = _event_result(chunk)
+            offset = _nonnegative_int(result.get("offset"))
+            size = _nonnegative_int(result.get("bytes"))
+            if offset is not None and size is not None:
+                ranges.append((offset, min(total, offset + size)))
+        end = 0
+        for start, next_end in sorted(ranges):
+            covered += max(0, next_end - max(start, end))
+            end = max(end, next_end)
+    if _result(operation).get("complete") is True:
+        covered = total
+    return f"{min(covered, total)}/{total}バイト"
+
+
 def transfer_complete(operation: Mapping[str, object]) -> bool:
     """Audit event の chunk 範囲から transfer の完了を判定する。"""
 
@@ -524,10 +731,19 @@ class ActivityProjection:
     logical_id: str
     active: bool
     terminal: bool
+    # 既存の位置引数/名前付き引数での生成を保つため、追加項目はすべて既定値を持つ。
+    duration_ms: int | None = None
+    duration_label: str = "所要時間"
+    elapsed_ms: int | None = None
+    elapsed_label: str = "経過"
+    change_details: bool = False
+    origin_summary: str = ""
 
 
 def _operation_kind(operation: Mapping[str, object]) -> str:
     tool = str(operation.get("tool_name") or "")
+    if tool in {"workspace_batch", "workspace_replace"} and _request(operation).get("preview") is True:
+        return "read"
     if tool in META_TOOLS or tool.startswith(META_PREFIXES):
         return "meta"
     if tool in TRANSFER_TOOLS:
@@ -593,7 +809,10 @@ def project_operation(
     active = False
     terminal = False
 
-    if _approval_pending(operation):
+    if _recovery_required(operation) or raw_status.startswith("failed") or raw_status == "error":
+        label = "Failed"
+        terminal = True
+    elif _approval_pending(operation):
         label = "Approval"
         active = True
     elif raw_status in ACTIVE_STATUSES or (
@@ -648,9 +867,6 @@ def project_operation(
                 label = "Finished"
         else:
             label = STATUS_LABELS.get(raw_status, "Failed")
-    elif raw_status.startswith("failed") or raw_status in {"recovery_required", "error"}:
-        terminal = True
-        label = "Failed"
     else:
         # Unknown nonterminal values are not silently presented as success. If the operation has
         # a meaningful known kind, Running is the safest human interpretation.  Future tools are
@@ -680,15 +896,44 @@ def project_operation(
         timestamp = _transfer_timestamp(operation)
     else:
         timestamp = operation.get("updated_at") or operation.get("created_at") or ""
+    counts = _summary_counts(operation, terminal=terminal)
+    if tool in TRANSFER_BEGIN_TO_CHUNK and not _recovery_required(operation):
+        counts = _transfer_progress(operation)
+    duration = _nonnegative_int(operation.get("duration_ms")) if terminal else None
+    elapsed = None
+    if tool in TRANSFER_BEGIN_TO_CHUNK or tool in TRANSFER_CHUNK_TO_BEGIN:
+        # begin/chunk の duration は一つのAPI呼出だけの時間であり、転送全体ではない。
+        duration = None
+        if terminal and "download" in tool:
+            elapsed = _elapsed_between(
+                operation.get("created_at"), timestamp
+            )
     return ActivityProjection(
         label=label,
-        detail=_truncate(detail, MAX_ACTIVITY_SUMMARY),
+        origin_summary=" ".join(
+            f"{label}:{_safe_text(operation.get(key), limit=80)}"
+            for key, label in (("client_name", "接続元"), ("session_id", "接続"), ("task_id", "タスク"))
+            if operation.get(key)
+        ),
+        detail=_bounded_detail(detail, counts),
         operation_id=operation_id,
         status=raw_status,
         timestamp=timestamp,
         logical_id=logical_id,
         active=active,
         terminal=terminal,
+        duration_ms=duration,
+        duration_label="確定処理" if tool in TRANSFER_COMMIT_TOOLS else "所要時間",
+        elapsed_ms=elapsed,
+        elapsed_label="転送経過" if terminal and kind == "transfer" else "経過",
+        change_details=bool(
+            terminal
+            and _confirmed_success(operation)
+            and kind in {"edit", "undo", "command"}
+            and tool not in LOCAL_CHANGE_TOOLS
+            and operation.get("pre_workspace_path")
+            and operation.get("post_workspace_path")
+        ),
     )
 
 
@@ -704,10 +949,18 @@ def format_projection(projection: ActivityProjection) -> str:
     """operation ID は表示し、request hash は出さずに一行へ安全に整形する。"""
 
     suffix = " [succeeded]" if projection.label == "Finished" and projection.status == "succeeded" else ""
+    # 時間とoperation IDは本文の上限とは独立に表示する。
+    if projection.elapsed_ms is not None:
+        suffix += f" | {projection.elapsed_label} {_duration_text(projection.elapsed_ms)}"
+    if projection.duration_ms is not None:
+        suffix += f" | {projection.duration_label} {_duration_text(projection.duration_ms)}"
+    if projection.change_details:
+        suffix += " | 変更詳細: operation_changes"
     operation_tag = f" [op:{projection.operation_id}]" if projection.operation_id else ""
+    origin_tag = f" [{projection.origin_summary}]" if projection.origin_summary else ""
     return terminal_safe(
         f"[{_timestamp(projection.timestamp)}] {projection.label:<10} "
-        f"{projection.detail}{suffix}{operation_tag}"
+        f"{projection.detail}{suffix}{operation_tag}{origin_tag}"
     )
 
 
@@ -738,17 +991,30 @@ def _raw_signature(operation: Mapping[str, object]) -> tuple[object, ...]:
         operation.get("status"),
         operation.get("approval_status"),
         operation.get("updated_at"),
+        operation.get("duration_ms"),
     )
 
 
 def _projection_signature(projection: ActivityProjection) -> tuple[object, ...]:
-    return (projection.logical_id, projection.label, projection.detail, projection.terminal)
+    return (
+        projection.logical_id, projection.label, projection.detail, projection.terminal,
+        projection.duration_ms, projection.change_details,
+        projection.elapsed_label,
+    )
 
 
 class LiveActivityTracker:
     """Approval UI 向けに監査 lifecycle を差分投影する tracker。"""
 
-    def __init__(self, audit: AuditStore, *, limit: int = 200) -> None:
+    def __init__(
+        self,
+        audit: AuditStore,
+        *,
+        limit: int = 200,
+        progress_interval_seconds: float = DEFAULT_PROGRESS_INTERVAL_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+        now: Callable[[], datetime] | None = None,
+    ) -> None:
         self.audit = audit
         self.limit = max(1, min(limit, 500))
         self._baseline_ready = False
@@ -756,7 +1022,15 @@ class LiveActivityTracker:
         self._known_projection: dict[str, tuple[object, ...]] = {}
         self._transfer_paths: dict[str, str] = {}
         self._transfer_states: dict[str, str] = {}
+        self._transfer_origins: dict[str, Mapping[str, object]] = {}
+        self._transfer_commits: dict[str, str] = {}
         self._cached: dict[str, Mapping[str, object]] = {}
+        self._diff_handled: set[str] = set()
+        self._clock = clock
+        self._now = now or (lambda: datetime.now(UTC))
+        self._progress_interval = max(1.0, progress_interval_seconds)
+        self._last_display_at: dict[str, float] = {}
+        self._activity_started: dict[str, tuple[tuple[str, str], float, int]] = {}
 
     @staticmethod
     def _requires_full(row: Mapping[str, object], previous: tuple[object, ...] | None) -> bool:
@@ -791,12 +1065,132 @@ class LiveActivityTracker:
             path = _safe_path(operation, _request(operation), _result(operation))
             if transfer_id and path:
                 self._transfer_paths[transfer_id] = path
+            if tool in TRANSFER_BEGIN_TO_CHUNK and transfer_id:
+                self._transfer_origins[transfer_id] = operation
             if tool in TRANSFER_COMMIT_TOOLS and transfer_id:
+                self._transfer_commits[transfer_id] = str(operation.get("id") or "")
                 status = _status(operation)
-                if status == "succeeded":
+                if _recovery_required(operation):
+                    self._transfer_states[transfer_id] = "terminal_failure"
+                elif status == "succeeded":
                     self._transfer_states[transfer_id] = "succeeded"
                 elif status in TERMINAL_STATUSES:
                     self._transfer_states[transfer_id] = "terminal_failure"
+
+    def _with_elapsed(
+        self, projection: ActivityProjection, operation: Mapping[str, object], moment: float
+    ) -> ActivityProjection:
+        tool = str(operation.get("tool_name") or "")
+        transfer_id, _total, _events = _transfer_info(operation)
+        origin = self._transfer_origins.get(transfer_id)
+        if tool in TRANSFER_COMMIT_TOOLS and origin is not None:
+            if projection.active:
+                # beginとcommitは同じ転送の進捗を使い、切り替わりだけでは再表示しない。
+                counts = _transfer_progress(origin)
+                projection = replace(
+                    projection,
+                    detail=_bounded_detail(
+                        _detail(operation, transfer_path=self._transfer_paths.get(transfer_id, "")),
+                        counts,
+                    ),
+                )
+            elif projection.terminal:
+                projection = replace(
+                    projection,
+                    elapsed_ms=_elapsed_between(
+                        origin.get("created_at"),
+                        operation.get("finished_at") or operation.get("updated_at"),
+                    ),
+                    elapsed_label="転送経過",
+                )
+        if not projection.active:
+            return projection
+        source = origin or operation
+        previous = self._activity_started.get(projection.logical_id)
+        if tool in TRANSFER_TOOLS:
+            phase_name, elapsed_label = "transfer", "転送経過"
+            started_at = source.get("created_at")
+        elif _status(operation) in {"pending", "pending_approval", "approved", "queued"}:
+            phase_name, elapsed_label = "waiting", "待機経過"
+            started_at = source.get("created_at")
+        else:
+            phase_name, elapsed_label = "executing", "経過"
+            started_at = source.get("started_at")
+            if _datetime(started_at) is None:
+                # 実際のstarted_atがない旧記録は、待機を観測済みなら実行の観測開始を
+                # 起点とする。runningとして作られるBroker操作はcreated_atから測る。
+                observed_start = previous is not None and previous[0][0] in {
+                    "waiting", "executing_observed"
+                }
+                if observed_start:
+                    phase_name, started_at = "executing_observed", None
+                else:
+                    started_at = source.get("created_at")
+        origin_key = (phase_name, str(started_at or ""))
+        start = self._activity_started.get(projection.logical_id)
+        if start is None or start[0] != origin_key:
+            age = _elapsed_between(started_at, self._now().isoformat())
+            start = (origin_key, moment, age or 0)
+            self._activity_started[projection.logical_id] = start
+        elapsed = start[2] + max(0, int((moment - start[1]) * 1000))
+        return replace(projection, elapsed_ms=elapsed, elapsed_label=elapsed_label)
+
+    def _completed_diff_lines(self, operation: Mapping[str, object]) -> list[str]:
+        """完了後の局所操作だけを一度展開する。本文には伏せ字や省略を加えない。"""
+
+        operation_id = str(operation.get("id") or "")
+        settings = getattr(self.audit, "settings", None)
+        if (
+            settings is None
+            or operation_id in self._diff_handled
+            or str(operation.get("tool_name") or "") not in LOCAL_CHANGE_TOOLS
+            or not _confirmed_success(operation)
+        ):
+            return []
+        self._diff_handled.add(operation_id)
+        tag = terminal_safe(f"[op:{operation_id}]")
+        content: list[str] = []
+        try:
+            # sourceはcheckpointの検証済み内容のみ。request/resultのdiffやdiff_pathは
+            # 読み出さず、保存プレビューのサイズ上限にも影響されない。
+            for chunk in iter_operation_diff_lines(settings, operation):
+                if not isinstance(chunk, str):
+                    raise TypeError("unexpected diff line type")
+                physical_lines = chunk.split("\n")
+                if chunk.endswith("\n"):
+                    physical_lines.pop()
+                for line in physical_lines:
+                    escaped = "".join(
+                        f"\\u{ord(character):04x}"
+                        if _is_terminal_control(character)
+                        else character
+                        for character in line
+                    )
+                    # LFだけを行区切りとして再構成する。本文のすべての行を識別し、
+                    # 偽のログ見出し、CR、ANSI、双方向制御が表示境界を越えないようにする。
+                    content.append(f"  | {escaped}")
+        except Exception as error:  # noqa: BLE001 - 差分の読出不能で監視を終了しない
+            return [
+                terminal_safe(
+                    f"  差分を読み出せませんでした ({type(error).__name__})。"
+                    f"operation_changes で確認してください {tag}"
+                )
+            ]
+        if not content:
+            return [f"  差分: 内容の変更なし {tag}"]
+        nontext_hint = []
+        if _nonnegative_int(_result(operation).get("nontext_file_count")) or any(
+            line.startswith("  | Binary files differ:") for line in content
+        ):
+            nontext_hint.append(
+                f"  非テキストの変更前後の内容: operation_changes の before/after で取得 {tag}"
+            )
+        return [
+            f"  差分・変更概要開始（テキスト差分は省略なし・制御文字は可視表現） {tag}",
+            *content,
+            *nontext_hint,
+            f"  差分・変更概要終了 {tag}",
+        ]
 
     def poll_once(self, *, emit: bool = True) -> list[str]:
         try:
@@ -815,6 +1209,17 @@ class LiveActivityTracker:
                     operation_id = str(row.get("id") or "")
                     if operation_id:
                         active_rows[operation_id] = row
+            # 完了した長時間操作が最新履歴の上限から押し出されても、直前まで追跡中
+            # だった操作は一度取得する。短い処理の大量発生で終端表示を失わない。
+            for operation_id, signature in self._known_projection.items():
+                if operation_id in active_rows or signature[1] not in {"Approval", "Running"}:
+                    continue
+                try:
+                    active_rows[operation_id] = self.audit.get_operation(
+                        operation_id, include_events=True
+                    )
+                except Exception:  # noqa: BLE001, S112 - 削除済みの履歴は次回の監視を妨げない
+                    continue
             rows = sorted(
                 active_rows.values(),
                 key=lambda row: (
@@ -830,12 +1235,12 @@ class LiveActivityTracker:
         for row in rows:
             operation_id = str(row.get("id") or "")
             previous_raw = self._known_raw.get(operation_id)
-            if emit:
-                self._known_raw[operation_id] = _raw_signature(row)
             if self._requires_full(row, previous_raw):
                 full = self._load_full(row)
                 if full is not None:
                     loaded.append(full)
+                    if emit:
+                        self._known_raw[operation_id] = _raw_signature(row)
             elif operation_id in self._cached:
                 loaded.append(self._cached[operation_id])
         self._refresh_transfer_paths(loaded)
@@ -851,6 +1256,8 @@ class LiveActivityTracker:
         by_id = {str(item.get("id") or ""): item for item in loaded}
 
         lines: list[str] = []
+        moment = self._clock()
+        prior_projections = dict(self._known_projection)
         logically_active_before_poll = {
             str(signature[0])
             for signature in self._known_projection.values()
@@ -859,8 +1266,20 @@ class LiveActivityTracker:
         # list_operations is newest-first; reverse it so terminal transitions read naturally.
         for row in reversed(rows):
             operation_id = str(row.get("id") or "")
-            operation = by_id.get(operation_id, row)
+            # 一時的なDB読取失敗で一覧の短い行だけを完了扱いし、差分を消費しない。
+            if operation_id not in by_id:
+                continue
+            operation = by_id[operation_id]
             tool = str(operation.get("tool_name") or row.get("tool_name") or "")
+            transfer_id, _total, _events = _transfer_info(operation)
+            if (
+                tool in TRANSFER_BEGIN_TO_CHUNK
+                and transfer_id in self._transfer_commits
+            ):
+                # 確定操作が存在する転送は、その行だけで成否と所要時間を表す。
+                if emit:
+                    self._known_projection.pop(operation_id, None)
+                continue
             target: Mapping[str, object] | None = None
             if tool in UNDO_TOOLS:
                 target_id = _request(operation).get("target_operation_id")
@@ -880,27 +1299,52 @@ class LiveActivityTracker:
                 target=target,
             )
             if projection is None:
-                self._known_projection.pop(operation_id, None)
+                if emit:
+                    self._known_projection.pop(operation_id, None)
                 continue
+            if emit:
+                projection = self._with_elapsed(projection, operation, moment)
             signature = _projection_signature(projection)
             previous_signature = self._known_projection.get(operation_id)
             was_new = previous_signature is None
             # Multiple operations in one logical transfer share a logical ID. Keep one line for
             # begin/chunk/commit instead of exposing protocol chatter.
             logical_previous = any(
-                value == signature for key, value in self._known_projection.items() if key != operation_id
+                value == signature
+                for key, value in {**prior_projections, **self._known_projection}.items()
+                if key != operation_id
             )
             changed = previous_signature != signature and not logical_previous
             if not self._baseline_ready:
-                self._known_projection[operation_id] = signature
-                if projection.active:
-                    line = format_projection(projection)
-                    if emit:
-                        lines.append(line)
-                    # Keep the baseline projection even when a caller explicitly suppresses
-                    # output; the initial Approval UI poll always emits active work.
+                # 開始時点の過去の完了は本文も再生しない。停止中のactive表示は消費しない。
+                if projection.terminal:
+                    self._diff_handled.add(operation_id)
+                if emit or projection.terminal:
+                    self._known_projection[operation_id] = signature
+                if projection.active and emit and not logical_previous:
+                    lines.append(format_projection(projection))
+                    self._last_display_at[projection.logical_id] = moment
                 continue
-            if changed:
+            last_display = self._last_display_at.get(projection.logical_id)
+            progress_due = bool(
+                projection.active
+                and projection.label in {"Running", "Approval"}
+                and last_display is not None
+                and moment - last_display >= self._progress_interval
+            )
+            same_active_state = bool(
+                projection.active
+                and previous_signature is not None
+                and previous_signature[1] == projection.label
+                and (
+                    previous_signature[-1] == projection.elapsed_label
+                    or _datetime(operation.get("started_at")) is None
+                )
+            )
+            # 件数だけが更新された場合も一定間隔へまとめる。成否や承認の遷移は即時表示。
+            if same_active_state and last_display is not None and not progress_due:
+                changed = False
+            if (changed or progress_due) and emit:
                 # Approval UI may pause polling while a user answers. If a fast operation jumps
                 # from pending to terminal, preserve a visible Running transition for Undo/
                 # rollback and transfer lifecycles.
@@ -918,6 +1362,7 @@ class LiveActivityTracker:
                 ) and synthesize_running:
                     synthetic = ActivityProjection(
                         label="Running",
+                        origin_summary=projection.origin_summary,
                         detail=projection.detail,
                         operation_id=projection.operation_id,
                         status="running",
@@ -926,11 +1371,14 @@ class LiveActivityTracker:
                         active=True,
                         terminal=False,
                     )
-                    if emit:
-                        lines.append(format_projection(synthetic))
+                    lines.append(format_projection(synthetic))
+                if progress_due and not changed:
+                    projection = replace(projection, timestamp=self._now().isoformat())
                 line = format_projection(projection)
-                if emit:
-                    lines.append(line)
+                lines.append(line)
+                self._last_display_at[projection.logical_id] = moment
+                if projection.terminal:
+                    lines.extend(self._completed_diff_lines(operation))
             # While the approval prompt is paused, leave the previous projection in place. The
             # first resumed poll then emits the missed transition instead of silently consuming it.
             if emit:
@@ -943,6 +1391,25 @@ class LiveActivityTracker:
         self._known_projection = {
             key: value for key, value in self._known_projection.items() if key in current_ids
         }
+        if emit:
+            # 表示範囲外になった完了履歴は再取得しない。表示用の時刻や差分既読状態も
+            # 同じ範囲へ揃え、長時間起動した承認画面で増え続けないようにする。
+            logical_ids = {str(value[0]) for value in self._known_projection.values()}
+            self._diff_handled.intersection_update(current_ids)
+            self._last_display_at = {
+                key: value for key, value in self._last_display_at.items() if key in logical_ids
+            }
+            self._activity_started = {
+                key: value for key, value in self._activity_started.items() if key in logical_ids
+            }
+            self._transfer_origins = {
+                key: value for key, value in self._transfer_origins.items()
+                if f"transfer:{key}" in logical_ids
+            }
+            self._transfer_commits = {
+                key: value for key, value in self._transfer_commits.items()
+                if f"transfer:{key}" in logical_ids
+            }
         return lines
 
     def run(

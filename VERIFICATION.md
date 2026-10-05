@@ -1,5 +1,46 @@
 # 検証記録
 
+## 2026-10-06 運用環境更新後の接続設定を対話なしで更新
+
+- `setup-localmcp.ps1 -RefreshApprovedHostTunnel` を追加。既存の設定を使い、対話メニューと
+  共通の運用環境・authority service・Tunnel doctor 検証と保存・復元処理へ接続する。
+  `-Config` を省略すると通常起動と同じ active config／既定設定を選び、選択ファイルは変更しない。
+- Windows PowerShell 5.1 の非対話試験8件と既存ランチャー試験21件が成功（`29 passed`、45.49秒）。
+  日本語・空白を含む設定パス、入力なしの成功、起動中Tunnel、運用環境／authority／資格情報の
+  検証失敗、保存失敗時の設定復元、非managed設定の拒否、設定不在時の終了コードを確認した。
+  追加試験の Ruff と差分空白検査も成功。運用環境・資格情報・保存先は試験内で代替しており、
+  本番の接続設定をこの作業で更新したものではない。手順は [ローカル起動ランチャー](docs/LOCAL_LAUNCHERS.md)。
+
+## 2026-10-06 複数クライアント・並行タスクの監査
+
+- 新規操作に接続／プロセスの監査用 `session_id` と発行元を記録し、各ツールの省略可能な
+  `task_id` で同一接続を共有する会話も区別する。履歴の接続・タスク絞り込み、イベント側の
+  発行元、旧DB移行、表示、実行枠の同時取得、別プロセス起動時の復旧を確認した。
+  仕様と適用方法は [複数クライアント・並行タスクの監査](docs/MULTI_CLIENT_AUDIT.md) を参照。
+- Python `3.13.15`／MCP SDK `2.1.1` で、実SDKの独立接続と同一接続内の並行要求、要求ごとの
+  スレッドへの発行元引き継ぎ、2プロセスからのDB移行・記録、旧記録の保持、検索条件を件数上限より
+  先に適用することを検証した。発行元情報は認可・操作所有権には使用しない。
+- 最終の対象確認は `86 passed`（26.01秒）。`test_request_origin.py`、
+  `test_multi_client_operations.py`、`test_audit_origin.py`、`test_concurrent_startup.py`、
+  `test_origin_views.py`、`test_performance_trace.py` と、下記ファイル置換試験の再確認を含む。
+  結果原本は `.dev-tmp/multi-client-confirm-20261006.xml`。
+- 並行作業による表示処理の更新後にも発行元表示と従来表示の回帰を確認し、`54 passed`
+  （1.71秒）。原本は `.dev-tmp/multi-client-views-final-20261006.xml`。
+  本件の変更対象モジュール・追加試験の Ruff と差分の空白検査も成功した。
+- 広い関連回帰は `206 passed, 1 skipped, 6 failed`（179.65秒）。結果原本は
+  `.dev-tmp/multi-client-final-20261006.xml`。1件の失敗はテスト用領域のファイル置換で発生した
+  `WinError 5` で、ACLを変更せず別の一時領域で再実行した
+  `test_workspace_checkpoint_restores_new_and_changed_files` は成功した。
+  skip は検証用シンボリックリンクを作成できない環境条件による。
+- 残る5件は Approved Host の監査完全性の実行試験で未解決。3件は承認用パイプへの接続で
+  `CreateFileW(Approved Host authority pipe) failed: WinError 2`、2件は試験用操作が待機期限後も
+  `queued` で実行結果を持たず、期待する改変シナリオを確認できなかった。これらの失敗原因を
+  すべて環境由来と確定したものではなく、全リポジトリ試験や Approved Host 実機検証の成功とは扱わない。
+- 試験用書き込みが制限環境で拒否されたため、専用の `.dev-tmp/pytest/multi-client-*` を使い
+  許可されたホスト実行で確認した。運用中のサーバー、サービス、権限設定は変更していない。
+  Program Files 配下の運用runtimeへの反映と再接続、および実際の ChatGPT／Tunnel を通した
+  複数会話の確認は未実施。Sandbox／Approved Host の隔離保証をこの試験結果から主張しない。
+
 ## 2026-09-09 WFP 読み取り権限と Sandbox 復旧
 
 - 通常 Windows user で App Isolation サブレイヤーの `FwpmSubLayerGetByKey0` が `0x00000005` を返すことを再現。管理者では同一 object が読み取り可能で、正しい provider／weight 7 を確認した。独自 Guard のサブレイヤーと IPv4／IPv6 フィルターは欠損していた。
@@ -26,6 +67,16 @@
 - schema、移行、試験範囲、未検証事項、全ファイル一覧と実測内訳は
   [Audit 処理時間診断の検証記録](docs/AUDIT_PERFORMANCE_VERIFICATION.md) を参照。
   仕様は [Audit の処理時間診断](docs/AUDIT_PERFORMANCE.md)。
+
+### Audit の詳細計測と監査モニター（2026-10-06）
+
+- schema v2 の親子関係・自己時間・上限超過後も続く処理別集計、内部保存処理の細分化、
+  起動端末での時間表示を追加した。Live Activity の実装はこの作業では変更していない。
+- 計測・監査モニター・Broker 操作の統合テスト74件と、Live Activity 関連83件が成功。
+- 合成ファイルの書込から監査モニター表示まで確認。計測収集・DB保存の負荷も別途測定した。
+- 運用 runtime への配備・再起動と実承認の確認は未実施。
+- 試験条件、途中の失敗と再確認、計測値と限界は
+  [Audit 詳細計測の検証記録](docs/AUDIT_DETAIL_VERIFICATION_2026_10_06.md) を参照。
 
 ## 2026-09-08 Binary transfer admission lifecycle
 
@@ -356,6 +407,58 @@ Live verification 自体を security design review の一部として扱い、�
 
 WLMCP-R2-001 は `fixed / live verified` とする。これは別 PC、別 runtime、別 service configuration、または authority/security-boundary code の変更後にも自動的に live-verified とみなす意味ではない。production execution は各環境で immutable runtime と authenticated LocalSystem authority service の current preflight を引き続き要求し、security boundary を変更した場合は normal／abnormal／recovery lifecycle を再検証する。
 
+## 2026-09-21 ローカル起動・Approved Host・Sandbox 再検証
+
+### `run-localmcp.bat` — PASS
+
+ショートカットと同じ `run-localmcp.bat` → Windows PowerShell 5.1 → Tunnel → Program Files 運用用 runtime の経路を通常ユーザー文脈で起動した。数秒後にも親ランチャーは終了せず、次の process chain が継続していることを確認した。
+
+- `run-localmcp.ps1`
+- Program Files runtime の activity monitor
+- approvals listener
+- `tunnel-client run --profile-file ...`
+- Program Files runtime の `windows_local_mcp.cli server`
+
+同じ config の Tunnel が稼働中にショートカット相当の起動を再実行した。起動 mutex は取得できなかったが、固定済み tunnel-client 実体、同じ profile の process、loopback ready 応答を再確認し、終了コード0で「起動済み」となった。再クリック側は Runtime API Key を取得せず、追加の doctor process も起動しない。再実行前後の正規 tunnel-client process 数は1で、新しい process は作成されなかった。その後、最初の検証 process を `Ctrl+C` で終了して process 数0を確認し、修正後コードで停止状態から再起動して ready 応答まで到達した。
+
+失敗時は batch が exit code を保持し、`WLMCP_NO_PAUSE=1` が指定されていない対話起動では画面を閉じずにエラーを確認できる。Tunnel／設定読み込みの失敗を direct server や別 execution boundary へ自動切り替えない。
+
+### Approved Host normal path — PASS
+
+- installer は wheel 導入後に `pip check` を必須化し、不整合時は同じ wheel を一度だけ再導入して再確認する。
+- immutable runtime verification: PASS
+- `WindowsLocalMCPApprovedHost`: Running / LocalSystem
+- reviewed coordinated recovery: PASS
+- recovery 後の独立した normal operation: PASS
+- child authority: requester と同じ非昇格ユーザー
+- LocalSystem monitor と durable authority state: runtime user から操作不可
+- service epoch: operation 前後で同一
+
+この回では abnormal worker-loss fault injection を再実行していない。過去の abnormal lifecycle 証拠を今回の再実行結果として扱わない。
+
+### Codex Sandbox — FAIL CLOSED
+
+自動選択 Codex `0.155.0-alpha.2.6` は、WLMCP の最小読み取りポリシーに対して ``elevated Windows sandbox requires effective `:root` read access`` で foundational command を開始できなかった。読み取り範囲を `:root` へ広げる変更は行っていない。
+
+公式 npm 版 Codex `0.146.0` を正式設定へ一時指定した実機検査では、親側の filesystem／network／resource／WFP／brokered-process check は成功したが、次の必須境界が失敗した。
+
+- `child_outside_user_read_denied=false`
+- `grandchild_outside_user_read_denied=false`
+- `descendant_containment=failed`
+- `passed=false`
+
+子プロセスは現在ユーザーではなく `CodexSandboxOffline` 専用ローカルアカウントで動作していたが、ユーザープロファイル直下の outside canary を読み取れた。失敗した `0.146.0` 固定は検証後に元の自動選択へ戻した。Sandbox route は unavailable、Approved Host への自動 fallback なしとする。詳細は `docs/SANDBOX_RECOVERY_2026_09_21.md` を参照する。
+
+### Automated regression
+
+- focused pytest: `111 passed, 2 skipped`
+- 再クリック修正後の launcher／Tunnel／approval UI 対象 pytest: `38 passed`
+- broader selected regression: `115 passed, 2 skipped, 2 failed`。2件は Approved Host audit operation が並行実行時に `running` のまま期限へ達した timing failure で、同 audit file の単独再実行は `8 passed`
+- Ruff changed Python files: PASS
+- `compileall src/windows_local_mcp`: PASS
+- Windows PowerShell 5.1 parser（`run-localmcp.ps1`、`secure-mcp-tunnel.ps1`、`install-approved-host-runtime.ps1`）: PASS
+- `git diff --check`: substantive error なし（既存の LF／CRLF warning のみ）
+
 ## 2026-08-31 Sandbox／Automatic Git の UAC 再試行抑止
 
 通常の Sandbox／Automatic Git 起動では WFP Guard の確認を read-back のみに限定し、missing、不一致、読み取り不能のいずれでも自動昇格や自動再構築を行わず fail closed とする。WFP object の変更を許可するのは、operator が明示的に開始した `verify-codex-sandbox` の先頭で exact missing を確認できた場合だけである。管理者権限が必要な場合、この検証単位で WLMCP が開始する UAC は原則 1 回であり、同じ検証内の後続 probe は再昇格しない。
@@ -380,6 +483,27 @@ Live verification limitation:
 - 現在の Codex Desktop 内から入れ子の Windows Sandbox／UAC を起動した結果は通常 Windows host の実機証拠として扱わないため、UAC の実表示回数、再起動後、BFE／WFP state 消失後、実 Codex Sandbox helper の初回セットアップは未検証である。
 - 通常 Windows PowerShell から明示 verifier を実行し、初回成功後の通常 Sandbox／Automatic Git 起動で追加 UAC がないこと、および再起動・WFP state 消失・binding 変更後に自動再昇格せず停止することを確認するまで、live verification verdict は `pending` とする。
 
+## 2026-09-21 Sandbox 最小ポリシー互換性の追加調査
+
+判定は **未解決／復旧条件未達**。表示修正を Sandbox の復旧完了として扱わない。
+
+- 通常ユーザー・非昇格・非制限トークンの経路で、Program Files 配下の導入済み runtime による正式 `verify-codex-sandbox` を再実行した。Desktop `0.155.0-alpha.2.6` は固定コマンドで ``requires effective `:root` read access`` を返し、`verification_status=unverified`、`route_eligible=false`、`passed=false`。後続境界は未検証のまま保持した。
+- 分離取得した署名済み公式 npm 安定版 `0.155.1` も、同じ最小ポリシーの固定診断で同じ拒否を返した。正式 marker や運用設定を候補用に置き換えていない。
+- `0.153.4` の追加診断は設定読み込み中の filesystem replace 検査が `WinError 32` で停止し、時間を空けた再実行でも backend 実行へ到達していない。既知の `0.146.0` の子・孫 outside-user read 失敗、過去の `0.153.4` の成功記録とも今回の実測を混同しない。
+- `request_sandbox_command` を実際の MCP から呼び、未検証 marker を理由とする登録前の拒否と監査 `rejected` を確認した。承認後の一回限りの実行、`poll_approval` の正常な結果、stdout、終了コード、正常終端監査は未検証。Windows local の正常実行 E2E と Secure MCP Tunnel／ChatGPT connector の正常実行 E2E はどちらも未達。
+- 実装修正は `dependency_available`、現在の正式証拠に結合した `policy_compatibility`、全必須境界の実行 gate の分離。ポリシー非互換・未検証で `available=true` と表示しない。署名、helper、hash、stable identity、version、policy generation、Windows、WFP、TTL の binding と全既存実行 gate は維持した。
+- 広い関連回帰: **263 passed, 2 skipped, 2 failed**。Sandbox、WFP、承認、Automatic Git、resource bound、descendant containment、server の対象を実行。失敗は `test_approval_execution_integration.py` の正常 snapshot と WMI 子プロセス検出で、期限時点の `running` と期待する終端状態の不一致だった。
+- 対象を絞った再確認: **38 passed, 1 skipped, 1 failed**。先の2件は成功したが、同ファイルの `test_approved_host_allows_legitimate_descendant_to_finish` が `running` のままで失敗。承認統合テスト全体が安定して成功したとは主張しない。
+- 最終の互換性・Sandbox architecture・残存リスク契約回帰: **62 passed**。変更した Python 4ファイルの Ruff `--no-cache`: PASS。`git diff --check`: エラーなし（既存の改行形式警告のみ）。各 pytest 実行は `.dev-tmp/pytest/turn2-*` の固有ディレクトリを使用した。
+- 今回の変更は作業ツリーのみ。変更不能な運用 runtime へ表示修正を再配布しておらず、接続中 MCP の表示を修正済みとは主張しない。既存・並行作業の変更は維持し、コミットしていない。
+
+原因、候補別証拠、次の選択肢は `docs/SANDBOX_RECOVERY_2026_09_21.md` を参照。
+
+同日後続の `0.153.4` 候補診断では設定読み込みを通過したが、親・子・孫の outside-user read denial がすべて失敗し、`passed=false`。
+通常 Windows user 文脈・導入済み runtime による `persist_evidence=False` の診断であり、正式 marker の更新や候補の運用採用はしていない。
+証拠は `.dev-tmp/sandbox-native-implementation-20260921/candidate-01534.json`。正式 CLI の全工程、承認後 E2E、Tunnel／ChatGPT connector の正常実行 E2E の成功証拠とは扱わない。
+OS は Windows 11 Home と確認した。Microsoft Windows Sandbox への方式変更は対応エディションまたは別仮想化製品の選択を必要とし、未実装・未検証。
+
 ## Historical verification record
 
 WLMCP-R2-001 closure 前の詳細な repository-wide verification chronology は `VERIFICATION_HISTORY_PRE_R2_001_CLOSURE.md` を参照する。そこに記録された古い `LIVE VERIFICATION PENDING`、capability-reduction、Round 2 `unresolved / release blocker` 等は historical point-in-time evidence として保持し、上記 current verdict により supersede される。
@@ -402,3 +526,114 @@ WLMCP-R2-001 closure 前の詳細な repository-wide verification chronology は
 | CONN-04 | CHATGPT_LIVE_TEST_V1 | PASS_NONREUSABLE | target=a09cf5372be147f46eb1f5a63e7cf4f64f659c7a; runtime_revision=unverified | d042752254c1c7549fcca70275d739b3d7301771 | workspace=C:\dev\decision-deck-localmcp-test; data_dir isolated; exact runtime revision not exposed | config_source=LOCAL_MCP_CONFIG; workspace_source=explicit_config; ambient_root_present=false; exact digest not exposed | 2026-08-31T23:02:43+09:00 | current `session_info` と audit を再取得。workspace/data directory は分離、config は LOCAL_MCP_CONFIG から explicit、ambient root は不存在かつ override=false。stdio configured/enabled/available=true・startup accepted。HTTP configured/enabled/available=false。表示上の暗黙 fallback は観測されない。runtime/config exact fingerprint を target main に結合できないため reusable にはしない。 | session_info 09f10c81-df4a-4e1b-97b0-2d6ce2f6a6e1; audit_get same id | false | exact runtime revision/config policy digest を得て同じ確認を再実行する。 |
 | FS-01 | CHATGPT_LIVE_TEST_V1 | RUNNING | a09cf5372be147f46eb1f5a63e7cf4f64f659c7a | d042752254c1c7549fcca70275d739b3d7301771 | pending | pending | 2026-08-31T23:03:11+09:00 | 開始前記録。fixture root の存在可否を含め、list_directory/read_file の通常動作、UTF-8、行範囲、改行、行数、SHA-256 を実経路で確認する。 | pending | false | fixture と安全な既存テキストを read/list して監査と結果を確認する。 |
 <!-- CHATGPT_LIVE_TEST_PROGRESS_V1:END -->
+# 2026-09-21 Approved Host source-workspace 実行準備
+
+- 非 code-loader の `source-workspace` と `workspace_write=false` で、存在しない `staged_cwd` を参照して child 起動前に失敗する問題を再現した。
+- source／Git source mode は既存の入力照合を維持し、manifest と一致する元 cwd／引数を保持するよう修正した。承認説明の「実行用コピー」も実際の source mode に合わせた。token、Job、postflight、durable recovery の処理は変更していない。
+- 修正後の対象回帰: **230 passed**。承認・入力改変拒否、既存 snapshot／Git、Approved Host、runtime installer、control-plane、timeout、異常終了、復旧を含む。追加回帰20件を含む。Ruff `--no-cache` は成功。
+- 運用用成果物は現在の導入版を基準に `approval.py` と `risk.py` だけを変更し、依存パッケージの版も現在の導入版へ固定した。同成果物で承認・source mode・policy・authority state・recovery の **68 passed** を確認した。
+- 管理者更新の UAC が「この操作はユーザーによって取り消されました」で終了し、インストーラーは未開始。既存ランチャーは稼働したままで、運用 runtime は未更新。修正後の Windows E2E は未完了。新しいローカル承認、child の通常ユーザー権限、標準出力、postflight、latch 解除、異常終了・復旧は今回の実機確認として未実施。[調査・検証記録](docs/APPROVED_HOST_SOURCE_WORKSPACE_2026_09_21.md) に再開手順を記載した。自動回帰を実機成功の代替としない。
+- 後続の実機テスト指示により17:47 JSTに運用 runtime 更新を完了。導入後ソース照合と非昇格ユーザーの変更不能性検証が成功した。MCP `session_info` も新 digest `4e1de0f5ccc5c0388fd97b941be8ccdeb416c541965334d265d201103d62b8c3` に対し runtime／authority preflight 成功、`available=true`、`execution_route_available=true`。新規の読み取り専用承認 `4c711aa2-a394-4401-b427-18a460764a7b` はローカル承認待ちであり、修正後 E2E 成功の判定はまだ行わない。
+- 同承認を18:08:43 JSTにローカル承認。元のcwd欠損は解消してbundle検証を通過したが、事前検証完了まで約118秒かかり、実行承認期限60秒を超えたため最終状態は **expired**。child未起動、終了コードなし、標準出力0バイト。終了後のauthenticated authorityはhealthy／activeなし、ユーザー側tamper／postflight markerもなし。180秒設定で再申請するか60秒維持で高速化するかはユーザー判断待ちで、設定・期限チェックは変更していない。E2E成功、child権限、正常child postflight、worker-loss／復旧の実機検証完了とは扱わない。
+- ユーザー許可で運用設定の承認後実行期限を180秒に変更し、運用 runtime の読み込みと再起動後のruntime／authority事前確認を再検証した。続くMCP申請3件はいずれも人が承認。1件は制御面容量上限で安全に拒否され、今回の終了済み申請3件の一時入力だけを整理して上限を変えずに解消した。残る2件はbundle・checkpoint・制御面guardを通過後、要求元PID不在で子プロセス作成前に失敗した。直近失敗後に承認UIプロセスは存在しなかったが、終了の正確な時点・理由は未確定。`docs/APPROVED_HOST_RUNTIME.md`のserviceによるtoken複製という記述と、workerが子起動直前に複製する現行実装の不一致を発見し、どちらを正とするか利用者に確認中。今回の読み取り専用Approved Host E2E、child権限、正常postflight、異常終了・復旧の実機確認は引き続き未完了。[操作別の監査結果](docs/APPROVED_HOST_SOURCE_WORKSPACE_2026_09_21.md)を参照。
+- 利用者は上記の不一致について、service が検証時に通常ユーザー token を保持して SYSTEM worker へ安全に渡す方針を仕様として選択した。開いた requester process HANDLE の作成時刻、SID／非昇格／primary token、明示的な継承 HANDLE list、worker の token 再検証と一度限りの使用へ実装を変更した。要求元終了後の token 継承の Windows 回帰と service の capture-before-arm／handle-list 回帰は実施中。更新後の運用 runtime による child／postflight／復旧の実機確認前に release-level 完了とは扱わない。
+- 上記3ファイルを運用 runtime へ更新し、導入後 SHA-256 照合と runtime／authority preflight 成功を確認した。MCP 読み取り専用申請 `6b39baf2-8f64-4470-8f90-699e8920160c` は人による承認後、`poll_approval`／監査で `succeeded`、終了コード0、child PID 58824、stdout に通常ユーザー SID の `whoami /user` 結果を確認。別の実機観測で同じ PID の SID と非昇格を確認した。`postflight_error=null`、再接続後の authority は同じ epoch で healthy／active なし、user-owned tamper／postflight pending marker なし。関連回帰42件成功。操作後に Tunnel／MCP server は停止して HTTP 504 となったが、LocalSystem service は Running、監査結果は成功のままだった。Tunnel 再起動後に MCP `poll_approval` から成功結果を再取得した。Tunnel 終了原因と、今回変更した token 境界の abnormal／recovery 実機 fault injection は未確認。[詳細](docs/APPROVED_HOST_SOURCE_WORKSPACE_2026_09_21.md)。
+- 再起動後の `run-localmcp.bat` 再クリックで端末が即閉じる事象を実機で再現した。既存 Tunnel と loopback ready は正常で、PowerShell／バッチの終了コードは0だった。失敗時だけ `pause` するバッチ分岐が原因である。正常に処理が戻った場合も、対話起動では結果を読めるまで待つよう変更した。修正後の対話型再クリックは「起動済み」を表示してキー入力まで5秒以上継続し、入力後に終了コード0。既存 Tunnel を停止してから同バッチで新規起動すると local ready 成功、端末は稼働継続、MCP `session_info` は Approved Host の runtime／authority preflight 成功、`available=true`、`execution_route_available=true`、active operation なしを確認した。`WLMCP_NO_PAUSE=1` の自動実行経路は再クリック後も終了コード0で即時返却。ランチャー回帰21件成功。停止原因の再現・特定や token 境界の abnormal／recovery 実機確認とは区別する。
+- 上の「結果表示後にキー入力待ち」だけでは、利用者が求める起動状態を回復できなかった。既存 Tunnel が健康な場合、再クリック側は正常終了せず同じ Tunnel の process HANDLE を待ち、承認画面の自動起動設定が有効なら選択済みの Program Files runtime から承認画面を開き直すよう修正した。MCP server／Tunnel を重複起動せず、ready と process identity が不明な状態は従来どおり拒否する。非対話の `WLMCP_NO_PAUSE=1` は健康確認後に即時0を返す。通常ユーザーの対話型バッチで再クリックした実機試験では、端末が継続し承認画面の PowerShell／Python が起動、Tunnel PID は不変で1個だった。デスクトップの実ショートカットからも通常ユーザーの端末と承認処理が継続し、MCP `session_info` は `available=true`／`execution_route_available=true`、runtime／authority preflight 成功、active operation なし。ランチャー回帰21件成功。Codex の対話端末から開始した試験用承認画面では Ctrl+C 後に `CloseMainWindow()` が終了を確認できず、試験用の正確な子孫 PID だけを照合して終了した。実デスクトップ画面が利用者に表示されているかはプロセス検査だけでは確定しないため別途確認する。
+# ChatGPT 添付取り込みの検証（2026-10-06）
+
+`artifact_import_file` と公式 `openai/fileParams` の接続を追加した。設計・設定・
+operatorが受容した会話所属検証の限界は [添付取り込み](docs/CHATGPT_ATTACHMENT_IMPORT.md) を参照。
+既存の512 KiBチャンク既定値を下げず、Base64文字数のdecode前検査とToolError識別を追加した。
+
+主担当が通常Windows環境・Python 3.13.15／MCP SDK 2.1.1で以下を独立実行した。
+制限環境では `.dev-tmp` 作成がWinError 5になったため、ACL変更を行わず通常環境で再実行した。
+
+```powershell
+.venv/Scripts/python.exe -m pytest tests/test_attachment_import.py tests/test_attachment_import_server.py tests/test_artifact_transfer_errors.py tests/test_artifact_fast_path.py tests/test_binary_transfer_lifecycle.py tests/test_transfer_timeline.py tests/test_high_level_operations.py tests/test_structured_files.py tests/test_structured_resource_admission.py tests/test_config.py tests/test_config_binding.py tests/test_audit.py tests/test_windows_transaction.py --basetemp=.dev-tmp/pytest/attachment-final-20261006
+```
+
+- **176 passed、4 skipped、2 failed、68.50秒**。追加した添付取得58件、添付保存12件、転送5件はすべて成功。
+- 数百KBのPillow生成JPEGを、合成HTTP応答から実取得処理・実保存処理まで通し、保存バイト列と元ハッシュの一致を確認した。元の名刺画像は未提供であり、その実ファイルの検証ではない。
+- 実ローカルMCP stdio ClientSessionで、乱数相当512 KiB・Base64 699,052文字をupload／commit／downloadし、全バイトとSHA-256の一致を確認した。512 KiB+1は同じBase64文字数でもraw上限で拒否した。
+- 不正参照、非公開IP、DNS再解決回避、HTTPS証明書検証設定、リダイレクト、曖昧なHTTP framing、受信中上限超過、途中切断、形式矛盾、SHA不一致を確認した。
+- 保存先検証、既存CAS、取得中の競合、checkpoint、書き込み後障害の自動回復、未完了ダウンロードの未確定を確認した。
+- 正常／拒否時の監査、およびSDK引数検証エラーでURLやBase64本体が露出しないことを確認した。必須path欠落時のSDKによる入力全体の表示も抑止した。
+- 4 skippedはシンボリックリンク作成に必要な権限がない環境での既存設定テスト。
+- 2 failedは変更していない `test_windows_transaction.py` のコピー／移動先作成競合テスト。単独再実行でも同じ2件が失敗した。別の限定診断では `_before_commit` の競合側 `destination.write_bytes` 自体がOSErrorとなり、元ファイルは不変、保存先は存在しなかった。テストが期待する「競合側のファイルが残る」と一致しない。関連実装 `windows_transaction.py` と当該テストは変更しておらず、今回の添付経路もコピー／移動関数を使わない。この既存テスト結果を成功扱いにしたり、テスト期待値を緩めたりしていない。
+
+変更箇所のRuffは一度すべて通過した。その後の最終確認中、別タスクによる
+`server.py` の `transfer_receipts` 関連変更と `artifact_errors.py` の追加変更を検出した。ユーザーが並行作業を確認し、
+その変更を保持して本作業を仕上げるよう指示したため、上書きしていない。
+上記テスト結果は実行時点のものであり、その後の並行変更を含む最終統合状態の成功を保証しない。
+並行編集中の静的検査では一時的に `ArtifactTransferNotFoundError` の重複定義も観測したが、
+その後の読み取りでは解消していた。本作業からは編集していない。
+
+未検証: 実ChatGPTが渡す添付参照、実配信ホストの特定・TLS取得、OpenAI Tunnelを含む往復、
+運用immutable runtimeへの配備・再起動・ツール再登録、当該会話への所属の独立検証。
+許可ホスト設定は空のまま維持した。自動テストの合成応答や外部authority検査のstubを、
+実ChatGPT／本番運用・SCM／WFP／Approved Hostの検証とみなさない。
+
+## バイナリ転送の再送・状態照会・期限分離（2026-10-06）
+
+- 新規uploadに永続受信記録を追加し、同一チャンクの冪等再送、内容不一致の拒否、再起動後の再開を確認した。記録領域を事前予約し、通常チャンクのquota全走査を増やしていない。
+- `artifact_transfer_status` はmanifest／workspaceを変更せずに状態を返す。`binary_transfer_ttl_seconds` は既定1800秒、30〜86400秒で、承認期限と終端retentionを分離した。
+- チャンクの既存Base64事前上限を維持し、正規形検査とone-shotの文字数先行検査を補強した。512 KiB／699,052文字は実MCP stdioで成功。プロセス再起動後のstatus・再送・commitも成功した。
+- 転送関連の最終回帰は **250 passed, 6 skipped**。スキップはWindowsのシンボリックリンク作成権限不足。性能試験は **5 passed**。変更箇所のRuffと差分空白検査も成功した。
+- download開始は前後とも論理読込3N・コピー書込N。安全性を保ったI/O削減の根拠が不足しており、処理は維持した。測定値から高速化達成とは判定しない。
+- 全体テストはランチャー起動試験で待機し900秒で打ち切った。その後の未完了範囲は **520 passed, 4 skipped, 2 failed, 1 deselected**。残る2失敗は変更していないWindows transactionのcopy／move競合試験で、独立再実行でも再現した。初回の転送manifest競合は修正済み。他領域5失敗は独立再実行で成功したが、全体成功とは扱わない。
+- fileParamsによる既存添付取り込みを追加検証した。許可配信ホスト設定、運用runtime配備、実ChatGPT／Tunnelの添付E2Eは未実施。通常ChatGPTへの直接exportを成立させる正式な配送形式を確認できず、独自方式は追加していない。
+
+条件・全コマンド・区間別性能・失敗の切り分け・未検証範囲は [検証記録](docs/BINARY_TRANSFER_VERIFICATION_2026_10_06.md)、利用方法と仕様は [転送の復旧仕様](docs/BINARY_TRANSFER_RESUME.md) を参照。
+
+## 2026-10-06 決定済みファイル操作の一括実行・CAS内部化・完全一致置換
+
+`workspace_batch`、`workspace_replace`、`workspace_plan_apply` を追加した。仕様と判断理由、変更ファイル、再現手順は [決定済みファイル操作](docs/DETERMINISTIC_WORKSPACE_OPERATIONS.md)、3標本の比較結果は [測定JSON](docs/DETERMINISTIC_WORKSPACE_BENCHMARK_2026_10_06.json) に記録した。
+
+- 新規テストは分割実行で62成功・1保留。最終統合27件、計画処理35件が成功。シンボリックリンク作成権限不足1件を保留し、Windowsの実junctionとハードリンクの拒否は確認した。
+- 広い対象回帰は182成功・5保留・既存2件分離、初期化WinError 5で3失敗。失敗対象の別一時フォルダーでの再試験は4成功。最終レビュー後の関連回帰と故障注入も再確認した。詳細と中間失敗の扱いは上記文書を参照。
+- Windowsコピー／移動の保存先競合テスト2件は、一括操作の実装時には未変更・未解決として今回の成功数に含めなかった。その後の追跡調査でテストの前提誤りを修正した。次節の結果を参照。
+- 添付取り込み・チャンク再送・再開等との互換性は113成功・1保留。並行artifact変更を上書きせず、同じcheckoutで共存を確認した。
+- 最終実装のローカル比較で、batchは5呼出→1呼出、検索・置換は3呼出→1呼出。生SHA-256の転記はそれぞれ128文字→0文字、256文字→0文字。処理全体の中央値は889.248ms→431.279ms、779.741ms→639.491ms。既存の詳細フェーズ上限を維持し、最終の監査・性能テスト8件も成功した。
+- 実行は合成workspaceのBroker経路で、外部authority確認はテスト用に置き換えている。実ChatGPT/Tunnelの通信・LLM生成時間、運用runtimeの配備・再起動、SCM/WFP/Sandbox/Approved Hostの実機受容を証明するものではない。
+
+## 2026-10-06 Windowsコピー・移動の保存先競合テストの追跡修正
+
+- 過去に分離していた2件は、TxFによる名前予約後の競合側ファイル作成が成功するというテストの前提誤りだった。競合側の例外を本体全体の `pytest.raises(OSError)` が捕捉し、作成されなかったファイルの存在を要求して失敗していた。
+- 通常Windowsプロセスで競合側の `CreateFileW` がエラー6800（`ERROR_TRANSACTIONAL_CONFLICT`）となることを確認。競合側の拒否を適切に扱うとコピー・移動本体は成功し、内容と識別情報も期待どおりだった。保存先を先に作られる条件でも第三者ファイルは保持された。
+- 対象2テストを修正し、ファイルHANDLEを閉じてからcommitするまでの保護、保存先確保前の衝突、コールバック例外時の復元と再実行を追加した。実行ロジック・CAS・権限・復旧仕様は変更せず、実装側はコメントのみ訂正した。
+- トランザクション試験全体は **15 passed**。対象2件を除外しない関連回帰は **105 passed, 1 skipped**。Ruff（キャッシュなし）と差分の空白検査は成功。過去の失敗記録は当時の結果として保持する。
+- このPCの通常Windows/NTFS上で合成データを使用した。全リポジトリ、他のWindows環境、実ChatGPT/Tunnel、Approved Host/Sandboxの実機受容を検証した結果ではない。
+
+原因・根拠・変更ファイル・再実行コマンドは [保存先競合の調査記録](docs/WINDOWS_TRANSACTION_DESTINATION_RACE_2026_10_06.md) を参照。
+
+## 2026-10-06 Live Activityの完全差分・所要時間・操作IDによる変更取得
+
+局所操作の完全差分、非テキスト変更の概要、実行中の経過時間と完了時の所要時間を追加した。
+高水準操作は概要表示とし、`operation_changes` で変更一覧・完全差分・変更前後のバイト列を
+ページ取得する。`operation_report` に操作IDによる承認付きUndo／完了時点への復元の
+呼び出し情報を追加した。仕様は [Live Activityの変更表示](docs/LIVE_ACTIVITY_CHANGES.md) を参照。
+過去の「差分を表示しない」という受容記録は当時の仕様であり、今回の表示要件は同文書に従う。
+
+通常Windows環境のリポジトリ内 `.venv` で、主担当が次の既存機能回帰を実行した。
+
+```powershell
+$env:PYTHONIOENCODING='utf-8'
+.venv/Scripts/python.exe -m pytest tests/test_timeline_and_rollback.py tests/test_high_level_operations.py tests/test_structured_files.py tests/test_filesystem_primitives.py tests/test_server_operations.py tests/test_deterministic_workspace_operations.py --basetemp=.dev-tmp/pytest/live-activity-regression-20261006-01 -q
+```
+
+- **129 passed, 2 skipped、107.57秒**。履歴・取り消し・高水準操作・構造化変換・基本ファイル操作・一括操作の回帰を確認した。スキップ2件は成功数に含めない。
+- 表示・変更取得API・発行元表示の統合テストは以下の実行で **124 passed, 1 failed、19.55秒**。失敗1件は初期化時の既存ファイル置換確認が `WinError 5` となり、改変検出本体に到達していなかった。その1件を検査や実装を変更せず独立実行し、**1 passed、0.40秒**。125件は分割実行で成功を確認した結果であり、単一実行の全成功とは記録しない。
+
+  ```powershell
+  $env:PYTHONIOENCODING='utf-8'
+  .venv/Scripts/python.exe -m pytest tests/test_operation_changes_server.py tests/test_operation_changes.py tests/test_live_activity_changes.py tests/test_live_activity.py tests/test_live_activity_operation_id.py tests/test_origin_views.py --basetemp=.dev-tmp/pytest/live-activity-integration-20261006-05 -q
+  .venv/Scripts/python.exe -m pytest tests/test_operation_changes.py::test_same_size_blob_tamper_is_rejected_before_return --basetemp=.dev-tmp/pytest/live-activity-tamper-20261006-01 -q
+  ```
+
+- 保存プレビューを超える完全差分、後続手動変更の混入防止、非テキストの変更前後バイト列、UTF-8をまたぐページ境界、名前空間・ハッシュ・許可パスの検証、欠落記録、承認前に変更を戻さないこと、200件を超える集計、変換開始前の操作表示、待機時間の分離、表示の抑止・再開・重複防止を確認した。
+- 変更対象のRuff、Python構文検査、差分の空白検査は成功した。
+- 開発中、並行する時間計測タスクのフェーズ登録待ちによりテスト読込が停止した。そのタスクの修正後に実行した結果を上記に記載した。時間計測と発行元表示の並行変更は保持した。
+- 制限環境の一時ディレクトリ作成は `WinError 5` となったため、ACLを変更せず承認された通常Windows環境で再実行した。
+- 検証は合成データと保存済みチェックポイントを使う自動テスト。実承認画面の操作、実ChatGPT／Tunnel経由の新ツール取得、運用runtimeへの配備・再起動は未実施。既存のローカル承認・競合検知・復旧経路は維持し、通常ユーザーの承認操作を自動テストで代替したとは扱わない。
+- 本文ページ取得は対象内容全体のハッシュ検証、差分の再生成を行う。大容量ファイルを小ページで反復取得する場合の処理量は残る。チェックポイント保存期限後の完全取得は保証しない。

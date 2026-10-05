@@ -37,7 +37,8 @@ function Get-RunTunnelFailureClass {
 function Start-LocalMcpActivityMonitor {
     param(
         [AllowNull()][string]$PythonPath,
-        [Parameter(Mandatory = $true)][string]$ConfigPath
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [switch]$StdoutOnly
     )
 
     if ([string]::IsNullOrWhiteSpace($PythonPath) -or -not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) {
@@ -48,6 +49,7 @@ function Start-LocalMcpActivityMonitor {
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = $PythonPath
     $startInfo.Arguments = "-I -B -m windows_local_mcp.activity_monitor --config " + (ConvertTo-TunnelCommandArgument -Value $ConfigPath)
+    if ($StdoutOnly) { $startInfo.Arguments += " --stdout-only" }
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $false
     $process = [Diagnostics.Process]::new()
@@ -62,7 +64,7 @@ function Start-LocalMcpActivityMonitor {
             Write-Warning "Live Activity 監視が起動直後に終了しました（終了コード: $exitCode）。LocalMCP の起動は継続します。"
             return $null
         }
-        Write-Host "Live Activity、監査操作、ローカル承認要求をこのウィンドウへ表示します。" -ForegroundColor Cyan
+        Write-Host "監査操作とローカル承認要求をこのウィンドウへ表示します。" -ForegroundColor Cyan
         return $process
     } catch {
         $process.Dispose()
@@ -233,6 +235,25 @@ function Stop-LocalMcpApprovalUi {
     }
 }
 
+function Wait-LocalMcpExistingTunnel {
+    param([Parameter(Mandatory = $true)][int]$ProcessId)
+
+    # Get-TunnelProcessStatus and /readyz were verified before this call. Hold a
+    # process handle so PID reuse cannot attach this window to a later process.
+    $process = Get-Process -Id $ProcessId -ErrorAction Stop
+    try {
+        Write-Host "既存の Tunnel を使用しています。このウィンドウは Tunnel の終了まで開いたままです。" -ForegroundColor Cyan
+        while (-not $process.WaitForExit(1000)) {
+            # Bounded waits let PowerShell process Ctrl+C and run the approval
+            # window cleanup without terminating the existing Tunnel.
+        }
+        Write-Warning "既存の Tunnel が終了しました。再起動するには run-localmcp.bat を実行してください。"
+        return $process.ExitCode
+    } finally {
+        $process.Dispose()
+    }
+}
+
 try {
     if (-not (Test-Path -LiteralPath $TunnelHelperPath -PathType Leaf)) {
         throw "secure-mcp-tunnel.ps1 が見つかりません。配布パッケージ全体を展開し直してください。"
@@ -329,7 +350,10 @@ try {
     }
     $context = Test-TunnelLocalMcpConfiguration -PythonPath $pythonPath -ConfigPath $resolvedConfig
     if (-not $context.Valid) {
-        Show-TunnelFailureGuide -FailureClass "server_start_failed"
+        Show-TunnelFailureGuide `
+            -FailureClass "server_start_failed" `
+            -ReasonCode ([string]$context.ReasonCode) `
+            -Detail ([string]$context.Message)
         throw "LocalMCP の active config を検証できません。"
     }
     $forbiddenRoots = @($ScriptRoot, $context.WorkspaceRoot, $context.DataDir) |
@@ -348,25 +372,12 @@ try {
     }
 
     $credential = $null
-    if ([string]$state.credential_mode -eq "credential_manager") {
-        $credential = Get-TunnelCredentialSecure -Target (Get-TunnelCredentialTarget -ConfigPath $resolvedConfig)
-        if ($null -eq $credential) {
-            Show-TunnelFailureGuide -FailureClass "auth_failed"
-            throw "Runtime API Key を安全な資格情報領域から取得できません。"
-        }
-    }
-
-    $doctor = Invoke-TunnelClientDoctor -ClientPath $binding.ClientPath -ProfilePath $binding.ProfilePath -Credential $credential
-    if (-not $doctor.Succeeded) {
-        Show-TunnelDoctorFailureGuide -DoctorResult $doctor
-        throw "Tunnel の起動前検証に失敗しました。"
-    }
-
     $mutex = [Threading.Mutex]::new($false, (Get-TunnelMutexName -ConfigPath $resolvedConfig))
     $hasMutex = $false
     $exitCode = 0
     $activityMonitor = $null
     $approvalUiProcess = $null
+    $existingTunnelPid = $null
     $approvalUiAutostart = Get-LocalMcpApprovalUiAutostart `
         -PythonPath $pythonPath `
         -ConfigPath $resolvedConfig
@@ -376,43 +387,97 @@ try {
     try {
         try { $hasMutex = $mutex.WaitOne(0) } catch { $hasMutex = $false }
         if (-not $hasMutex) {
-            throw "Tunnel が別の起動処理で使用中です。二重起動を避けるため停止します。"
-        }
-
-        $status = Get-TunnelProcessStatus `
-            -PidFile ([string]$state.pid_file) `
-            -ClientPath $binding.ClientPath `
-            -ProfilePath $binding.ProfilePath
-        if ($status.Status -eq "running") {
-            Write-Host "既存の Tunnel client は起動済みです。" -ForegroundColor Green
-            $exitCode = 0
-        } elseif ($status.Status -eq "indeterminate") {
-            throw "既存 Tunnel のプロセス識別情報を確認できません。重複起動を避けるため停止します。"
-        } else {
-            if ($status.Status -eq "stale" -and (Test-Path -LiteralPath $state.pid_file -PathType Leaf)) {
-                Remove-Item -LiteralPath $state.pid_file -Force -ErrorAction Stop
-            }
-            if (Test-Path -LiteralPath $state.health_url_file -PathType Leaf) {
-                Remove-Item -LiteralPath $state.health_url_file -Force -ErrorAction Stop
-            }
-            $activityMonitor = Start-LocalMcpActivityMonitor -PythonPath $pythonPath -ConfigPath $resolvedConfig
-            if ($approvalUiAutostart.Valid -and $approvalUiAutostart.Enabled) {
-                $approvalUiProcess = Start-LocalMcpApprovalUi `
-                    -ServerScriptPath $ServerScript `
-                    -ConfigPath $resolvedConfig
-            }
-            $started = Start-TunnelClientProcess -ClientPath $binding.ClientPath -ProfilePath $binding.ProfilePath -Credential $credential
+            # 正常な既存 Tunnel の再クリックは idempotent に扱います。mutex だけを
+            # 根拠に成功とはせず、同じ client/profile と loopback ready 応答の両方を
+            # 確認します。起動途中の場合も bounded wait の間だけ待機します。
             $ready = Wait-TunnelReady -HealthUrlFile $state.health_url_file -TimeoutSeconds 20
-            if ($ready.Ready) {
-                Write-Host "Tunnel は起動し、ローカル ready 応答を確認しました。" -ForegroundColor Green
-                Write-Host "ChatGPT 側で新しい接続が表示されない場合は、Tunnel/connector の tool refresh を行ってください。" -ForegroundColor Gray
+            $status = Get-TunnelProcessStatus `
+                -PidFile ([string]$state.pid_file) `
+                -ClientPath $binding.ClientPath `
+                -ProfilePath $binding.ProfilePath
+            if ($ready.Ready -and $status.Status -eq "running") {
+                Write-Host "Tunnel は既に起動済みで、ローカル ready 応答を確認しました。Tunnel は追加起動しません。" -ForegroundColor Green
+                $existingTunnelPid = [int]$status.ProcessId
+            } elseif ($status.Status -eq "indeterminate") {
+                throw "別の Tunnel 起動処理を検出しましたが、プロセス識別情報を安全に確認できません。二重起動を避けるため停止します。"
             } else {
-                Write-Warning "Tunnel client は起動しましたが、20 秒以内にローカル ready 応答を確認できませんでした。プロセスは維持します。"
-                Show-TunnelFailureGuide -FailureClass "tunnel_client_failed"
+                throw "別の Tunnel 起動処理を検出しましたが、20 秒以内に正規プロセスとローカル ready 応答を確認できません。二重起動を避けるため停止します。"
             }
-            $exitCode = Wait-TunnelClientProcess -Started $started
-            if ($exitCode -ne 0) {
-                Show-TunnelFailureGuide -FailureClass "tunnel_client_failed"
+        } else {
+            # 初回起動または mutex を安全に取得できた recovery path だけが
+            # Credential Manager と doctor を使用します。正常な既存 Tunnel の
+            # 再クリックでは秘密情報や追加の診断 process を起動しません。
+            if ([string]$state.credential_mode -eq "credential_manager") {
+                $credential = Get-TunnelCredentialSecure -Target (Get-TunnelCredentialTarget -ConfigPath $resolvedConfig)
+                if ($null -eq $credential) {
+                    Show-TunnelFailureGuide -FailureClass "auth_failed"
+                    throw "Runtime API Key を安全な資格情報領域から取得できません。"
+                }
+            }
+
+            $doctor = Invoke-TunnelClientDoctor -ClientPath $binding.ClientPath -ProfilePath $binding.ProfilePath -Credential $credential
+            if (-not $doctor.Succeeded) {
+                Show-TunnelDoctorFailureGuide -DoctorResult $doctor
+                throw "Tunnel の起動前検証に失敗しました。"
+            }
+
+            $status = Get-TunnelProcessStatus `
+                -PidFile ([string]$state.pid_file) `
+                -ClientPath $binding.ClientPath `
+                -ProfilePath $binding.ProfilePath
+            if ($status.Status -eq "running") {
+                $ready = Wait-TunnelReady -HealthUrlFile $state.health_url_file -TimeoutSeconds 20
+                if (-not $ready.Ready) {
+                    throw "既存の Tunnel client は起動中ですが、ローカル ready 応答を確認できません。"
+                }
+                Write-Host "Tunnel は既に起動済みで、ローカル ready 応答を確認しました。Tunnel は追加起動しません。" -ForegroundColor Green
+                $existingTunnelPid = [int]$status.ProcessId
+            } elseif ($status.Status -eq "indeterminate") {
+                throw "既存 Tunnel のプロセス識別情報を確認できません。重複起動を避けるため停止します。"
+            } else {
+                if ($status.Status -eq "stale" -and (Test-Path -LiteralPath $state.pid_file -PathType Leaf)) {
+                    Remove-Item -LiteralPath $state.pid_file -Force -ErrorAction Stop
+                }
+                if (Test-Path -LiteralPath $state.health_url_file -PathType Leaf) {
+                    Remove-Item -LiteralPath $state.health_url_file -Force -ErrorAction Stop
+                }
+                $activityMonitor = Start-LocalMcpActivityMonitor -PythonPath $pythonPath -ConfigPath $resolvedConfig
+                if ($approvalUiAutostart.Valid -and $approvalUiAutostart.Enabled) {
+                    $approvalUiProcess = Start-LocalMcpApprovalUi `
+                        -ServerScriptPath $ServerScript `
+                        -ConfigPath $resolvedConfig
+                }
+                $started = Start-TunnelClientProcess -ClientPath $binding.ClientPath -ProfilePath $binding.ProfilePath -Credential $credential
+                $ready = Wait-TunnelReady -HealthUrlFile $state.health_url_file -TimeoutSeconds 20
+                if ($ready.Ready) {
+                    Write-Host "Tunnel は起動し、ローカル ready 応答を確認しました。" -ForegroundColor Green
+                    Write-Host "ChatGPT 側で新しい接続が表示されない場合は、Tunnel/connector の tool refresh を行ってください。" -ForegroundColor Gray
+                } else {
+                    Write-Warning "Tunnel client は起動しましたが、20 秒以内にローカル ready 応答を確認できませんでした。プロセスは維持します。"
+                    Show-TunnelFailureGuide -FailureClass "tunnel_client_failed"
+                }
+                $exitCode = Wait-TunnelClientProcess -Started $started
+                if ($exitCode -ne 0) {
+                    Show-TunnelFailureGuide -FailureClass "tunnel_client_failed"
+                }
+            }
+        }
+        if ($null -ne $existingTunnelPid) {
+            if ($env:WLMCP_NO_PAUSE -eq "1") {
+                # Noninteractive callers only need the verified status and exit code.
+                $exitCode = 0
+            } else {
+                # Reopening the launcher restores the local approval window if its
+                # prior owner disappeared; the approval mutex prevents duplicates.
+                # This observer only displays audit changes. The original owner
+                # remains the sole writer of the rotating activity log.
+                $activityMonitor = Start-LocalMcpActivityMonitor -PythonPath $pythonPath -ConfigPath $resolvedConfig -StdoutOnly
+                if ($approvalUiAutostart.Valid -and $approvalUiAutostart.Enabled) {
+                    $approvalUiProcess = Start-LocalMcpApprovalUi `
+                        -ServerScriptPath $ServerScript `
+                        -ConfigPath $resolvedConfig
+                }
+                $exitCode = Wait-LocalMcpExistingTunnel -ProcessId $existingTunnelPid
             }
         }
     } finally {

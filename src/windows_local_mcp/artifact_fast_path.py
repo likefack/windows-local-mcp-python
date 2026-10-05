@@ -15,6 +15,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Final, Literal
 
+from .artifact_errors import ArtifactTransferError
 from .util import sha256_bytes
 
 _SHA256_RE: Final = re.compile(r"[0-9a-f]{64}")
@@ -24,7 +25,7 @@ _DEFAULT_UPLOAD_ROUTE: Final = (
 )
 
 
-class OneShotLimitExceeded(ValueError):
+class OneShotLimitExceeded(ArtifactTransferError):
     """The payload cannot safely be returned or accepted as one MCP message.
 
     ``chunked_route`` is intentionally part of the exception.  A high-level server tool can
@@ -47,6 +48,7 @@ class OneShotLimitExceeded(ValueError):
         self.unit = unit
         self.chunked_route = chunked_route
         super().__init__(
+            "TRANSFER_BASE64_LIMIT" if unit == "base64_chars" else "TRANSFER_TOTAL_SIZE_LIMIT",
             f"one-shot {direction} {unit} limit exceeded: {actual} > {limit}; "
             f"chunked transfer is required ({chunked_route})"
         )
@@ -57,13 +59,16 @@ class OneShotLimitExceeded(ValueError):
 ChunkedTransferRequired = OneShotLimitExceeded
 
 
-class OneShotDigestMismatch(ValueError):
+class OneShotDigestMismatch(ArtifactTransferError):
     """The payload bytes do not match a caller-declared SHA-256 digest."""
 
     def __init__(self, *, expected: str, actual: str) -> None:
         self.expected = expected
         self.actual = actual
-        super().__init__(f"one-shot payload SHA-256 mismatch: expected {expected}, got {actual}")
+        super().__init__(
+            "TRANSFER_SHA256_MISMATCH",
+            f"one-shot payload SHA-256 mismatch: expected {expected}, got {actual}",
+        )
 
 
 def _validate_limit(value: int, *, name: str) -> int:
@@ -253,20 +258,26 @@ def decode_one_shot_upload(
         expected_sha256 = _validate_digest(expected_sha256, name="expected_sha256")
     if not isinstance(encoded, str):
         raise TypeError("base64 payload must be a string")
-    if any(ord(character) > 127 for character in encoded):
-        raise ValueError("base64 payload must contain ASCII characters only")
     _check_encoded_limit(
         len(encoded), max_base64_chars=max_base64_chars, direction="upload"
     )
+    if not encoded.isascii():
+        raise ArtifactTransferError(
+            "TRANSFER_BASE64_INVALID", "base64 payload must contain ASCII characters only"
+        )
 
     try:
         payload = base64.b64decode(encoded, validate=True)
     except (binascii.Error, ValueError) as error:
-        raise ValueError("base64 payload must be valid canonical base64") from error
+        raise ArtifactTransferError(
+            "TRANSFER_BASE64_INVALID", "base64 payload must be valid canonical base64"
+        ) from error
     # Re-encoding rejects alternate spellings (including non-zero padding bits) and guarantees
     # that the exact bytes represented by the request are the bytes committed by the caller.
     if base64.b64encode(payload).decode("ascii") != encoded:
-        raise ValueError("base64 payload must use canonical padding and alphabet")
+        raise ArtifactTransferError(
+            "TRANSFER_BASE64_NONCANONICAL", "base64 payload must use canonical padding and alphabet"
+        )
 
     check_one_shot_size(len(payload), max_bytes=max_bytes, direction="upload")
     actual_sha256 = sha256_bytes(payload)

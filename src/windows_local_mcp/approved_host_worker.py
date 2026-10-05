@@ -8,12 +8,11 @@ from typing import Any
 
 from .approved_host_process_census import (
     capture_user_processes,
-    requester_username,
     wait_for_untracked_user_processes,
 )
 from .approved_host_worker_lease import HardenedAuthorityWorkerLease
 from .control_plane import load_worker_context
-from .windows_user_process import popen_as_requester_in_job
+from .windows_user_process import RequesterPrimaryToken, popen_as_requester_in_job
 
 
 def _install_authority_hooks(
@@ -21,6 +20,8 @@ def _install_authority_hooks(
     *,
     requester_pid: int,
     requester_create_time: float,
+    requester_username_value: str,
+    requester_token: RequesterPrimaryToken,
 ) -> None:
     """Move Approved Host launch/postflight authority into this LocalSystem worker."""
     from . import control_plane_guard, process_utils, windows_job
@@ -29,7 +30,7 @@ def _install_authority_hooks(
     original_expected = control_plane_guard.expected_critical_state
     original_capture = control_plane_guard.capture_critical_state
     expected_state: dict[str, Any] | None = None
-    username = requester_username(requester_pid, requester_create_time)
+    username = requester_username_value
 
     def authority_popen(self: Any, argv: list[str], **kwargs: Any) -> Any:
         stdin = kwargs.pop("stdin", subprocess.DEVNULL)
@@ -49,16 +50,21 @@ def _install_authority_hooks(
             raise RuntimeError("Approved Host authority never launches through a shell")
         if not isinstance(environment, dict) or cwd is None:
             raise RuntimeError("Approved Host authority child environment or cwd is missing")
-        return popen_as_requester_in_job(
-            self,
-            argv,
-            requester_pid=requester_pid,
-            requester_create_time=requester_create_time,
-            cwd=str(cwd),
-            environment={str(key): str(value) for key, value in environment.items()},
-            creationflags=creationflags,
-            on_process_created=lease.mark_child_started,
-        )
+        try:
+            return popen_as_requester_in_job(
+                self,
+                argv,
+                requester_pid=requester_pid,
+                requester_create_time=requester_create_time,
+                requester_token=requester_token,
+                cwd=str(cwd),
+                environment={str(key): str(value) for key, value in environment.items()},
+                creationflags=creationflags,
+                on_process_created=lease.mark_child_started,
+            )
+        finally:
+            # A one-shot child has no further need for the privileged token HANDLE.
+            requester_token.close()
 
     def authority_expected(settings: Any, operation_id: str) -> dict[str, Any]:
         nonlocal expected_state
@@ -110,6 +116,9 @@ def main() -> None:
     parser.add_argument("--context-sha256", required=True)
     parser.add_argument("--approved-host-requester-pid", required=True, type=int)
     parser.add_argument("--approved-host-requester-create-time", required=True, type=float)
+    parser.add_argument("--approved-host-requester-sid", required=True)
+    parser.add_argument("--approved-host-requester-username", required=True)
+    parser.add_argument("--approved-host-requester-token-handle", required=True, type=int)
     parser.add_argument("--authority-service-epoch", required=True)
     parser.add_argument("--authority-nonce", required=True)
     parser.add_argument("--authority-proof-path", required=True, type=Path)
@@ -122,22 +131,28 @@ def main() -> None:
         authority_nonce=args.authority_nonce,
         proof_path=args.authority_proof_path,
     )
-    _install_authority_hooks(
-        lease,
-        requester_pid=args.approved_host_requester_pid,
-        requester_create_time=args.approved_host_requester_create_time,
-    )
-    settings = load_worker_context(args.context, args.context_sha256, args.operation_id)
+    with RequesterPrimaryToken.from_inherited(
+        args.approved_host_requester_token_handle,
+        args.approved_host_requester_sid,
+    ) as requester_token:
+        _install_authority_hooks(
+            lease,
+            requester_pid=args.approved_host_requester_pid,
+            requester_create_time=args.approved_host_requester_create_time,
+            requester_username_value=args.approved_host_requester_username,
+            requester_token=requester_token,
+        )
+        settings = load_worker_context(args.context, args.context_sha256, args.operation_id)
 
-    # Import only after the control-plane, census, and Job hooks are installed so worker.py's
-    # direct imports bind to the independently privileged implementations.
-    from .worker import run_operation
+        # Import only after the control-plane, census, and Job hooks are installed so worker.py's
+        # direct imports bind to the independently privileged implementations.
+        from .worker import run_operation
 
-    exit_code = int(run_operation(args.operation_id, settings))
-    # Reaching this line proves run_operation returned normally. Any unhandled exception or
-    # external process termination skips proof creation and leaves the ProgramData latch armed.
-    lease.finalize_normal_return(exit_code)
-    raise SystemExit(exit_code)
+        exit_code = int(run_operation(args.operation_id, settings))
+        # Reaching this line proves run_operation returned normally. Any unhandled exception or
+        # external process termination skips proof creation and leaves the ProgramData latch armed.
+        lease.finalize_normal_return(exit_code)
+        raise SystemExit(exit_code)
 
 
 if __name__ == "__main__":

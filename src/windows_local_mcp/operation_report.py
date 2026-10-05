@@ -58,6 +58,13 @@ def build_operation_report(
     )
     return {
         "operation_id": operation_id,
+        "session_id": operation.get("session_id"),
+        "server_instance_id": operation.get("server_instance_id"),
+        "origin_scope": operation.get("origin_scope"),
+        "client_name": operation.get("client_name"),
+        "client_version": operation.get("client_version"),
+        "request_id": operation.get("request_id"),
+        "task_id": operation.get("task_id"),
         "status": activity.get("status", operation.get("status")),
         "tool": operation.get("tool_name"),
         "high_level_operation": request.get("high_level_operation")
@@ -68,9 +75,15 @@ def build_operation_report(
         "result_summary": result,
         "workspace_changes": {
             "changed_files": activity.get("changed_files", []),
+            "changed_file_count": activity.get("changed_file_count", 0),
             "changed_directories": activity.get("changed_directories", []),
+            "changed_directory_count": activity.get("changed_directory_count", 0),
             "added_lines": activity.get("added_lines", 0),
             "removed_lines": activity.get("removed_lines", 0),
+            "diff_truncated": activity.get("diff_truncated"),
+            "details": activity.get("change_details"),
+            "changed_file_list_truncated": activity.get("changed_file_list_truncated", False),
+            "changed_directory_list_truncated": activity.get("changed_directory_list_truncated", False),
             "checkpoint_integrity": activity.get("checkpoint_integrity"),
         },
         "approval": {
@@ -85,6 +98,17 @@ def build_operation_report(
             "point_in_time_available": activity.get("point_in_time_rollback_available"),
             "selective_undo_available": activity.get("selective_undo_available"),
             "preview": activity.get("point_in_time_rollback_preview"),
+            # 操作だけの取り消しと、操作完了時点への復元を明確に分ける。
+            "undo_request": {
+                "tool": "request_selective_undo",
+                "arguments": {"operation_id": operation_id},
+            } if activity.get("selective_undo_available") else None,
+            "restore_completion_request": {
+                "tool": "request_workspace_rollback",
+                "arguments": {"operation_id": operation_id},
+            } if activity.get("point_in_time_rollback_available") else None,
+            "requires_local_approval": True,
+            "scope": "recorded_workspace_paths",
         },
         "audit_activity": {
             "created_at": operation.get("created_at"),

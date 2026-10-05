@@ -41,6 +41,7 @@ trusted operator はこの対処を product concept に反するとして拒否�
 
 - monitor／postflight worker は LocalSystem service `WindowsLocalMCPApprovedHost` 配下で実行する。
 - 実 Approved Host command は、verified named-pipe requester の元の非昇格 Windows user token を `CreateProcessAsUserW` で使用する。child を SYSTEM に昇格しない。
+- service は pipe peer の PID／作成時刻／SID／非昇格を検証し、同じ process object から primary token を複製する。明示的な HANDLE list で SYSTEM worker だけへ渡し、worker は token の SID／非昇格／primary type を再検証する。承認 UI の終了後に PID から別 token を取得しない。
 - SYSTEM worker は child を suspended 作成し Job Object に割り当ててから resume する。
 - WMI／CIM provider が Job 外に作る process の census は SYSTEM user ではなく元 requester user の PID／create-time を追う。
 - durable `active.json` は `%ProgramData%\WindowsLocalMCP\ApprovedHostAuthority` の LocalSystem-owned protected namespace に置き、normal completion まで immutable とする。

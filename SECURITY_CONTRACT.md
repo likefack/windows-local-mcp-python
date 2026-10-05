@@ -146,6 +146,12 @@ Windows user authority で実行する中核 route です。project-controlled c
 production execution は immutable Program Files runtime と authenticated LocalSystem authority service の両方を必要とします。
 monitor／postflight は LocalSystem worker が所有し、実 child は pipe requester の verified non-elevated token を
 `CreateProcessAsUserW` で使用します。same-desktop UAC elevation を security boundary としません。
+authority service は named-pipe peer の PID／作成時刻、SID、非昇格を確認し、その同じ
+process object から primary token を複製してから SYSTEM worker を起動します。継承は
+worker に明示した token HANDLE 一つへ限定し、worker は token 自体の SID／非昇格／primary
+type を再検証します。承認 UI が後で終了しても、別 PID の token へ取り直しません。
+実 command はこの複製 token で suspended 作成し、Job Object に割り当ててから再開します。
+token 取得、継承、再検証の失敗は子を起動せず fail closed とします。
 
 service-owned durable `active.json` は normal verified completion まで immutable とし、worker kill、service restart、channel
 loss、postflight mismatch、Job 外 helper 残存では解除しません。authority service が provision 済みである限り、user-owned
@@ -169,6 +175,8 @@ release-level WLMCP-R2-001 boundary は 2026-08-28 の normal／abnormal／recov
 - protected information を「project が安全と申告した」ことだけで読み取り対象にしません。
 
 ### B. Broker boundary
+
+2026-10-06のoperator decisionにより、`artifact_import_file`には管理者が確認・設定した完全一致のファイル配信ホストからの限定HTTPS取得を追加する。これは任意URL取得権限ではない。公開IP検査と接続先固定、証明書検証、リダイレクト／プロキシ拒否、実受信サイズ制限、URL非記録を必須とし、取得後は既存の保存・回復境界を使う。公式fileParamsは当該会話への所属の証明にはならず、その独立検証がない制約をoperatorが明示受容した。許可先の初期値は空とし、モデルやworkspaceから許可範囲を拡大しない。詳細は [添付取り込みの境界](docs/CHATGPT_ATTACHMENT_IMPORT.md)。その他のnetwork／process境界は変更しない。
 
 - Broker は deny-by-default の完全な文法、path 検証、resource bound を通過した閉じた操作だけを
   実行します。
@@ -209,6 +217,14 @@ Codex Sandbox の `available` は必要な local dependency と起動前提が�
 OS 境界の安全性を証明した意味には使いません。`Windows live-verified` または個別の property を
 `verified` と表示するには、同一の launcher、helper、version、署名、hash、policy generation に
 対して、その property を実機で確認します。
+
+起動前提には WLMCP の管理対象ポリシーを変更せず受理できることを含めます。署名・実体・version の
+確認だけは `dependency_available` として分離し、それだけで `available=true` にしません。
+`policy_compatibility` は正式検証の固定コマンドの結果を、現在の backend、隔離文脈、Windows、
+Sandbox account、WFP binding と有効期間へ照合して `accepted`／`rejected`／`unverified` で表示します。
+この診断のために通常の状態取得から Sandbox、UAC、修復を起動しません。ポリシー受理は全必須境界の
+成功とは別であり、失敗した marker を実行許可へ昇格させません。`:root=read` の追加や自動 fallback で
+ポリシー非互換を回避してはなりません。
 
 Live verification marker は schema v6 のみを受理します。v1～v5、`verification_status=verified` ではない marker、または必須 field が欠けた marker から
 identity を推測・移行しません。v6 は、実際に import された WFP Guard module の canonical path、
@@ -317,6 +333,7 @@ guaranteed された根拠にはせず、general Sandbox の受容済み残存 r
 - 並列化や高速化のために stale／concurrent change detection を弱めません。
 - 高水準の workspace 操作も既存の `Workspace` path／reparse 検証、verified handle、CAS、target-scoped lock を使用します。`workspace_apply` は全対象の precondition を mutation 前に確認し、対象 slot と thread lock を決定的順序で transaction 完了まで保持します。無関係な target や read-only operation を workspace-wide に直列化しません。
 - Binary transfer の admission は upload／download 共通で `preparing`／`open` だけを数え、正常完了、commit、cancel、expiry、永続 payload identity failure の終端状態は枠を解放します。download の terminal response loss に備えて `completed` manifest と immutable snapshot は retention まで保持し、同じ有効な chunk retryだけを許可します。`artifact_transfer_cancel` は workspace を変更せず active transfer を冪等に終端化し、既存の SHA-256、byte count、offset、path、source binding、atomic commit、quota、TTL、durable manifest 検証を迂回しません。bounded audit retention が転送 snapshot より先に親 operation を削除した場合も、保持中の正当な retry／cancel は独立 operation として監査し、監査を省略したり外部キー失敗で lifecycle を破綻させたりしません。
+- uploadの冪等再送は永続化された境界・長さ・SHA-256と保存済み範囲の一致を条件とし、異なる内容を再送で上書きしません。記録も容量制限へ計上し、本文・記録のfsync後にmanifestを確定します。`artifact_transfer_status` は本文や内部情報を返さず、照会によって状態やworkspaceを変更しません。転送期限は承認期限と分離し、終端状態を期限切れで上書きしません。[転送の復旧仕様](docs/BINARY_TRANSFER_RESUME.md)を参照してください。
 
 ### H. Transaction／recovery
 

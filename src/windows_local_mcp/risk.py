@@ -63,7 +63,13 @@ def command_risk_facts(
             "child_process_creation_os_possible": True,
             "note": "These are token capabilities, not effects detected in this command.",
         }
-        impact_default = "staged execution copy; process still runs with the local account token"
+        # A source-mode snapshot binds approval inputs; it does not relocate execution.
+        # Derive this description from the manifest, not the requested write flag.
+        impact_default = (
+            "承認時に固定・検証した元の作業ディレクトリと入力を使用し、通常のWindowsユーザー権限で実行"
+            if manifest.get("mode") in {"source-workspace", "git-state-source-workspace"}
+            else "staged execution copy; process still runs with the local account token"
+        )
     result = {
         "risk_level": "high" if high else ("medium" if staged or git_commit else "low"),
         "detected_requested_effects": detected,

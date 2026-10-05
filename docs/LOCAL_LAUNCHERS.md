@@ -7,11 +7,32 @@ Windows Local MCP の初回設定、設定確認・変更、通常起動を、�
 - `configure-localmcp.bat`: 設定を管理する正式な入口（初回セットアップと設定確認・変更）
 - `start-localmcp.bat`: 旧名称から正式入口へ転送する互換ラッパー（非推奨）
 - `run-localmcp.bat`: 2 回目以降の通常起動
+- `update-localmcp.bat`: 手元のDEV／配布物から、設定済みの運用版を明示的に更新する入口。使い方と検証範囲は [RUNTIME_UPDATE.md](RUNTIME_UPDATE.md) を参照。
 - `setup-localmcp.ps1`: `configure-localmcp.bat` から呼び出す対話型設定管理
 - `run-localmcp.ps1`: active config の読み取り、Tunnel の検証・起動、または既存サーバー起動スクリプトへの委譲
 - `secure-mcp-tunnel.ps1`: Tunnel profile、Credential Manager、client／ready 検証を共有する内部ヘルパー
 
 バッチは人間がダブルクリックするための入口です。MCP クライアントの stdio 設定は、既存の `run-server.ps1 -Config` を明示的に指定する契約を維持します。
+
+## 運用環境更新後の接続設定をコマンドで更新する
+
+管理者による運用環境の更新後、Tunnel を停止した状態で、通常権限の PowerShell から実行します。
+既に Approved Host 運用環境を使う managed Tunnel が設定済みの場合に利用できます。
+
+```powershell
+cd C:\dev\windows-local-mcp-python
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\setup-localmcp.ps1 -RefreshApprovedHostTunnel
+if ($LASTEXITCODE -eq 0) { .\run-localmcp.bat }
+```
+
+`active-config.txt` の設定を使い、未指定なら既定の `config.toml` を使います。
+別の設定には `-Config C:\path\to\config.toml` を付けてください。その場合の起動にも同じ `-Config` を指定します。
+選択ファイルは変更しません。運用環境の場所は既存の Tunnel state から取得します。
+対話メニューと共通の運用環境・authority service・Tunnel doctor 検証と保存処理を実行し、
+保存済みの Tunnel ID と資格情報を再利用して、profile と起動スクリプトのハッシュを更新します。
+失敗時は終了コード1で止まり、既存の復元処理を通します。入力待ち、Python の導入、
+運用環境やサービスの置換、Tunnel の停止・起動はこの更新コマンドでは行いません。
+初回導入や別の実行環境への切り替えは、引き続き対話メニューを使用します。
 
 ## 初回設定
 
@@ -103,13 +124,24 @@ run-localmcp.bat -Config C:\path\to\config.toml
 
 `run-localmcp.bat` は `run-localmcp.ps1` を呼び出します。PowerShell 側で UTF-8 の active config を読み、Tunnel integration が有効なら profile／client／Credential Manager／ready 状態を確認して Tunnel 経由で `run-server.ps1 -Config` を一度だけ起動します。無効または未設定なら、従来の `run-server.ps1 -Config` へ直接渡します。
 
+同じ config の Tunnel が正常に起動済みの状態でショートカットを再度クリックした場合は、新しい Tunnel／server を起動しません。config ごとの起動 mutex に加え、保存済み client の実体、同じ profile を使用する process、loopback の ready 応答を再確認できた場合だけ、その Tunnel の終了まで再クリックした端末を開いておきます。再クリックした端末でも、選択済みの運用 runtime の Activity Monitor が監査DBを読み取り専用で確認し、操作と状態変化を表示します。この追加の表示プロセスは回転ログに書き込まず、元の起動端末が所有する監視プロセスだけがログへ保存します。承認画面の自動起動が有効なら、選択済みの運用 runtime から承認画面を開き直します。承認画面自身の mutex が重複を防ぎ、再クリックした端末が所有しない承認画面は終了時に閉じません。別の起動処理が進行中なら最大20秒待ちます。再クリック側は Runtime API Key を取得せず、追加の `tunnel-client doctor` も起動しません。process identity が不明、ready 未確認、複数 process などの状態は成功へ丸めず、従来どおり二重起動を避けて停止します。
+
+既存 Tunnel に接続したバッチは、その Tunnel が動いている間、キー入力待ちに移らず端末を開いたままにします。Tunnel が終了した場合や起動前検証／実行に失敗した場合は、結果と診断を読めるようキー入力を待ちます。タスクスケジューラーや自動テストなど、人が画面を確認しない実行だけは、環境変数 `WLMCP_NO_PAUSE=1` を設定すると既存 Tunnel の確認結果を直ちに返し、承認画面の自動起動と終了後のキー入力待ちを省略します。この設定は検証・重複防止・fail-closed 条件を省略せず、起動中の Tunnel を終了させるものでもありません。
+
 起動中は、低レベルの Activity Monitor が `activity_timeline`／`audit_list` と同じ `<data_dir>\audit.db` を別プロセスから読み取り専用で確認し、起動後に発生したoperation lifecycleを一行ずつ表示します。表示項目は操作 ID、ツール、実行経路、状態、承認状態、安全に伏せ字化したコマンドまたは対象の短い要約です。承認待ちは `PENDING_APPROVAL 要承認` と表示します。
 
 初期設定で別ウィンドウに自動起動する`run-approvals.ps1`は、承認または拒否を行うローカル境界です。その画面のLive ActivityはActivity Monitorと別の人間向け投影で、ファイルの読み取り・編集、構造化処理、artifact転送、コマンド、失敗・拒否、Selective Undo、point-in-time rollbackを簡潔に表示します。監査・診断・poll操作は通常表示せず、詳細は`activity_get`／`audit_get`で確認します。Live Activityの表示内容は承認やsecurity decisionには使用されません。
 
+局所的な変更操作は完了後に完全なテキスト差分を表示し、一括処理や構造化ファイル編集は変更件数と概要を表示します。実行中の経過時間と完了後の所要時間も表示します。行末の完全な operation ID を `operation_changes` へ渡すと全変更内容を取得でき、`request_selective_undo` へ渡すとローカル承認付きでその操作を取り消せます。差分本文を低レベル Activity Monitor の永続ログへ追加する変更ではありません。分類・取得方法・保存期限の扱いは [Live Activity の変更表示](LIVE_ACTIVITY_CHANGES.md) を参照してください。
+
+低レベル Activity Monitor は、計測対象の操作が終了して時間記録が保存されると、
+TIMING 行と処理別の集計・開始順内訳も表示します。ロック取得、保存、検証などの時間を
+調べるための表示です。承認画面の Live Activity には追加しません。
+意味と保存上限は [Audit の処理時間診断](AUDIT_PERFORMANCE.md) を参照してください。
+
 `approval_ui_autostart=true`の場合、選択済みserver runtimeと同じ場所の承認ランチャーを、同じconfigで通常ユーザーの可視なWindows PowerShell 5.1ウィンドウとして起動します。同じconfigの画面を手動起動済みなら名前付きmutexで二重起動を防ぎます。自動起動した画面だけを`run-localmcp.bat`が追跡し、終了時に通常のウィンドウ終了を要求します。画面が応答しない場合はPython承認プロセスを孤立させる強制終了を行わず、手動終了を案内します。起動失敗時も承認を省略せず、必要なら`run-approvals.ps1 -Config <path>`を手動実行します。設定確認・変更メニューの`承認画面の自動起動を有効化 / 無効化する`で切り替えられます。
 
-表示した行は `<data_dir>\logs\localmcp-activity.log` にも UTF-8 で保存し、5 MiB ごとに切り替えて過去10ファイルまで保持します。生の要求・結果、ファイル内容、標準出力・標準エラーは監視ログへ複製しません。Tunnel client の生出力も Runtime API Key などを含む可能性があるため、画面・ログへ転送しません。活動監視だけを開始できなかった場合は警告を出して LocalMCP を起動しますが、Tunnel や実行経路の安全性検証を迂回することはありません。
+元の起動端末で表示した行は `<data_dir>\logs\localmcp-activity.log` にも UTF-8 で保存し、5 MiB ごとに切り替えて過去10ファイルまで保持します。再接続した端末は同じ監査DBを表示しますが、ログへは複製しません。生の要求・結果、ファイル内容、標準出力・標準エラーは監視ログへ複製しません。Tunnel client の生出力も Runtime API Key などを含む可能性があるため、画面・ログへ転送しません。活動監視だけを開始できなかった場合は警告を出して LocalMCP を起動しますが、Tunnel や実行経路の安全性検証を迂回することはありません。
 
 Windows PowerShell 5.1 を正式サポートする配布対象の `.ps1`（setup、run、server、approvals、Tunnel helper）は、ソース内の日本語を正しく解釈できるよう UTF-8 BOM 付きで保存します。PowerShell 7 だけでなく、実際の Windows PowerShell 5.1 parser でも配布対象全体を検証します。
 
@@ -119,9 +151,13 @@ stdio server の初期化に成功すると、`起動に成功しました`、`C
 
 通常のサーバーは管理者権限で起動しません。管理者権限が必要な Approved Host の runtime／authority service の導入は、通常起動とは別の明示的な手順です。ウィザードは既存の Program Files runtime と authority service を検証して Tunnel profile へ結び付けられますが、production runtime／service を勝手にインストール・置換しません。Approved Host 用 state では `run-server.ps1` の絶対 path と SHA-256 を保存し、起動ごとに runtime の変更不能性を検証します。失敗時に開発用 runtime へ戻しません。
 
-Tunnel の設定不整合、client の変更、API Key の取得失敗、認証失敗、LocalMCP server の起動失敗、ready 応答未確認は、それぞれ別の案内を表示して起動を停止します。Tunnel を設定済みの状態で問題がある場合に、Tunnel を迂回して LocalMCP を直接公開する自動 fallback は行いません。二重起動を避けるため、起動中のプロセスを確認できない場合も停止します。
+Tunnel の設定不整合、client の変更、API Key の取得失敗、認証失敗、LocalMCP server の起動失敗、ready 応答未確認は、それぞれ別の案内を表示して起動を停止します。Tunnel を設定済みの状態で問題がある場合に、Tunnel を迂回して LocalMCP を直接公開する自動 fallback は行いません。正常な既存 Tunnel は再利用しますが、二重起動を避けるため、起動中のプロセスまたは ready 応答を確認できない場合は停止します。
 
-`data_dir ACL changed after provisioning` が出た場合は、Win32 security descriptor から取得した SID、ACE 種別、継承フラグ、権限値を固定 policy と比較して fail closed にします。`.acl-policy.json` の削除による通常起動への復帰や自動 ACL 再設定は行いません。旧 marker が `icacls` の表示文字列ハッシュを保持している場合だけ、現在の ACL が固定 policy と完全一致することを確認して新形式へ移行します。実際の ACL 差分がある場合は移行しません。エラー時は `data_dir` と marker を保全して ACL 差分を確認し、既存 state を引き継がない新しい config／`data_dir` を作るか、確認済み ACL を明示的に再設定してから再検証します。
+`data_dir ACL changed after provisioning` が出た場合は、Win32 security descriptor から取得した SID、ACE 種別、継承フラグ、権限値を固定 policy と比較して fail closed にします。`.acl-policy.json` の削除による通常起動への復帰や自動 ACL 再設定は行いません。旧 marker が `icacls` の表示文字列ハッシュを保持している場合だけ、現在の ACL が下記の許容形式を含む固定 policy を満たすことを確認して新形式へ移行します。許容範囲を外れる差分では移行しません。エラー時は `data_dir` と marker を保全して ACL 差分を確認し、既存 state を引き継がない新しい config／`data_dir` を作るか、確認済み ACL を明示的に再設定してから再検証します。
+
+許可対象は引き続き現在のユーザーと SYSTEM のみです。自己適用と子への継承を分けた許可 ACE と、それを `OI|CI` にまとめた同値の表現は同じ固定 policy として検証します。また、この PC のローカル alias として確認できた `CodexSandboxUsers` に対する、既知の読み取り拒否 ACE 2 本（自己適用 `0x00120089`、継承専用 `OI|CI|IO` の `0x80120089`）に限り、許可 ACE より前に揃っている場合は追加制限として受理します。これらの拒否を削除せず、実 ACL と既存 version 2 marker を書き換えません。同値の許可設定から従来形式の digest を計算するため、追加制限のある実行環境でも既存 marker との照合を維持できます。未知の SID／ACE、権限の追加、継承の不一致、重複、拒否の不完全な組合せは引き続き拒否します。
+
+Sandbox の最初の検査が ``elevated Windows sandbox requires effective `:root` read access`` で止まる場合は、選択された Codex backend と WLMCP の最小読み取りポリシーの互換性を確認します。エラーを消すために `:minimal` を `:root` に変更して読み取り範囲を広げません。別の導入済み公式 backend を使用する場合も、署名・helper・実体の検証と全必須境界の実機確認を行い、成功した実体だけを `approved_sandbox_codex_path` に明示指定します。正式設定で Sandbox の検証記録を更新した後、Automatic Git は別途 `verify-git-broker` に成功する必要があります。候補を一時的な設定で検証した結果だけでは、現在の接続が利用可能になったとは扱いません。
 
 ## 自動設定しないもの
 

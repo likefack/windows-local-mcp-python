@@ -24,6 +24,12 @@ _ACTIVE_AUDIT_GUARDS: dict[str, _AuditMutationGuard] = {}
 _SQLITE_CONNECT_PATCHED = False
 
 
+def _wlmcp_package_root(module_file: Path = Path(__file__)) -> Path:
+    """Return only the WLMCP package tree, not its dependency namespace."""
+
+    return module_file.resolve(strict=True).parent
+
+
 def _is_reparse(path: Path) -> bool:
     details = path.lstat()
     attributes = int(getattr(details, "st_file_attributes", 0))
@@ -228,7 +234,10 @@ def capture_critical_state(settings: Settings, operation_id: str) -> dict[str, A
             settings.data_dir / "worker-contexts" / f"{operation_id}.json",
             settings.data_dir / "control-plane",
             settings.data_dir / "workspace-history",
-            Path(__file__).resolve(strict=True).parent.parent,
+            # The complete installed dependency closure is admitted independently by the
+            # immutable-runtime gate. Including its site-packages parent here duplicates that
+            # gate and makes accumulated control-plane state consume the same byte budget.
+            _wlmcp_package_root(),
         ]
         if settings.sandbox_scratch_dir is not None:
             roots.append(settings.sandbox_scratch_dir / "approval-inputs")

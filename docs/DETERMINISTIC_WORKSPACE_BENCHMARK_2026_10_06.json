@@ -1,0 +1,751 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-10-05T16:42:29.626639+00:00",
+  "samples_per_workflow": 3,
+  "measurement_scope": {
+    "entry_point": "direct in-process Python calls to MCP tool functions",
+    "includes": [
+      "tool implementation elapsed time",
+      "compact JSON argument/result size estimates",
+      "Audit timings.total_ns per returned operation_id",
+      "Audit event rows and SQLite write trace during measured calls"
+    ],
+    "excludes": [
+      "MCP transport",
+      "LLM reasoning or token latency",
+      "ChatGPT confirmation UI",
+      "normal Windows host end-to-end latency",
+      "fixture creation and result diagnostics"
+    ],
+    "fixture": "bounded synthetic UTF-8 content without secrets",
+    "sqlite_scope": "AuditStore connections only; file journal I/O is not a SQLite write"
+  },
+  "equivalence_checks": {
+    "batch_final_workspace_state": "identical for every sample",
+    "replace_final_workspace_state": "identical for every sample"
+  },
+  "samples": [
+    {
+      "workflow": "legacy_batch",
+      "sample": 1,
+      "mcp_tool_calls": 5,
+      "input_json_characters": 715,
+      "input_json_utf8_bytes": 715,
+      "output_json_characters": 3767,
+      "output_json_utf8_bytes": 3767,
+      "raw_hash_state_copied_characters": 128,
+      "opaque_plan_state_copied_characters": 0,
+      "local_elapsed_ms": 889.2483,
+      "audit_total_ns_sum": 818583800,
+      "audit_event_count": 13,
+      "audit_sqlite_connections": 27,
+      "audit_sql_write_statements": 32,
+      "sqlite_transaction_statements": 54,
+      "sqlite_write_statement_types": {
+        "INSERT": 18,
+        "UPDATE": 14
+      },
+      "operation_ids": [
+        "832eda36-a2bb-4e2f-aa35-5ddc212ebe3e",
+        "f403ecf1-0fed-4547-bf60-0593efec3ece",
+        "c2a97ca4-98c8-4b85-aa7b-e3892f4a0523",
+        "dbfb2e81-acda-4f5b-afef-e7c7e6f74464",
+        "abd9ec5a-26c1-45a9-8ab3-236abf58967a"
+      ],
+      "final_state": {
+        "flow": {
+          "kind": "directory"
+        },
+        "flow/moved.txt": {
+          "kind": "file",
+          "bytes": 32,
+          "sha256": "f9be7c73de50fcbb44672cb09c1247439bad038676cb893c958cf9f197403b26"
+        }
+      }
+    },
+    {
+      "workflow": "deterministic_batch",
+      "sample": 1,
+      "mcp_tool_calls": 1,
+      "input_json_characters": 328,
+      "input_json_utf8_bytes": 328,
+      "output_json_characters": 1100,
+      "output_json_utf8_bytes": 1100,
+      "raw_hash_state_copied_characters": 0,
+      "opaque_plan_state_copied_characters": 0,
+      "local_elapsed_ms": 387.6748,
+      "audit_total_ns_sum": 376127000,
+      "audit_event_count": 7,
+      "audit_sqlite_connections": 10,
+      "audit_sql_write_statements": 11,
+      "sqlite_transaction_statements": 20,
+      "sqlite_write_statement_types": {
+        "INSERT": 8,
+        "UPDATE": 3
+      },
+      "operation_ids": [
+        "10154e28-2dbd-4fee-95c9-bbaf0f02e1ab"
+      ],
+      "final_state": {
+        "flow": {
+          "kind": "directory"
+        },
+        "flow/moved.txt": {
+          "kind": "file",
+          "bytes": 32,
+          "sha256": "f9be7c73de50fcbb44672cb09c1247439bad038676cb893c958cf9f197403b26"
+        }
+      }
+    },
+    {
+      "workflow": "legacy_replace",
+      "sample": 1,
+      "mcp_tool_calls": 3,
+      "input_json_characters": 1281,
+      "input_json_utf8_bytes": 1281,
+      "output_json_characters": 3289,
+      "output_json_utf8_bytes": 3289,
+      "raw_hash_state_copied_characters": 256,
+      "opaque_plan_state_copied_characters": 0,
+      "local_elapsed_ms": 747.9286,
+      "audit_total_ns_sum": 712747600,
+      "audit_event_count": 13,
+      "audit_sqlite_connections": 20,
+      "audit_sql_write_statements": 23,
+      "sqlite_transaction_statements": 40,
+      "sqlite_write_statement_types": {
+        "INSERT": 16,
+        "UPDATE": 7
+      },
+      "operation_ids": [
+        "7a772362-061d-404e-90eb-264208af8c8b",
+        "ced0a5c3-bdda-4a94-9f22-4e2e528844a8",
+        "ee9639dd-c06b-4d5c-854e-b518783f3f96"
+      ],
+      "final_state": {
+        "replace-0.txt": {
+          "kind": "file",
+          "bytes": 32,
+          "sha256": "ad6f4d59fe000afbe721d2ca5b32265f4212eda830ed801da34e54073398a2a4"
+        },
+        "replace-1.txt": {
+          "kind": "file",
+          "bytes": 32,
+          "sha256": "55be56013b807f4b93044ff0c96059c4720066056fed43a2a048d5ffc0e9f4a6"
+        },
+        "replace-2.txt": {
+          "kind": "file",
+          "bytes": 32,
+          "sha256": "fe96516ee9540988cdd5a97f243a72b64363cc2f375477f21bed1733b09285e4"
+        },
+        "replace-3.txt": {
+          "kind": "file",
+          "bytes": 32,
+          "sha256": "3d426dad6b1754e8971d99dc5322e01cdc4b4843a2ff310764c7d2bb6742d474"
+        }
+      }
+    },
+    {
+      "workflow": "deterministic_replace",
+      "sample": 1,
+      "mcp_tool_calls": 1,
+      "input_json_characters": 382,
+      "input_json_utf8_bytes": 382,
+      "output_json_characters": 1176,
+      "output_json_utf8_bytes": 1176,
+      "raw_hash_state_copied_characters": 0,
+      "opaque_plan_state_copied_characters": 0,
+      "local_elapsed_ms": 758.3557,
+      "audit_total_ns_sum": 691458600,
+      "audit_event_count": 7,
+      "audit_sqlite_connections": 10,
+      "audit_sql_write_statements": 11,
+      "sqlite_transaction_statements": 20,
+      "sqlite_write_statement_types": {
+        "INSERT": 8,
+        "UPDATE": 3
+      },
+      "operation_ids": [
+        "89b31ae8-fd1a-43f5-a042-ff1c99ee170f"
+      ],
+      "final_state": {
+        "replace-0.txt": {
+          "kind": "file",
+          "bytes": 32,
+          "sha256": "ad6f4d59fe000afbe721d2ca5b32265f4212eda830ed801da34e54073398a2a4"
+        },
+        "replace-1.txt": {
+          "kind": "file",
+          "bytes": 32,
+          "sha256": "55be56013b807f4b93044ff0c96059c4720066056fed43a2a048d5ffc0e9f4a6"
+        },
+        "replace-2.txt": {
+          "kind": "file",
+          "bytes": 32,
+          "sha256": "fe96516ee9540988cdd5a97f243a72b64363cc2f375477f21bed1733b09285e4"
+        },
+        "replace-3.txt": {
+          "kind": "file",
+          "bytes": 32,
+          "sha256": "3d426dad6b1754e8971d99dc5322e01cdc4b4843a2ff310764c7d2bb6742d474"
+        }
+      }
+    },
+    {
+      "workflow": "legacy_batch",
+      "sample": 2,
+      "mcp_tool_calls": 5,
+      "input_json_characters": 715,
+      "input_json_utf8_bytes": 715,
+      "output_json_characters": 3767,
+      "output_json_utf8_bytes": 3767,
+      "raw_hash_state_copied_characters": 128,
+      "opaque_plan_state_copied_characters": 0,
+      "local_elapsed_ms": 914.0956,
+      "audit_total_ns_sum": 852039300,
+      "audit_event_count": 13,
+      "audit_sqlite_connections": 27,
+      "audit_sql_write_statements": 32,
+      "sqlite_transaction_statements": 54,
+      "sqlite_write_statement_types": {
+        "INSERT": 18,
+        "UPDATE": 14
+      },
+      "operation_ids": [
+        "a9f2cf57-1259-4ea4-a2f0-40089e8c3761",
+        "c3f970f6-203a-40e1-9ee0-e47974b9f018",
+        "4c1ef04f-f93f-45df-8961-ef11bb4c0201",
+        "5cf47f58-561e-4a48-8da6-2d4eeabddf44",
+        "e72ca6cb-fe8d-4b85-8337-4f108fb2276a"
+      ],
+      "final_state": {
+        "flow": {
+          "kind": "directory"
+        },
+        "flow/moved.txt": {
+          "kind": "file",
+          "bytes": 32,
+          "sha256": "f9be7c73de50fcbb44672cb09c1247439bad038676cb893c958cf9f197403b26"
+        }
+      }
+    },
+    {
+      "workflow": "deterministic_batch",
+      "sample": 2,
+      "mcp_tool_calls": 1,
+      "input_json_characters": 328,
+      "input_json_utf8_bytes": 328,
+      "output_json_characters": 1100,
+      "output_json_utf8_bytes": 1100,
+      "raw_hash_state_copied_characters": 0,
+      "opaque_plan_state_copied_characters": 0,
+      "local_elapsed_ms": 431.2791,
+      "audit_total_ns_sum": 418888900,
+      "audit_event_count": 7,
+      "audit_sqlite_connections": 10,
+      "audit_sql_write_statements": 11,
+      "sqlite_transaction_statements": 20,
+      "sqlite_write_statement_types": {
+        "INSERT": 8,
+        "UPDATE": 3
+      },
+      "operation_ids": [
+        "6746852a-430f-4c11-8be8-e3c5ace067a7"
+      ],
+      "final_state": {
+        "flow": {
+          "kind": "directory"
+        },
+        "flow/moved.txt": {
+          "kind": "file",
+          "bytes": 32,
+          "sha256": "f9be7c73de50fcbb44672cb09c1247439bad038676cb893c958cf9f197403b26"
+        }
+      }
+    },
+    {
+      "workflow": "legacy_replace",
+      "sample": 2,
+      "mcp_tool_calls": 3,
+      "input_json_characters": 1281,
+      "input_json_utf8_bytes": 1281,
+      "output_json_characters": 3289,
+      "output_json_utf8_bytes": 3289,
+      "raw_hash_state_copied_characters": 256,
+      "opaque_plan_state_copied_characters": 0,
+      "local_elapsed_ms": 779.7411,
+      "audit_total_ns_sum": 744883500,
+      "audit_event_count": 13,
+      "audit_sqlite_connections": 20,
+      "audit_sql_write_statements": 23,
+      "sqlite_transaction_statements": 40,
+      "sqlite_write_statement_types": {
+        "INSERT": 16,
+        "UPDATE": 7
+      },
+      "operation_ids": [
+        "effb96a1-0469-44c8-a9fd-99f148aba4ff",
+        "9acac484-431d-4509-b241-c4d61b2fe254",
+        "9ac9baef-d7b3-4221-bac8-f410cdec9b7f"
+      ],
+      "final_state": {
+        "replace-0.txt": {
+          "kind": "file",
+          "bytes": 32,
+          "sha256": "ad6f4d59fe000afbe721d2ca5b32265f4212eda830ed801da34e54073398a2a4"
+        },
+        "replace-1.txt": {
+          "kind": "file",
+          "bytes": 32,
+          "sha256": "55be56013b807f4b93044ff0c96059c4720066056fed43a2a048d5ffc0e9f4a6"
+        },
+        "replace-2.txt": {
+          "kind": "file",
+          "bytes": 32,
+          "sha256": "fe96516ee9540988cdd5a97f243a72b64363cc2f375477f21bed1733b09285e4"
+        },
+        "replace-3.txt": {
+          "kind": "file",
+          "bytes": 32,
+          "sha256": "3d426dad6b1754e8971d99dc5322e01cdc4b4843a2ff310764c7d2bb6742d474"
+        }
+      }
+    },
+    {
+      "workflow": "deterministic_replace",
+      "sample": 2,
+      "mcp_tool_calls": 1,
+      "input_json_characters": 382,
+      "input_json_utf8_bytes": 382,
+      "output_json_characters": 1176,
+      "output_json_utf8_bytes": 1176,
+      "raw_hash_state_copied_characters": 0,
+      "opaque_plan_state_copied_characters": 0,
+      "local_elapsed_ms": 639.4915,
+      "audit_total_ns_sum": 627309600,
+      "audit_event_count": 7,
+      "audit_sqlite_connections": 10,
+      "audit_sql_write_statements": 11,
+      "sqlite_transaction_statements": 20,
+      "sqlite_write_statement_types": {
+        "INSERT": 8,
+        "UPDATE": 3
+      },
+      "operation_ids": [
+        "1a7c6be6-7d89-46c9-9531-33392353fc1d"
+      ],
+      "final_state": {
+        "replace-0.txt": {
+          "kind": "file",
+          "bytes": 32,
+          "sha256": "ad6f4d59fe000afbe721d2ca5b32265f4212eda830ed801da34e54073398a2a4"
+        },
+        "replace-1.txt": {
+          "kind": "file",
+          "bytes": 32,
+          "sha256": "55be56013b807f4b93044ff0c96059c4720066056fed43a2a048d5ffc0e9f4a6"
+        },
+        "replace-2.txt": {
+          "kind": "file",
+          "bytes": 32,
+          "sha256": "fe96516ee9540988cdd5a97f243a72b64363cc2f375477f21bed1733b09285e4"
+        },
+        "replace-3.txt": {
+          "kind": "file",
+          "bytes": 32,
+          "sha256": "3d426dad6b1754e8971d99dc5322e01cdc4b4843a2ff310764c7d2bb6742d474"
+        }
+      }
+    },
+    {
+      "workflow": "legacy_batch",
+      "sample": 3,
+      "mcp_tool_calls": 5,
+      "input_json_characters": 715,
+      "input_json_utf8_bytes": 715,
+      "output_json_characters": 3767,
+      "output_json_utf8_bytes": 3767,
+      "raw_hash_state_copied_characters": 128,
+      "opaque_plan_state_copied_characters": 0,
+      "local_elapsed_ms": 871.7775,
+      "audit_total_ns_sum": 805561100,
+      "audit_event_count": 13,
+      "audit_sqlite_connections": 27,
+      "audit_sql_write_statements": 32,
+      "sqlite_transaction_statements": 54,
+      "sqlite_write_statement_types": {
+        "INSERT": 18,
+        "UPDATE": 14
+      },
+      "operation_ids": [
+        "83d3f6d7-9c73-4a42-8739-d5d0a821c97f",
+        "ed88b82f-b610-4df9-ae91-1de34d6f8009",
+        "a7f7b5b4-2d4a-45e0-b8b6-1526b10444e9",
+        "2a3c70a3-15a4-4bc4-abfa-463f3f4df17d",
+        "5a5bc5f1-ade9-4e59-bee6-39daa2e1a395"
+      ],
+      "final_state": {
+        "flow": {
+          "kind": "directory"
+        },
+        "flow/moved.txt": {
+          "kind": "file",
+          "bytes": 32,
+          "sha256": "f9be7c73de50fcbb44672cb09c1247439bad038676cb893c958cf9f197403b26"
+        }
+      }
+    },
+    {
+      "workflow": "deterministic_batch",
+      "sample": 3,
+      "mcp_tool_calls": 1,
+      "input_json_characters": 328,
+      "input_json_utf8_bytes": 328,
+      "output_json_characters": 1100,
+      "output_json_utf8_bytes": 1100,
+      "raw_hash_state_copied_characters": 0,
+      "opaque_plan_state_copied_characters": 0,
+      "local_elapsed_ms": 439.0322,
+      "audit_total_ns_sum": 425710700,
+      "audit_event_count": 7,
+      "audit_sqlite_connections": 10,
+      "audit_sql_write_statements": 11,
+      "sqlite_transaction_statements": 20,
+      "sqlite_write_statement_types": {
+        "INSERT": 8,
+        "UPDATE": 3
+      },
+      "operation_ids": [
+        "1cb07b62-c90f-480c-9c06-52d614c02fab"
+      ],
+      "final_state": {
+        "flow": {
+          "kind": "directory"
+        },
+        "flow/moved.txt": {
+          "kind": "file",
+          "bytes": 32,
+          "sha256": "f9be7c73de50fcbb44672cb09c1247439bad038676cb893c958cf9f197403b26"
+        }
+      }
+    },
+    {
+      "workflow": "legacy_replace",
+      "sample": 3,
+      "mcp_tool_calls": 3,
+      "input_json_characters": 1281,
+      "input_json_utf8_bytes": 1281,
+      "output_json_characters": 3289,
+      "output_json_utf8_bytes": 3289,
+      "raw_hash_state_copied_characters": 256,
+      "opaque_plan_state_copied_characters": 0,
+      "local_elapsed_ms": 857.2049,
+      "audit_total_ns_sum": 822008300,
+      "audit_event_count": 13,
+      "audit_sqlite_connections": 20,
+      "audit_sql_write_statements": 23,
+      "sqlite_transaction_statements": 40,
+      "sqlite_write_statement_types": {
+        "INSERT": 16,
+        "UPDATE": 7
+      },
+      "operation_ids": [
+        "91bce989-9b14-477d-8377-a695635f052a",
+        "334238a4-d8f1-4a1e-bb4e-de58ea6d7c4a",
+        "194fb317-de96-4d7c-ad5a-b2cf84f28b48"
+      ],
+      "final_state": {
+        "replace-0.txt": {
+          "kind": "file",
+          "bytes": 32,
+          "sha256": "ad6f4d59fe000afbe721d2ca5b32265f4212eda830ed801da34e54073398a2a4"
+        },
+        "replace-1.txt": {
+          "kind": "file",
+          "bytes": 32,
+          "sha256": "55be56013b807f4b93044ff0c96059c4720066056fed43a2a048d5ffc0e9f4a6"
+        },
+        "replace-2.txt": {
+          "kind": "file",
+          "bytes": 32,
+          "sha256": "fe96516ee9540988cdd5a97f243a72b64363cc2f375477f21bed1733b09285e4"
+        },
+        "replace-3.txt": {
+          "kind": "file",
+          "bytes": 32,
+          "sha256": "3d426dad6b1754e8971d99dc5322e01cdc4b4843a2ff310764c7d2bb6742d474"
+        }
+      }
+    },
+    {
+      "workflow": "deterministic_replace",
+      "sample": 3,
+      "mcp_tool_calls": 1,
+      "input_json_characters": 382,
+      "input_json_utf8_bytes": 382,
+      "output_json_characters": 1176,
+      "output_json_utf8_bytes": 1176,
+      "raw_hash_state_copied_characters": 0,
+      "opaque_plan_state_copied_characters": 0,
+      "local_elapsed_ms": 629.69,
+      "audit_total_ns_sum": 618376200,
+      "audit_event_count": 7,
+      "audit_sqlite_connections": 10,
+      "audit_sql_write_statements": 11,
+      "sqlite_transaction_statements": 20,
+      "sqlite_write_statement_types": {
+        "INSERT": 8,
+        "UPDATE": 3
+      },
+      "operation_ids": [
+        "4868aabe-bd42-4e6c-9f4f-cd2292e2e3df"
+      ],
+      "final_state": {
+        "replace-0.txt": {
+          "kind": "file",
+          "bytes": 32,
+          "sha256": "ad6f4d59fe000afbe721d2ca5b32265f4212eda830ed801da34e54073398a2a4"
+        },
+        "replace-1.txt": {
+          "kind": "file",
+          "bytes": 32,
+          "sha256": "55be56013b807f4b93044ff0c96059c4720066056fed43a2a048d5ffc0e9f4a6"
+        },
+        "replace-2.txt": {
+          "kind": "file",
+          "bytes": 32,
+          "sha256": "fe96516ee9540988cdd5a97f243a72b64363cc2f375477f21bed1733b09285e4"
+        },
+        "replace-3.txt": {
+          "kind": "file",
+          "bytes": 32,
+          "sha256": "3d426dad6b1754e8971d99dc5322e01cdc4b4843a2ff310764c7d2bb6742d474"
+        }
+      }
+    }
+  ],
+  "medians": {
+    "legacy_batch": {
+      "mcp_tool_calls": 5.0,
+      "input_json_characters": 715.0,
+      "input_json_utf8_bytes": 715.0,
+      "output_json_characters": 3767.0,
+      "output_json_utf8_bytes": 3767.0,
+      "raw_hash_state_copied_characters": 128.0,
+      "opaque_plan_state_copied_characters": 0.0,
+      "local_elapsed_ms": 889.2483,
+      "audit_total_ns_sum": 818583800.0,
+      "audit_event_count": 13.0,
+      "audit_sqlite_connections": 27.0,
+      "audit_sql_write_statements": 32.0,
+      "sqlite_transaction_statements": 54.0
+    },
+    "deterministic_batch": {
+      "mcp_tool_calls": 1.0,
+      "input_json_characters": 328.0,
+      "input_json_utf8_bytes": 328.0,
+      "output_json_characters": 1100.0,
+      "output_json_utf8_bytes": 1100.0,
+      "raw_hash_state_copied_characters": 0.0,
+      "opaque_plan_state_copied_characters": 0.0,
+      "local_elapsed_ms": 431.2791,
+      "audit_total_ns_sum": 418888900.0,
+      "audit_event_count": 7.0,
+      "audit_sqlite_connections": 10.0,
+      "audit_sql_write_statements": 11.0,
+      "sqlite_transaction_statements": 20.0
+    },
+    "legacy_replace": {
+      "mcp_tool_calls": 3.0,
+      "input_json_characters": 1281.0,
+      "input_json_utf8_bytes": 1281.0,
+      "output_json_characters": 3289.0,
+      "output_json_utf8_bytes": 3289.0,
+      "raw_hash_state_copied_characters": 256.0,
+      "opaque_plan_state_copied_characters": 0.0,
+      "local_elapsed_ms": 779.7411,
+      "audit_total_ns_sum": 744883500.0,
+      "audit_event_count": 13.0,
+      "audit_sqlite_connections": 20.0,
+      "audit_sql_write_statements": 23.0,
+      "sqlite_transaction_statements": 40.0
+    },
+    "deterministic_replace": {
+      "mcp_tool_calls": 1.0,
+      "input_json_characters": 382.0,
+      "input_json_utf8_bytes": 382.0,
+      "output_json_characters": 1176.0,
+      "output_json_utf8_bytes": 1176.0,
+      "raw_hash_state_copied_characters": 0.0,
+      "opaque_plan_state_copied_characters": 0.0,
+      "local_elapsed_ms": 639.4915,
+      "audit_total_ns_sum": 627309600.0,
+      "audit_event_count": 7.0,
+      "audit_sqlite_connections": 10.0,
+      "audit_sql_write_statements": 11.0,
+      "sqlite_transaction_statements": 20.0
+    }
+  },
+  "comparisons": {
+    "batch": {
+      "mcp_tool_calls": {
+        "legacy_median": 5.0,
+        "deterministic_median": 1.0,
+        "absolute_change": -4.0,
+        "reduction_percent": 80.0
+      },
+      "input_json_characters": {
+        "legacy_median": 715.0,
+        "deterministic_median": 328.0,
+        "absolute_change": -387.0,
+        "reduction_percent": 54.12587412587413
+      },
+      "input_json_utf8_bytes": {
+        "legacy_median": 715.0,
+        "deterministic_median": 328.0,
+        "absolute_change": -387.0,
+        "reduction_percent": 54.12587412587413
+      },
+      "output_json_characters": {
+        "legacy_median": 3767.0,
+        "deterministic_median": 1100.0,
+        "absolute_change": -2667.0,
+        "reduction_percent": 70.79904433235997
+      },
+      "output_json_utf8_bytes": {
+        "legacy_median": 3767.0,
+        "deterministic_median": 1100.0,
+        "absolute_change": -2667.0,
+        "reduction_percent": 70.79904433235997
+      },
+      "raw_hash_state_copied_characters": {
+        "legacy_median": 128.0,
+        "deterministic_median": 0.0,
+        "absolute_change": -128.0,
+        "reduction_percent": 100.0
+      },
+      "opaque_plan_state_copied_characters": {
+        "legacy_median": 0.0,
+        "deterministic_median": 0.0,
+        "absolute_change": 0.0,
+        "reduction_percent": null
+      },
+      "local_elapsed_ms": {
+        "legacy_median": 889.2483,
+        "deterministic_median": 431.2791,
+        "absolute_change": -457.96919999999994,
+        "reduction_percent": 51.500711331132145
+      },
+      "audit_total_ns_sum": {
+        "legacy_median": 818583800.0,
+        "deterministic_median": 418888900.0,
+        "absolute_change": -399694900.0,
+        "reduction_percent": 48.82760934189022
+      },
+      "audit_event_count": {
+        "legacy_median": 13.0,
+        "deterministic_median": 7.0,
+        "absolute_change": -6.0,
+        "reduction_percent": 46.15384615384615
+      },
+      "audit_sqlite_connections": {
+        "legacy_median": 27.0,
+        "deterministic_median": 10.0,
+        "absolute_change": -17.0,
+        "reduction_percent": 62.96296296296296
+      },
+      "audit_sql_write_statements": {
+        "legacy_median": 32.0,
+        "deterministic_median": 11.0,
+        "absolute_change": -21.0,
+        "reduction_percent": 65.625
+      },
+      "sqlite_transaction_statements": {
+        "legacy_median": 54.0,
+        "deterministic_median": 20.0,
+        "absolute_change": -34.0,
+        "reduction_percent": 62.96296296296296
+      }
+    },
+    "replace": {
+      "mcp_tool_calls": {
+        "legacy_median": 3.0,
+        "deterministic_median": 1.0,
+        "absolute_change": -2.0,
+        "reduction_percent": 66.66666666666666
+      },
+      "input_json_characters": {
+        "legacy_median": 1281.0,
+        "deterministic_median": 382.0,
+        "absolute_change": -899.0,
+        "reduction_percent": 70.17954722872756
+      },
+      "input_json_utf8_bytes": {
+        "legacy_median": 1281.0,
+        "deterministic_median": 382.0,
+        "absolute_change": -899.0,
+        "reduction_percent": 70.17954722872756
+      },
+      "output_json_characters": {
+        "legacy_median": 3289.0,
+        "deterministic_median": 1176.0,
+        "absolute_change": -2113.0,
+        "reduction_percent": 64.24445120097295
+      },
+      "output_json_utf8_bytes": {
+        "legacy_median": 3289.0,
+        "deterministic_median": 1176.0,
+        "absolute_change": -2113.0,
+        "reduction_percent": 64.24445120097295
+      },
+      "raw_hash_state_copied_characters": {
+        "legacy_median": 256.0,
+        "deterministic_median": 0.0,
+        "absolute_change": -256.0,
+        "reduction_percent": 100.0
+      },
+      "opaque_plan_state_copied_characters": {
+        "legacy_median": 0.0,
+        "deterministic_median": 0.0,
+        "absolute_change": 0.0,
+        "reduction_percent": null
+      },
+      "local_elapsed_ms": {
+        "legacy_median": 779.7411,
+        "deterministic_median": 639.4915,
+        "absolute_change": -140.2496,
+        "reduction_percent": 17.986688145590886
+      },
+      "audit_total_ns_sum": {
+        "legacy_median": 744883500.0,
+        "deterministic_median": 627309600.0,
+        "absolute_change": -117573900.0,
+        "reduction_percent": 15.784199811111401
+      },
+      "audit_event_count": {
+        "legacy_median": 13.0,
+        "deterministic_median": 7.0,
+        "absolute_change": -6.0,
+        "reduction_percent": 46.15384615384615
+      },
+      "audit_sqlite_connections": {
+        "legacy_median": 20.0,
+        "deterministic_median": 10.0,
+        "absolute_change": -10.0,
+        "reduction_percent": 50.0
+      },
+      "audit_sql_write_statements": {
+        "legacy_median": 23.0,
+        "deterministic_median": 11.0,
+        "absolute_change": -12.0,
+        "reduction_percent": 52.17391304347826
+      },
+      "sqlite_transaction_statements": {
+        "legacy_median": 40.0,
+        "deterministic_median": 20.0,
+        "absolute_change": -20.0,
+        "reduction_percent": 50.0
+      }
+    }
+  }
+}

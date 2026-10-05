@@ -206,6 +206,7 @@ def test_expired_and_failed_transfers_release_admission(
     expired = server.artifact_download_begin("source.bin")
     expired_root, expired_manifest = manifest_for(server, expired["transfer_id"])
     expired_manifest["created_at"] = (datetime.now(UTC) - timedelta(days=1)).isoformat()
+    expired_manifest["expires_at"] = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
     server._write_transfer_manifest(expired_root, expired_manifest)
     replacement = server.artifact_download_begin("source.bin")
     assert manifest_for(server, expired["transfer_id"])[1]["state"] == "expired"

@@ -48,6 +48,22 @@ def test_runtime_installer_root_acl_is_not_recursively_stripped() -> None:
     assert "*${runtimeSid}:(OI)(CI)RX" in grant_line
 
 
+def test_runtime_installer_verifies_dependency_closure_before_acl_and_publish() -> None:
+    script = _installer_text()
+    first_install = script.index("pip install $wheel.FullName")
+    first_check = script.index("pip check", first_install)
+    retry_install = script.index("pip install $wheel.FullName", first_install + 1)
+    final_check = script.index("pip check", first_check + 1)
+    protect_runtime = script.index("# Build one protected ACL boundary")
+    publish_runtime = script.index(
+        "Move-Item -LiteralPath $StagingRoot -Destination $InstallRoot"
+    )
+
+    assert first_install < first_check < retry_install < final_check
+    assert final_check < protect_runtime < publish_runtime
+    assert "Approved Host runtime dependency verification failed." in script
+
+
 def test_runtime_installer_descendants_are_reset_to_protected_root_acl() -> None:
     security_block = _security_block()
 

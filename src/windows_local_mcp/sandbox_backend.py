@@ -64,6 +64,10 @@ _WLMCP_ISOLATION_POLICY_VERSION = 3
 _SANDBOX_STATE_POLICY_VERSION = 2
 _SANDBOX_STATE_GLOB_SCAN_MAX_DEPTH = 64
 SANDBOX_LIVE_MARKER_VERSION = 6
+_MANAGED_POLICY_ROOT_READ_REJECTIONS = (
+    "elevated Windows sandbox requires effective ':root' read access",
+    "elevated Windows sandbox requires effective `:root` read access",
+)
 SANDBOX_SECURITY_PROPERTIES = (
     "filesystem_read",
     "filesystem_write",
@@ -812,6 +816,7 @@ def codex_sandbox_live_verification_status(
     backend: CodexSandboxBackend,
     *,
     now: datetime | None = None,
+    validate_non_verified_identity: bool = False,
 ) -> dict[str, Any]:
     """Durable marker を実行可否とは独立した lifecycle 状態へ分類する。"""
 
@@ -852,14 +857,14 @@ def codex_sandbox_live_verification_status(
     persisted_status = evidence.get("verification_status")
     if persisted_status == "verifying":
         return {**result, "status": "verifying"}
-    if persisted_status in {"failed", "unverified"}:
+    if persisted_status in {"failed", "unverified"} and not validate_non_verified_identity:
         return {
             **result,
             "status": persisted_status,
             "failure_reason": _live_verification_failure_reason(evidence)
             or "required live properties remain unverified",
         }
-    if persisted_status != "verified":
+    if persisted_status not in {"verified", "failed", "unverified"}:
         return {
             **result,
             "status": "stale",
@@ -935,7 +940,7 @@ def codex_sandbox_live_verification_status(
     ):
         return {**result, "status": "stale", "stale_reason": "verification_ttl_expired"}
 
-    if sandbox_live_verification_route_eligible(evidence):
+    if persisted_status == "verified" and sandbox_live_verification_route_eligible(evidence):
         return {
             **result,
             "status": "verified",
@@ -943,10 +948,88 @@ def codex_sandbox_live_verification_status(
         }
     failure_reason = _live_verification_failure_reason(evidence)
     inferred_status = "failed" if _has_failed_live_property(evidence) else "unverified"
+    if persisted_status in {"failed", "unverified"}:
+        # The optional identity pass above is used only by policy compatibility
+        # inspection.  Preserve a terminal failed/unverified marker as such and
+        # never turn a partial marker into route verification.
+        inferred_status = persisted_status
     return {
         **result,
         "status": inferred_status,
         "failure_reason": failure_reason or "required live properties remain unverified",
+    }
+
+
+def _simple_command_managed_policy_rejection(evidence: dict[str, Any]) -> str | None:
+    """Recognize only the exact upstream managed-policy rejection diagnostic."""
+
+    diagnostics = evidence.get("diagnostics")
+    if isinstance(diagnostics, dict):
+        for key in ("simple_command", "verification_error"):
+            value = diagnostics.get(key)
+            if isinstance(value, str):
+                for rejection in _MANAGED_POLICY_ROOT_READ_REJECTIONS:
+                    if rejection in value:
+                        return rejection
+
+    probe_diagnostics = evidence.get("probe_diagnostics")
+    if not isinstance(probe_diagnostics, list):
+        return None
+    for item in probe_diagnostics:
+        if not isinstance(item, dict) or item.get("probe") != "simple_command":
+            continue
+        for key in ("stderr", "stdout", "launch_error", "probe_error"):
+            value = item.get(key)
+            if isinstance(value, str):
+                for rejection in _MANAGED_POLICY_ROOT_READ_REJECTIONS:
+                    if rejection in value:
+                        return rejection
+    return None
+
+
+def codex_sandbox_policy_compatibility(
+    settings: Settings, backend: CodexSandboxBackend
+) -> dict[str, str | None]:
+    """Classify managed-policy acceptance without claiming a verified boundary.
+
+    This is deliberately read-only.  It consumes the exact live marker produced by
+    the formal verifier and performs the same backend, isolation, OS, account, WFP,
+    and TTL checks for terminal failed/unverified markers before accepting a simple
+    command result.  It never starts a probe, repairs state, or selects another
+    backend.
+    """
+
+    inspection = codex_sandbox_live_verification_status(
+        settings,
+        backend,
+        validate_non_verified_identity=True,
+    )
+    status = inspection.get("status")
+    evidence = inspection.get("evidence")
+    if status not in {"verified", "failed", "unverified"} or not isinstance(evidence, dict):
+        reason = inspection.get("stale_reason") or inspection.get("failure_reason")
+        return {
+            "status": "unverified",
+            "reason": (
+                str(reason)
+                if isinstance(reason, str) and reason
+                else "policy acceptance evidence is unavailable"
+            ),
+        }
+
+    checks = evidence.get("checks")
+    simple_command = checks.get("simple_command") if isinstance(checks, dict) else None
+    if simple_command is True:
+        return {"status": "accepted", "reason": None}
+    rejection = _simple_command_managed_policy_rejection(evidence)
+    if rejection is not None:
+        return {
+            "status": "rejected",
+            "reason": rejection,
+        }
+    return {
+        "status": "unverified",
+        "reason": "managed sandbox policy acceptance was not verified",
     }
 
 

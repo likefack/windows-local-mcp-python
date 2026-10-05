@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, BinaryIO, Self
 
 from .config import Settings
+from .performance_trace import timed_phase
 
 _LOCK_SLOT_COUNT = 32
 _LOCAL_LOCKS_GUARD = threading.Lock()
@@ -62,6 +63,8 @@ class WorkspaceExecutionLock:
             else list(range(_LOCK_SLOT_COUNT))
         )
 
+    # Measure acquisition only; the protected operation and release are outside this phase.
+    @timed_phase("workspace_lock_wait")
     def __enter__(self) -> Self:
         self.lock_dir.mkdir(parents=True, exist_ok=True)
         deadline = time.monotonic() + self.timeout
@@ -129,6 +132,7 @@ class NamedControlPlaneLock:
         self._local_lock: threading.RLock | None = None
         self._nested = False
 
+    @timed_phase("control_plane_lock_wait")
     def __enter__(self) -> Self:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         key = os.path.normcase(str(self.path.resolve(strict=False)))
@@ -280,6 +284,7 @@ class BoundedStreamCapture:
         return text[:half] + "\n... <preview truncated> ...\n" + text[-half:]
 
 
+@timed_phase("data_directory_scan")
 def directory_size(path: Path, *, stop_after: int | None = None) -> int:
     total = 0
     for root, directories, files in os.walk(path, followlinks=False):
@@ -418,6 +423,7 @@ def _has_named_data_stream(path: Path) -> bool:
         find_close(handle)
 
 
+@timed_phase("quota_validation")
 def enforce_data_quota(settings: Settings, *, incoming_bytes: int = 0) -> None:
     used = directory_size(settings.data_dir, stop_after=settings.max_data_dir_bytes)
     if used + incoming_bytes > settings.max_data_dir_bytes:
@@ -436,6 +442,7 @@ def _workspace_history_serialized(function: Any) -> Any:
 
 
 @_workspace_history_serialized
+@timed_phase("artifact_pruning")
 def prune_artifacts(settings: Settings, *, protected_ids: set[str] | None = None) -> int:
     """Apply age and size retention only to known artifact directories."""
     artifact_roots = [

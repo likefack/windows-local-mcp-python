@@ -57,6 +57,12 @@ sandbox_live_verification_retry_cooldown_seconds = 300
 adb_emulator_only = true
 adb_allowed_serials = []
 
+# ChatGPT 添付ファイル専用。管理者が実際の配信先を確認した完全一致ホストのみ指定。
+# 空配列では取得しません。URL、IP、ワイルドカード、汎用クラウドの共有親ドメインは指定しない。
+# 導入手順と保証の限界: docs/CHATGPT_ATTACHMENT_IMPORT.md
+attachment_import_allowed_hosts = []
+attachment_import_timeout_seconds = 60
+
 # Child processes receive a small built-in Windows/toolchain allowlist instead of the whole
 # parent environment. Add only project-specific variable names that are genuinely required.
 # Known injection/redirection variables such as PYTHONPATH, NODE_OPTIONS, GIT_DIR and
@@ -76,6 +82,9 @@ max_backup_bytes = 16777216
 max_image_bytes = 10485760
 max_structured_file_bytes = 67108864
 max_transfer_chunk_bytes = 524288
+# 転送開始からの有効期間（30〜86400秒）。承認TTL・完了済み転送の保持期間とは独立。
+# 旧版でapproval_request_ttl_secondsを転送用に変更していた場合、同じ値をここへ設定する。
+binary_transfer_ttl_seconds = 1800
 max_zip_entries = 10000
 max_zip_expanded_bytes = 268435456
 max_structured_elements = 250000

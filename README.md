@@ -1,5 +1,9 @@
 # Windows Local MCP
 
+ChatGPTへ添付した画像・ファイルの保存には、モデルがBase64をコピーしない `artifact_import_file` を使用できます。管理者による配信ホストの事前設定が必要です。[設定・使い方・保証の範囲](docs/CHATGPT_ATTACHMENT_IMPORT.md)を参照してください。従来のone-shot／チャンク転送はバイト列を保持するプログラム向けに引き続き利用できます。
+
+転送の応答が失われた場合は `artifact_transfer_status` で受信位置を確認し、同じuploadチャンクを安全に再送できます。転送専用の `binary_transfer_ttl_seconds` は既定1800秒です。[再開方法・設定移行・ChatGPT直接出力の制約](docs/BINARY_TRANSFER_RESUME.md)を参照してください。
+
 ## 用語解説（最初に読む章）
 
 このプロジェクトでは、機能名や設定名に英語の名前が多く登場します。ここでは、その言葉をこの README でどのような意味で使うかを、できるだけ簡単に説明します。設定名、コマンド名、ツール名は動作に必要な名前なので、そのまま表記します。
@@ -95,6 +99,7 @@ Python 3.11 以上が見つからない場合は、ウィザードに表示さ�
 ```text
 初回:       configure-localmcp.bat → かんたんセットアップ → workspace → Tunnel → 完了 → 今すぐ起動
 通常:       run-localmcp.bat
+運用版更新: update-localmcp.bat（LocalMCP終了後。詳細は docs/RUNTIME_UPDATE.md）
 設定変更:   configure-localmcp.bat → 現在の設定を確認・変更する
 ```
 
@@ -125,7 +130,9 @@ Tunnel 設定後は、`run-localmcp.bat` が profile、tunnel-client の実体�
 
 `run-localmcp.bat` のウィンドウには、低レベルの Activity Monitor が、起動後に作成された監査操作と lifecycle の変化を一行ずつ表示します。`activity_timeline`／`audit_list` と同じ監査DBを読み取り専用で参照し、操作 ID、ツール、実行経路、状態、承認状態、安全に伏せ字化したコマンドまたは対象の要約を表示します。ローカル承認が必要になると `PENDING_APPROVAL 要承認` を表示します。
 
-初期設定では、同じconfigの`run-approvals.ps1`も可視な別ウィンドウで一つだけ自動起動します。この承認画面の Live Activity は低レベル monitor と異なり、現在PC上で意味のある活動を `Read`、`Edited`、`Running`、`Uploaded`、`Downloaded`、`Failed`、`Rejected`、`Undone`、`Rolled back` などの人間向け分類で簡潔に表示します。承認または拒否はこの画面で行います。どちらの表示も生の要求・結果、ファイル内容、diff本文、標準出力・標準エラー、Runtime API Key を表示・保存しません。
+同じ Tunnel が既に起動している状態でバッチを再度クリックすると、新しい server は起動せず、既存プロセスとローカル ready 応答を確認します。クリックした端末には監査操作の Activity Monitor を読み取り専用で再開し、既存の監視プロセスが所有する回転ログには二重書き込みしません。承認画面の自動起動が有効なら、運用 runtime の承認画面も開き直し、クリックした端末は既存 Tunnel の終了まで開いたままにします。Tunnel の終了や起動失敗で処理が戻った後も、結果を読めるようキー入力を待ちます。自動実行では `WLMCP_NO_PAUSE=1` を設定すると、既存 Tunnel の確認結果を直ちに返し、承認画面や表示待ちは開始しません。
+
+初期設定では、同じconfigの`run-approvals.ps1`も可視な別ウィンドウで一つだけ自動起動します。この承認画面の Live Activity は、操作内容・変更件数・経過時間・所要時間と完全な operation ID を表示します。局所的な変更は実変更の完全なテキスト差分も表示し、高水準の一括処理は概要を表示します。承認または拒否はこの画面で行います。低レベル Activity Monitor の永続ログへ差分本文は複製しません。生の要求・結果、読み取り本文、標準出力・標準エラー、Runtime API Key は一般の概要表示に含めません。詳細は [Live Activity の変更表示](docs/LIVE_ACTIVITY_CHANGES.md) を参照してください。
 
 同じ行は `<data_dir>\logs\localmcp-activity.log` に UTF-8 で保存します。5 MiB ごとに切り替え、過去10ファイルまで保持します。Tunnel client 自身の生出力は秘密情報を含む可能性があるため、従来どおり画面にもログにも流しません。
 
@@ -262,6 +269,11 @@ args:
 
 接続後は最初に `session_info` を呼び出し、`workspace_root`、`data_dir`、transport、利用可能な capability を確認します。画面に入力欄が見えているだけでは接続確認になりません。
 
+複数の ChatGPT・クライアントから同時に使う場合は、`session_info` の `session_id` で接続を
+区別できます。同じ接続を共有する会話では、各ツール呼び出しに任意の `task_id` を付けて
+作業を区別してください。`audit_list` と `activity_timeline` は `session_id` と
+`filter_task_id` で絞り込めます。[使い方と同時実行の条件](docs/MULTI_CLIENT_AUDIT.md) を参照してください。
+
 ### 8. 最初の操作を試す
 
 最初は次の順で、影響の小さい操作から確認します。
@@ -368,6 +380,8 @@ powershell.exe -NoProfile -File C:\dev\windows-local-mcp-python\run-server.ps1 -
 現在の実装では、1つの `config` と1つの MCP サーバープロセスにつき、操作対象の `workspace_root` は1つだけです。複数の作業領域を使う場合は、それぞれに別の `config`、`data_dir`、Sandbox の一時領域を用意し、`run-localmcp.bat -Config C:\path\to\config.toml` またはセットアップ画面で切り替えます。同じプロセスから複数フォルダーを同時に操作する機能は、承認・履歴・Git・Sandbox の境界を含む仕様変更が必要です。作業領域、保存領域、実体の識別情報が混ざった設定は拒否します。Windows の別名、junction、reparse point、SUBST などを使って同じ場所を別の場所に見せる設定も利用できません。
 
 ## Approved Host の現行仕様
+
+読み取り専用の非 code-loader コマンドも、ローカル承認後に実行できます。`source-workspace` の実行場所は、承認時に固定して入力を再検証した元の作業ディレクトリです。承認用コピーは照合のための記録であり、Sandbox の実行用コピーとは異なります。読み取り専用という指定だけで検証を省略したり、通常ユーザー権限を制限する Sandbox と同じ隔離を保証したりはしません。
 
 Approved Host を運用で使うには、変更できない運用用実行環境と、LocalSystem で動く監視サービスの両方が必要です。`approved_host_enabled=true` にしたり、`request_host_command` が表示されたりするだけでは、実行できる状態とは限りません。
 
@@ -493,7 +507,7 @@ $env:LOCAL_MCP_CONFIG = 'C:\path\to\config.local.toml'
 - optimistic concurrency には表示用文字列ではなく raw file bytes の SHA-256 を使います。CRLF も raw identity に含まれます。
 - 書き込みは checkpoint、durable journal、atomic replacement、post-write 検証を通します。対象 path は OS にかかわらず `/` 区切りで同一に照合し、第三者変更を復旧処理が上書きしません。
 - `data_dir`、Sandbox scratch、workspace は分離し、起動時に lock／atomic replacement／filesystem identity と Windows の物理 path の前提を確認します。
-- `.env`、credential 等の保護対象は通常の Broker read、automatic helper／snapshot から返しません。Automatic Git Broker は live workspace を Git child に渡さず、sanitized projection から protected worktree file／behavior metadata を除外します。Git object database の historical blob は path validation だけで safe content とみなさず、Automatic Git の content-bearing diff/show を禁止します。audit、approval、Activity、argv、stdout／stderr preview は secret を伏せ字にします。一般 Codex Sandbox から workspace 内 protected information を direct read できる可能性は別途受容済み残存 risk として明示します。
+- `.env`、credential 等の保護対象は通常の Broker read、automatic helper／snapshot から返しません。Automatic Git Broker は live workspace を Git child に渡さず、sanitized projection から protected worktree file／behavior metadata を除外します。Git object database の historical blob は path validation だけで safe content とみなさず、Automatic Git の content-bearing diff/show を禁止します。audit、approval、Activity のメタデータ・概要、argv、stdout／stderr preview は secret を伏せ字にします。局所変更の完全な差分本文は許可されたチェックポイントの内容を省略せずローカル画面に表示し、端末制御文字を可視表現にします。一般 Codex Sandbox から workspace 内 protected information を direct read できる可能性は別途受容済み残存 risk として明示します。
 - 同時 job、pending approval、出力、artifact、data_dir、Sandbox scratch、structured element／pixel／archive 展開量に上限があります。
 
 ## 活動履歴と変更の取り消し
@@ -506,14 +520,22 @@ Audit は機械解析・詳細診断のため、同期 Broker 操作の全体時
 計測区間、保存上限、既存 DB の移行、欠損値の意味は [Audit の処理時間診断](docs/AUDIT_PERFORMANCE.md)
 を参照してください。
 
+起動端末の監査モニターには、完了後の全体時間・処理別集計・開始順の内訳も表示します。
+ロック取得、容量走査、チェックポイント内部、監査 DB の SQL と確定を分けて測定し、
+子の時間を除いた自己時間、回数、最大時間から改善候補を探せます。詳細一覧が 128 段階を
+超えても処理別集計は継続します。承認画面の Live Activity は操作全体の時間を表示し、内部段階は概要に展開しません。
+
 | 表示・記録 | 役割 |
 | --- | --- |
 | Audit | operation ID、tool、route、status、approval、request／result、rollback／recoveryなどを含む完全な技術監査証跡 |
-| Activity Monitor | `audit.db` の NEW／UPDATE、tool、route、status、approval status、bounded summaryを起動ウィンドウへ表示する低レベル監視 |
+| Activity Monitor | `audit.db` の NEW／UPDATE と安全な要約に加え、保存された処理時間の集計・詳細を起動ウィンドウへ表示する低レベル監視 |
 | `activity_timeline`／`activity_get` | 過去operationの軽量一覧と、必要時のbounded preview／diff／event／詳細 |
 | Approval UI Live Activity | 現在PC上で何をしているか、成功・失敗・拒否・転送・Undo／rollbackを人間向けに表示 |
+| `operation_changes` | operation ID から全変更対象、完全な差分、変更前後の実バイト列をページ分割で取得 |
 
-Live Activityは、ファイルの読み取り／編集、構造化ファイル処理、コマンド、artifactの送受信、重要な失敗や拒否、承認待ち、Undo／rollbackを表示します。`workspace_apply` などの高水準操作は、preflight、個別ファイル処理、検証、復旧を内部イベントとして記録しつつ、トップレベルでは一つの操作として表示します。artifactのbegin／chunk／commitは可能な範囲で一つの転送として扱います。`audit_list`、`audit_get`、`activity_timeline`、`activity_get`、`operation_report`、`session_info`、poll等の監査・診断・metadata取得は、通常のLive Activityを埋めないよう意図的に表示しません。技術詳細は`operation_report`、`activity_get`、`audit_get`で確認してください。Live Activityは観測用であり、承認、policy、checkpoint、transaction、rollbackその他のsecurity decisionの根拠にはなりません。
+Live Activityは、ファイルの読み取り／編集、構造化ファイル処理、コマンド、転送、失敗・拒否、承認待ち、Undo／rollbackを表示します。局所的な変更は保存済みの変更前後の記録から完全なテキスト差分を表示し、`workspace_apply` などの高水準操作は一つの項目で変更件数と概要を表示します。バイナリやフォルダーは件数・容量などの概要を表示し、実行中の経過時間と完了後の所要時間も確認できます。完全な変更内容は `operation_changes(operation_id)`、その操作だけの取り消しは `request_selective_undo(operation_id)` を使います。取り消しはローカル承認が必要です。詳しい分類とページ取得方法は [Live Activity の変更表示と取り消し](docs/LIVE_ACTIVITY_CHANGES.md) を参照してください。
+
+転送のbegin／chunk／commitは可能な範囲で一つの転送として扱います。`audit_list`、`audit_get`、`activity_timeline`、`activity_get`、`operation_report`、`operation_changes`、`session_info`、poll等の診断取得は通常表示しません。技術詳細は `operation_report`、`activity_get`、`audit_get` で確認できます。Live Activityは観測用であり、承認、経路選択、チェックポイント、競合検知、復旧の根拠にはなりません。
 
 checkpoint で戻せるのは、記録対象になった通常の作業ファイルです。`.git`、Windows のアクセス権、端末、ネットワーク、外部サービス、別のプログラムが行った変更は戻せません。選択的な Undo は独立したテキスト変更に使えますが、バイナリファイルや判断できない競合では停止します。
 
@@ -621,11 +643,14 @@ ADB は任意コマンドを実行する機能ではありません。`adb_read`
 | `approved_host_enabled` | Approved Host を利用する設定。設定ウィザードとサンプルの初期値は `false` で、運用用実行環境と authority service の検証後に有効化します |
 | `approval_ui_autostart` | `run-localmcp.bat` と同時に同じconfigの承認画面を別ウィンドウで自動起動します。初期値は`true`です |
 | `approval_request_ttl_seconds` | 承認要求の有効期間。サンプルは 1800 秒 |
+| `binary_transfer_ttl_seconds` | 転送開始からの有効期間。既定1800秒、30〜86400秒。承認や完了済み転送の保持期間とは独立 |
 | `approval_execution_ttl_seconds` | 承認後の実行有効期間。サンプルは 60 秒 |
 | `default_approver` | 既定の承認者識別子。サンプルは `local-user` |
 | `approval_manifest_max_files`／`approval_manifest_max_bytes` | 承認対象 manifest のファイル数と合計サイズの上限 |
 
 Approved Host は、Broker や Sandbox で実行できない eligible command のための中核経路です。immutable な Program Files runtime、LocalSystem authority service、current approval、manifest、generation、postflight を組み合わせ、実コマンドは検証済みの通常ユーザー token で起動します。サービスの停止、worker の消失、postflight の不確実性がある場合は recovery required となり、ユーザー権限から勝手に修復しません。
+
+authority service はローカル承認元の PID／作成時刻／SID／非昇格を検証した時点で通常ユーザー token を複製し、明示した HANDLE だけを LocalSystem worker に渡します。worker は token を再検証して一度限りの command に使用するため、承認画面が後で閉じても別の PID の権限へ切り替わりません。受け渡しに失敗した場合は実コマンドを起動しません。
 
 Approved Host の導入・復旧は、通常の editable checkout を起動する手順とは別です。詳細は [docs/APPROVED_HOST_PRODUCT_INVARIANT.md](docs/APPROVED_HOST_PRODUCT_INVARIANT.md) とリポジトリ内の install／verify／recover script を確認してください。Sandbox の失敗を理由に Host へ自動 fallback することはありません。
 
@@ -680,7 +705,7 @@ Approved Host の導入・復旧は、通常の editable checkout を起動す�
 | Git と ADB | `git_info`、`adb_read`、`get_adb_screenshot` |
 | 非同期 operation | `poll_job`、`stop_job` |
 | Sandbox／Host の承認 | `request_sandbox_command`、`request_host_command`、`poll_approval` |
-| 監査と活動履歴 | `operation_report`、`audit_list`、`audit_get`、`activity_timeline`、`activity_get` |
+| 監査と活動履歴 | `operation_report`、`operation_changes`、`audit_list`、`audit_get`、`activity_timeline`、`activity_get` |
 | 変更の復旧 | `request_workspace_rollback`、`request_selective_undo` |
 | 外部文脈 | `context_read_info`、`context_search`、`context_read`、`context_export_info`、`export_context` |
 
@@ -689,6 +714,8 @@ Approved Host の導入・復旧は、通常の editable checkout を起動す�
 `workspace_tree` と `workspace_search` は再帰走査を Broker 内で完結させ、`read_files` は複数の UTF-8 ファイルを一度に返します。いずれも既存の workspace／reparse／verified-handle 境界を使い、depth、entry、file、byte、result の上限を適用します。
 
 `text_file_apply` は expected SHA-256 に一致する UTF-8 ファイルで、対象文字列がちょうど1回現れる場合だけ完全一致置換を行います。`workspace_apply` は全対象の CAS と置換を先に検証し、対象ごとの既存 lock を決定的な順序で保持したまま、一つの checkpoint／transaction／operation ID でまとめて確定します。mutation 開始後に低水準ツールへ自動 fallback せず、失敗時は `failed_recovered` または `recovery_required` として終端化します。
+
+内容と対象が決まっている操作列には `workspace_batch`、範囲内の完全一致置換には `workspace_replace` を使えます。読取・ハッシュ計算・件数集計・CAS・結果確認をサーバー内で行うため、生SHA-256や検索結果からの変更要求をLLMが組み立て直す必要はありません。確認を挟む場合は `preview=True` で計画を作り、返された短期有効の `plan_id` を `workspace_plan_apply` へ渡します。既存の低水準APIも引き続き利用できます。[操作例・保証・上限](docs/DETERMINISTIC_WORKSPACE_OPERATIONS.md) を参照してください。
 
 `artifact_download` と `artifact_upload` は `max_one_shot_artifact_bytes` 以内だけを対象とする byte-exact な1回経路です。SHA-256、既存ファイル置換時の CAS、checkpoint、transaction、rollback は従来経路と同じです。上限を超える場合は巨大な応答を生成せず、既存の chunk 転送ツールを案内します。
 
@@ -703,6 +730,8 @@ Approved Host の導入・復旧は、通常の editable checkout を起動す�
 - `available`：依存関係、承認、current marker、runtime などを含む実行前提がそろっている。
 - `windows_live_verified`：この PC の Windows 境界を実測した証拠がある。
 - `execution_route_available`：その route の必須 property を満たして、実行を受け付けられる。
+
+Codex Sandbox では、署名と実行ファイルの構成を確認できた状態を `dependency_available`、WLMCP の最小権限ポリシーを受理できた状態を `policy_compatibility.status=accepted` として分けます。後者を現在の実体・設定・有効期間へ結合した正式検証から確認できるまで `available=false` です。受理できても他の必須境界が失敗すれば `execution_route_available=false` のままです。`rejected` はポリシー非互換、`unverified` は証拠不足・期限切れなどを示します。状態の取得だけで追加の検証や UAC は起動しません。
 
 テスト、marker の存在、WFP object の存在、Sandbox の起動ログだけでは、通常の Windows user としての UAC、LocalSystem service、Job／WMI process census、worker 消失後の recovery、実トラフィック遮断、Secure MCP Tunnel／ChatGPT の E2E を証明しません。証拠の種類を混ぜず、未検証のものは未検証として扱います。
 

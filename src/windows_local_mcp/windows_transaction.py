@@ -607,10 +607,9 @@ def transactional_move_file(
             expected_sha256=expected_source_sha256,
         )
 
-        # Recheck a destination that was absent at the initial lexical check in
-        # the transaction view.  MoveFileTransactedW is called without a replace
-        # flag, so a concurrent create causes transaction commit failure rather
-        # than an overwrite.
+        # 元ファイルの検証後に保存先を再確認する。残る確認直後の競合は、
+        # 上書きフラグを持たないMoveFileTransactedWが拒否する。
+        # 移動がトランザクション内で成立した後は、TxFが保存先の名前を予約する。
         if not case_only and _path_exists(destination):
             raise FileExistsError(f"move destination already exists: {destination}")
 
@@ -626,10 +625,9 @@ def transactional_move_file(
 
         if _before_commit is not None:
             _before_commit()
-        # TxF commit may be unable to reconcile a destination created outside
-        # this transaction.  Close the moved-file handle before committing, but
-        # retain both parent handles until CommitTransaction returns so an
-        # ancestor cannot be replaced during the commit boundary.
+        # ファイルHANDLEを閉じても保存先の予約はトランザクション終了まで残る。
+        # 両親ディレクトリのHANDLEはCommitTransactionが戻るまで保持し、
+        # 確定処理中の祖先ディレクトリの差し替えを防ぐ。
         kernel32.CloseHandle(source_handle)
         source_handle = None
         _finish_transaction(transaction, commit=True)
@@ -826,8 +824,8 @@ def transactional_copy_file(
             raise RuntimeError("copy destination is not a regular, singly linked file")
         if _before_commit is not None:
             _before_commit()
-        # A destination created concurrently outside this transaction remains a
-        # collision at TxF commit; no replacement flag is ever used.
+        # CREATE_NEWが成功した保存先はTxFで予約済みであり、HANDLEを閉じた後も
+        # トランザクション終了までは他の書き手による同名ファイル作成を拒否する。
         kernel32.CloseHandle(destination_handle)
         destination_handle = None
         kernel32.CloseHandle(source_handle)

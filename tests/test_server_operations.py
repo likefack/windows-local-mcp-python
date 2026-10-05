@@ -334,8 +334,9 @@ def test_sandbox_is_snapshot_only_and_host_rejects_project_code_loaders(
         )
 
 
+@pytest.mark.parametrize("policy_status", ["unverified", "rejected", "accepted"])
 def test_sandbox_dependency_availability_is_separate_from_live_verified_route(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, policy_status: str
 ) -> None:
     server, _ = load_server(tmp_path, monkeypatch)
     codex = tmp_path / "trusted" / "codex.exe"
@@ -356,6 +357,14 @@ def test_sandbox_dependency_availability_is_separate_from_live_verified_route(
     )
     monkeypatch.setattr(server, "resolve_codex_sandbox_backend", lambda _settings: backend)
     monkeypatch.setattr(
+        server, "codex_sandbox_policy_compatibility",
+        lambda _settings, _backend: {
+            "status": policy_status,
+            "reason": "elevated Windows sandbox requires effective `:root` read access"
+            if policy_status == "rejected" else None,
+        },
+    )
+    monkeypatch.setattr(
         server,
         "require_codex_sandbox_live_verification",
         lambda _settings, _backend: (_ for _ in ()).throw(
@@ -366,10 +375,15 @@ def test_sandbox_dependency_availability_is_separate_from_live_verified_route(
     status = server._codex_sandbox_capability()
 
     assert status["dependency_available"] is True
-    assert status["available"] is True
+    assert status["available"] is (policy_status == "accepted")
     assert status["execution_route_available"] is False
     assert status["windows_live_verified"] is False
-    assert "property evidence is incomplete" in status["execution_unavailable_reason"]
+    assert status["policy_compatibility"]["status"] == policy_status
+    expected = (
+        "property evidence is incomplete" if policy_status == "accepted"
+        else "managed policy acceptance is not current"
+    )
+    assert expected in status["execution_unavailable_reason"]
 
 
 def test_session_info_exposes_live_verification_reason_fields(

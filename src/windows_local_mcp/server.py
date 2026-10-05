@@ -13,12 +13,12 @@ from contextlib import ExitStack
 from datetime import UTC, datetime, timedelta
 from itertools import islice
 from pathlib import Path, PureWindowsPath
-from typing import Any
+from typing import Annotated, Any
 
-from mcp.server import MCPServer
 from mcp.server.mcpserver import Image
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
+from pydantic import WithJsonSchema
 
 from .approval import (
     is_project_controlled_code_loader,
@@ -26,11 +26,17 @@ from .approval import (
     settings_digest,
 )
 from .approved_host_policy import assert_approved_host_authority_available
+from .artifact_errors import (
+    ArtifactTransferError,
+    ArtifactTransferNotFoundError,
+    ArtifactTransferStateError,
+)
 from .artifact_fast_path import (
     check_one_shot_size,
     decode_one_shot_upload,
     encode_one_shot_download,
 )
+from .attachment_import import FILE_INPUT_SCHEMA, download_attachment, validate_reference
 from .audit import AuditStore
 from .command_traits import (
     SafeExecutionKind,
@@ -49,6 +55,7 @@ from .high_level_mutation import plan_exact_text_edits
 from .high_level_read import read_files as read_files_high_level
 from .high_level_read import workspace_search as workspace_search_high_level
 from .high_level_read import workspace_tree as workspace_tree_high_level
+from .operation_changes import build_operation_changes
 from .operation_report import build_operation_report
 from .paths import (
     PathIdentity,
@@ -60,13 +67,16 @@ from .paths import (
 from .performance_trace import phase, timed_phase, traced_operation
 from .policy import CommandPolicy, NormalizedCommand, approved_request_hash
 from .redaction import redact_command_args, redact_text
+from .request_origin import OriginMCPServer, origin_fields
 from .resources import NamedControlPlaneLock, WorkspaceExecutionLock, enforce_data_quota
 from .risk import command_risk_facts
 from .runtime_immutability import assert_approved_host_runtime_immutable
 from .sandbox_backend import (
     SANDBOX_SECURITY_PROPERTIES,
+    ApprovedSandboxUnavailable,
     codex_sandbox_effective_policy,
     codex_sandbox_live_verification_status,
+    codex_sandbox_policy_compatibility,
     require_codex_sandbox_live_verification,
     resolve_codex_sandbox_backend,
 )
@@ -76,6 +86,7 @@ from .structured_files import inspect as inspect_structured
 from .structured_files import transform as transform_structured
 from .timeline import timeline_entry, timeline_list
 from .tool_safety import trusted_helper_identity
+from .transfer_receipts import RECEIPT_BYTES, append_receipt, find_receipt
 from .util import (
     canonical_json,
     read_text_limited,
@@ -107,6 +118,8 @@ from .workspace_history import (
     verify_checkpoint_integrity,
     workspace_recovery_required,
 )
+from .workspace_operations import run_workspace_plan
+from .workspace_plan import WorkspacePlanStore
 
 READ_ONLY = ToolAnnotations(
     readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False
@@ -129,8 +142,11 @@ class NonUtf8TextError(ValueError, ToolError):
     """Expected text/binary route error that is safe to surface to the MCP model."""
 
 
-class TransferIntegrityError(RuntimeError):
+class TransferIntegrityError(ArtifactTransferStateError):
     """A durable transfer artifact no longer matches its persisted manifest."""
+
+    def __init__(self, message: str, *, code: str = "TRANSFER_INTEGRITY") -> None:
+        super().__init__(code, message)
 
 
 class Runtime:
@@ -138,6 +154,7 @@ class Runtime:
         self.settings: Settings = load_settings()
         assert_trusted_runtime(self.settings)
         self.workspace = Workspace(self.settings)
+        self.workspace_plans = WorkspacePlanStore(self.settings.max_high_level_total_bytes)
         self.audit = AuditStore(self.settings)
         self.policy = CommandPolicy(self.settings, self.workspace)
         self.executor = Executor(self.settings, self.audit)
@@ -151,16 +168,26 @@ class Runtime:
 
 runtime = Runtime()
 
-mcp = MCPServer(
+mcp = OriginMCPServer(
     "Windows Local MCP",
     version="0.6.0",
     instructions=(
-        "Operate inside the configured workspace. Use broker primitives for bounded file, "
-        "artifact, fixed ADB-read, and metadata-only fixed Git-read operations. Automatic Git "
+        "Operate inside the configured workspace. "
+        "Call session_info to inspect your audit session. When running multiple tasks, "
+        "choose a short non-secret task_id and pass it on every tool call for that task. "
+        "Session IDs identify server connections, not ChatGPT conversations or authorization. "
+        "Use workspace_batch for decided file-operation sequences and workspace_replace for "
+        "decided literal replacements. Preview with preview=True, then workspace_plan_apply; "
+        "keep raw hashes and deterministic search/edit assembly inside the server. "
+        "Use broker primitives for bounded file, artifact, fixed ADB-read, and "
+        "metadata-only fixed Git-read operations. Automatic Git "
         "requires current Git-specific live verification and otherwise fails closed. "
         "Content-producing or open-ended Git, project code, plugins, Flutter/Dart processing, "
         "test/build, and general commands use request_sandbox_command. DOCX/XLSX/CSV/TSV/ZIP/"
         "image work uses bounded structured processing or hash-bound container artifacts. "
+        "ChatGPT attachments use artifact_import_file with host-provided fileParams; never "
+        "generate or copy attachment Base64 in the model. Programmatic byte-owning clients "
+        "may continue to use artifact_upload and chunked transfers. "
         "request_host_command stages a separate one-shot Approved Host request through the "
         "authority-separated Windows service and is never an automatic fallback. Activity tools "
         "expose bounded operation details; workspace rollback is always a locally approved "
@@ -179,6 +206,8 @@ def _safe_request(value: Any, *, depth: int = 0) -> Any:
             folded = str(key).casefold()
             if any(secret in folded for secret in ("token", "password", "secret", "api_key")):
                 result[str(key)] = "<redacted>"
+            elif folded in {"download_url", "base64", "base64_payload", "base64_chunk"}:
+                result[str(key)] = "<omitted>"
             elif folded == "content":
                 encoded = str(item).encode("utf-8", errors="replace")
                 result[str(key)] = {"bytes": len(encoded), "sha256": sha256_bytes(encoded)}
@@ -266,7 +295,8 @@ def _audit_rejection(tool_name: str, request: dict[str, Any], error: Exception) 
 
 @timed_phase("request_validation")
 def _require_filesystem() -> None:
-    assert_control_plane_healthy(runtime.settings)
+    with phase("control_plane_health_check"):
+        assert_control_plane_healthy(runtime.settings)
     if not runtime.settings.filesystem_enabled:
         raise PermissionError("filesystem capability is disabled")
 
@@ -384,6 +414,7 @@ def _codex_sandbox_capability() -> dict[str, Any]:
         "available": False,
         "execution_route_available": False,
         "dependency_available": False,
+        "policy_compatibility": {"status": "unverified", "reason": None},
         "live_verified": False,
         "windows_live_verified": False,
         "live_verification_status": "unverified",
@@ -406,10 +437,13 @@ def _codex_sandbox_capability() -> dict[str, Any]:
         resolved = resolve_codex_sandbox_backend(runtime.settings)
         backend = resolved.as_dict()
         status["dependency_available"] = True
-        status["available"] = True
+        # 署名と存在だけでは、最小読み取りポリシーを受理できるとは限らない。
+        compatibility = codex_sandbox_policy_compatibility(runtime.settings, resolved)
+        status["policy_compatibility"] = compatibility
+        status["available"] = compatibility["status"] == "accepted"
         status["backend"] = {
             key: backend[key]
-            for key in ("name", "provenance", "signature_status", "signer_subject")
+            for key in ("name", "version", "provenance", "signature_status", "signer_subject")
         }
         inspection = codex_sandbox_live_verification_status(runtime.settings, resolved)
         evidence = inspection.get("evidence")
@@ -446,6 +480,11 @@ def _codex_sandbox_capability() -> dict[str, Any]:
         status["unavailable_reason"] = redact_text(f"{type(error).__name__}: {error}")
         return status
     try:
+        if not status["available"]:
+            raise ApprovedSandboxUnavailable(
+                "Codex Sandbox managed policy acceptance is not current: "
+                + str(status["policy_compatibility"]["reason"] or "unverified")
+            )
         require_codex_sandbox_live_verification(runtime.settings, resolved)
         status["execution_route_available"] = True
         status["live_verified"] = True
@@ -589,6 +628,7 @@ def session_info() -> dict[str, Any]:
     adb_helper = _broker_helper_capability("adb", runtime.settings.adb_enabled)
     approved_host = _approved_host_capability()
     result = {
+        **origin_fields(),
         "workspace_root": str(runtime.settings.workspace_root),
         "data_dir": str(runtime.settings.data_dir),
         "capabilities": {
@@ -993,11 +1033,11 @@ def _atomic_binary_mutation(
     allow_create: bool = False,
     require_expected_for_existing: bool = False,
     source_bindings: tuple[tuple[str, str], ...] = (),
+    operation_id: str | None = None,
 ) -> dict[str, Any]:
     """Apply one CAS-bound binary replacement through the normal workspace journal."""
     _require_filesystem()
     _require_workspace_mutation_ready()
-    operation_id: str | None = None
     target = runtime.workspace.resolve_for_write(path)
     bound_sources: list[Path] = []
     for source_path, _expected_sha256 in source_bindings:
@@ -1046,7 +1086,10 @@ def _atomic_binary_mutation(
                     raise ValueError("expected_sha256 is required when replacing an existing file")
             with phase("cas_recheck"):
                 if expected_sha256 is not None and expected_sha256 != before_sha:
-                    raise RuntimeError("expected_sha256 mismatch; source is stale or concurrently modified")
+                    raise ArtifactTransferStateError(
+                        "TRANSFER_CAS_MISMATCH",
+                        "expected_sha256 mismatch; source is stale or concurrently modified",
+                    )
 
             _verify_binary_source_bindings(source_bindings)
 
@@ -1065,13 +1108,19 @@ def _atomic_binary_mutation(
                 "before_bytes": len(before),
                 **request_summary,
             }
-            operation_id = runtime.audit.create_operation(
-                tool_name=tool_name,
-                tier="structured_processing",
-                status="running",
-                cwd=str(runtime.settings.workspace_root),
-                request=_safe_request(request),
-            )
+            if operation_id is None:
+                operation_id = runtime.audit.create_operation(
+                    tool_name=tool_name,
+                    tier="structured_processing",
+                    status="running",
+                    cwd=str(runtime.settings.workspace_root),
+                    request=_safe_request(request),
+                )
+            else:
+                # 構造化変換の開始時に登録済みの操作へ、確定時の情報を追記する。
+                runtime.audit.update_operation(
+                    operation_id, request_json=canonical_json(_safe_request(request))
+                )
             relative_target = runtime.workspace.relative(target)
             checkpoint_paths = {relative_target}
             with phase("checkpoint_before"):
@@ -1341,6 +1390,7 @@ def structured_file_apply(
         "output_path": output_path,
         "expected_output_sha256": expected_output_sha256,
     }
+    operation_id: str | None = None
     try:
         kind = infer_format(path, format)
         target_path = output_path or path
@@ -1391,6 +1441,21 @@ def structured_file_apply(
                     raise RuntimeError(
                         "expected_output_sha256 mismatch; output is stale or concurrently modified"
                     )
+        # 大きな文書の変換中も操作内容と経過時間を表示できるよう、変換前に登録する。
+        # 編集本文は含めず、対象と操作種別だけを概要に使う。
+        request_summary = {
+            "format": kind,
+            "source_path": path,
+            "output_path": target_path,
+            "operations": [item.get("op") for item in operations],
+        }
+        operation_id = runtime.audit.create_operation(
+            tool_name="structured_file_apply",
+            tier="structured_processing",
+            status="running",
+            cwd=str(runtime.settings.workspace_root),
+            request=_safe_request({"path": target_path, **request_summary}),
+        )
         output, semantic = transform_structured(
             prepared_source,
             path,
@@ -1411,21 +1476,29 @@ def structured_file_apply(
             path=target_path,
             expected_sha256=(expected_output_sha256 if distinct_output else expected_sha256),
             reason=reason,
-            request_summary={
-                "format": kind,
-                "source_path": path,
-                "output_path": target_path,
-                "operations": [item.get("op") for item in operations],
-            },
+            request_summary=request_summary,
             transform=apply,
             allow_create=allow_create or distinct_output,
             require_expected_for_existing=True,
             source_bindings=(
                 ((path, prepared_sha),) if distinct_output else ()
             ),
+            operation_id=operation_id,
         )
     except Exception as error:
-        _audit_rejection("structured_file_apply", request, error)
+        if operation_id is None:
+            _audit_rejection("structured_file_apply", request, error)
+        else:
+            # 変換や確定前の失敗でも、開始済み操作を実行中のまま残さない。
+            transitioned = runtime.audit.transition_operation(
+                operation_id,
+                from_statuses={"running"},
+                status="failed",
+                finished_at=utc_now_iso(),
+                error=redact_text(f"{type(error).__name__}: {error}"),
+            )
+            if transitioned:
+                runtime.audit.add_event(operation_id, "failed", {"path": path})
         raise
 
 
@@ -1674,7 +1747,7 @@ def zip_extract_many(
 
 def _transfer_root(transfer_id: str) -> Path:
     if not re.fullmatch(r"[0-9a-f-]{36}", transfer_id):
-        raise ValueError("invalid transfer id")
+        raise ArtifactTransferError("TRANSFER_ID_INVALID", "invalid transfer id")
     return runtime.settings.data_dir / "binary-transfers" / transfer_id
 
 
@@ -1705,6 +1778,34 @@ _TRANSFER_TERMINAL_STATES = {
     "committed",
 }
 _TRANSFER_KNOWN_STATES = _TRANSFER_ADMISSION_STATES | _TRANSFER_TERMINAL_STATES
+
+
+def _transfer_expiry(manifest: dict[str, Any]) -> datetime:
+    """Pin new transfer lifetimes; use the dedicated setting for legacy manifests."""
+    try:
+        created = datetime.fromisoformat(str(manifest["created_at"]))
+        expiry = (
+            datetime.fromisoformat(str(manifest["expires_at"]))
+            if "expires_at" in manifest
+            else created + timedelta(seconds=runtime.settings.binary_transfer_ttl_seconds)
+        )
+        if created.tzinfo is None or expiry.tzinfo is None or expiry < created:
+            raise ValueError("invalid lifetime")
+        return expiry
+    except (KeyError, TypeError, ValueError) as error:
+        raise ArtifactTransferStateError(
+            "TRANSFER_LIFETIME_INVALID", "binary transfer manifest has invalid lifetime binding"
+        ) from error
+
+
+def _new_transfer_lifetime() -> dict[str, str]:
+    created = datetime.now(UTC)
+    return {
+        "created_at": created.isoformat(),
+        "expires_at": (
+            created + timedelta(seconds=runtime.settings.binary_transfer_ttl_seconds)
+        ).isoformat(),
+    }
 
 
 def _validated_transfer_payload(
@@ -1740,35 +1841,22 @@ def _admit_transfer() -> None:
     open_count = 0
     if root.is_dir() and not root.is_symlink():
         for manifest_path in root.glob("*/manifest.json"):
-            try:
-                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                continue
-            if manifest.get("state") in _TRANSFER_ADMISSION_STATES:
+            # Even a short manifest read must use the lifecycle lock: on Windows
+            # an open reader can otherwise deny a concurrent atomic replacement.
+            with NamedControlPlaneLock(
+                runtime.settings, f"transfer-{manifest_path.parent.name}"
+            ):
                 try:
-                    created = datetime.fromisoformat(str(manifest["created_at"]))
-                except (KeyError, TypeError, ValueError):
-                    raise RuntimeError("binary transfer manifest has invalid lifetime binding")
-                if datetime.now(UTC) - created > timedelta(
-                    seconds=runtime.settings.approval_request_ttl_seconds
-                ):
-                    with NamedControlPlaneLock(
-                        runtime.settings, f"transfer-{manifest_path.parent.name}"
-                    ):
-                        current = json.loads(manifest_path.read_text(encoding="utf-8"))
-                        if current.get("state") not in {"preparing", "open"}:
-                            continue
-                        current_created = datetime.fromisoformat(str(current["created_at"]))
-                        if datetime.now(UTC) - current_created <= timedelta(
-                            seconds=runtime.settings.approval_request_ttl_seconds
-                        ):
-                            open_count += 1
-                            continue
-                        current["state"] = "expired"
-                        current["expired_at"] = utc_now_iso()
-                        _write_transfer_manifest(manifest_path.parent, current)
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
                     continue
-                open_count += 1
+                if manifest.get("state") in _TRANSFER_ADMISSION_STATES:
+                    if datetime.now(UTC) > _transfer_expiry(manifest):
+                        manifest["state"] = "expired"
+                        manifest["expired_at"] = utc_now_iso()
+                        _write_transfer_manifest(manifest_path.parent, manifest)
+                    else:
+                        open_count += 1
     if open_count >= runtime.settings.max_open_transfers:
         raise RuntimeError("open binary transfer admission limit reached")
 
@@ -1798,11 +1886,13 @@ def _load_transfer(
     """Load and validate one transfer manifest under its caller's lifecycle lock."""
     root = _transfer_root(transfer_id)
     transfer_root = runtime.settings.data_dir / "binary-transfers"
+    if not transfer_root.exists():
+        raise ArtifactTransferNotFoundError()
     if _is_reparse(transfer_root) or not transfer_root.is_dir():
         raise RuntimeError("binary transfer root has an unsafe directory identity")
     transfers = transfer_root.resolve(strict=True)
     if not root.exists() or _is_reparse(root) or not root.is_dir():
-        raise FileNotFoundError("transfer session was not found")
+        raise ArtifactTransferNotFoundError()
     root.resolve(strict=True).relative_to(transfers)
     manifest_path = root / "manifest.json"
     if (
@@ -1811,9 +1901,9 @@ def _load_transfer(
         or not manifest_path.is_file()
         or manifest_path.stat().st_nlink > 1
     ):
-        raise FileNotFoundError("transfer session was not found")
+        raise ArtifactTransferNotFoundError()
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("version") not in {1, 2, 3, 4}:
+    if manifest.get("version") not in {1, 2, 3, 4, 5}:
         raise RuntimeError("transfer session version is unsupported")
     direction = manifest.get("direction")
     if direction not in {"download", "upload"} or (
@@ -1823,15 +1913,11 @@ def _load_transfer(
     state = manifest.get("state")
     if state not in _TRANSFER_KNOWN_STATES:
         raise RuntimeError("transfer session state is invalid")
-    try:
-        created = datetime.fromisoformat(str(manifest["created_at"]))
-    except (KeyError, TypeError, ValueError) as error:
-        raise RuntimeError("binary transfer manifest has invalid lifetime binding") from error
+    expiry = _transfer_expiry(manifest)
     if (
         expire_active
         and state in _TRANSFER_ADMISSION_STATES
-        and datetime.now(UTC) - created
-        > timedelta(seconds=runtime.settings.approval_request_ttl_seconds)
+        and datetime.now(UTC) > expiry
     ):
         manifest["state"] = "expired"
         manifest["expired_at"] = utc_now_iso()
@@ -1840,10 +1926,14 @@ def _load_transfer(
     allowed = {"open"} if allowed_states is None else allowed_states
     if state not in allowed:
         if state == "expired":
-            raise RuntimeError("transfer session expired")
+            raise ArtifactTransferStateError("TRANSFER_EXPIRED", "transfer session expired")
         if allowed == {"open"}:
-            raise RuntimeError("transfer session is not open for this operation")
-        raise RuntimeError("transfer session is not available for this operation")
+            raise ArtifactTransferStateError(
+                "TRANSFER_TERMINAL", "transfer session is not open for this operation"
+            )
+        raise ArtifactTransferStateError(
+            "TRANSFER_TERMINAL", "transfer session is not available for this operation"
+        )
     return root, manifest
 
 
@@ -1899,10 +1989,66 @@ def _write_upload_chunk_locked(
     offset: int,
     payload: bytes,
 ) -> dict[str, Any]:
-    if offset != int(manifest["received"]):
-        raise RuntimeError("upload chunk offset is not the next expected offset")
+    received = int(manifest["received"])
+    if type(offset) is not int or offset < 0 or offset > received:
+        raise ArtifactTransferStateError(
+            "TRANSFER_OFFSET_INVALID", "upload chunk offset is not the next expected offset"
+        )
+    if offset < received:
+        # Legacy manifests have no reliable chunk boundaries; never guess an acknowledgement.
+        if manifest["version"] < 5:
+            raise ArtifactTransferStateError(
+                "TRANSFER_OFFSET_INVALID", "legacy upload has no receipt for this offset"
+            )
+        try:
+            receipt = find_receipt(
+                root, manifest["receipt_count"], offset, max_records=int(manifest["bytes"])
+            )
+        except ValueError as error:
+            raise TransferIntegrityError("upload receipt index is invalid") from error
+        if receipt is None:
+            raise ArtifactTransferStateError(
+                "TRANSFER_OFFSET_INVALID", "offset is not a received chunk boundary"
+            )
+        if receipt != (len(payload), sha256_bytes(payload)):
+            raise TransferIntegrityError(
+                "duplicate upload chunk differs from its receipt",
+                code="TRANSFER_DUPLICATE_MISMATCH",
+            )
+        payload_path = _validated_transfer_payload(root, manifest, immutable=False)
+        with payload_path.open("rb") as existing:
+            existing.seek(offset)
+            if existing.read(len(payload)) != payload:
+                raise TransferIntegrityError("received upload chunk changed after acknowledgement")
+        _validated_transfer_payload(root, manifest, immutable=False)
+        return manifest
+    if manifest["state"] != "open":
+        raise ArtifactTransferStateError("TRANSFER_TERMINAL", "upload is already committed")
     if offset + len(payload) > int(manifest["bytes"]):
-        raise ValueError("upload exceeds declared total_bytes")
+        raise ArtifactTransferError("TRANSFER_TOTAL_SIZE_LIMIT", "upload exceeds declared total_bytes")
+    if manifest["version"] >= 5:
+        # Reserve receipts in batches, preserving the normal chunk path's no-quota-scan
+        # property. Tiny-chunk clients can grow the index only after another quota check.
+        index = root / "chunks.bin"
+        if not index.exists() or _is_reparse(index) or not index.is_file():
+            raise TransferIntegrityError("upload receipt index has an unsafe identity")
+        details = index.stat()
+        count = manifest["receipt_count"]
+        if (
+            type(count) is not int or count < 0 or count > received
+            or details.st_nlink != 1 or details.st_size % RECEIPT_BYTES
+            or not count * RECEIPT_BYTES <= details.st_size <= int(manifest["bytes"]) * RECEIPT_BYTES
+        ):
+            raise TransferIntegrityError("upload receipt index has an invalid capacity")
+        if details.st_size == count * RECEIPT_BYTES:
+            capacity = min(int(manifest["bytes"]), count + 1024)
+            enforce_data_quota(
+                runtime.settings, incoming_bytes=capacity * RECEIPT_BYTES - details.st_size
+            )
+            with index.open("r+b") as receipt_file:
+                receipt_file.truncate(capacity * RECEIPT_BYTES)
+                receipt_file.flush()
+                os.fsync(receipt_file.fileno())
     if manifest["version"] >= 4:
         payload_path = _validated_transfer_payload(root, manifest, immutable=False)
         with payload_path.open("r+b") as output:
@@ -1917,12 +2063,23 @@ def _write_upload_chunk_locked(
             output.write(payload)
             output.flush()
             os.fsync(output.fileno())
+    if manifest["version"] >= 5:
+        try:
+            append_receipt(
+                root, manifest["receipt_count"], offset, payload,
+                max_records=int(manifest["bytes"]),
+            )
+        except ValueError as error:
+            raise TransferIntegrityError("upload receipt index is invalid") from error
+        manifest["receipt_count"] += 1
+    # Payload and receipt are durable before the manifest publishes the acknowledgement.
     manifest["received"] = offset + len(payload)
     _write_transfer_manifest(root, manifest)
     return manifest
 
 
 @mcp.tool(annotations=READ_ONLY)
+@traced_operation
 def artifact_download(path: str, expected_sha256: str | None = None) -> dict[str, Any]:
     """Download one small byte-exact artifact in a single bounded MCP response."""
 
@@ -1940,12 +2097,13 @@ def artifact_download(path: str, expected_sha256: str | None = None) -> dict[str
             direction="download",
         )
         payload = read_verified_bytes(source, runtime.settings.max_one_shot_artifact_bytes)
-        result = encode_one_shot_download(
-            payload,
-            max_bytes=runtime.settings.max_one_shot_artifact_bytes,
-            path=runtime.workspace.relative(source),
-            expected_sha256=expected_sha256,
-        )
+        with phase("artifact_encoding"):
+            result = encode_one_shot_download(
+                payload,
+                max_bytes=runtime.settings.max_one_shot_artifact_bytes,
+                path=runtime.workspace.relative(source),
+                expected_sha256=expected_sha256,
+            )
         result["operation_id"] = _log_simple(
             tool_name="artifact_download",
             request=request,
@@ -1961,6 +2119,7 @@ def artifact_download(path: str, expected_sha256: str | None = None) -> dict[str
 
 
 @mcp.tool(annotations=LOCAL_WRITE)
+@traced_operation
 def artifact_upload(
     path: str,
     base64_payload: str,
@@ -1978,19 +2137,22 @@ def artifact_upload(
         "base64_characters": len(base64_payload) if isinstance(base64_payload, str) else None,
     }
     try:
-        prepared = decode_one_shot_upload(
-            base64_payload,
-            max_bytes=runtime.settings.max_one_shot_artifact_bytes,
-            sha256=sha256,
-            expected_sha256=expected_sha256,
-        )
+        with phase("artifact_decoding"):
+            prepared = decode_one_shot_upload(
+                base64_payload,
+                max_bytes=runtime.settings.max_one_shot_artifact_bytes,
+                sha256=sha256,
+                expected_sha256=expected_sha256,
+            )
         _require_filesystem()
         _require_workspace_mutation_ready()
         _target, current, exists = _read_bounded_binary(path, allow_missing=True)
         if exists and expected_sha256 is None:
             raise ValueError("expected_sha256 is required when replacing an existing file")
         if expected_sha256 is not None and sha256_bytes(current) != expected_sha256:
-            raise RuntimeError("expected_sha256 mismatch; target is stale or concurrently modified")
+            raise ArtifactTransferStateError(
+                "TRANSFER_CAS_MISMATCH", "expected_sha256 mismatch; target is stale or concurrently modified"
+            )
     except Exception as error:
         _audit_rejection("artifact_upload", request, error)
         raise
@@ -2020,6 +2182,85 @@ def artifact_upload(
         allow_create=True,
         require_expected_for_existing=True,
     )
+
+
+@mcp.tool(annotations=LOCAL_WRITE, meta={"openai/fileParams": ["file"]})
+@traced_operation
+def artifact_import_file(
+    file: Annotated[Any, WithJsonSchema(FILE_INPUT_SCHEMA)],
+    path: str,
+    sha256: str | None = None,
+    expected_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Save a ChatGPT attachment from host-provided fileParams, without model-copied Base64.
+
+    The operator must configure exact file-service hosts first. path alone chooses the
+    destination. sha256 asserts source bytes; expected_sha256 protects existing destination.
+    File references do not prove membership in the current conversation.
+    """
+    # Never put the file object (including invalid inputs) into an audit or error record.
+    request: dict[str, Any] = {"high_level_operation": "artifact_import_file"}
+    try:
+        _require_filesystem()
+        _require_workspace_mutation_ready()
+        validate_reference(file, runtime.settings.attachment_import_allowed_hosts)
+        for digest in (sha256, expected_sha256):
+            if digest is not None and not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise ArtifactTransferError("ATTACHMENT_SHA256_INVALID", "invalid SHA-256 digest")
+        try:
+            _target, current, exists = _read_bounded_binary(path, allow_missing=True)
+        except (OSError, ValueError, RuntimeError):
+            raise ArtifactTransferError(
+                "ATTACHMENT_PATH_REJECTED", "destination is invalid or unavailable"
+            ) from None
+        if exists and expected_sha256 is None:
+            raise ArtifactTransferError(
+                "ATTACHMENT_CAS_REQUIRED", "expected_sha256 is required when replacing an existing file"
+            )
+        if expected_sha256 is not None and sha256_bytes(current) != expected_sha256:
+            raise ArtifactTransferStateError("ATTACHMENT_CAS_MISMATCH", "destination has changed")
+        # Serialize bounded retrievals. Network work never holds the workspace mutation lock.
+        with NamedControlPlaneLock(runtime.settings, "attachment-import"):
+            try:
+                with phase("attachment_fetch"):
+                    downloaded = download_attachment(
+                        file, allowed_hosts=runtime.settings.attachment_import_allowed_hosts,
+                        max_bytes=runtime.settings.max_structured_file_bytes,
+                        expected_sha256=sha256,
+                        timeout_seconds=runtime.settings.attachment_import_timeout_seconds,
+                    )
+            except ArtifactTransferError:
+                raise
+            except Exception:  # noqa: BLE001 - never log a bearer URL from a network failure
+                # Keep even unforeseen downloader failures out of SDK traceback logs.
+                raise ArtifactTransferError(
+                    "ATTACHMENT_FETCH_FAILED", "file retrieval failed or was interrupted"
+                ) from None
+
+            def apply(_: bytes) -> tuple[bytes, dict[str, Any]]:
+                return downloaded.payload, {
+                    "execution_path": "attachment_import",
+                    "artifact_kind": "opaque_binary",
+                    "detected_mime_type": downloaded.detected_mime_type,
+                    "format_validation": "signature_only",
+                    "embedded_code_executed": False,
+                    "source_sha256_verified": sha256 is not None,
+                }
+
+            # The existing commit rechecks CAS under lock and owns checkpoint/recovery.
+            # Do not retry a failed transaction or replace its recovery result.
+            return _atomic_binary_mutation(
+                tool_name="artifact_import_file", path=path,
+                expected_sha256=expected_sha256, reason="ChatGPT attachment import",
+                request_summary={
+                    **request, "received_bytes": len(downloaded.payload),
+                    "received_sha256": downloaded.sha256,
+                },
+                transform=apply, allow_create=True, require_expected_for_existing=True,
+            )
+    except (ArtifactTransferError, ArtifactTransferStateError) as error:
+        _audit_rejection("artifact_import_file", request, error)
+        raise
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -2056,7 +2297,7 @@ def artifact_download_begin(path: str, chunk_bytes: int | None = None) -> dict[s
                     "version": 3,
                     "direction": "download",
                     "state": "preparing",
-                    "created_at": utc_now_iso(),
+                    **_new_transfer_lifetime(),
                     "path": runtime.workspace.relative(source),
                     "bytes": size,
                     "chunk_bytes": chunk,
@@ -2072,7 +2313,9 @@ def artifact_download_begin(path: str, chunk_bytes: int | None = None) -> dict[s
             snapshot_sha, snapshot_bytes = _copy_source_to_reserved_snapshot(source, snapshot)
             current = runtime.workspace.resolve_existing(path, allow_directory=False)
             if current != source or runtime.workspace.identity(current) != source_identity:
-                raise RuntimeError("source changed while preparing download snapshot")
+                raise ArtifactTransferStateError(
+                    "TRANSFER_SOURCE_CHANGED", "source changed while preparing download snapshot"
+                )
             current_data = read_verified_bytes(
                 current, runtime.settings.max_structured_file_bytes
             )
@@ -2082,12 +2325,14 @@ def artifact_download_begin(path: str, chunk_bytes: int | None = None) -> dict[s
                 or current_bytes != snapshot_bytes
                 or current_sha != snapshot_sha
             ):
-                raise RuntimeError("source changed while preparing download snapshot")
+                raise ArtifactTransferStateError(
+                    "TRANSFER_SOURCE_CHANGED", "source changed while preparing download snapshot"
+                )
             persisted_sha, persisted_bytes = sha256_file(
                 snapshot, max_bytes=runtime.settings.max_structured_file_bytes
             )
             if persisted_bytes != snapshot_bytes or persisted_sha != snapshot_sha:
-                raise RuntimeError("download snapshot verification failed")
+                raise TransferIntegrityError("download snapshot verification failed")
             manifest.update(
                 {
                     # A zero-byte snapshot has no chunk to acknowledge. Terminalize it before
@@ -2158,10 +2403,12 @@ def artifact_download_chunk(transfer_id: str, offset: int) -> dict[str, Any]:
                     allowed_states={"open", "completed"},
                 )
                 if not isinstance(offset, int) or offset < 0 or offset % int(manifest["chunk_bytes"]) != 0:
-                    raise ValueError("offset must be a non-negative chunk boundary")
+                    raise ArtifactTransferError(
+                        "TRANSFER_BOUNDARY_INVALID", "offset must be a non-negative chunk boundary"
+                    )
                 size = int(manifest["bytes"])
                 if size == 0 or offset >= size:
-                    raise ValueError("offset is outside the source file")
+                    raise ArtifactTransferError("TRANSFER_OFFSET_INVALID", "offset is outside the source file")
                 if manifest["version"] >= 3:
                     snapshot = _validated_transfer_payload(root, manifest, immutable=True)
                     with snapshot.open("rb") as input_file:
@@ -2221,7 +2468,7 @@ def artifact_upload_begin(
     try:
         _require_filesystem()
         if not isinstance(total_bytes, int) or total_bytes < 0 or total_bytes > runtime.settings.max_structured_file_bytes:
-            raise ValueError("total_bytes is outside the configured bound")
+            raise ArtifactTransferError("TRANSFER_TOTAL_SIZE_LIMIT", "total_bytes is outside the configured bound")
         if not re.fullmatch(r"[0-9a-f]{64}", sha256):
             raise ValueError("sha256 must be a lowercase SHA-256 digest")
         target = runtime.workspace.resolve_for_write(path)
@@ -2234,7 +2481,9 @@ def artifact_upload_begin(
             if sha256_bytes(
                 read_verified_path_bytes(target, runtime.settings.max_structured_file_bytes)
             ) != expected_sha256:
-                raise RuntimeError("expected_sha256 mismatch; target is stale or concurrently modified")
+                raise ArtifactTransferStateError(
+                    "TRANSFER_CAS_MISMATCH", "expected_sha256 mismatch; target is stale or concurrently modified"
+                )
         source_binding = None
         transfer_operation_id = str(uuid.uuid4())
         with NamedControlPlaneLock(runtime.settings, "binary-transfer"):
@@ -2256,7 +2505,14 @@ def artifact_upload_begin(
                         "bytes": source_manifest["bytes"],
                     }
             _admit_transfer()
-            enforce_data_quota(runtime.settings, incoming_bytes=total_bytes + 4096)
+            receipt_capacity = min(
+                total_bytes,
+                max(1024, (total_bytes + runtime.settings.max_transfer_chunk_bytes - 1)
+                    // runtime.settings.max_transfer_chunk_bytes),
+            )
+            enforce_data_quota(
+                runtime.settings, incoming_bytes=total_bytes + receipt_capacity * RECEIPT_BYTES + 4096
+            )
             transfer_id = str(uuid.uuid4())
             root = _transfer_root(transfer_id)
             try:
@@ -2265,7 +2521,19 @@ def artifact_upload_begin(
                     payload.truncate(total_bytes)
                     payload.flush()
                     os.fsync(payload.fileno())
-                manifest = {"version": 4, "direction": "upload", "state": "open", "created_at": utc_now_iso(), "path": runtime.workspace.relative(target), "bytes": total_bytes, "sha256": sha256, "expected_sha256": expected_sha256, "received": 0, "source_binding": source_binding, "operation_id": transfer_operation_id}
+                with (root / "chunks.bin").open("xb") as receipts:
+                    receipts.truncate(receipt_capacity * RECEIPT_BYTES)
+                    receipts.flush()
+                    os.fsync(receipts.fileno())
+                manifest = {
+                    "version": 5, "direction": "upload", "state": "open",
+                    **_new_transfer_lifetime(),
+                    "path": runtime.workspace.relative(target), "bytes": total_bytes,
+                    "sha256": sha256, "expected_sha256": expected_sha256, "received": 0,
+                    "source_binding": source_binding, "operation_id": transfer_operation_id,
+                    "receipt_count": 0,
+                    "chunk_bytes_max": runtime.settings.max_transfer_chunk_bytes,
+                }
                 _write_transfer_manifest(root, manifest)
             except Exception:
                 if root.exists():
@@ -2289,19 +2557,34 @@ def artifact_upload_begin(
         raise
 
 
-@mcp.tool(annotations=CONTROL)
+@mcp.tool(annotations=IDEMPOTENT_CONTROL)
 def artifact_upload_chunk(transfer_id: str, offset: int, base64_chunk: str) -> dict[str, Any]:
-    """Append one exact, bounded base64 upload chunk at the next expected offset."""
+    """Receive a bounded chunk, or acknowledge an identical previously received chunk."""
     try:
         root = _transfer_root(transfer_id)
+        # Bound the encoded input before allocating decoded bytes. 512 KiB raw still
+        # accepts exactly 699,052 canonical Base64 characters (including padding).
+        encoded_limit = 4 * ((runtime.settings.max_transfer_chunk_bytes + 2) // 3)
+        if len(base64_chunk) > encoded_limit:
+            raise ArtifactTransferError(
+                "TRANSFER_BASE64_LIMIT", "base64_chunk exceeds the encoded configured bound"
+            )
         try:
             payload = base64.b64decode(base64_chunk, validate=True)
         except ValueError as error:
-            raise ValueError("base64_chunk must be valid base64") from error
+            raise ArtifactTransferError(
+                "TRANSFER_BASE64_INVALID", "base64_chunk must be valid base64"
+            ) from error
         if not payload or len(payload) > runtime.settings.max_transfer_chunk_bytes:
-            raise ValueError("upload chunk is outside the configured bound")
+            raise ArtifactTransferError("TRANSFER_CHUNK_LIMIT", "upload chunk is outside the configured bound")
+        if base64.b64encode(payload).decode("ascii") != base64_chunk:
+            raise ArtifactTransferError(
+                "TRANSFER_BASE64_NONCANONICAL", "base64_chunk must use canonical padding and alphabet"
+            )
         with NamedControlPlaneLock(runtime.settings, f"transfer-{transfer_id}"):
-            root, manifest = _load_transfer(transfer_id, "upload")
+            root, manifest = _load_transfer(
+                transfer_id, "upload", allowed_states={"open", "committed"}
+            )
             manifest = _write_upload_chunk_locked(
                 root, manifest, offset=offset, payload=payload
             )
@@ -2338,11 +2621,18 @@ def artifact_upload_commit(transfer_id: str, reason: str = "") -> dict[str, Any]
                 if int(manifest["received"]) != int(manifest["bytes"]):
                     # An incomplete upload is a normal client workflow error. Keep it open so
                     # the caller can send the missing chunk rather than terminalizing it.
-                    raise RuntimeError("upload is incomplete and cannot be committed")
+                    raise ArtifactTransferStateError(
+                        "TRANSFER_INCOMPLETE", "upload is incomplete and cannot be committed"
+                    )
                 payload_path = _validated_transfer_payload(root, manifest, immutable=False)
                 payload = payload_path.read_bytes()
-                if len(payload) != int(manifest["bytes"]) or sha256_bytes(payload) != manifest["sha256"]:
+                if len(payload) != int(manifest["bytes"]):
                     raise TransferIntegrityError("staged upload does not match declared byte identity")
+                if sha256_bytes(payload) != manifest["sha256"]:
+                    raise TransferIntegrityError(
+                        "staged upload does not match declared byte identity",
+                        code="TRANSFER_SHA256_MISMATCH",
+                    )
 
                 def apply(_: bytes) -> tuple[bytes, dict[str, Any]]:
                     return payload, {
@@ -2415,6 +2705,47 @@ def artifact_transfer_cancel(transfer_id: str, reason: str = "") -> dict[str, An
     except Exception as error:
         _audit_rejection("artifact_transfer_cancel", request, error)
         raise
+
+
+@mcp.tool(annotations=READ_ONLY)
+def artifact_transfer_status(transfer_id: str) -> dict[str, Any]:
+    """Inspect a retained transfer without changing its manifest or touching its payload.
+
+    Upload next_offset is authoritative. Downloads permit random chunk reads, so the
+    server cannot infer which responses the client received; track offsets on the client.
+    can_commit reports byte completeness only; commit still verifies SHA-256 and CAS.
+    """
+    _require_filesystem()
+    _transfer_root(transfer_id)  # Validate before constructing a control-plane lock name.
+    with NamedControlPlaneLock(runtime.settings, f"transfer-{transfer_id}"):
+        _root, manifest = _load_transfer(
+            transfer_id, None, allowed_states=_TRANSFER_KNOWN_STATES, expire_active=False
+        )
+        expiry = _transfer_expiry(manifest)
+        state = manifest["state"]
+        if state in _TRANSFER_ADMISSION_STATES and datetime.now(UTC) > expiry:
+            state = "expired"
+        upload = manifest["direction"] == "upload"
+        received = int(manifest["received"]) if upload else None
+        complete = received == manifest["bytes"] if upload else state == "completed"
+        return {
+            "transfer_id": transfer_id,
+            "direction": manifest["direction"],
+            "state": state,
+            "total_bytes": manifest["bytes"],
+            "received_bytes": received,
+            "next_offset": received if upload else None,
+            "chunk_bytes": manifest.get("chunk_bytes"),
+            "chunk_bytes_max": min(
+                manifest.get("chunk_bytes_max", runtime.settings.max_transfer_chunk_bytes),
+                runtime.settings.max_transfer_chunk_bytes,
+            ) if upload else manifest.get("chunk_bytes"),
+            "sha256": manifest.get("sha256"),
+            "created_at": manifest["created_at"],
+            "expires_at": expiry.isoformat(),
+            "complete": complete,
+            "can_commit": upload and state == "open" and complete,
+        }
 
 
 # Compatibility names remain thin aliases; the security boundary and audit identity are the
@@ -2551,11 +2882,12 @@ def write_file(
             enforce_data_quota(runtime.settings, incoming_bytes=diff_bytes + len(previous_bytes))
             backup_path: str | None = None
             if target.exists():
-                backup_dir = runtime.settings.data_dir / "backups" / operation_id
-                backup_dir.mkdir(parents=True)
-                backup_file = backup_dir / target.name
-                backup_file.write_bytes(previous_bytes)
-                backup_path = str(backup_file)
+                with phase("backup_write"):
+                    backup_dir = runtime.settings.data_dir / "backups" / operation_id
+                    backup_dir.mkdir(parents=True)
+                    backup_file = backup_dir / target.name
+                    backup_file.write_bytes(previous_bytes)
+                    backup_path = str(backup_file)
 
             workspace_changed = False
             committed_native: tuple[int, int] | None = None
@@ -3289,6 +3621,91 @@ def make_directory(path: str, parents: bool = False, reason: str = "") -> dict[s
         raise
 
 
+def _require_workspace_plan_ready() -> None:
+    _require_filesystem()
+    _require_workspace_mutation_ready()
+
+
+@mcp.tool(annotations=LOCAL_WRITE)
+@traced_operation
+def workspace_batch(
+    operations: list[dict[str, Any]], preview: bool = False, reason: str = ""
+) -> dict[str, Any]:
+    """Preflight ordered mkdir/create/replace/copy/move/delete operations, then recoverably apply.
+
+    Existing sources are read and CAS-bound internally; expected_sha256 is optional.
+    New destinations must be absent. Use preview=True then workspace_plan_apply(plan_id)
+    when the user needs to inspect the selected paths before applying. No automatic retry.
+    Operation objects: {op:mkdir,path}, {op:create,path,content},
+    {op:replace,path,old_text,new_text}, {op:copy|move,source,destination},
+    {op:delete,path}. Only replace/copy/move/delete accept expected_sha256.
+    Explicit mkdir then create, and new-file create/replace then move are supported.
+    Existing directories, overwrites, and case-only renames use existing primitive tools.
+    Batch copy/move preserves bytes, not file IDs or metadata; use move_file for native rename.
+    """
+    from .workspace_batch import plan_workspace_batch
+
+    return run_workspace_plan(
+        runtime, "workspace_batch",
+        lambda: plan_workspace_batch(runtime.workspace, runtime.settings, operations),
+        preview=preview, reason=reason, require_ready=_require_workspace_plan_ready,
+        safe=_safe_request,
+    )
+
+
+@mcp.tool(annotations=LOCAL_WRITE)
+@traced_operation
+def workspace_replace(
+    path: str, old_text: str, new_text: str, expected_total_matches: int | None = None,
+    file_glob: str = "*", case_sensitive: bool = True, match_mode: str = "all",
+    preview: bool = False, reason: str = "",
+    max_depth: int | None = None, max_entries: int | None = None,
+    max_files: int | None = None, max_total_bytes: int | None = None,
+    max_matches: int | None = None, max_changed_files: int | None = None,
+) -> dict[str, Any]:
+    """Replace a decided literal in bounded UTF-8 files, with exact total match-count checks.
+
+    match_mode is all or unique_per_file. case_sensitive controls both literal and glob.
+    Direct apply requires expected_total_matches. Preview may omit it to discover the count.
+    Use preview=True for a frozen five-minute plan; apply with workspace_plan_apply.
+    For contextual or semantic choices, use workspace_search/read_files/workspace_apply.
+    """
+    from .workspace_replace import plan_workspace_replace
+
+    def planner():
+        if preview is False and expected_total_matches is None:
+            raise ValueError("direct replacement requires expected_total_matches; use preview=True to count")
+        return plan_workspace_replace(
+            runtime.workspace, runtime.settings, path, old_text, new_text,
+            expected_total_matches=expected_total_matches, file_glob=file_glob,
+            case_sensitive=case_sensitive, match_mode=match_mode,
+            max_depth=max_depth, max_entries=max_entries, max_files=max_files,
+            max_total_bytes=max_total_bytes, max_matches=max_matches,
+            max_changed_files=max_changed_files,
+        )
+
+    return run_workspace_plan(
+        runtime, "workspace_replace", planner,
+        preview=preview, reason=reason, require_ready=_require_workspace_plan_ready,
+        safe=_safe_request,
+    )
+
+
+@mcp.tool(annotations=LOCAL_WRITE)
+@traced_operation
+def workspace_plan_apply(plan_id: str, reason: str = "") -> dict[str, Any]:
+    """Consume a preview plan without copying hashes; reject changed identities/content.
+
+    The reference binds the entire immutable plan; it cannot be used on a different path.
+    Plans expire after five minutes and do not survive restart. Failure consumes the plan.
+    """
+    return run_workspace_plan(
+        runtime, "workspace_plan_apply", lambda: runtime.workspace_plans.take(plan_id),
+        preview=False, reason=reason, require_ready=_require_workspace_plan_ready,
+        safe=_safe_request, prepared=True,
+    )
+
+
 @mcp.tool(annotations=LOCAL_WRITE)
 @traced_operation
 def text_file_apply(
@@ -3655,7 +4072,25 @@ def _queue_command(
         cwd=normalized_command["cwd"],
         request=request,
     )
-    return runtime.executor.launch(operation_id, timeout)
+    try:
+        return runtime.executor.launch(operation_id, timeout)
+    except Exception as error:
+        # 起動前失敗で queued を残すと、別タスクの実行枠まで塞いでしまう。
+        # worker が既に動いている場合はその寿命を優先し、ここでは変更しない。
+        current = runtime.audit.get_operation(operation_id, include_events=False)
+        if (
+            not current.get("worker_pid")
+            and not current.get("child_pid")
+            and runtime.audit.transition_operation(
+                operation_id,
+                from_statuses={"queued"},
+                status="failed",
+                finished_at=utc_now_iso(),
+                error=f"command launch failed: {type(error).__name__}: {error}",
+            )
+        ):
+            runtime.audit.add_event(operation_id, "launch_failed", {"error": str(error)[:1000]})
+        raise
 
 
 def _run_automatic_tool(
@@ -4090,12 +4525,18 @@ def audit_list(
     limit: int = 50,
     status: str | None = None,
     approval_status: str | None = None,
+    session_id: str | None = None,
+    filter_task_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """List bounded audit metadata; access to the audit log is itself audited."""
-    request = {"limit": limit, "status": status, "approval_status": approval_status}
+    request = {
+        "limit": limit, "status": status, "approval_status": approval_status,
+        "session_id": session_id, "filter_task_id": filter_task_id,
+    }
     try:
         result = runtime.audit.list_operations(
-            limit=limit, status=status, approval_status=approval_status
+            limit=limit, status=status, approval_status=approval_status,
+            session_id=session_id, task_id=filter_task_id,
         )
         _log_simple(tool_name="audit_list", request=request, result={"returned": len(result)})
         return result
@@ -4118,11 +4559,15 @@ def audit_get(operation_id: str) -> dict[str, Any]:
 
 
 @mcp.tool(annotations=READ_ONLY)
-def activity_timeline(limit: int = 50) -> list[dict[str, Any]]:
+def activity_timeline(
+    limit: int = 50, session_id: str | None = None, filter_task_id: str | None = None
+) -> list[dict[str, Any]]:
     """List human-readable, bounded operation history including changes and network policy."""
-    request = {"limit": limit}
+    request = {"limit": limit, "session_id": session_id, "filter_task_id": filter_task_id}
     try:
-        result = timeline_list(runtime.settings, runtime.audit, limit)
+        result = timeline_list(
+            runtime.settings, runtime.audit, limit, session_id=session_id, task_id=filter_task_id
+        )
         _log_simple(
             tool_name="activity_timeline", request=request, result={"returned": len(result)}
         )
@@ -4142,6 +4587,45 @@ def activity_get(operation_id: str) -> dict[str, Any]:
         return result
     except Exception as error:
         _audit_rejection("activity_get", request, error)
+        raise
+
+
+@mcp.tool(annotations=READ_ONLY)
+def operation_changes(
+    operation_id: str,
+    offset: int = 0,
+    limit: int = 50,
+    path: str | None = None,
+    view: str = "diff",
+    content_offset: int = 0,
+    max_bytes: int = 65536,
+) -> dict[str, Any]:
+    """Page through recorded changes; select a path for its full diff or before/after bytes.
+
+    Pass next_offset as offset for the path list, or as content_offset for path content.
+    before/after return base64 bytes, including binary files. This reads retained checkpoints,
+    never the current workspace, and does not grant approval to undo the operation.
+    """
+    request = {
+        "operation_id": operation_id,
+        "offset": offset,
+        "limit": limit,
+        "path": path,
+        "view": view,
+        "content_offset": content_offset,
+        "max_bytes": max_bytes,
+    }
+    try:
+        result = build_operation_changes(runtime.settings, runtime.audit, **request)
+        # 本文は監査へ複製せず、どの操作のどの範囲を取得したかだけを残す。
+        _log_simple(
+            tool_name="operation_changes",
+            request=request,
+            result={"accessed": operation_id, "path": path, "view": view},
+        )
+        return result
+    except Exception as error:
+        _audit_rejection("operation_changes", request, error)
         raise
 
 
@@ -4370,6 +4854,20 @@ def _workspace_mutation_risk(
             "child_process": "not used",
         },
     }
+
+
+# MCP generates a top-level Pydantic argument model. A missing path would otherwise
+# echo the *whole* input (including the bearer URL/Base64) before our tool runs.
+# Configure only payload-bearing tools, and fail at startup if the SDK contract changes.
+for _private_input_tool in (
+    "artifact_import_file", "artifact_upload", "artifact_upload_chunk", "structured_file_upload_chunk"
+):
+    _registered_tool = mcp._tool_manager.get_tool(_private_input_tool)
+    if _registered_tool is None:
+        raise RuntimeError("payload-bearing tool registration is missing")
+    _argument_model = _registered_tool.fn_metadata.arg_model
+    _argument_model.model_config["hide_input_in_errors"] = True
+    _argument_model.model_rebuild(force=True)
 
 
 def main() -> None:

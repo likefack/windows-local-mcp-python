@@ -3,6 +3,7 @@ import json
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
+from contextvars import copy_context
 
 import pytest
 
@@ -94,7 +95,7 @@ def test_handled_exception_does_not_retain_frame_resources():
         {"total_ns": True},
         {"total_ms": float("nan")},
         {"total_ms": 100},
-        {"schema_version": 2},
+        {"schema_version": 3},
         {"secret": "no"},
         {"phases": [{"name": "credential", "offset_ns": 0, "duration_ns": 0, "status": "failed"}]},
         {
@@ -177,3 +178,109 @@ def test_phases_only_persist_once_at_scope_exit(tmp_path, monkeypatch):
                 pass
         assert calls == []
     assert calls == [oid]
+
+
+def test_v2_exact_parent_self_and_uninstrumented_time(monkeypatch):
+    ticks = iter([0, 10, 20, 50, 90, 100])
+    monkeypatch.setattr("time.perf_counter_ns", lambda: next(ticks))
+    with operation_trace() as trace, phase("operation_body"), phase("source_hash"):
+        pass
+    payload = trace.to_payload()
+    outer, child = payload["phases"]
+    assert payload["schema_version"] == 2
+    assert outer["parent_sequence"] is None
+    assert child["parent_sequence"] == outer["sequence"]
+    assert (outer["duration_ns"], outer["self_ns"]) == (80, 50)
+    assert (child["duration_ns"], child["self_ns"]) == (30, 30)
+    assert payload["uninstrumented_ns"] == 20
+    assert sum(p["self_ns"] for p in payload["phase_summary"]) + 20 == 100
+
+
+def test_dropped_child_time_and_late_failure_remain_in_summary(monkeypatch):
+    # Once details fill up, the parent's self time must still exclude its children.
+    ticks = iter(range(10_000))
+    monkeypatch.setattr("time.perf_counter_ns", lambda: next(ticks))
+    with pytest.raises(ValueError), operation_trace() as trace, phase("operation_body"):
+        for _ in range(MAX_PHASES + 2):
+            with phase("source_hash"):
+                pass
+        with phase("audit_commit"):
+            raise ValueError("must not enter diagnostics")
+    payload = trace.to_payload()
+    summary = {p["name"]: p for p in payload["phase_summary"]}
+    assert summary["source_hash"]["count"] == MAX_PHASES + 2
+    assert summary["audit_commit"]["failed_count"] == 1
+    assert payload["failed_phase"] == "audit_commit"
+    parent = payload["phases"][0]
+    assert parent["self_ns"] == parent["duration_ns"] - (MAX_PHASES + 3)
+    assert "must not enter diagnostics" not in encode_timing_payload(payload)
+
+
+def test_legacy_v1_does_not_gain_invented_self_or_aggregates():
+    value = {
+        "schema_version": 1, "total_ns": 100, "phases": [
+            {"name": "source_read", "offset_ns": 10, "duration_ns": 50, "status": "succeeded"}
+        ],
+    }
+    normalized = decode_timing_payload(encode_timing_payload(value))
+    assert normalized["schema_version"] == 1
+    assert "phase_summary" not in normalized
+    assert "self_ns" not in normalized["phases"][0]
+
+
+def test_copied_thread_context_does_not_mix_synchronous_trace():
+    def child():
+        with phase("source_hash"):
+            pass
+        with operation_trace() as own, phase("source_read"):
+            pass
+        return own.to_payload()
+
+    with (
+        operation_trace() as trace,
+        phase("operation_body"),
+        ThreadPoolExecutor(max_workers=1) as pool,
+    ):
+        child_payload = pool.submit(copy_context().run, child).result()
+    assert [p["name"] for p in trace.to_payload()["phases"]] == ["operation_body"]
+    assert [p["name"] for p in child_payload["phases"]] == ["source_read"]
+
+
+@pytest.mark.parametrize("field,value", [
+    ("count", 0), ("failed_count", 100), ("self_ns", -1),
+    ("max_ns", 2**63), ("name", "secret-content"),
+])
+def test_v2_rejects_corrupt_summary(field, value):
+    with operation_trace() as trace, phase("source_read"):
+        pass
+    payload = trace.to_payload()
+    payload["phase_summary"][0][field] = value
+    with pytest.raises(ValueError):
+        encode_timing_payload(payload)
+
+
+def test_v2_rejects_invalid_parent_and_self():
+    with operation_trace() as trace, phase("source_read"):
+        pass
+    payload = trace.to_payload()
+    payload["phases"][0]["parent_sequence"] = 1
+    with pytest.raises(ValueError, match="parent"):
+        encode_timing_payload(payload)
+    payload = trace.to_payload()
+    payload["phases"][0]["self_ns"] = payload["total_ns"] + 1
+    with pytest.raises(ValueError, match="self"):
+        encode_timing_payload(payload)
+
+
+def test_v2_rejects_corrupted_self_even_when_totals_still_match(monkeypatch):
+    ticks = iter([0, 10, 20, 50, 90, 100])
+    monkeypatch.setattr("time.perf_counter_ns", lambda: next(ticks))
+    with operation_trace() as trace, phase("operation_body"), phase("source_hash"):
+        pass
+    payload = trace.to_payload()
+    payload["phases"][0]["self_ns"] = 80
+    payload["phases"][1]["self_ns"] = 0
+    for item in payload["phase_summary"]:
+        item["self_ns"] = 80 if item["name"] == "operation_body" else 0
+    with pytest.raises(ValueError, match="child"):
+        encode_timing_payload(payload)

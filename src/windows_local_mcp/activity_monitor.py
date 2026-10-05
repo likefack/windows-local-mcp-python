@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -22,6 +23,7 @@ from pathlib import Path
 from typing import Any, Self, TextIO
 
 from .config import Settings, load_settings
+from .performance_trace import MAX_TIMING_JSON_BYTES, decode_timing_payload, encode_timing_payload
 from .redaction import redact_text, redact_value
 
 LOG_MAX_BYTES = 5 * 1024 * 1024
@@ -169,6 +171,10 @@ def format_activity_line(
         f"status={status}",
         f"approval_status={approval_status}",
     ]
+    # 表示用ラベルは信頼せず、他の監査文字列と同じ伏せ字・長さ制限を適用する。
+    for name in ("session_id", "client_name", "task_id"):
+        if operation.get(name):
+            fields.append(f"{name}={_safe_field(operation, name, '-')}")
     if pending:
         # 機械可読な状態名と人間向けの目印を併記し、端末を少し離れて見ても承認要求を
         # 見落とさないようにする。
@@ -177,6 +183,98 @@ def format_activity_line(
     if summary:
         fields.append(f"summary={summary}")
     return sanitize_display_text(" ".join(fields))
+
+
+def _milliseconds(nanoseconds: int) -> str:
+    # 浮動小数点への変換で丸めず、1 ns の精度を保って ms を併記する。
+    return f"{nanoseconds // 1_000_000}.{nanoseconds % 1_000_000:06d}"
+
+
+def _timing_prefix(operation: Mapping[str, object], event: str) -> str:
+    return (
+        f"[{_timestamp(operation)}] {event} "
+        f"operation={_safe_field(operation, 'id', 'unknown')}"
+    )
+
+
+def _format_timing_lines(
+    operation: Mapping[str, object], payload: Mapping[str, Any]
+) -> list[str]:
+    """検証済みの固定語彙と数値だけから、完了後の診断内訳を作る。"""
+
+    version = payload["schema_version"]
+    total_ns = payload["total_ns"]
+    phases = payload["phases"]
+    fields = [
+        _timing_prefix(operation, "TIMING"),
+        f"tool={_safe_field(operation, 'tool_name', 'operation')}",
+        f"route={_safe_field(operation, 'tier', '-')}",
+        f"schema={version}",
+        f"trace_status={payload['status']}",
+        f"total_ns={total_ns}",
+        f"total_ms={_milliseconds(total_ns)}",
+        f"phases={len(phases)}",
+        f"dropped_phase_count={payload['dropped_phase_count']}",
+        f"failed_phase={payload['failed_phase'] or '-'}",
+    ]
+    if version == 2:
+        fields.append(f"uninstrumented_ns={payload['uninstrumented_ns']}")
+        summaries = payload["phase_summary"]
+        summary_scope = "all_phases"
+    else:
+        # v1 は親子関係・自己時間を持たない。保存済みの段階だけを集計し、
+        # 記録上限で省略された区間や自己時間は推測で補わない。
+        by_name: dict[str, dict[str, Any]] = {}
+        for item in phases:
+            name, duration = item["name"], item["duration_ns"]
+            summary = by_name.setdefault(
+                name,
+                {"name": name, "count": 0, "failed_count": 0, "total_ns": 0,
+                     "min_ns": duration, "max_ns": duration},
+            )
+            summary["count"] += 1
+            summary["failed_count"] += item["status"] == "failed"
+            summary["total_ns"] += duration
+            summary["min_ns"] = min(summary["min_ns"], duration)
+            summary["max_ns"] = max(summary["max_ns"], duration)
+        summaries = list(by_name.values())
+        summary_scope = "retained_phases"
+    fields.append(f"summary_scope={summary_scope}")
+    lines = [" ".join(fields)]
+
+    # 集計は自己時間の大きい順（v1 は包括時間順）、詳細は保存された開始順。
+    for summary in sorted(
+        summaries,
+        key=lambda item: (-item.get("self_ns", item["total_ns"]), item["name"]),
+    ):
+        fields = [
+            _timing_prefix(operation, "TIMING_SUMMARY"),
+            f"phase={summary['name']}", f"count={summary['count']}",
+            f"failed_count={summary['failed_count']}",
+            f"total_ns={summary['total_ns']}",
+            f"total_ms={_milliseconds(summary['total_ns'])}",
+            f"min_ns={summary['min_ns']}", f"max_ns={summary['max_ns']}",
+        ]
+        if version == 2:
+            fields.extend((f"self_ns={summary['self_ns']}",
+                           f"self_ms={_milliseconds(summary['self_ns'])}"))
+        lines.append(" ".join(fields))
+    for item in phases:
+        fields = [
+            _timing_prefix(operation, "TIMING_PHASE"),
+            f"sequence={item['sequence']}", f"phase={item['name']}",
+            f"offset_ns={item['offset_ns']}",
+            f"duration_ns={item['duration_ns']}",
+            f"duration_ms={_milliseconds(item['duration_ns'])}",
+            f"status={item['status']}",
+        ]
+        if version == 2:
+            parent = item["parent_sequence"]
+            fields.extend((f"parent_sequence={parent if parent is not None else '-'}",
+                           f"self_ns={item['self_ns']}",
+                           f"self_ms={_milliseconds(item['self_ns'])}"))
+        lines.append(" ".join(fields))
+    return lines
 
 
 class ActivitySink:
@@ -224,6 +322,21 @@ class ActivitySink:
         self.close()
 
 
+class ConsoleActivitySink:
+    """Display safe audit lines without competing for the persistent log."""
+
+    def __init__(self, *, stdout: TextIO | None = None) -> None:
+        self.stdout = stdout if stdout is not None else sys.stdout
+
+    def write_line(self, line: str) -> str:
+        safe_line = sanitize_display_text(line)
+        print(safe_line, file=self.stdout, flush=True)
+        return safe_line
+
+    def close(self) -> None:
+        pass
+
+
 def _connect_read_only(db_path: Path) -> sqlite3.Connection:
     """既存の監査DBを、この監視プロセスから書き込めない形で開く。"""
 
@@ -241,9 +354,16 @@ def _read_operation_metadata(db_path: Path) -> dict[str, dict[str, object]] | No
         return None
     try:
         with _connect_read_only(db_path) as database:
+            columns = {row["name"] for row in database.execute("PRAGMA table_info(operations)")}
+            # 診断保存は updated_at を変えない。全文は取得せず、完了時1回保存の
+            # 契約に合わせて NULL→値を型情報だけで追う。同じ型の差替えは対象外。
+            timing_metadata = (
+                ", typeof(timing_json) AS timing_type "
+                if "timing_json" in columns else " "
+            )
             rows = database.execute(
-                "SELECT id, created_at, updated_at, tool_name, tier, status, approval_status "
-                "FROM operations ORDER BY created_at ASC, id ASC"
+                "SELECT id, created_at, updated_at, tool_name, tier, status, approval_status"
+                + timing_metadata + "FROM operations ORDER BY created_at ASC, id ASC"
             ).fetchall()
     except (OSError, sqlite3.Error):
         return None
@@ -257,9 +377,15 @@ def _read_operation(db_path: Path, operation_id: str) -> dict[str, object] | Non
         return None
     try:
         with _connect_read_only(db_path) as database:
+            # 監視側でDB移行はしない。更新前のDBも読み取り専用で表示する。
+            columns = {row["name"] for row in database.execute("PRAGMA table_info(operations)")}
+            origin_select = ", ".join(
+                name if name in columns else f"NULL AS {name}"
+                for name in ("session_id", "client_name", "task_id")
+            )
             row = database.execute(
                 "SELECT id, created_at, updated_at, tool_name, tier, status, approval_status, "
-                "request_json FROM operations WHERE id = ?",
+                f"request_json, {origin_select} FROM operations WHERE id = ?",
                 (operation_id,),
             ).fetchone()
     except (OSError, sqlite3.Error):
@@ -273,14 +399,38 @@ def _operation_signature(operation: Mapping[str, object]) -> tuple[object, objec
     return operation.get("status"), operation.get("approval_status")
 
 
+def _timing_signature(operation: Mapping[str, object]) -> str:
+    return str(operation.get("timing_type", "null"))
+
+
+def _read_operation_timing(db_path: Path, operation_id: str) -> dict[str, object] | None:
+    """変化した行の時間だけを上限付きで取得し、request/result は読み込まない。"""
+
+    try:
+        with _connect_read_only(db_path) as database:
+            row = database.execute(
+                "SELECT id, created_at, updated_at, tool_name, tier, "
+                "typeof(timing_json) AS timing_type, "
+                "length(CAST(timing_json AS BLOB)) AS timing_bytes, "
+                "CASE WHEN typeof(timing_json) = 'text' "
+                "AND length(CAST(timing_json AS BLOB)) <= ? "
+                "THEN CAST(timing_json AS BLOB) ELSE NULL END AS timing_json "
+                "FROM operations WHERE id = ?",
+                (MAX_TIMING_JSON_BYTES, operation_id),
+            ).fetchone()
+    except (OSError, sqlite3.Error):
+        return None
+    return dict(row) if row is not None else None
+
+
 class ActivityMonitor:
-    """Poll ``data_dir/audit.db`` and emit only post-baseline lifecycle changes."""
+    """起動後の状態変化と、完了後に保存された詳細時間を監査DBから表示する。"""
 
     def __init__(
         self,
         data_dir: str | Path,
         *,
-        sink: ActivitySink | None = None,
+        sink: ActivitySink | ConsoleActivitySink | None = None,
         interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
     ) -> None:
         if interval_seconds <= 0:
@@ -291,6 +441,8 @@ class ActivityMonitor:
         self.sink = sink if sink is not None else ActivitySink(self.data_dir)
         self._owns_sink = sink is None
         self._known: dict[str, tuple[object, object]] = {}
+        self._timing_known: dict[str, str] = {}
+        self._timing_fingerprints: dict[str, bytes] = {}
         self._baseline_ready = False
 
     def poll_once(self) -> list[str]:
@@ -302,6 +454,10 @@ class ActivityMonitor:
         if not self._baseline_ready:
             self._known = {
                 operation_id: _operation_signature(operation)
+                for operation_id, operation in metadata.items()
+            }
+            self._timing_known = {
+                operation_id: _timing_signature(operation)
                 for operation_id, operation in metadata.items()
             }
             self._baseline_ready = True
@@ -326,24 +482,66 @@ class ActivityMonitor:
         for operation_id, operation in metadata.items():
             signature = _operation_signature(operation)
             previous = self._known.get(operation_id)
-            if previous == signature:
+            if previous != signature:
+                full_operation = _read_operation(self.db_path, operation_id)
+                if full_operation is None:
+                    # The row may have been deleted or be mid-transaction. Retry next poll.
+                    continue
+                line = format_activity_line(
+                    full_operation,
+                    event_kind="new" if previous is None else "updated",
+                )
+                self.sink.write_line(line)
+                lines.append(line)
+                self._known[operation_id] = _operation_signature(full_operation)
+
+            timing_signature = _timing_signature(operation)
+            if timing_signature == self._timing_known.get(operation_id):
                 continue
-            full_operation = _read_operation(self.db_path, operation_id)
-            if full_operation is None:
-                # The row may have been deleted or be mid-transaction. Retry next poll.
+            if timing_signature == "null":
+                self._timing_known[operation_id] = timing_signature
                 continue
-            line = format_activity_line(
-                full_operation,
-                event_kind="new" if previous is None else "updated",
-            )
-            self.sink.write_line(line)
-            lines.append(line)
-            self._known[operation_id] = _operation_signature(full_operation)
+            timing_operation = _read_operation_timing(self.db_path, operation_id)
+            if timing_operation is None:
+                continue  # 一時的な読込失敗は次回に再試行する。
+            timing_signature = _timing_signature(timing_operation)
+            self._timing_known[operation_id] = timing_signature
+            if timing_signature == "null":
+                continue
+            try:
+                raw_timing = timing_operation["timing_json"]
+                if not isinstance(raw_timing, bytes):
+                    raise TypeError("timing is unavailable")
+                payload = decode_timing_payload(raw_timing.decode("utf-8"))
+                fingerprint = hashlib.sha256(encode_timing_payload(payload).encode("ascii")).digest()
+                if fingerprint == self._timing_fingerprints.get(operation_id):
+                    continue
+                timing_lines = _format_timing_lines(timing_operation, payload)
+                self._timing_fingerprints[operation_id] = fingerprint
+            except (ValueError, TypeError, UnicodeError, RecursionError, OverflowError):
+                # 未知ラベルや入力値を含み得るエラー本文は一切転記しない。
+                timing_lines = [
+                    _timing_prefix(timing_operation, "TIMING_UNAVAILABLE")
+                    + " reason=invalid_payload"
+                ]
+            for line in timing_lines:
+                self.sink.write_line(line)
+                lines.append(line)
 
         # A deleted ID must not suppress a later operation that legitimately reuses that ID.
         self._known = {
             operation_id: signature
             for operation_id, signature in self._known.items()
+            if operation_id in current_ids
+        }
+        self._timing_known = {
+            operation_id: signature
+            for operation_id, signature in self._timing_known.items()
+            if operation_id in current_ids
+        }
+        self._timing_fingerprints = {
+            operation_id: fingerprint
+            for operation_id, fingerprint in self._timing_fingerprints.items()
             if operation_id in current_ids
         }
         return lines
@@ -365,18 +563,22 @@ def run_activity_monitor(
     interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
     stop_event: threading.Event | None = None,
     stdout: TextIO | None = None,
+    stdout_only: bool = False,
 ) -> None:
     """Run the monitor from an already resolved Settings object or ``load_settings``."""
 
     resolved = settings if settings is not None else load_settings()
-    sink = ActivitySink(resolved.data_dir, stdout=stdout)
+    sink = ConsoleActivitySink(stdout=stdout) if stdout_only else ActivitySink(resolved.data_dir, stdout=stdout)
     monitor = ActivityMonitor(
         resolved.data_dir,
         sink=sink,
         interval_seconds=interval_seconds,
     )
     try:
-        sink.write_line(f"[Activity] 監視開始 log={sink.log_path}")
+        if stdout_only:
+            sink.write_line("[Activity] 監査表示を開始しました（この端末からログへ書き込みません）")
+        else:
+            sink.write_line(f"[Activity] 監視開始 log={sink.log_path}")
         monitor.run(stop_event)
     finally:
         sink.close()
@@ -407,6 +609,11 @@ def _parser() -> argparse.ArgumentParser:
         type=_positive_interval,
         default=DEFAULT_POLL_INTERVAL_SECONDS,
         help="監査DBを確認する間隔（秒）",
+    )
+    parser.add_argument(
+        "--stdout-only",
+        action="store_true",
+        help="既存 Tunnel への再接続時、監査ログへ書き込まず端末にだけ表示する",
     )
     return parser
 
@@ -442,6 +649,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             settings,
             interval_seconds=args.interval,
             stop_event=stop,
+            stdout_only=args.stdout_only,
         )
     except KeyboardInterrupt:
         stop.set()

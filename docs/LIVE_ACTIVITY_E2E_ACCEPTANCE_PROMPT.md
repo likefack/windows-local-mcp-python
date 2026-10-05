@@ -26,7 +26,7 @@ Windows Local MCP の Live Activity 実機 E2E 受入試験を実施してくだ
 - 各操作前後に専用ディレクトリのファイル名、byte数、SHA-256、必要なテキスト内容を記録し、期待外のファイル変更がないことを確認してください。ファイル本文は必要最小限の専用fixtureだけを扱い、Live Activityや報告へ秘密情報を出さないでください。
 - Live Activity の確認は、実際の Windows Approval UI に表示された行を利用者が目視した結果に基づきます。あなたがUIを直接読めない場合は、期待する表示と確認時刻を示して利用者へ確認を依頼し、その返答があるまで該当項目を PASS にしないでください。
 - audit_list / audit_get / activity_timeline / activity_get は対応 operation の確認に使います。Live Activity の表示文字列を承認、policy、rollback、security decision の根拠にしないでください。
-- Live Activity は完全な operation ID を行末に [op:<完全ID>] 形式で表示し、表示順を「時刻 → 状態 → 操作内容 → 対象 → [op:<完全ID>]」にしてください。request hash、credential、token、秘密値、ファイル本文、diff本文、stdout/stderr本文は表示させず、最終報告へ operation ID を不用意に複製しないでください。必要な operation ID は試験証跡の表に記録してください。
+- Live Activity は完全な operation ID を行末に [op:<完全ID>] 形式で表示し、操作内容・対象・変更件数・経過時間または所要時間が分かることを確認してください。局所的な変更の完了後は実変更の完全なテキスト差分を表示し、高水準操作は件数・概要だけを表示します。差分の試験には秘密を含まない専用fixtureを使い、端末制御文字が可視表現になることを確認してください。一般の概要にrequest hash、credential、token、秘密値、読み取り本文、stdout/stderr本文を表示させないでください。必要なoperation IDは試験証跡の表に記録してください。
 - ある独立ケースが FAIL / BLOCKED / TIMEOUT になっても、安全に続行できる別ケースは続けてください。ただし workspace の期待状態が不明、復旧が必要、または cleanup の安全性を証明できない場合は mutation を停止してください。
 - policy、承認、checkpoint、transaction、rollback、Undo、Approved Host、Codex Sandbox、Automatic Git、structured processing、artifact transfer の保証を無効化、迂回、弱体化しないでください。
 
@@ -77,6 +77,9 @@ C. Edited
 
 1. 専用の edit-fixture.txt を新規作成し、E0からE1へ編集してください。
 2. Live Activityに Edited と対象名が表示されること、Auditにwrite_fileの成功operationとcheckpointがあること、実内容がE1であることを確認してください。
+3. 局所変更の全diffが実際の変更前後と一致し、末尾改行の有無、空ファイルの作成・削除、保存プレビュー上限を超える差分が省略されないことを確認してください。完了履歴の再生や同じ差分の重複表示がないことも対象です。
+4. 複数ファイルを変更する高水準操作では件数・概要だけが表示され、operation_changesで全対象と全差分をページ取得できることを確認してください。全ページを結合した内容を操作直前・直後のfixtureと比較してください。
+5. 長時間処理を安全に確認できる場合は、経過時間が一定間隔で更新され、終了後に記録済み所要時間が表示されることを確認してください。短い操作だけではこの項目をPASSにしないでください。
 
 D. Structured processing
 
@@ -84,6 +87,7 @@ D. Structured processing
 2. structured_file_inspectで形式と対象を確認し、structured_file_applyで1セルだけを既知の値へ変更してください。必要なexpected SHA-256を使ってください。
 3. Live Activityで「Excelを編集」等の人間向けRunningと、完了時のEdited相当が確認できること、tool名だけの低レベル行にならないことを確認してください。
 4. 実XLSXを再inspectして期待セルを確認し、Audit / activity_getのstatus、format、target、checkpointと一致させてください。
+5. 非テキスト変更の件数・変更前後の容量などが概要に表示され、operation_changesのbefore／after全ページが実際の変更前後のSHA-256と一致することを確認してください。binaryのdiff概要だけを完全な内容取得とは扱わないでください。
 
 E. Artifact transfer
 

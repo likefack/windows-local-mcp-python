@@ -25,8 +25,10 @@ from .approved_host_authority import (
     authority_completion_path,
     default_authority_state_root,
 )
+from .approved_host_process_census import requester_username
 from .process_utils import capture_process_identity, creation_flags
 from .util import canonical_json
+from .windows_user_process import RequesterPrimaryToken
 
 _SYSTEM_SID = "S-1-5-18"
 _MAX_PIPE_MESSAGE_BYTES = 1024 * 1024
@@ -270,6 +272,9 @@ def _worker_bootstrap_argv(
     context_sha256: str,
     requester_pid: int,
     requester_create_time: float,
+    requester_sid: str,
+    requester_username_value: str,
+    requester_token_handle: int,
     service_epoch: str,
     authority_nonce: str,
     proof_path: Path,
@@ -297,6 +302,12 @@ def _worker_bootstrap_argv(
         str(requester_pid),
         "--approved-host-requester-create-time",
         repr(requester_create_time),
+        "--approved-host-requester-sid",
+        requester_sid,
+        "--approved-host-requester-username",
+        requester_username_value,
+        "--approved-host-requester-token-handle",
+        str(requester_token_handle),
         "--authority-service-epoch",
         service_epoch,
         "--authority-nonce",
@@ -497,6 +508,11 @@ class ApprovedHostAuthorityServer:
             raise PermissionError(
                 "Approved Host authority requester process identity changed"
             )
+        # Resolve census identity while the authenticated pipe peer still exists.
+        # The worker must not need this short-lived UI process after launch.
+        requester_username_value = requester_username(
+            requester_pid, requester_create_time
+        )
 
         operation_id = str(request.get("operation_id") or "")
         context_sha256 = str(request.get("context_sha256") or "")
@@ -530,51 +546,69 @@ class ApprovedHostAuthorityServer:
                 "explicit recovery is required"
             )
 
-        authority_nonce = secrets.token_hex(32)
-        proof_path = authority_completion_path(
-            self.store.root, operation_id, authority_nonce
-        )
-        self.store.arm(
-            operation_id=operation_id,
-            authority_nonce=authority_nonce,
-            requester_pid=requester_pid,
-            requester_create_time=requester_create_time,
-            requester_sid=self.runtime_sid,
-            context_sha256=context_sha256,
-            proof_path=proof_path,
-        )
-        argv = _worker_bootstrap_argv(
-            operation_id=operation_id,
-            context_path=context_path,
-            context_sha256=context_sha256,
-            requester_pid=requester_pid,
-            requester_create_time=requester_create_time,
-            service_epoch=self.service_epoch,
-            authority_nonce=authority_nonce,
-            proof_path=proof_path,
-        )
-        try:
-            process = subprocess.Popen(
-                argv,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                shell=False,
-                creationflags=creation_flags(),
-                env=worker_environment,
+        # Capture the non-elevated peer token before the local approval UI can exit.
+        # The only inherited handle is listed explicitly for the SYSTEM worker.
+        with RequesterPrimaryToken.capture(
+            requester_pid, requester_create_time, self.runtime_sid
+        ) as requester_token:
+            authority_nonce = secrets.token_hex(32)
+            proof_path = authority_completion_path(
+                self.store.root, operation_id, authority_nonce
             )
-            identity = capture_process_identity(process.pid, process_nonce)
-            authority_identity = AuthorityWorkerIdentity(
-                pid=identity.pid,
-                create_time=identity.create_time,
-                executable=identity.executable,
+            self.store.arm(
+                operation_id=operation_id,
+                authority_nonce=authority_nonce,
+                requester_pid=requester_pid,
+                requester_create_time=requester_create_time,
+                requester_sid=self.runtime_sid,
+                context_sha256=context_sha256,
+                proof_path=proof_path,
             )
-            self.store.mark_running(authority_identity)
-        except Exception as error:
-            self.store.mark_recovery_required(
-                f"SYSTEM worker launch failed: {type(error).__name__}: {error}"
+            argv = _worker_bootstrap_argv(
+                operation_id=operation_id,
+                context_path=context_path,
+                context_sha256=context_sha256,
+                requester_pid=requester_pid,
+                requester_create_time=requester_create_time,
+                requester_sid=self.runtime_sid,
+                requester_username_value=requester_username_value,
+                requester_token_handle=requester_token.handle,
+                service_epoch=self.service_epoch,
+                authority_nonce=authority_nonce,
+                proof_path=proof_path,
             )
-            raise
+            try:
+                startup = subprocess.STARTUPINFO()
+                startup.lpAttributeList = {
+                    "handle_list": [requester_token.handle],
+                }
+                os.set_handle_inheritable(requester_token.handle, True)
+                try:
+                    process = subprocess.Popen(
+                        argv,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        shell=False,
+                        close_fds=True,
+                        startupinfo=startup,
+                        creationflags=creation_flags(),
+                        env=worker_environment,
+                    )
+                finally:
+                    os.set_handle_inheritable(requester_token.handle, False)
+                identity = capture_process_identity(process.pid, process_nonce)
+                authority_identity = AuthorityWorkerIdentity(
+                    pid=identity.pid,
+                    create_time=identity.create_time,
+                    executable=identity.executable,
+                )
+                self.store.mark_running(authority_identity)
+            except Exception as error:
+                self.store.mark_recovery_required(
+                    f"SYSTEM worker launch failed: {type(error).__name__}: {error}"
+                )
+                raise
 
         with self._workers_lock:
             self._workers[operation_id] = process

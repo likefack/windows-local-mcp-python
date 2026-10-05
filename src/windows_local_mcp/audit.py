@@ -4,18 +4,23 @@ import json
 import sqlite3
 import threading
 import uuid
+from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime, timedelta
 from functools import wraps
 from typing import Any
 
+from .audit_connection import TimedAuditConnection
 from .config import Settings
+from .operation_owner import capture_execution_owner
 from .performance_trace import (
     current_trace,
     decode_timing_payload,
     encode_timing_payload,
+    phase,
     timed_phase,
 )
 from .redaction import redact_text, redact_value
+from .request_origin import origin_fields
 from .resources import NamedControlPlaneLock, WorkspaceExecutionLock, prune_artifacts
 from .util import canonical_json, utc_now_iso
 from .workspace_history import (
@@ -39,6 +44,18 @@ TERMINAL_STATUSES = {
     "conflict",
 }
 
+_ORIGIN_COLUMNS = frozenset(
+    {
+        "session_id",
+        "server_instance_id",
+        "origin_scope",
+        "client_name",
+        "client_version",
+        "request_id",
+        "task_id",
+    }
+)
+
 
 def _serialized_audit_mutation(function: Any) -> Any:
     @wraps(function)
@@ -59,15 +76,28 @@ class AuditStore:
         self._prune_database()
         prune_artifacts(settings, protected_ids=self._protected_operation_ids())
 
+    @contextmanager
+    def _timed_lock(self):
+        # 取得待ちだけを独立させ、保持中の DB 処理を待ち時間に含めない。
+        with phase("audit_lock_wait"):
+            self._lock.acquire()
+        try:
+            yield
+        finally:
+            self._lock.release()
+
+    @timed_phase("audit_connect")
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.db_path, timeout=30)
+        connection = sqlite3.connect(self.db_path, timeout=30, factory=TimedAuditConnection)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("PRAGMA synchronous = FULL")
         return connection
 
+    @_serialized_audit_mutation
     def _init_db(self) -> None:
+        # 別プロセスの同時起動でも、列の確認と追加を同じ監査ロックで直列化する。
         with self._connect() as db:
             db.executescript(
                 """
@@ -76,6 +106,13 @@ class AuditStore:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     session_id TEXT,
+                    server_instance_id TEXT,
+                    origin_scope TEXT,
+                    client_name TEXT,
+                    client_version TEXT,
+                    request_id TEXT,
+                    task_id TEXT,
+                    execution_owner_json TEXT,
                     tool_name TEXT NOT NULL,
                     tier TEXT NOT NULL,
                     status TEXT NOT NULL,
@@ -128,6 +165,7 @@ class AuditStore:
                     occurred_at TEXT NOT NULL,
                     event_type TEXT NOT NULL,
                     payload_json TEXT NOT NULL,
+                    origin_json TEXT,
                     FOREIGN KEY(operation_id) REFERENCES operations(id)
                 );
 
@@ -139,6 +177,13 @@ class AuditStore:
                 row["name"] for row in db.execute("PRAGMA table_info(operations)").fetchall()
             }
             migrations = {
+                "server_instance_id": "TEXT",
+                "origin_scope": "TEXT",
+                "client_name": "TEXT",
+                "client_version": "TEXT",
+                "request_id": "TEXT",
+                "task_id": "TEXT",
+                "execution_owner_json": "TEXT",
                 "timing_json": "TEXT",
                 "request_expires_at": "TEXT",
                 "approval_expires_at": "TEXT",
@@ -156,9 +201,23 @@ class AuditStore:
             for name, sql_type in migrations.items():
                 if name not in existing:
                     db.execute(f"ALTER TABLE operations ADD COLUMN {name} {sql_type}")
+            event_columns = {
+                row["name"] for row in db.execute("PRAGMA table_info(events)").fetchall()
+            }
+            if "origin_json" not in event_columns:
+                db.execute("ALTER TABLE events ADD COLUMN origin_json TEXT")
+            # 旧行の発行元は不明のまま残す。絞り込み用の索引は列追加後に作成する。
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_operations_session_created "
+                "ON operations(session_id, created_at DESC)"
+            )
+            db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_operations_task_created "
+                "ON operations(task_id, created_at DESC)"
+            )
 
     def _prune_database(self) -> None:
-        with self._lock, self._connect() as db:
+        with self._timed_lock(), self._connect() as db:
             keep = self.settings.retention_max_operations
             stale_rows = db.execute(
                 """
@@ -193,6 +252,18 @@ class AuditStore:
 
     def _reconcile_workspace_transactions(self) -> None:
         """Surface interrupted mutation journals instead of silently treating them as complete."""
+        if not incomplete_workspace_transactions(self.settings):
+            return
+        with ExitStack() as stack:
+            try:
+                stack.enter_context(WorkspaceExecutionLock(self.settings))
+            except TimeoutError:
+                # 他プロセスが操作中なら、そのjournalを復旧失敗として書き換えない。
+                return
+            self._reconcile_workspace_transactions_locked()
+
+    def _reconcile_workspace_transactions_locked(self) -> None:
+        # ロック取得前の列挙結果は古くなり得るので、確定済みjournalも含め再確認する。
         for journal in incomplete_workspace_transactions(self.settings):
             operation_id = str(journal.get("operation_id") or "")
             state = str(journal.get("state") or "unknown")
@@ -209,28 +280,27 @@ class AuditStore:
                 "complete",
             }:
                 try:
-                    with WorkspaceExecutionLock(self.settings):
-                        journal = recover_incomplete_workspace_transaction(
-                            self.settings, journal
+                    journal = recover_incomplete_workspace_transaction(
+                        self.settings, journal
+                    )
+                    if journal.get("state") in {"applied_verified", "complete"}:
+                        after_path = (
+                            self.settings.data_dir
+                            / "workspace-history"
+                            / "operations"
+                            / operation_id
+                            / "after"
+                            / "manifest.json"
                         )
-                        if journal.get("state") in {"applied_verified", "complete"}:
-                            after_path = (
-                                self.settings.data_dir
-                                / "workspace-history"
-                                / "operations"
-                                / operation_id
-                                / "after"
-                                / "manifest.json"
+                        if after_path.exists():
+                            verify_checkpoint_integrity(
+                                self.settings, str(after_path)
                             )
-                            if after_path.exists():
-                                verify_checkpoint_integrity(
-                                    self.settings, str(after_path)
-                                )
-                                reconciled_after_path = str(after_path.resolve(strict=True))
-                            else:
-                                reconciled_after_path = capture_workspace_state(
-                                    self.settings, operation_id, "after"
-                                ).manifest_path
+                            reconciled_after_path = str(after_path.resolve(strict=True))
+                        else:
+                            reconciled_after_path = capture_workspace_state(
+                                self.settings, operation_id, "after"
+                            ).manifest_path
                     state = str(journal.get("state") or state)
                 except Exception as error:  # noqa: BLE001 - persist and block mutations
                     recovery_error = f"{type(error).__name__}: {error}"[:2000]
@@ -247,7 +317,7 @@ class AuditStore:
                 else "interrupted"
             )
             now = utc_now_iso()
-            with self._lock, self._connect() as db:
+            with self._timed_lock(), self._connect() as db:
                 row = db.execute(
                     "SELECT status, post_workspace_path FROM operations WHERE id = ?",
                     (operation_id,),
@@ -345,24 +415,34 @@ class AuditStore:
     ) -> str:
         operation_id = operation_id or str(uuid.uuid4())
         now = utc_now_iso()
+        origin, origin_json = self._prepare_origin(session_id=session_id)
+        execution_owner_json = (
+            canonical_json(capture_execution_owner()) if status in {"queued", "running"} else None
+        )
         request_json = canonical_json(redact_value(request))
         if len(request_json.encode("utf-8")) > self.settings.max_audit_record_bytes:
             raise ValueError("audit request exceeds max_audit_record_bytes")
-        self._ensure_audit_capacity(len(request_json.encode("utf-8")) + 8192)
-        with self._lock, self._connect() as db:
+        self._ensure_audit_capacity(
+            len(request_json.encode("utf-8")) + 2 * len(origin_json.encode("utf-8")) + 8192
+        )
+        with self._timed_lock(), self._connect() as db:
+            if status == "queued":
+                db.execute("BEGIN IMMEDIATE")
+                self._ensure_job_capacity(db)
             db.execute(
                 """
                 INSERT INTO operations (
                     id, created_at, updated_at, session_id, tool_name, tier,
                     status, cwd, request_json, request_hash, approval_status,
-                    request_expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    request_expires_at, server_instance_id, origin_scope,
+                    client_name, client_version, request_id, task_id, execution_owner_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     operation_id,
                     now,
                     now,
-                    session_id,
+                    origin["session_id"],
                     tool_name,
                     tier,
                     status,
@@ -371,14 +451,22 @@ class AuditStore:
                     request_hash,
                     approval_status,
                     request_expires_at,
+                    origin["server_instance_id"],
+                    origin["origin_scope"],
+                    origin["client_name"],
+                    origin["client_version"],
+                    origin["request_id"],
+                    origin["task_id"],
+                    execution_owner_json,
                 ),
             )
             db.execute(
                 """
-                INSERT INTO events(operation_id, occurred_at, event_type, payload_json)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO events(
+                    operation_id, occurred_at, event_type, payload_json, origin_json
+                ) VALUES (?, ?, ?, ?, ?)
                 """,
-                (operation_id, now, "created", canonical_json({"status": status})),
+                (operation_id, now, "created", canonical_json({"status": status}), origin_json),
             )
         trace = current_trace()
         if trace is not None:
@@ -393,7 +481,7 @@ class AuditStore:
         fields = self._prepare_update_fields(fields)
         assignments = ", ".join(f"{key} = ?" for key in fields)
         values = list(fields.values()) + [operation_id]
-        with self._lock, self._connect() as db:
+        with self._timed_lock(), self._connect() as db:
             cursor = db.execute(f"UPDATE operations SET {assignments} WHERE id = ?", values)
             if cursor.rowcount != 1:
                 raise KeyError(f"operation not found: {operation_id}")
@@ -416,15 +504,22 @@ class AuditStore:
         assignments = ", ".join(f"{key} = ?" for key in fields)
         placeholders = ", ".join("?" for _ in from_statuses)
         values = [*fields.values(), operation_id, *sorted(from_statuses)]
-        with self._lock, self._connect() as db:
+        with self._timed_lock(), self._connect() as db:
             cursor = db.execute(
                 f"UPDATE operations SET {assignments} WHERE id = ? AND status IN ({placeholders})",
                 values,
             )
             return cursor.rowcount == 1
 
+    @timed_phase("audit_payload_encoding")
     def _prepare_update_fields(self, fields: dict[str, Any]) -> dict[str, Any]:
         fields = dict(fields)
+        for name in fields:
+            # SQL の識別子を引用・式へ変形して不変列の制限を迂回させない。
+            if not name.isascii() or not name.isidentifier():
+                raise ValueError("invalid audit update field")
+            if name.casefold() in _ORIGIN_COLUMNS:
+                raise ValueError("operation origin fields are immutable")
         if "timing_json" in fields:
             raise ValueError("use persist_timings for diagnostic timing updates")
         if isinstance(fields.get("error"), str):
@@ -451,6 +546,27 @@ class AuditStore:
         )
         return fields
 
+    def _prepare_origin(
+        self, *, session_id: str | None = None
+    ) -> tuple[dict[str, str | None], str]:
+        """発行元は作成時に確定し、追跡情報にも既存の伏せ字・容量制限を適用する。"""
+        fields = origin_fields()
+        if session_id is not None:
+            fields["session_id"] = session_id
+        fields = redact_value(fields)
+        serialized = canonical_json(fields)
+        if len(serialized.encode("utf-8")) > self.settings.max_audit_record_bytes:
+            raise ValueError("audit origin exceeds max_audit_record_bytes")
+        return fields, serialized
+
+    def _ensure_job_capacity(self, db: sqlite3.Connection) -> None:
+        """実行枠の確認と確保を、同じ監査ロック・DBトランザクション内で行う。"""
+        active = db.execute(
+            "SELECT COUNT(*) FROM operations WHERE status IN ('queued', 'running')"
+        ).fetchone()[0]
+        if active >= self.settings.max_concurrent_jobs:
+            raise RuntimeError("concurrent job admission limit exceeded")
+
     @_serialized_audit_mutation
     def persist_timings(
         self, operation_id: str, *, timing_json: str, duration_ms: int
@@ -464,7 +580,7 @@ class AuditStore:
         if size > self.settings.max_audit_record_bytes:
             raise ValueError("audit timing exceeds max_audit_record_bytes")
         self._ensure_audit_capacity(size + 4096)
-        with self._lock, self._connect() as db:
+        with self._timed_lock(), self._connect() as db:
             cursor = db.execute(
                 "UPDATE operations SET timing_json=?, duration_ms=? WHERE id=?",
                 (timing_json, duration_ms, operation_id),
@@ -480,19 +596,23 @@ class AuditStore:
         event_type: str,
         payload: dict[str, Any] | None = None,
     ) -> None:
+        _, origin_json = self._prepare_origin()
         payload_json = canonical_json(redact_value(payload or {}))
         if len(payload_json.encode("utf-8")) > self.settings.max_audit_record_bytes:
             payload_json = canonical_json(
                 {"truncated": True, "original_bytes": len(payload_json.encode("utf-8"))}
             )
-        self._ensure_audit_capacity(len(payload_json.encode("utf-8")) + 4096)
-        with self._lock, self._connect() as db:
+        self._ensure_audit_capacity(
+            len(payload_json.encode("utf-8")) + len(origin_json.encode("utf-8")) + 4096
+        )
+        with self._timed_lock(), self._connect() as db:
             db.execute(
                 """
-                INSERT INTO events(operation_id, occurred_at, event_type, payload_json)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO events(
+                    operation_id, occurred_at, event_type, payload_json, origin_json
+                ) VALUES (?, ?, ?, ?, ?)
                 """,
-                (operation_id, utc_now_iso(), event_type, payload_json),
+                (operation_id, utc_now_iso(), event_type, payload_json, origin_json),
             )
 
     @timed_phase("audit_result_persistence")
@@ -504,29 +624,34 @@ class AuditStore:
         payload: dict[str, Any] | None = None,
     ) -> bool:
         """Append an event only while its retained parent operation still exists."""
+        _, origin_json = self._prepare_origin()
         payload_json = canonical_json(redact_value(payload or {}))
         if len(payload_json.encode("utf-8")) > self.settings.max_audit_record_bytes:
             payload_json = canonical_json(
                 {"truncated": True, "original_bytes": len(payload_json.encode("utf-8"))}
             )
-        self._ensure_audit_capacity(len(payload_json.encode("utf-8")) + 4096)
-        with self._lock, self._connect() as db:
+        self._ensure_audit_capacity(
+            len(payload_json.encode("utf-8")) + len(origin_json.encode("utf-8")) + 4096
+        )
+        with self._timed_lock(), self._connect() as db:
             cursor = db.execute(
                 """
-                INSERT INTO events(operation_id, occurred_at, event_type, payload_json)
-                SELECT id, ?, ?, ? FROM operations WHERE id = ?
+                INSERT INTO events(
+                    operation_id, occurred_at, event_type, payload_json, origin_json
+                ) SELECT id, ?, ?, ?, ? FROM operations WHERE id = ?
                 """,
-                (utc_now_iso(), event_type, payload_json, operation_id),
+                (utc_now_iso(), event_type, payload_json, origin_json, operation_id),
             )
             return cursor.rowcount == 1
 
+    @timed_phase("audit_capacity_check")
     def _ensure_audit_capacity(self, incoming_bytes: int) -> None:
         """Keep long-lived audit/WAL growth inside a reserved share of data_dir."""
         budget = max(
             256 * 1024,
             min(self.settings.max_data_dir_bytes // 4, 128 * 1024 * 1024),
         )
-        with self._lock:
+        with self._timed_lock():
             if self._audit_storage_bytes() + incoming_bytes <= budget:
                 return
             self._prune_database()
@@ -585,7 +710,7 @@ class AuditStore:
             if include_events:
                 event_rows = db.execute(
                     """
-                    SELECT id, occurred_at, event_type, payload_json
+                    SELECT id, occurred_at, event_type, payload_json, origin_json
                     FROM events WHERE operation_id = ? ORDER BY id
                     """,
                     (operation_id,),
@@ -596,6 +721,7 @@ class AuditStore:
                         "occurred_at": event["occurred_at"],
                         "event_type": event["event_type"],
                         "payload": json.loads(event["payload_json"]),
+                        "origin": json.loads(event["origin_json"]) if event["origin_json"] else None,
                     }
                     for event in event_rows
                 ]
@@ -607,6 +733,8 @@ class AuditStore:
         limit: int = 50,
         status: str | None = None,
         approval_status: str | None = None,
+        session_id: str | None = None,
+        task_id: str | None = None,
     ) -> list[dict[str, Any]]:
         limit = max(1, min(limit, 500))
         clauses: list[str] = []
@@ -617,6 +745,12 @@ class AuditStore:
         if approval_status:
             clauses.append("approval_status = ?")
             values.append(approval_status)
+        if session_id is not None:
+            clauses.append("session_id = ?")
+            values.append(session_id)
+        if task_id is not None:
+            clauses.append("task_id = ?")
+            values.append(task_id)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         values.append(limit)
         with self._connect() as db:
@@ -624,7 +758,9 @@ class AuditStore:
                 f"""
                 SELECT id, created_at, updated_at, tool_name, tier, status, cwd,
                        approval_status, approval_by, approved_at, request_expires_at,
-                       approval_expires_at, claimed_at, exit_code, duration_ms, error
+                       approval_expires_at, claimed_at, exit_code, duration_ms, error,
+                       session_id, server_instance_id, origin_scope, client_name,
+                       client_version, request_id, task_id
                 FROM operations {where}
                 ORDER BY created_at DESC LIMIT ?
                 """,
@@ -682,7 +818,7 @@ class AuditStore:
     @_serialized_audit_mutation
     def expire_pending(self) -> int:
         now = utc_now_iso()
-        with self._lock, self._connect() as db:
+        with self._timed_lock(), self._connect() as db:
             rows = db.execute(
                 """
                 SELECT id FROM operations
@@ -723,7 +859,7 @@ class AuditStore:
         ).isoformat()
         new_approval = "approved" if approved else "rejected"
         new_status = "approved" if approved else "rejected"
-        with self._lock, self._connect() as db:
+        with self._timed_lock(), self._connect() as db:
             cursor = db.execute(
                 """
                 UPDATE operations SET approval_status=?, status=?, approval_by=?,
@@ -777,7 +913,9 @@ class AuditStore:
         grant_expires = (
             now_value + timedelta(seconds=self.settings.approval_execution_ttl_seconds)
         ).isoformat()
-        with self._lock, self._connect() as db:
+        with self._timed_lock(), self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._ensure_job_capacity(db)
             hash_clause = " AND request_hash=?" if expected_request_hash is not None else ""
             parameters: list[object] = [
                 approver,
@@ -786,6 +924,7 @@ class AuditStore:
                 grant_expires,
                 now,
                 now,
+                canonical_json(capture_execution_owner()),
                 operation_id,
                 now,
             ]
@@ -795,7 +934,7 @@ class AuditStore:
                 f"""
                 UPDATE operations SET approval_status='approved', status='queued',
                     approval_by=?, approval_note=?, approved_at=?, approval_expires_at=?,
-                    claimed_at=?, updated_at=?
+                    claimed_at=?, updated_at=?, execution_owner_json=?
                 WHERE id=? AND approval_status='pending' AND status='pending_approval'
                     AND request_expires_at > ?{hash_clause}
                 """,
@@ -815,14 +954,17 @@ class AuditStore:
     @_serialized_audit_mutation
     def claim_approved(self, operation_id: str) -> dict[str, Any]:
         now = utc_now_iso()
-        with self._lock, self._connect() as db:
+        with self._timed_lock(), self._connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._ensure_job_capacity(db)
             cursor = db.execute(
                 """
-                UPDATE operations SET status='queued', claimed_at=?, updated_at=?
+                UPDATE operations SET status='queued', claimed_at=?, updated_at=?,
+                    execution_owner_json=?
                 WHERE id=? AND approval_status='approved' AND status='approved'
                     AND approval_expires_at > ? AND claimed_at IS NULL
                 """,
-                (now, now, operation_id, now),
+                (now, now, canonical_json(capture_execution_owner()), operation_id, now),
             )
             if cursor.rowcount != 1:
                 db.execute(

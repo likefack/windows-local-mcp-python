@@ -60,7 +60,11 @@ runtime immutability は authority separation と別の必須 layer です。
 & "C:\Program Files\WindowsLocalMCP\verify-approved-host-runtime.ps1"
 ```
 
+インストーラーは staging venv への初回導入後に `pip check` で依存関係全体を検査します。fresh venv の初回依存解決が終了コード 0 を返しても transitive dependency が欠けていた場合は、同じ WLMCP wheel を一度だけ再解決し、再度 `pip check` が成功した場合に限って ACL を固定して Program Files へ公開します。依存不整合のある staging runtime を既存運用 runtime と置換しません。
+
 lower-level verifier は installed Python を `-I -B` で起動し、WLMCP package、startup-active dependency、import namespace、launcher、base Python／stdlib／DLL、ancestor replacement access、reparse point 等を検査します。runtime immutability 成功だけを Approved Host availability／R2-001 fix の証拠にしません。
+
+Approved Host の実行中に用いる control-plane guard は、可変な control-plane state と WLMCP package を検査します。`site-packages` 全体はここへ重複して含めず、上記の immutable-runtime gate が依存関係全体を検査します。これにより、Sandbox の履歴が蓄積しても依存パッケージの容量との合算だけを理由に control-plane admission が拒否されることを避けつつ、依存関係の改変検出は維持します。
 
 ## LocalSystem authority provisioning
 
@@ -79,7 +83,7 @@ service は named pipe peer PID と SCM の service PID を相互確認し、cli
 
 Approved Host の control-plane worker は LocalSystem として動作し、preflight、Job Object ownership、control-plane digest、audit mirror、postflight、WMI／CIM job-external process census、durable completion proof を所有します。
 
-実 command は service が pipe client の verified process token から primary token を複製し、`CreateProcessAsUserW` で suspended 作成します。child を SYSTEM worker 所有 Job Object へ割り当てた後に resume します。
+service は pipe client の verified PID／作成時刻／SID／非昇格を確認し、開いた同じ process HANDLE の作成時刻を再検証して primary token を複製します。SYSTEM worker へは明示的な継承 HANDLE list にその token だけを載せ、service 側の複製は worker 起動後に閉じます。worker は継承 token の SID／非昇格／primary type を再確認し、承認 UI が終了しても別 PID から token を取り直しません。実 command は worker がその token で `CreateProcessAsUserW` により suspended 作成し、SYSTEM worker 所有 Job Object へ割り当てた後に resume します。worker 側の token HANDLE は一度限りの child 起動試行後に閉じます。取得・継承・再検証の失敗は child 起動前に fail closed とし、arm 後に worker が正常完了証明を残せなければ既存の durable recovery 境界を維持します。
 
 したがって intended function は「通常 Windows user authority」のままです。child を SYSTEM に昇格させません。live verifier は child SID が requester SID と一致し、非昇格のまま、runtime user が自分の child に通常の process authority を持つことを確認します。
 
@@ -226,4 +230,4 @@ LocalSystem authority、requester-token launch、durable state、restart recover
 
 現行実装は coordinated recovery、digest／stable-identity-bound postflight quarantine、interruption resume、historical split-recovery compatibility を追加しています。CIに加えて、実Windowsの fresh abnormal → coordinated recovery → post-recovery normal pathが成功済みです。現行判定と検証範囲は `VERIFICATION.md` を正本とします。
 
-R2-001 専用 live verifier は別 finding WLMCP-R3-002 の `workspace_write=false` materialization 経路に依存しないよう、non-project-controlled command を `workspace_write=true` で実行します。
+R2-001 専用 live verifier は既存の検証範囲として non-project-controlled command を `workspace_write=true` で実行します。この結果だけでは `workspace_write=false` の実行準備は確認できません。読み取り専用の `source-workspace` は承認済みの元 cwd／引数と入力照合を維持し、存在しない `staged_cwd` を使用しない修正を追加しました。運用 runtime 更新後、MCP から `C:\Windows\System32\whoami.exe /user` を `workspace_write=false`、`network_required=false`、上限30秒で申請し、人がローカル承認した正常経路で child 起動・通常ユーザー SID・非昇格・標準出力・postflight・latch 解除を確認しました。今回変更した token 境界の異常終了・復旧実機 fault injection は別途確認が必要です。証拠と範囲は [source-workspace 調査記録](APPROVED_HOST_SOURCE_WORKSPACE_2026_09_21.md) を参照してください。

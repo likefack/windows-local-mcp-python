@@ -405,6 +405,14 @@ def materialize_execution_copy(
     assert settings.sandbox_scratch_dir is not None
     stage_root.relative_to((settings.sandbox_scratch_dir / "approval-inputs").resolve(strict=True))
     immutable_cwd = Path(normalized.cwd).resolve(strict=True)
+    mode = str(manifest.get("mode", ""))
+    if mode in {"source-workspace", "git-state-source-workspace"}:
+        # These modes bind source inputs in verify_approval_bundle; their snapshot is
+        # evidence, not an execution cwd. Preserve the verified source cwd/argv even
+        # when the caller requests materialization for workspace_write=False.
+        if normalized.model_dump() != manifest["execution"]:
+            raise RuntimeError("source execution command differs from the approved manifest")
+        return normalized
     expected_cwd = Path(str(manifest.get("staged_cwd", stage_root / "cwd"))).resolve(
         strict=True
     )
@@ -417,7 +425,6 @@ def materialize_execution_copy(
         shutil.rmtree(run_root)
     run_root.mkdir(parents=True)
     entry_budget = _EntryBudget(settings)
-    mode = str(manifest.get("mode", ""))
     try:
         if mode in {"staged-sandbox-workspace", "staged-sandbox-workspace-write"}:
             immutable_workspace = Path(str(manifest["staged_workspace"])).resolve(strict=True)

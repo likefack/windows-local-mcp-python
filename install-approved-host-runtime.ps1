@@ -140,6 +140,20 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "Installing the WLMCP wheel and dependencies failed."
     }
+    & $RuntimePython -I -B -m pip check
+    if ($LASTEXITCODE -ne 0) {
+        # pip can report success after the first fresh-venv resolution while a
+        # transitive leaf remains absent. Re-resolve the same immutable wheel once,
+        # then require a clean dependency closure before protecting or publishing it.
+        & $RuntimePython -I -B -m pip install $wheel.FullName
+        if ($LASTEXITCODE -ne 0) {
+            throw "Retrying the WLMCP dependency installation failed."
+        }
+    }
+    & $RuntimePython -I -B -m pip check
+    if ($LASTEXITCODE -ne 0) {
+        throw "Approved Host runtime dependency verification failed."
+    }
 
     foreach ($script in @(
         "run-server.ps1",

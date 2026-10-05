@@ -7,9 +7,7 @@ import subprocess
 from collections.abc import Callable, Mapping
 from ctypes import wintypes
 from pathlib import Path
-from typing import Any, BinaryIO
-
-import psutil
+from typing import Any, BinaryIO, Self
 
 
 class WindowsUserProcessUnavailable(RuntimeError):
@@ -28,6 +26,8 @@ if os.name == "nt":
     _SECURITY_IMPERSONATION = 2
     _TOKEN_PRIMARY = 1
     _TOKEN_ELEVATION = 20
+    _TOKEN_USER = 1
+    _TOKEN_TYPE = 8
     _CREATE_SUSPENDED = 0x00000004
     _CREATE_UNICODE_ENVIRONMENT = 0x00000400
     _EXTENDED_STARTUPINFO_PRESENT = 0x00080000
@@ -91,8 +91,22 @@ if os.name == "nt":
     class _TOKEN_ELEVATION_VALUE(ctypes.Structure):
         _fields_ = [("TokenIsElevated", wintypes.DWORD)]
 
+    class _TOKEN_USER_VALUE(ctypes.Structure):
+        _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", wintypes.DWORD)]
+
+    class _FILETIME(ctypes.Structure):
+        _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
+
     _kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     _kernel32.OpenProcess.restype = wintypes.HANDLE
+    _kernel32.GetProcessTimes.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(_FILETIME),
+        ctypes.POINTER(_FILETIME),
+        ctypes.POINTER(_FILETIME),
+        ctypes.POINTER(_FILETIME),
+    ]
+    _kernel32.GetProcessTimes.restype = wintypes.BOOL
     _kernel32.CreatePipe.argtypes = [
         ctypes.POINTER(wintypes.HANDLE),
         ctypes.POINTER(wintypes.HANDLE),
@@ -124,6 +138,8 @@ if os.name == "nt":
     _kernel32.ResumeThread.restype = wintypes.DWORD
     _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     _kernel32.CloseHandle.restype = wintypes.BOOL
+    _kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    _kernel32.LocalFree.restype = ctypes.c_void_p
     _kernel32.InitializeProcThreadAttributeList.argtypes = [
         ctypes.c_void_p,
         wintypes.DWORD,
@@ -167,6 +183,11 @@ if os.name == "nt":
         ctypes.POINTER(wintypes.DWORD),
     ]
     _advapi32.GetTokenInformation.restype = wintypes.BOOL
+    _advapi32.ConvertSidToStringSidW.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.LPWSTR),
+    ]
+    _advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
     _advapi32.CreateProcessAsUserW.argtypes = [
         wintypes.HANDLE,
         wintypes.LPCWSTR,
@@ -193,22 +214,30 @@ def _environment_block(environment: Mapping[str, str]) -> ctypes.Array[ctypes.c_
     return ctypes.create_unicode_buffer("\0".join(entries) + "\0\0")
 
 
-def _validate_requester_identity(pid: int, expected_create_time: float) -> None:
-    try:
-        actual = float(psutil.Process(pid).create_time())
-    except (psutil.NoSuchProcess, psutil.AccessDenied) as error:
-        raise WindowsUserProcessUnavailable("requester process identity is unavailable") from error
-    if abs(actual - float(expected_create_time)) > 0.01:
-        raise WindowsUserProcessUnavailable("requester PID was reused before Approved Host launch")
-
-
-def _duplicate_requester_primary_token(pid: int) -> wintypes.HANDLE:
+def _duplicate_requester_primary_token(
+    pid: int, expected_create_time: float
+) -> wintypes.HANDLE:
     process = _kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not process:
         raise _winerror("OpenProcess(Approved Host requester)")
     token = wintypes.HANDLE()
     primary = wintypes.HANDLE()
     try:
+        created = _FILETIME()
+        exited = _FILETIME()
+        kernel = _FILETIME()
+        user = _FILETIME()
+        if not _kernel32.GetProcessTimes(
+            process, ctypes.byref(created), ctypes.byref(exited),
+            ctypes.byref(kernel), ctypes.byref(user),
+        ):
+            raise _winerror("GetProcessTimes(Approved Host requester)")
+        ticks = (int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime)
+        actual_create_time = ticks / 10_000_000 - 11_644_473_600
+        if abs(actual_create_time - float(expected_create_time)) > 0.01:
+            raise WindowsUserProcessUnavailable(
+                "requester PID was reused before Approved Host token capture"
+            )
         desired = _TOKEN_ASSIGN_PRIMARY | _TOKEN_DUPLICATE | _TOKEN_QUERY
         if not _advapi32.OpenProcessToken(process, desired, ctypes.byref(token)):
             raise _winerror("OpenProcessToken(Approved Host requester)")
@@ -244,6 +273,100 @@ def _duplicate_requester_primary_token(pid: int) -> wintypes.HANDLE:
         if token:
             _kernel32.CloseHandle(token)
         _kernel32.CloseHandle(process)
+
+
+def _validate_primary_token(token: wintypes.HANDLE, expected_sid: str) -> None:
+    """Recheck the inherited token itself, independently of the old requester PID."""
+    needed = wintypes.DWORD()
+    _advapi32.GetTokenInformation(token, _TOKEN_USER, None, 0, ctypes.byref(needed))
+    if not 0 < needed.value <= 65536:
+        raise _winerror("GetTokenInformation(TokenUser size)")
+    user_buffer = ctypes.create_string_buffer(needed.value)
+    if not _advapi32.GetTokenInformation(
+        token, _TOKEN_USER, user_buffer, needed.value, ctypes.byref(needed)
+    ):
+        raise _winerror("GetTokenInformation(TokenUser)")
+    user = ctypes.cast(user_buffer, ctypes.POINTER(_TOKEN_USER_VALUE)).contents
+    sid_text = wintypes.LPWSTR()
+    if not _advapi32.ConvertSidToStringSidW(user.Sid, ctypes.byref(sid_text)):
+        raise _winerror("ConvertSidToStringSidW")
+    try:
+        actual_sid = str(sid_text.value)
+    finally:
+        _kernel32.LocalFree(sid_text)
+    if actual_sid.casefold() != expected_sid.casefold():
+        raise WindowsUserProcessUnavailable("Approved Host requester token SID changed")
+
+    elevation = _TOKEN_ELEVATION_VALUE()
+    returned = wintypes.DWORD()
+    if not _advapi32.GetTokenInformation(
+        token, _TOKEN_ELEVATION, ctypes.byref(elevation),
+        ctypes.sizeof(elevation), ctypes.byref(returned),
+    ):
+        raise _winerror("GetTokenInformation(TokenElevation)")
+    if elevation.TokenIsElevated:
+        raise WindowsUserProcessUnavailable("Approved Host requester token is elevated")
+    token_type = wintypes.DWORD()
+    if not _advapi32.GetTokenInformation(
+        token, _TOKEN_TYPE, ctypes.byref(token_type),
+        ctypes.sizeof(token_type), ctypes.byref(returned),
+    ):
+        raise _winerror("GetTokenInformation(TokenType)")
+    if token_type.value != _TOKEN_PRIMARY:
+        raise WindowsUserProcessUnavailable("Approved Host requester token is not primary")
+
+
+class RequesterPrimaryToken:
+    """SYSTEM-owned, one-operation copy of the verified ordinary-user token."""
+
+    def __init__(self, handle: int, expected_sid: str) -> None:
+        if not handle or not expected_sid:
+            raise WindowsUserProcessUnavailable("Approved Host requester token is missing")
+        self._handle = wintypes.HANDLE(handle)
+        self.expected_sid = expected_sid
+
+    @classmethod
+    def capture(
+        cls, requester_pid: int, requester_create_time: float, expected_sid: str
+    ) -> RequesterPrimaryToken:
+        token = _duplicate_requester_primary_token(requester_pid, requester_create_time)
+        lease = cls(int(token.value), expected_sid)
+        try:
+            lease.verify()
+        except Exception:
+            lease.close()
+            raise
+        return lease
+
+    @classmethod
+    def from_inherited(cls, handle: int, expected_sid: str) -> RequesterPrimaryToken:
+        lease = cls(handle, expected_sid)
+        try:
+            lease.verify()
+        except Exception:
+            lease.close()
+            raise
+        return lease
+
+    @property
+    def handle(self) -> int:
+        if not self._handle.value:
+            raise WindowsUserProcessUnavailable("Approved Host requester token was closed")
+        return int(self._handle.value)
+
+    def verify(self) -> None:
+        _validate_primary_token(wintypes.HANDLE(self.handle), self.expected_sid)
+
+    def close(self) -> None:
+        if self._handle.value:
+            _kernel32.CloseHandle(self._handle)
+            self._handle = wintypes.HANDLE()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
+        self.close()
 
 
 def _create_output_pipe() -> tuple[wintypes.HANDLE, wintypes.HANDLE]:
@@ -364,6 +487,7 @@ def popen_as_requester_in_job(
     *,
     requester_pid: int,
     requester_create_time: float,
+    requester_token: RequesterPrimaryToken | None = None,
     cwd: str | Path,
     environment: Mapping[str, str],
     creationflags: int = 0,
@@ -372,8 +496,15 @@ def popen_as_requester_in_job(
     """Create a user process suspended, bind it to the SYSTEM-owned Job, then resume."""
     if os.name != "nt":
         raise WindowsUserProcessUnavailable("Approved Host user-token launch requires native Windows")
-    _validate_requester_identity(requester_pid, requester_create_time)
-    primary_token = _duplicate_requester_primary_token(requester_pid)
+    if requester_token is None:
+        primary_token = _duplicate_requester_primary_token(
+            requester_pid, requester_create_time
+        )
+    else:
+        # The service captured this token while the authenticated pipe peer was live.
+        # Its verified SID and non-elevated state survive the approval UI exiting.
+        requester_token.verify()
+        primary_token = wintypes.HANDLE(requester_token.handle)
     stdout_read = wintypes.HANDLE()
     stdout_write = wintypes.HANDLE()
     stderr_read = wintypes.HANDLE()
@@ -506,7 +637,7 @@ def popen_as_requester_in_job(
             stderr_read,
             stderr_write,
             stdin_handle,
-            primary_token,
+            primary_token if requester_token is None else wintypes.HANDLE(),
         ):
             if handle:
                 _kernel32.CloseHandle(handle)

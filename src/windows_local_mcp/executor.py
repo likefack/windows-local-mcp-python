@@ -15,6 +15,7 @@ from .child_env import build_worker_environment
 from .config import Settings
 from .control_plane import create_worker_context, isolated_worker_argv
 from .git_broker_worker import isolated_git_broker_worker_argv
+from .operation_owner import execution_owner_liveness
 from .process_utils import (
     ProcessIdentity,
     capture_process_identity,
@@ -260,6 +261,12 @@ class Executor:
                     break
                 if self._authority_owns_operation(current):
                     break
+                # 子の識別情報が保存される前や同期 Broker の実行中は、別サーバーや
+                # 承認 UI が操作を所有している。追跡用 session/task ID は使用しない。
+                if not self._worker_identity_recorded(current) and execution_owner_liveness(
+                    current.get("execution_owner_json")
+                ) in {"alive", "unknown"}:
+                    break
                 identities = self._identities(current)
                 if identities and any(
                     process_identity_matches(identity) for identity in identities
@@ -278,6 +285,16 @@ class Executor:
                 if transitioned:
                     self.audit.add_event(operation["id"], "stale_job_reconciled", {})
                     break
+
+    @staticmethod
+    def _worker_identity_recorded(operation: dict[str, Any]) -> bool:
+        # 部分的な識別情報も保存済みとして扱い、壊れた worker identity を
+        # 生きている要求元だけを根拠に有効扱いしない。
+        return operation.get("process_nonce") is not None or any(
+            operation.get(f"{prefix}_{field}") is not None
+            for prefix in ("child", "worker")
+            for field in ("pid", "create_time", "executable")
+        )
 
     @staticmethod
     def _authority_owns_operation(operation: dict[str, Any]) -> bool:

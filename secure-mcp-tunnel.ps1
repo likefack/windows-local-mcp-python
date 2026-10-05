@@ -369,9 +369,33 @@ function Test-TunnelLocalMcpConfiguration {
             "print('workspace_root=' + str(settings.workspace_root))",
             "print('data_dir=' + str(settings.data_dir))"
         ) -join "; "
-        $output = @(& $PythonPath -I -X utf8 -B -c $probe 2>$null)
+        $output = @(& $PythonPath -I -X utf8 -B -c $probe 2>&1)
         if ($LASTEXITCODE -ne 0) {
-            return [PSCustomObject]@{ Valid = $false; WorkspaceRoot = $null; DataDir = $null }
+            # 生の stderr は path や将来の依存情報を含み得るため表示せず、
+            # 利用者が安全に対処できる固定分類だけを呼び出し側へ返します。
+            $failureText = ($output | ForEach-Object { $_.ToString() }) -join "`n"
+            $reasonCode = "configuration_load_failed"
+            $message = "設定を固定実行環境で読み込めませんでした。configure-localmcp.bat から設定を確認してください。"
+            if ($failureText -match 'data_dir ACL changed after provisioning') {
+                $reasonCode = "data_dir_acl_changed"
+                $message = "data_dir の ACL が初期設定後に変更されています。marker を削除せず、ACL 差分を確認してください。"
+            } elseif ($failureText -match 'data_dir ACL policy marker is missing') {
+                $reasonCode = "data_dir_acl_marker_missing"
+                $message = "data_dir の ACL marker がありません。自動再作成せず、既存 data_dir を保全して確認してください。"
+            } elseif ($failureText -match 'data_dir ACL policy marker is corrupt') {
+                $reasonCode = "data_dir_acl_marker_corrupt"
+                $message = "data_dir の ACL marker を安全に読み取れません。既存 marker を保全して確認してください。"
+            } elseif ($failureText -match 'workspace_root does not exist') {
+                $reasonCode = "workspace_missing"
+                $message = "設定された操作対象フォルダーが見つかりません。configure-localmcp.bat から設定を確認してください。"
+            }
+            return [PSCustomObject]@{
+                Valid = $false
+                WorkspaceRoot = $null
+                DataDir = $null
+                ReasonCode = $reasonCode
+                Message = $message
+            }
         }
         $workspaceLine = $output | Where-Object { $_.ToString().StartsWith("workspace_root=", [StringComparison]::Ordinal) } | Select-Object -Last 1
         $dataLine = $output | Where-Object { $_.ToString().StartsWith("data_dir=", [StringComparison]::Ordinal) } | Select-Object -Last 1
@@ -382,9 +406,17 @@ function Test-TunnelLocalMcpConfiguration {
             Valid = $true
             WorkspaceRoot = $workspaceLine.ToString().Substring("workspace_root=".Length)
             DataDir = $dataLine.ToString().Substring("data_dir=".Length)
+            ReasonCode = ""
+            Message = ""
         }
     } catch {
-        return [PSCustomObject]@{ Valid = $false; WorkspaceRoot = $null; DataDir = $null }
+        return [PSCustomObject]@{
+            Valid = $false
+            WorkspaceRoot = $null
+            DataDir = $null
+            ReasonCode = "configuration_probe_failed"
+            Message = "設定の検証プロセスを完了できませんでした。configure-localmcp.bat から設定を確認してください。"
+        }
     } finally {
         if ($null -eq $previousConfig) {
             Remove-Item Env:LOCAL_MCP_CONFIG -ErrorAction SilentlyContinue
