@@ -341,6 +341,9 @@ def test_transient_full_row_read_failure_does_not_consume_diff(monkeypatch: pyte
 def test_upload_has_one_commit_diff_and_separate_transfer_and_commit_times(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # この試験は表示時間と差分が対象。永続状態の読取は別の実ファイル試験で検証する。
+    monkeypatch.setattr(live_activity, "read_transfer_activity_state",
+                        lambda *args: live_activity.TransferActivityState("open"))
     calls = _diff_spy(monkeypatch, ["+uploaded\n"])
     begin = _operation(
         "begin", "artifact_upload_begin", duration_ms=11,
@@ -358,14 +361,15 @@ def test_upload_has_one_commit_diff_and_separate_transfer_and_commit_times(
         "payload": {"result": {"received": 4}},
     })
     clock.seconds = 1
-    assert tracker.poll_once() == []
+    line = tracker.poll_once()[0]
+    assert "Waiting" in line and "4/8バイト" in line and "経過" not in line
     clock.seconds = 5
-    assert "4/8バイト" in tracker.poll_once()[0]
+    assert tracker.poll_once() == []
     audit.add(_operation(
         "commit", "artifact_upload_commit", status="running",
         request={"transfer_id": "transfer", "path": "notes.txt"}, result={},
     ))
-    assert tracker.poll_once() == []
+    assert "Running" in tracker.poll_once()[0]
     clock.seconds = 12
     audit.operations["commit"].update(
         status="succeeded", duration_ms=31, updated_at=clock.now().isoformat()
@@ -377,7 +381,9 @@ def test_upload_has_one_commit_diff_and_separate_transfer_and_commit_times(
     assert calls == ["commit"] and tracker.poll_once() == []
 
 
-def test_download_retries_do_not_double_count_and_begin_duration_is_not_total() -> None:
+def test_download_retries_do_not_double_count_and_begin_duration_is_not_total(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(live_activity, "read_transfer_activity_state",
+                        lambda *args: live_activity.TransferActivityState("open"))
     begin = _operation(
         "download", "artifact_download_begin", duration_ms=9,
         result={"transfer_id": "transfer", "path": "notes.txt", "bytes": 8}, events=[],

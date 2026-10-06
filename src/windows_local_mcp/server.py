@@ -2196,6 +2196,10 @@ def artifact_import_file(
 
     The operator must configure exact file-service hosts first. path alone chooses the
     destination. sha256 asserts source bytes; expected_sha256 protects existing destination.
+    The client must materialize the selected file into the declared fileParams object.
+    The server cannot resolve a bare attachment ID, filename, URL, or /mnt/data path.
+    On path-upload clients, file must name an existing absolute path on the client host.
+    Do not retry rejected references with model-generated Base64 or guessed URLs.
     File references do not prove membership in the current conversation.
     """
     # Never put the file object (including invalid inputs) into an audit or error record.
@@ -2259,7 +2263,18 @@ def artifact_import_file(
                 transform=apply, allow_create=True, require_expected_for_existing=True,
             )
     except (ArtifactTransferError, ArtifactTransferStateError) as error:
-        _audit_rejection("artifact_import_file", request, error)
+        # The observed delivery host is transient setup guidance, not audit data.
+        audit_error = (
+            ArtifactTransferError(error.code, "operator-approved file hosts required")
+            if error.code == "ATTACHMENT_IMPORT_NOT_CONFIGURED"
+            else error
+        )
+        if error.code == "ATTACHMENT_REFERENCE_REJECTED":
+            # 拒否理由は維持し、応答専用の配信ホストを監査へ永続化しない。
+            audit_message = str(error).removeprefix(f"{error.code}: ")
+            audit_message = audit_message.partition("; observed file-service host: ")[0]
+            audit_error = ArtifactTransferError(error.code, audit_message)
+        _audit_rejection("artifact_import_file", request, audit_error)
         raise
 
 

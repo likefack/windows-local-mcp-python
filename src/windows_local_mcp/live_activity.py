@@ -18,6 +18,7 @@ from typing import Any
 from .audit import TERMINAL_STATUSES, AuditStore
 from .operation_changes import iter_operation_diff_lines
 from .redaction import redact_command_args, redact_text
+from .transfer_activity import TransferActivityState, read_transfer_activity_state
 
 MAX_ACTIVITY_SUMMARY = 200
 DEFAULT_PROGRESS_INTERVAL_SECONDS = 5.0
@@ -808,6 +809,7 @@ def project_operation(
     detail = _detail(operation, target=target, transfer_path=transfer_path)
     active = False
     terminal = False
+    display_status = raw_status
 
     if _recovery_required(operation) or raw_status.startswith("failed") or raw_status == "error":
         label = "Failed"
@@ -841,18 +843,30 @@ def project_operation(
                     and transfer_state == "terminal_failure"
                 ):
                     return None
-                if tool in TRANSFER_BEGIN_TO_CHUNK and "upload" in tool and transfer_state == "succeeded":
+                if tool in TRANSFER_BEGIN_TO_CHUNK and transfer_state in {"cancelled", "expired", "failed"}:
+                    # begin の成功は受付だけ。保存済みの終了状態を実行中へ戻さない。
+                    label = STATUS_LABELS[transfer_state]
+                    display_status = transfer_state
+                elif tool in TRANSFER_BEGIN_TO_CHUNK and transfer_state == "unavailable":
+                    label = "Unknown"
+                    display_status = "unknown"
+                    terminal = False
+                    detail = _bounded_detail(detail, "転送状態を確認できません")
+                elif tool in TRANSFER_BEGIN_TO_CHUNK and "upload" in tool and transfer_state in {"succeeded", "committed"}:
                     label = "Uploaded"
-                elif tool in TRANSFER_BEGIN_TO_CHUNK and not transfer_complete(operation):
-                    label = "Running"
-                    active = True
+                elif tool in TRANSFER_BEGIN_TO_CHUNK and (
+                    not transfer_complete(operation) or "upload" in tool
+                ):
+                    # 受付APIの終了後は次の要求待ち。転送が未完了でも処理中とは限らない。
+                    # 受信完了も保存確定ではないため、完了扱いや時間だけの再表示をしない。
+                    label = "Waiting"
+                    display_status = "waiting"
                     terminal = False
-                elif tool in TRANSFER_BEGIN_TO_CHUNK and "upload" in tool:
-                    # Upload chunks only stage the payload. The user-visible transfer is complete
-                    # after the separate commit operation verifies and writes it.
-                    label = "Running"
-                    active = True
-                    terminal = False
+                    if "upload" in tool:
+                        waiting_for = "保存確定待ち" if transfer_complete(operation) else "データ待ち"
+                    else:
+                        waiting_for = "取得要求待ち"
+                    detail = _bounded_detail(detail, waiting_for)
                 elif "download" in tool:
                     label = "Downloaded"
                 else:
@@ -892,7 +906,9 @@ def project_operation(
         tier = _safe_text(operation.get("tier"), limit=40)
         if tier in {"structured_processing", "transfer", "approved_host", "codex_sandbox"}:
             detail = f"{detail} [{tier}]"
-    if kind == "transfer" and tool in TRANSFER_BEGIN_TO_CHUNK and transfer_complete(operation):
+    if kind == "transfer" and tool in TRANSFER_BEGIN_TO_CHUNK and (
+        transfer_complete(operation) or label == "Waiting"
+    ):
         timestamp = _transfer_timestamp(operation)
     else:
         timestamp = operation.get("updated_at") or operation.get("created_at") or ""
@@ -917,7 +933,7 @@ def project_operation(
         ),
         detail=_bounded_detail(detail, counts),
         operation_id=operation_id,
-        status=raw_status,
+        status=display_status,
         timestamp=timestamp,
         logical_id=logical_id,
         active=active,
@@ -1024,6 +1040,7 @@ class LiveActivityTracker:
         self._transfer_states: dict[str, str] = {}
         self._transfer_origins: dict[str, Mapping[str, object]] = {}
         self._transfer_commits: dict[str, str] = {}
+        self._transfer_observations: dict[str, TransferActivityState] = {}
         self._cached: dict[str, Mapping[str, object]] = {}
         self._diff_handled: set[str] = set()
         self._clock = clock
@@ -1067,6 +1084,15 @@ class LiveActivityTracker:
                 self._transfer_paths[transfer_id] = path
             if tool in TRANSFER_BEGIN_TO_CHUNK and transfer_id:
                 self._transfer_origins[transfer_id] = operation
+                settings = getattr(self.audit, "settings", None)
+                if settings is not None and _status(operation) == "succeeded":
+                    # 表示専用の読取。期限切れ処理やサーバー初期化は実行しない。
+                    observation = read_transfer_activity_state(
+                        settings, transfer_id, str(operation.get("id") or ""),
+                        "upload" if "upload" in tool else "download", self._now(),
+                    )
+                    self._transfer_observations[transfer_id] = observation
+                    self._transfer_states[transfer_id] = observation.state
             if tool in TRANSFER_COMMIT_TOOLS and transfer_id:
                 self._transfer_commits[transfer_id] = str(operation.get("id") or "")
                 status = _status(operation)
@@ -1083,6 +1109,18 @@ class LiveActivityTracker:
         tool = str(operation.get("tool_name") or "")
         transfer_id, _total, _events = _transfer_info(operation)
         origin = self._transfer_origins.get(transfer_id)
+        observation = self._transfer_observations.get(transfer_id)
+        if (
+            tool in TRANSFER_BEGIN_TO_CHUNK and observation is not None and projection.terminal
+            and _status(operation) == "succeeded"
+            and observation.state in {"cancelled", "expired", "failed", "committed", "completed"}
+        ):
+            # begin APIの完了時刻を、キャンセルや保存確定の時刻として流用しない。
+            return replace(
+                projection, timestamp=observation.finished_at or "",
+                elapsed_ms=_elapsed_between(operation.get("created_at"), observation.finished_at),
+                elapsed_label="転送経過",
+            )
         if tool in TRANSFER_COMMIT_TOOLS and origin is not None:
             if projection.active:
                 # beginとcommitは同じ転送の進捗を使い、切り替わりだけでは再表示しない。
@@ -1212,7 +1250,7 @@ class LiveActivityTracker:
             # 完了した長時間操作が最新履歴の上限から押し出されても、直前まで追跡中
             # だった操作は一度取得する。短い処理の大量発生で終端表示を失わない。
             for operation_id, signature in self._known_projection.items():
-                if operation_id in active_rows or signature[1] not in {"Approval", "Running"}:
+                if operation_id in active_rows or signature[1] not in {"Approval", "Running", "Waiting", "Unknown"}:
                     continue
                 try:
                     active_rows[operation_id] = self.audit.get_operation(
@@ -1261,7 +1299,7 @@ class LiveActivityTracker:
         logically_active_before_poll = {
             str(signature[0])
             for signature in self._known_projection.values()
-            if len(signature) > 1 and signature[1] in {"Approval", "Running"}
+            if len(signature) > 1 and signature[1] in {"Approval", "Running", "Waiting"}
         }
         # list_operations is newest-first; reverse it so terminal transitions read naturally.
         for row in reversed(rows):
@@ -1321,7 +1359,7 @@ class LiveActivityTracker:
                     self._diff_handled.add(operation_id)
                 if emit or projection.terminal:
                     self._known_projection[operation_id] = signature
-                if projection.active and emit and not logical_previous:
+                if (projection.active or projection.label in {"Waiting", "Unknown"}) and emit and not logical_previous:
                     lines.append(format_projection(projection))
                     self._last_display_at[projection.logical_id] = moment
                 continue
@@ -1355,6 +1393,7 @@ class LiveActivityTracker:
                 )
                 synthesize_running = tool in UNDO_TOOLS or (
                     tool in TRANSFER_TOOLS
+                    and tool not in TRANSFER_BEGIN_TO_CHUNK
                     and projection.logical_id not in logically_active_before_poll
                 )
                 if projection.terminal and (
@@ -1408,6 +1447,10 @@ class LiveActivityTracker:
             }
             self._transfer_commits = {
                 key: value for key, value in self._transfer_commits.items()
+                if f"transfer:{key}" in logical_ids
+            }
+            self._transfer_observations = {
+                key: value for key, value in self._transfer_observations.items()
                 if f"transfer:{key}" in logical_ids
             }
         return lines

@@ -38,6 +38,45 @@ def _reject(code: str, message: str) -> ArtifactTransferError:
     return ArtifactTransferError(code, message)
 
 
+def _reference_kind(value: Any) -> str:
+    """入力の内容を出力せず、参照の形式だけを固定ラベルで分類する。"""
+    if isinstance(value, dict):
+        return "file_params_object"
+    if value is None:
+        return "missing"
+    if isinstance(value, list):
+        return "array"
+    if not isinstance(value, str):
+        return "unsupported_type"
+    if value.startswith(("https://", "http://", "file://", "data:")):
+        return "url"
+    if "/" in value or "\\" in value or re.match(r"^[A-Za-z]:", value):
+        return "local_path"
+    if value.startswith(("file_", "file-")):
+        return "attachment_id"
+    if re.search(r"\.[A-Za-z0-9]{1,16}$", value):
+        return "filename"
+    return "text"
+
+
+def _reference_rejected(
+    file: Any, message: str, *, reason: str, field: str | None = None
+) -> ArtifactTransferError:
+    """クライアントの変換不足とサーバーの拒否を、秘密を記録せず区別する。"""
+    details = [
+        "layer=server_reference_validation",
+        f"reference_kind={_reference_kind(file)}",
+        f"reason={reason}",
+    ]
+    if field is not None:
+        # field は呼び出し元の固定値のみ。未知のキーや値を診断へ転記しない。
+        details.append(f"field={field}")
+        if field == "file_id" and isinstance(file, dict):
+            details.append(f"file_id_kind={_reference_kind(file.get(field))}")
+    details.append("expected=fileParams object {download_url, file_id, mime_type?, file_name?}")
+    return _reject("ATTACHMENT_REFERENCE_REJECTED", message + "; " + "; ".join(details))
+
+
 def validate_allowed_hosts(hosts: list[str]) -> list[str]:
     """Accept exact DNS names only; never expand a wildcard or a URL into authority."""
     result = []
@@ -67,19 +106,29 @@ def validate_allowed_hosts(hosts: list[str]) -> list[str]:
 
 def validate_reference(file: Any, allowed_hosts: list[str]) -> tuple[str, str]:
     """Validate manually so invalid file objects cannot be echoed by schema errors."""
-    if not isinstance(file, dict) or set(file) - set(FILE_INPUT_SCHEMA["properties"]):
-        raise _reject("ATTACHMENT_REFERENCE_REJECTED", "invalid file reference")
+    if not isinstance(file, dict):
+        raise _reference_rejected(file, "invalid file reference", reason="object_required")
+    if set(file) - set(FILE_INPUT_SCHEMA["properties"]):
+        raise _reference_rejected(file, "invalid file reference", reason="unsupported_fields")
     for key in ("download_url", "file_id"):
         if not isinstance(file.get(key), str) or not file[key]:
-            raise _reject("ATTACHMENT_REFERENCE_REJECTED", "missing file reference field")
+            raise _reference_rejected(
+                file, "missing file reference field", reason="required_field_missing", field=key
+            )
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,256}", file["file_id"]):
-        raise _reject("ATTACHMENT_REFERENCE_REJECTED", "invalid file identifier")
+        raise _reference_rejected(
+            file, "invalid file identifier", reason="identifier_format", field="file_id"
+        )
     for key in ("mime_type", "file_name"):
         if key in file and (not isinstance(file[key], str) or len(file[key]) > 1024):
-            raise _reject("ATTACHMENT_REFERENCE_REJECTED", "invalid file metadata")
+            raise _reference_rejected(
+                file, "invalid file metadata", reason="metadata_format", field=key
+            )
     url = file["download_url"]
     if len(url) > 8192 or any(ord(c) <= 32 or ord(c) >= 127 for c in url) or "\\" in url:
-        raise _reject("ATTACHMENT_REFERENCE_REJECTED", "invalid download URL")
+        raise _reference_rejected(
+            file, "invalid download URL", reason="download_url_format", field="download_url"
+        )
     try:
         parsed = urlsplit(url)
         host = parsed.hostname
@@ -96,11 +145,32 @@ def validate_reference(file: Any, allowed_hosts: list[str]) -> tuple[str, str]:
         valid = False
         host = None
     if not valid:
-        raise _reject("ATTACHMENT_REFERENCE_REJECTED", "HTTPS file URL on port 443 required")
+        raise _reference_rejected(
+            file, "HTTPS file URL on port 443 required",
+            reason="download_url_policy", field="download_url",
+        )
     if not allowed_hosts:
-        raise _reject("ATTACHMENT_IMPORT_NOT_CONFIGURED", "operator-approved file hosts required")
+        # Show only a validated DNS name so the operator can configure the actual
+        # delivery host. Never disclose the bearer URL, its path/query, or file ID.
+        try:
+            validate_allowed_hosts([host])
+        except ValueError:
+            raise _reference_rejected(
+                file, "invalid file-service host", reason="file_service_host_format"
+            ) from None
+        raise _reject(
+            "ATTACHMENT_IMPORT_NOT_CONFIGURED",
+            f"operator-approved file hosts required; observed file-service host: {host}",
+        )
     if host not in allowed_hosts:
-        raise _reject("ATTACHMENT_REFERENCE_REJECTED", "file host is not permitted")
+        error = _reference_rejected(file, "file host is not permitted", reason="host_not_permitted")
+        # 設定済みでも配信ホストが変わり得る。DNS 名だけを応答に示し、許可は追加しない。
+        try:
+            validate_allowed_hosts([host])
+        except ValueError:
+            raise error from None
+        message = str(error).removeprefix(f"{error.code}: ")
+        raise _reject(error.code, f"{message}; observed file-service host: {host}")
     return host, parsed.path + ("?" + parsed.query if parsed.query else "")
 
 

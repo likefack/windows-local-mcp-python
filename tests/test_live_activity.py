@@ -226,7 +226,7 @@ def test_transfer_begin_and_chunks_are_one_logical_lifecycle() -> None:
     audit = _FakeAudit([begin])
     tracker = LiveActivityTracker(audit)
     first = tracker.poll_once()
-    assert len(first) == 1 and "Running" in first[0] and "report.xlsx" in first[0]
+    assert len(first) == 1 and "Waiting" in first[0] and "report.xlsx" in first[0]
 
     # Chunk events append to the begin operation and do not change updated_at.
     audit.operations["download-op"]["events"].append(
@@ -281,7 +281,7 @@ def test_upload_commit_reuses_transfer_path_and_hides_begin_chunk_commit_noise()
     assert "artifact_upload" not in lines[0]
 
 
-def test_upload_chunks_are_running_until_commit_and_completed_pair_is_not_replayed() -> None:
+def test_upload_waits_for_commit_and_completed_pair_is_not_replayed() -> None:
     begin = _operation(
         "upload-begin-paired",
         "artifact_upload_begin",
@@ -293,7 +293,7 @@ def test_upload_chunks_are_running_until_commit_and_completed_pair_is_not_replay
         result={"transfer_id": "transfer-paired", "path": "paired.bin"},
         request={"transfer_id": "transfer-paired", "path": "paired.bin"},
     )
-    assert "Running" in (format_activity(begin) or "")
+    assert "Waiting" in (format_activity(begin) or "")
     audit = _FakeAudit([begin, commit])
     tracker = LiveActivityTracker(audit)
     # Both rows already represent a completed logical upload; baseline must not replay either.
@@ -301,7 +301,7 @@ def test_upload_chunks_are_running_until_commit_and_completed_pair_is_not_replay
     assert tracker.poll_once() == []
 
 
-def test_commit_arrival_does_not_duplicate_existing_logical_transfer_running_line() -> None:
+def test_commit_arrival_changes_waiting_transfer_to_running_once() -> None:
     begin = _operation(
         "upload-begin-running",
         "artifact_upload_begin",
@@ -317,7 +317,7 @@ def test_commit_arrival_does_not_duplicate_existing_logical_transfer_running_lin
     audit = _FakeAudit([begin])
     tracker = LiveActivityTracker(audit)
     first = tracker.poll_once()
-    assert len(first) == 1 and "Running" in first[0]
+    assert len(first) == 1 and "Waiting" in first[0]
     audit.add(
         _operation(
             "upload-commit-running",
@@ -327,6 +327,8 @@ def test_commit_arrival_does_not_duplicate_existing_logical_transfer_running_lin
             result={"transfer_id": "transfer-running", "path": "running.bin"},
         )
     )
+    lines = tracker.poll_once()
+    assert len(lines) == 1 and "Running" in lines[0]
     assert tracker.poll_once() == []
     audit.operations["upload-commit-running"]["status"] = "succeeded"
     audit.operations["upload-commit-running"]["updated_at"] = "2026-08-31T11:00:03+00:00"
@@ -353,7 +355,7 @@ def test_failed_upload_commit_stops_begin_lifecycle_without_replaying_running() 
     audit = _FakeAudit([begin])
     tracker = LiveActivityTracker(audit)
     first = tracker.poll_once()
-    assert len(first) == 1 and "Running" in first[0]
+    assert len(first) == 1 and "Waiting" in first[0]
     audit.add(commit)
     lines = tracker.poll_once()
     assert len(lines) == 1

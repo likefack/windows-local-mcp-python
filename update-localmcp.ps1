@@ -69,9 +69,19 @@ function Assert-UpdateSnapshot([string]$Root, [string]$ManifestHash) {
     if ($seen.Count -ne @($manifest.files.PSObject.Properties).Count) { throw 'Update snapshot is incomplete.' }
 }
 
-function Invoke-UpdatePython([string]$Python, [string]$Helper, [string[]]$Arguments) {
-    $output = @(& $Python -I -B -X utf8 $Helper @Arguments)
-    if ($LASTEXITCODE -ne 0) { throw "更新の検査に失敗しました: $($Arguments[0])" }
+function Invoke-UpdatePython([string]$Python, [string]$Helper, [string[]]$Arguments, [switch]$QuietFailure) {
+    # stderrも捕捉する。終了待ちの一時的な失敗は最後の診断だけを表示する。
+    $savedPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = @(& $Python -I -B -X utf8 $Helper @Arguments 2>&1)
+        $code = $LASTEXITCODE
+    } finally { $ErrorActionPreference = $savedPreference }
+    if ($code -ne 0) {
+        $detail = ($output | ForEach-Object { $_.ToString() }) -join "`n"
+        if (-not $QuietFailure -and $detail) { Write-Host $detail }
+        throw "更新の検査に失敗しました: $($Arguments[0])`n$detail"
+    }
     if ($output.Count) { return (($output -join "`n") | ConvertFrom-Json) }
 }
 
@@ -82,6 +92,77 @@ function Assert-UpdateAuthorityIdle {
     foreach ($name in @('active.json', 'active-status.json', 'recovery_required')) {
         if ($name -in $names) { throw 'Approved Host has active or recovery state. Update cancelled.' }
     }
+}
+
+function Stop-UpdateTunnel([object]$State, [object]$Binding) {
+    $status = Get-TunnelProcessStatus -PidFile $State.pid_file -ClientPath $Binding.ClientPath -ProfilePath $Binding.ProfilePath
+    if ($status.Status -in @('absent', 'stale')) { return }
+    if ($status.Status -ne 'running') { throw '終了するTunnelを識別できません。更新を中止します。' }
+    $process = Get-Process -Id $status.ProcessId -ErrorAction Stop
+    try {
+        # ハンドルを先に確保し、PIDの再利用や曖昧なprofile一致による誤終了を防ぐ。
+        $null = $process.Handle
+        $cim = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$($process.Id)" -ErrorAction Stop
+        $profilePattern = '(?i)(?:^|\s)--profile-file\s+(?:"' + [regex]::Escape($Binding.ProfilePath) + '"|' + [regex]::Escape($Binding.ProfilePath) + ')(?=\s|$)'
+        if ($process.HasExited -or $null -eq $cim -or
+            -not ([string]$cim.ExecutablePath).Equals($Binding.ClientPath, [StringComparison]::OrdinalIgnoreCase) -or
+            ([string]$cim.CommandLine) -notmatch $profilePattern) {
+            throw 'Tunnelの識別情報が変わったため終了しませんでした。'
+        }
+        Write-Host '更新対象のTunnelを終了し、サーバーと起動ウィンドウの終了処理を待ちます。'
+        # 対象の接続だけを閉じる。子サーバー・承認UI・authorityの一括強制終了はしない。
+        $process.Kill()
+        if (-not $process.WaitForExit(10000)) { throw 'Tunnelの終了を確認できませんでした。' }
+    } finally { $process.Dispose() }
+}
+
+function Start-UpdateAuthority([string]$InstallRoot, [string]$UserSid) {
+    if (-not (Test-UpdateAdministrator)) { throw '監視サービスの開始には管理者権限が必要です。' }
+    if ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value -ne $UserSid) { throw '同じユーザーのUAC承認が必要です。' }
+    $root = Assert-UpdatePath $InstallRoot
+    $python = Join-Path $root 'runtime\Scripts\python.exe'
+    $stateRoot = Join-Path $env:ProgramData 'WindowsLocalMCP\ApprovedHostAuthority'
+    $expected = '"' + $python + '" -I -B -m windows_local_mcp.approved_host_service_entry --runtime-sid "' + $UserSid + '" --state-root "' + $stateRoot + '"'
+    $service = Get-CimInstance -ClassName Win32_Service -Filter "Name='WindowsLocalMCPApprovedHost'"
+    if ($null -eq $service -or $service.StartName -ne 'LocalSystem' -or $service.PathName -ne $expected) {
+        throw '監視サービスの登録先が更新対象と一致しません。'
+    }
+    # 登録・ACL・復旧状態は変更せず、確認済みの既存サービスだけを開始する。
+    if ($service.State -eq 'Stopped') { Start-Service -Name 'WindowsLocalMCPApprovedHost' }
+    elseif ($service.State -ne 'Running') { throw '監視サービスは状態移行中です。後で再実行してください。' }
+    (Get-Service -Name 'WindowsLocalMCPApprovedHost').WaitForStatus('Running', [TimeSpan]::FromSeconds(30))
+}
+
+function Ensure-UpdateAuthority([string]$InstallRoot) {
+    $service = Get-Service -Name 'WindowsLocalMCPApprovedHost' -ErrorAction Stop
+    if ($service.Status -eq 'Running') { return }
+    if ($service.Status -ne 'Stopped') { throw '監視サービスは状態移行中です。後で再実行してください。' }
+    Write-Host '監視サービスが停止しています。Windowsの確認で「はい」を選ぶと既存サービスを開始します。'
+    $scriptPath = (Join-Path $PSScriptRoot 'update-localmcp.ps1').Replace("'", "''")
+    $root = $InstallRoot.Replace("'", "''")
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $hash = Get-UpdateHash (Join-Path $PSScriptRoot 'update-localmcp.ps1')
+    # UAC起動までにスクリプトが変わっていないことを、読み込み前に検査する。
+    $code = "`$ErrorActionPreference='Stop'; try { if ((Get-FileHash -LiteralPath '$scriptPath' -Algorithm SHA256).Hash -ne '$hash') { throw 'Updater changed' }; . '$scriptPath'; Start-UpdateAuthority '$root' '$sid'; exit 0 } catch { exit 1 }"
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($code))
+    $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $child = Start-Process -FilePath $powershell -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $encoded) -Verb RunAs -WindowStyle Hidden -PassThru
+    try {
+        if (-not $child.WaitForExit(60000)) { throw '監視サービス開始の確認が時間切れになりました。更新は行いません。' }
+        if ($child.ExitCode -ne 0 -or (Get-Service -Name 'WindowsLocalMCPApprovedHost').Status -ne 'Running') {
+            throw '監視サービスを開始できませんでした。サービスの登録と状態を確認してください。'
+        }
+    } finally { $child.Dispose() }
+}
+
+function Wait-UpdateOffline([string]$Python, [string]$Helper, [string[]]$Arguments) {
+    # 接続終了後、stdioのEOFと起動側finallyによる後片付けを最大30秒待つ。
+    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    do {
+        try { Invoke-UpdatePython $Python $Helper $Arguments -QuietFailure | Out-Null; return }
+        catch { if ([DateTime]::UtcNow -ge $deadline) { throw } }
+        Start-Sleep -Milliseconds 500
+    } while ($true)
 }
 
 function Wait-UpdateDecision([object]$Plan, [string]$Phase) {
@@ -143,9 +224,10 @@ function Invoke-ElevatedUpdate([object]$Plan) {
         if ((Get-UpdateHash (Join-Path $install 'run-server.ps1')) -ne $Plan.old_server_sha256) { throw 'Installed launcher changed.' }
         Assert-UpdateAuthorityIdle
         Invoke-UpdatePython $oldPython $helper $Plan.offline_arguments | Out-Null
-        $service = Get-CimInstance Win32_Service -Filter "Name='$serviceName'"
-        if ($null -eq $service -or $service.State -ne 'Running' -or
-            $service.PathName.IndexOf($install + '\', [StringComparison]::OrdinalIgnoreCase) -lt 0) {
+        $service = Get-Service -Name $serviceName
+        $serviceImage = (Get-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\$serviceName").ImagePath
+        if ($service.Status -ne 'Running' -or
+            $serviceImage.IndexOf($install + '\', [StringComparison]::OrdinalIgnoreCase) -lt 0) {
             throw 'The installed Approved Host authority service must be running from this runtime.'
         }
 
@@ -162,7 +244,8 @@ function Invoke-ElevatedUpdate([object]$Plan) {
         if ((Get-UpdateHash $constraints) -ne $Plan.constraints_sha256) { throw 'Dependency constraints changed.' }
         Copy-Item -LiteralPath $constraints -Destination (Join-Path $protectedSource 'update-constraints.txt')
         if ((Get-UpdateHash (Join-Path $protectedSource 'update-constraints.txt')) -ne $Plan.constraints_sha256) { throw 'Dependency constraints changed during copying.' }
-        $env:PIP_CONSTRAINT = Join-Path $protectedSource 'update-constraints.txt'
+        # pip はこの環境変数を空白で分割する。file URI で空白・日本語を保持する。
+        $env:PIP_CONSTRAINT = ([Uri](Join-Path $protectedSource 'update-constraints.txt')).AbsoluteUri
         Set-UpdateStatus $Plan 'building'
         # Never use -Replace: the working runtime and its ACLs remain intact while building.
         & (Join-Path $protectedSource 'install-approved-host-runtime.ps1') `
@@ -273,7 +356,6 @@ function Invoke-LocalMcpUpdate {
     $finalStatus = ''
     try {
         try { $held = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $held = $true }
-        if (-not $held -and -not $PrepareOnly) { throw 'LocalMCP が起動中です。起動ウィンドウと承認画面を閉じてから、このバッチを再実行してください。' }
         $binding = Test-TunnelProfileBinding -State $state -ConfigPath $Config -ServerScript $runtime.ServerScript `
             -ProfileRoot (Join-Path $stateRoot 'tunnel-profiles') -StateRoot $stateRoot
         if (-not $binding.Valid) { throw $binding.Message }
@@ -281,7 +363,23 @@ function Invoke-LocalMcpUpdate {
         $offlineArguments = @('offline', '--config', $Config, '--install-root', $install, '--launcher-root', $sourceRoot, '--profile', $state.profile_path)
         Write-Host '[1/5] 対象と停止状態を確認しています。'
         if (-not $PrepareOnly) {
-            Invoke-UpdatePython $runtime.PythonPath $helper $offlineArguments | Out-Null
+            if ($Check) {
+                if (-not $held) { throw 'LocalMCP が起動中です。確認のみのためサーバーは終了しません。' }
+                Invoke-UpdatePython $runtime.PythonPath $helper $offlineArguments | Out-Null
+            } else {
+                Ensure-UpdateAuthority $install
+                Invoke-UpdatePython $runtime.PythonPath $helper @('authority') | Out-Null
+                # 処理・承認・復旧待ちを確認してから接続を終了する。
+                Invoke-UpdatePython $runtime.PythonPath $helper @('idle', '--config', $Config) | Out-Null
+                if ((Get-UpdateHash $statePath) -ne $stateHash) { throw '終了前にTunnelの設定が変更されました。' }
+                Stop-UpdateTunnel $state $binding
+                Invoke-UpdatePython $runtime.PythonPath $helper @('close-ui', '--config', $Config, '--install-root', $install) | Out-Null
+                if (-not $held) {
+                    try { $held = $mutex.WaitOne(30000) } catch [Threading.AbandonedMutexException] { $held = $true }
+                    if (-not $held) { throw 'サーバー起動側の終了を30秒以内に確認できませんでした。' }
+                }
+                Wait-UpdateOffline $runtime.PythonPath $helper $offlineArguments
+            }
             $status = Get-TunnelProcessStatus -PidFile $state.pid_file -ClientPath $binding.ClientPath -ProfilePath $binding.ProfilePath
             if ($status.Status -notin @('absent', 'stale')) { throw '対象のTunnelが起動中、または識別できません。LocalMCPを閉じてから再実行してください。' }
         }
@@ -403,7 +501,8 @@ function Invoke-LocalMcpUpdate {
             $launchEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($launch))
             Start-Process -FilePath $powershell -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $launchEncoded) -WindowStyle Hidden | Out-Null
             $ready = Wait-TunnelReady -HealthUrlFile $state.health_url_file -TimeoutSeconds 60
-            if (-not $ready.Ready) { throw '運用版は更新済みですが、Tunnelの接続準備を確認できません。run-localmcp.bat を起動して診断を確認してください。' }
+            $running = Get-TunnelProcessStatus -PidFile $state.pid_file -ClientPath $binding.ClientPath -ProfilePath $binding.ProfilePath
+            if (-not $ready.Ready -or $running.Status -ne 'running') { throw '運用版は更新済みですが、正規のTunnelと接続準備を確認できません。run-localmcp.bat を起動して診断を確認してください。' }
             Write-Host 'Tunnelの接続準備が完了しました。'
         }
     } finally {

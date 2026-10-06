@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -50,15 +51,127 @@ if ($errors.Count) {{ throw 'parse failed' }}
     assert result.returncode == 0, result.stderr
 
 
+@pytest.mark.parametrize("state", ["absent", "stale", "running", "indeterminate", "changed", "prefix"])
+def test_stop_update_tunnel_only_terminates_verified_connection(tmp_path: Path, state: str) -> None:
+    # 実プロセスは終了させず、識別失敗時にKillへ到達しないことを検査する。
+    result = run_ps(tmp_path, f"""
+$script:killed = $false
+$script:disposed = $false
+$script:rejected = $false
+function Get-TunnelProcessStatus {{
+    return [PSCustomObject]@{{ Status=$(if ({ps_literal(state)} -in @('changed', 'prefix')) {{ 'running' }} else {{ {ps_literal(state)} }}); ProcessId=123 }}
+}}
+function Get-Process {{
+    $p = [PSCustomObject]@{{ Id=123; Handle=1; HasExited=$false }}
+    $p | Add-Member ScriptMethod Kill {{ $script:killed=$true }}
+    $p | Add-Member ScriptMethod WaitForExit {{ param($timeout); return $true }}
+    $p | Add-Member ScriptMethod Dispose {{ $script:disposed=$true }}
+    return $p
+}}
+function Get-CimInstance {{
+    return [PSCustomObject]@{{
+        ExecutablePath=$(if ({ps_literal(state)} -eq 'changed') {{ 'C:\\other.exe' }} else {{ 'C:\\client.exe' }})
+        CommandLine=$(if ({ps_literal(state)} -eq 'prefix') {{ 'client run --profile-file "C:\\日本語 profile.json.extra"' }} else {{ 'client run --profile-file "C:\\日本語 profile.json"' }})
+    }}
+}}
+try {{ Stop-UpdateTunnel ([PSCustomObject]@{{pid_file='unused'}}) ([PSCustomObject]@{{ClientPath='C:\\client.exe';ProfilePath='C:\\日本語 profile.json'}}) }}
+catch {{ $script:rejected=$true }}
+@{{killed=$script:killed;rejected=$script:rejected;disposed=$script:disposed}} | ConvertTo-Json -Compress
+""")
+    assert result.returncode == 0, result.stderr
+    actual = json.loads(result.stdout.strip().splitlines()[-1])
+    assert actual["killed"] is (state == "running")
+    assert actual["rejected"] is (state in {"indeterminate", "changed", "prefix"})
+    assert actual["disposed"] is (state in {"running", "changed", "prefix"})
+
+
+def test_wait_update_offline_rechecks_after_server_cleanup(tmp_path: Path) -> None:
+    result = run_ps(tmp_path, """
+$script:attempts=0
+function Invoke-UpdatePython {
+    param($Python, $Helper, $Arguments)
+    $script:attempts++
+    if ($script:attempts -lt 3) { throw 'server is exiting' }
+}
+function Start-Sleep { }
+Wait-UpdateOffline 'python' 'helper' @('offline')
+if ($script:attempts -ne 3) { throw 'missing recheck' }
+""")
+    assert result.returncode == 0, result.stderr
+
+
+def test_quiet_update_probe_preserves_final_error_without_repeated_output(tmp_path: Path) -> None:
+    helper = tmp_path / "probe.py"
+    helper.write_text(
+        'import sys\nprint("remaining approval process", file=sys.stderr)\nsys.exit(1)\n',
+        encoding="utf-8",
+    )
+    result = run_ps(tmp_path, f"""
+try {{
+    Invoke-UpdatePython {ps_literal(sys.executable)} {ps_literal(helper)} @('offline') -QuietFailure
+    throw 'unexpected success'
+}} catch {{
+    if ($_.Exception.Message -notmatch 'remaining approval process') {{ throw }}
+}}
+Write-Output 'captured'
+""")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "captured"
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize("state", ["Stopped", "Running", "Start Pending", "wrong-path", "wrong-user"])
+def test_authority_start_preserves_registration_and_checks_binding(tmp_path: Path, state: str) -> None:
+    result = run_ps(tmp_path, f"""
+$script:started=$false
+$script:rejected=$false
+function Test-UpdateAdministrator {{ return $true }}
+function Assert-UpdatePath {{ param($Path); return $Path }}
+$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$root='C:\\Program Files\\WindowsLocalMCP'
+$expected='"' + (Join-Path $root 'runtime\\Scripts\\python.exe') + '" -I -B -m windows_local_mcp.approved_host_service_entry --runtime-sid "' + $sid + '" --state-root "' + (Join-Path $env:ProgramData 'WindowsLocalMCP\\ApprovedHostAuthority') + '"'
+function Get-CimInstance {{
+    return [PSCustomObject]@{{
+        State={ps_literal(state)}
+        StartName=$(if ({ps_literal(state)} -eq 'wrong-user') {{ 'Other' }} else {{ 'LocalSystem' }})
+        PathName=$(if ({ps_literal(state)} -eq 'wrong-path') {{ 'other.exe' }} else {{ $expected }})
+    }}
+}}
+function Start-Service {{ $script:started=$true }}
+function Get-Service {{
+    $s=[PSCustomObject]@{{Status='Running'}}
+    $s | Add-Member ScriptMethod WaitForStatus {{param($state,$timeout)}}
+    return $s
+}}
+try {{ Start-UpdateAuthority $root $sid }} catch {{ $script:rejected=$true }}
+@{{started=$script:started;rejected=$script:rejected}} | ConvertTo-Json -Compress
+""")
+    assert result.returncode == 0, result.stderr
+    actual = json.loads(result.stdout.strip().splitlines()[-1])
+    assert actual["started"] is (state == "Stopped")
+    assert actual["rejected"] is (state not in {"Stopped", "Running"})
+
+
 @pytest.mark.parametrize("failure", ["none", "staged", "switched", "build", "idle"])
 def test_update_transaction_preserves_previous_runtime(tmp_path: Path, failure: str) -> None:
     source = tmp_path / "source"
     source.mkdir()
     (source / "scripts").mkdir()
     (source / "scripts/runtime_update_support.py").write_text("# fixture\n", encoding="utf-8")
+    # 実 pip の環境変数解析と file URI 読み込みで、Program Files 等の空白を検証する。
+    read_constraint = (
+        "from pip._internal.commands import create_command; "
+        "from pip._internal.network.session import PipSession; "
+        "from pip._internal.req.req_file import get_file_content; "
+        "options, _ = create_command('install').parse_args([]); "
+        "assert len(options.constraints) == 1; "
+        "assert get_file_content(options.constraints[0], PipSession())[1] == '# fixture'"
+    )
     (source / "install-approved-host-runtime.ps1").write_text(
         "param($BasePython, $InstallRoot, $RuntimeUser)\n"
         + ("throw 'build failed'\n" if failure == "build" else "")
+        + f"& {ps_literal(sys.executable)} -I -B -c {ps_literal(read_constraint)}\n"
+        + "if ($LASTEXITCODE -ne 0) { throw 'pip could not read the dependency constraints' }\n"
         + "New-Item -ItemType Directory -Path (Join-Path $InstallRoot 'runtime/Scripts') -Force | Out-Null\n"
         "Set-Content -LiteralPath (Join-Path $InstallRoot 'runtime/Scripts/python.exe') -Value 'new'\n"
         "Set-Content -LiteralPath (Join-Path $InstallRoot 'run-server.ps1') -Value 'new'\n",
@@ -81,6 +194,7 @@ function Start-Transcript {{ }}
 function Stop-Transcript {{ }}
 function icacls.exe {{ $global:LASTEXITCODE = 0 }}
 function Get-CimInstance {{ return [PSCustomObject]@{{ State='Running'; PathName={ps_literal(install / 'runtime/Scripts/python.exe')} }} }}
+function Get-ItemProperty {{ return [PSCustomObject]@{{ ImagePath={ps_literal(install / 'runtime/Scripts/python.exe')} }} }}
 function Stop-Service {{ $script:stopped = $true }}
 function Start-Service {{ $script:stopped = $false }}
 function Get-Service {{
@@ -92,7 +206,7 @@ function Wait-UpdateDecision {{ param($Plan, $Phase); if ($Phase -eq {ps_literal
 $plan = [PSCustomObject]@{{
     task_root={ps_literal(tmp_path)}; source={ps_literal(source)}; install_root={ps_literal(install)}
     ready_root={ps_literal(tmp_path / 'ready')}; backup_root={ps_literal(tmp_path / 'backup')}
-    failed_root={ps_literal(tmp_path / 'failed')}; protected_source={ps_literal(tmp_path / 'protected-source')}
+    failed_root={ps_literal(tmp_path / 'failed')}; protected_source={ps_literal(tmp_path / 'protected source 日本語')}
     config={ps_literal(tmp_path / 'config.toml')}; config_sha256=(Get-UpdateHash {ps_literal(tmp_path / 'config.toml')})
     old_server_sha256=(Get-UpdateHash {ps_literal(install / 'run-server.ps1')})
     constraints_sha256=(Get-UpdateHash {ps_literal(tmp_path / 'constraints.txt')})
@@ -106,11 +220,11 @@ if (-not (Test-Path {ps_literal(tmp_path / 'status.json')})) {{ throw 'No transa
     state = json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))["status"]
     current = (install / "run-server.ps1").read_text(encoding="utf-8").strip()
     if failure == "none":
-        assert state == "installed"
+        assert state == "installed", result.stdout + result.stderr
         assert current == "new"
         assert (tmp_path / "backup/run-server.ps1").read_text(encoding="utf-8") == "old"
     elif failure == "switched":
-        assert state == "rolled_back"
+        assert state == "rolled_back", result.stdout + result.stderr
         assert current == "old"
         assert (tmp_path / "failed/run-server.ps1").read_text(encoding="utf-8").strip() == "new"
     else:

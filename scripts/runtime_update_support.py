@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib.metadata
+import itertools
 import json
 import ntpath
 import os
@@ -339,12 +340,72 @@ def assert_no_runtime_processes(
 ) -> int:
     import psutil
 
-    current_user = psutil.Process().username().casefold()
+    current_process = psutil.Process()
+    current_user = current_process.username().casefold()
+    launcher_identity: tuple[int, float] | None = None
+    base_executable = getattr(sys, "_base_executable", None)
+    if (
+        os.name == "nt"
+        and isinstance(base_executable, str)
+        and not _same_path(sys.executable, base_executable)
+    ):
+        try:
+            # Windows venv は起動用 python.exe が即親として残る。実行ファイル、
+            # 引数列、起動順を確認できたその一個だけを、自分の起動処理として扱う。
+            parent = current_process.parent()
+            if (
+                parent is not None
+                and _same_path(parent.exe(), sys.executable)
+                and _same_path(current_process.exe(), base_executable)
+            ):
+                current_arguments = current_process.cmdline()
+                parent_created = parent.create_time()
+                if (
+                    current_arguments
+                    and current_arguments == parent.cmdline()
+                    and 0 < parent_created <= current_process.create_time()
+                    and current_process.ppid() == parent.pid
+                    and parent.is_running()
+                ):
+                    launcher_identity = (parent.pid, parent_created)
+        except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+            # 証拠を取得できない親は除外せず、通常の対象プロセス検査へ回す。
+            pass
     # service 本体は停止前検査でも常駐する。PS 側が service executable と
-    # install_root の binding を別途確認する前提で、SCM が返す当該 PID のみ除外する。
+    # install_root の binding を別途確認する前提で、SCM が返す当該 PID を除外する。
     service_pid = _authority_service_pid()
     if not isinstance(service_pid, int) or service_pid < 0:
         raise UpdateCheckError("Approved Host service の PID を確認できません。")
+    service_launcher_identity: tuple[int, float, float] | None = None
+    if os.name == "nt" and service_pid > 0 and isinstance(base_executable, str):
+        try:
+            service_process = psutil.Process(service_pid)
+            service_parent = service_process.parent()
+            if (
+                service_parent is not None
+                and _same_path(service_process.exe(), base_executable)
+                and _same_path(
+                    service_parent.exe(), install_root / "runtime" / "Scripts" / "python.exe"
+                )
+            ):
+                parent_created = service_parent.create_time()
+                service_created = service_process.create_time()
+                if (
+                    0 < parent_created <= service_created
+                    and service_process.ppid() == service_parent.pid
+                    and service_process.is_running()
+                    and service_parent.is_running()
+                ):
+                    # SYSTEM の引数列・username は通常ユーザーから取得できない。
+                    # SCM が指定した本体の即親だけを実行ファイルと生成時刻に束縛する。
+                    service_launcher_identity = (
+                        service_parent.pid,
+                        parent_created,
+                        service_created,
+                    )
+        except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+            # worker や未確認の ancestor をまとめて除外してはならない。
+            pass
     checked = 0
     for process in psutil.process_iter(
         ["pid", "name", "exe", "cmdline", "username"], ad_value=None
@@ -352,6 +413,32 @@ def assert_no_runtime_processes(
         if process.pid == os.getpid() or (service_pid > 0 and process.pid == service_pid):
             continue
         try:
+            if (
+                launcher_identity is not None
+                and process.pid == launcher_identity[0]
+                and process.create_time() == launcher_identity[1]
+                and process.is_running()
+            ):
+                # 列挙時にも作成時刻を照合し、再利用された同じ PID は除外しない。
+                continue
+            if (
+                service_launcher_identity is not None
+                and process.pid == service_launcher_identity[0]
+                and process.create_time() == service_launcher_identity[1]
+                and process.is_running()
+            ):
+                try:
+                    # 本体側の PID 再利用・終了・親の変化も列挙時に検出する。
+                    service_now = psutil.Process(service_pid)
+                    if (
+                        service_now.create_time() == service_launcher_identity[2]
+                        and service_now.ppid() == process.pid
+                        and service_now.is_running()
+                    ):
+                        continue
+                except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+                    # 本体の消滅で、まだ生きている親の通常検査を飛ばさない。
+                    pass
             info = process.info
             name = str(info.get("name") or "").casefold()
             executable = info.get("exe")
@@ -409,9 +496,8 @@ def audit_nonterminal_count(database: Path) -> int:
     return int(row[0])
 
 
-def offline(
-    config: Path, install_root: Path, launcher_root: Path, profile: Path | None = None
-) -> dict[str, Any]:
+def idle(config: Path) -> dict[str, Any]:
+    """サーバー終了前に処理・復旧状態だけを読み取り確認する。"""
     from windows_local_mcp.config import validate_configuration_candidate
     from windows_local_mcp.workspace_history import workspace_recovery_required
 
@@ -433,21 +519,169 @@ def offline(
         raise UpdateCheckError("workspace の復旧待ちが残っています。")
     if audit_nonterminal_count(settings.data_dir / "audit.db"):
         raise UpdateCheckError("監査DBに未完了の処理が残っています。")
-    checked = assert_no_runtime_processes(
-        install_root=install_root, launcher_root=launcher_root, config=config, profile=profile
-    )
     return {
         "data_dir": str(settings.data_dir),
         "workspace_root": str(settings.workspace_root),
-        "checked_process_count": checked,
         "nonterminal_count": 0,
     }
+
+
+def offline(
+    config: Path, install_root: Path, launcher_root: Path, profile: Path | None = None
+) -> dict[str, Any]:
+    result = idle(config)
+    checked = assert_no_runtime_processes(
+        install_root=install_root, launcher_root=launcher_root, config=config, profile=profile
+    )
+    return {**result, "checked_process_count": checked}
+
+
+def _approval_process_chain(process: Any, install_root: Path, config: Path) -> list[Any]:
+    """設定が明示された専用 PowerShell と、直接起動した承認 UI だけを認める。"""
+    import psutil
+
+    try:
+        executable = str(install_root / "runtime" / "Scripts" / "python.exe")
+        expected = [executable, "-I", "-B", "-m", "windows_local_mcp.cli", "approvals"]
+        # 他プロセスの引数読み取りは高コストになり得るため、実行ファイルで先に絞る。
+        if not _same_path(process.exe(), executable):
+            return []
+        arguments = process.cmdline()
+        if (
+            not arguments
+            or not _same_path(arguments[0], executable)
+            or arguments[1:] != expected[1:]
+        ):
+            return []
+        wrapper = process.parent()
+        if wrapper is None:
+            return []
+        powershell = ntpath.join(
+            os.environ.get("SystemRoot", "C:\\Windows"),
+            "System32",
+            "WindowsPowerShell",
+            "v1.0",
+            "powershell.exe",
+        )
+        if not _same_path(wrapper.exe(), powershell):
+            return []
+        args = wrapper.cmdline()
+        if (
+            len(args) != 8
+            or not _same_path(args[0], powershell)
+            or [item.casefold() for item in args[1:5]]
+            != ["-noprofile", "-executionpolicy", "bypass", "-file"]
+            or not _same_path(args[5], install_root / "run-approvals.ps1")
+            or args[6].casefold() != "-config"
+            or not _same_path(args[7], config)
+        ):
+            return []
+        chain = [wrapper, process]
+        children = process.children()
+        if len(children) != 1:
+            return []
+        child = children[0]
+        base = getattr(sys, "_base_executable", "")
+        if not base or not _same_path(child.exe(), base) or child.cmdline() != arguments:
+            return []
+        chain.append(child)
+        user = psutil.Process().username().casefold()
+        if any(item.username().casefold() != user or not item.is_running() for item in chain):
+            return []
+        for parent, descendant in itertools.pairwise(chain):
+            if descendant.ppid() != parent.pid or not (
+                0 < parent.create_time() <= descendant.create_time()
+            ):
+                return []
+        return chain
+    except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+        return []
+
+
+def _interrupt_approval_console(chain: list[Any], recheck: Any) -> None:
+    """専用コンソールに Ctrl+C を通知する。共有コンソールと強制終了は使わない。"""
+    import ctypes
+    from ctypes import wintypes
+
+    api = ctypes.WinDLL("kernel32", use_last_error=True)
+    api.FreeConsole.argtypes, api.FreeConsole.restype = [], wintypes.BOOL
+    api.AttachConsole.argtypes, api.AttachConsole.restype = [wintypes.DWORD], wintypes.BOOL
+    api.GetConsoleProcessList.argtypes = [ctypes.POINTER(wintypes.DWORD), wintypes.DWORD]
+    api.GetConsoleProcessList.restype = wintypes.DWORD
+    api.SetConsoleCtrlHandler.argtypes = [ctypes.c_void_p, wintypes.BOOL]
+    api.SetConsoleCtrlHandler.restype = wintypes.BOOL
+    api.GenerateConsoleCtrlEvent.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    api.GenerateConsoleCtrlEvent.restype = wintypes.BOOL
+    api.FreeConsole()
+    if not api.AttachConsole(chain[0].pid):
+        raise UpdateCheckError("承認UIの専用コンソールに接続できません。")
+    try:
+        # AttachConsole はハンドラを初期化するため、接続後に自身の無視を設定する。
+        if not api.SetConsoleCtrlHandler(None, True):
+            raise UpdateCheckError("承認UIの終了通知を準備できません。")
+        recheck()
+        pids = (wintypes.DWORD * 64)()
+        count = api.GetConsoleProcessList(pids, len(pids))
+        expected = {item.pid for item in chain} | {os.getpid()}
+        if not count or count > len(pids) or set(pids[:count]) != expected:
+            raise UpdateCheckError("承認UIのコンソールを他の処理が共有しているため終了できません。")
+        if not api.GenerateConsoleCtrlEvent(0, 0):
+            raise UpdateCheckError("承認UIへ通常終了を通知できません。")
+    finally:
+        # 呼び出し元のパイプは保持するが、別コンソールへ通知が漏れないよう離脱する。
+        api.FreeConsole()
+
+
+def close_ui(config: Path, install_root: Path) -> dict[str, Any]:
+    import psutil
+
+    if os.name != "nt":
+        raise UpdateCheckError("承認UIの通常終了には Windows が必要です。")
+    authority()
+    idle(config)
+    notified = 0
+    for process in psutil.process_iter():
+        chain = _approval_process_chain(process, install_root, config)
+        if not chain:
+            continue
+        identities = [(item.pid, item.create_time()) for item in chain]
+
+        def recheck(process: Any = process, identities: list = identities) -> None:
+            # 通知直前にも承認待ち・復旧状態と PID 再利用を再確認する。
+            authority()
+            idle(config)
+            current = _approval_process_chain(process, install_root, config)
+            if [(item.pid, item.create_time()) for item in current] != identities:
+                raise UpdateCheckError("承認UIの所属が終了通知前に変化しました。")
+
+        _interrupt_approval_console(chain, recheck)
+        _, alive = psutil.wait_procs(chain, timeout=10)
+        if alive:
+            raise UpdateCheckError("承認UIの通常終了が完了しませんでした。強制終了は行いません。")
+        notified += 1
+    return {"closed_approval_ui_count": notified}
 
 
 def smoke(scratch: Path, source: Path | None = None) -> dict[str, Any]:
     import anyio
     from mcp import Client, StdioServerParameters
     from mcp.client.stdio import stdio_client
+
+    from windows_local_mcp.approved_host_policy import (
+        _authority_service_installed,
+        assert_approved_host_authority_available,
+    )
+
+    # 一時設定でも導入済み監視サービスの健全性保証は維持する。
+    # 停止中なら MCP の匿名化された tool error に埋もれる前に原因を案内する。
+    if _authority_service_installed():
+        try:
+            assert_approved_host_authority_available()
+        except Exception as error:
+            raise UpdateCheckError(
+                "Approved Host 監視サービスに接続できないか、正常な状態ではありません。"
+                "WindowsLocalMCPApprovedHost の起動状態と復旧状態を確認してください。"
+            ) from error
 
     _assert_no_reparse(scratch)
     scratch.mkdir(parents=True, exist_ok=True)
@@ -557,6 +791,11 @@ def main(argv: list[str] | None = None) -> int:
     for option in ("config", "install-root", "launcher-root"):
         offline_parser.add_argument(f"--{option}", type=Path, required=True)
     offline_parser.add_argument("--profile", type=Path)
+    idle_parser = commands.add_parser("idle")
+    idle_parser.add_argument("--config", type=Path, required=True)
+    close_ui_parser = commands.add_parser("close-ui")
+    close_ui_parser.add_argument("--config", type=Path, required=True)
+    close_ui_parser.add_argument("--install-root", type=Path, required=True)
     smoke_parser = commands.add_parser("smoke")
     smoke_parser.add_argument("--scratch", type=Path, required=True)
     smoke_parser.add_argument("--source", type=Path)
@@ -564,18 +803,36 @@ def main(argv: list[str] | None = None) -> int:
     arguments = vars(parser.parse_args(argv))
     command = arguments.pop("command")
     try:
-        result = globals()[command](**arguments)
+        result = globals()[command.replace("-", "_")](**arguments)
     except UpdateCheckError as error:
         print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False), file=sys.stderr)
         return 1
     except Exception as error:  # noqa: BLE001 -- CLI 境界で例外内の秘密情報を出力しない。
         # ライブラリ例外は入力や秘密情報を含み得るため型名だけを返す。
+        details: dict[str, Any] = {}
+        if isinstance(error, BaseExceptionGroup):
+            # TaskGroup は検査自身の安全な診断も包むため、有限個の末端を取り出す。
+            pending: list[BaseException] = [error]
+            leaves: list[BaseException] = []
+            for _ in range(64):
+                if not pending or len(leaves) >= 8:
+                    break
+                item = pending.pop()
+                if isinstance(item, BaseExceptionGroup):
+                    pending.extend(item.exceptions[:8])
+                else:
+                    leaves.append(item)
+            details["cause_types"] = sorted({type(item).__name__ for item in leaves})
+            checks = [str(item) for item in leaves if isinstance(item, UpdateCheckError)]
+            if checks:
+                details["check_errors"] = checks
         print(
             json.dumps(
                 {
                     "ok": False,
                     "error": "更新検証を完了できませんでした。",
                     "error_type": type(error).__name__,
+                    **details,
                 },
                 ensure_ascii=False,
             ),

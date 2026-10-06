@@ -165,7 +165,7 @@ def run_approval_ui(settings: Settings | None = None) -> None:
     executor = Executor(settings, audit)
     print(f"Audit DB: {audit.db_path}")
     print(
-        "Live activity: Read / Edited / Running / Finished / Approval / Uploaded / "
+        "Live activity: Read / Edited / Running / Waiting / Finished / Approval / Uploaded / "
         "Downloaded / Failed / Rejected / Interrupted / Cancelled / Undone / Rolled back"
     )
     print("局所変更は完全な差分、一括処理は変更件数・概要・所要時間を表示します。")

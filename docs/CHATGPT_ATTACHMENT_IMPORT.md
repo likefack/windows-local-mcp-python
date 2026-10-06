@@ -32,6 +32,14 @@ ChatGPTは `download_url` と `file_id`、任意で `mime_type` と `file_name` 
    小文字DNS名を、信頼済みローカル設定 `attachment_import_allowed_hosts` に登録する。
    初期値は空。推測したOpenAIドメイン、共有クラウド全体、ワイルドカードは登録しない。
    一時URLや署名クエリを設定ファイル、チャット、監査へ貼り付けない。
+   未設定時の `ATTACHMENT_IMPORT_NOT_CONFIGURED` は、実際の参照から取得した検証済みDNSホスト名だけを
+   応答に表示する。これを確認の手掛かりとして使い、表示されたことだけを理由に自動許可しない。
+   URLのパス・署名クエリ・ファイルIDは表示しない。監査にはホスト名も保存しない。
+   許可ホストが設定済みでも、別の配信ホストに切り替わると
+   `ATTACHMENT_REFERENCE_REJECTED`（`reason=host_not_permitted`）で拒否する。
+   この場合もDNS形式の検査に通った実ホスト名だけを応答へ表示し、監査には保存しない。
+   既存の1件が別の画像でも使われるとは限らない。追加先の信頼性を確認し、
+   必要な正確なホストだけを管理者が追加する。ワイルドカードへの拡大や自動追加はしない。
 2. 通常の配備手順でサーバーを更新・再起動し、ChatGPT側でもツール定義を更新する。
    immutable runtimeを使う環境ではソース変更だけでは配備されない。
 3. ファイルを添付し、`artifact_import_file(file=<ChatGPTが渡す参照>, path="cards/input.jpg")`
@@ -45,6 +53,25 @@ ChatGPTは `download_url` と `file_id`、任意で `mime_type` と `file_name` 
 
 fileParams非対応のクライアントや配信先が未設定の環境では、この経路は使えない。
 モデルにBase64をコピーさせて代用せず、バイト列を持つプログラムから従来の転送APIを使う。
+
+### 添付ID・ファイル名・実行環境のパスの違い
+
+サーバーが受け取る `file` は、URLとIDを含むfileParamsオブジェクトである。
+添付ID、ファイル名、URL、`/mnt/data/...` の文字列をサーバーへそのまま渡しても解決しない。
+`/mnt/data` はChatGPT側の実行環境のパスであり、Windows側と共有されたファイルシステムではない。
+クライアントが選択された添付を実体化し、このオブジェクトへ変換する必要がある。
+
+現在のCodex接続では、モデル向けの `file` は「クライアント端末上に実在する絶対パス」の
+文字列として公開され、クライアントがファイルをアップロードしてfileParamsへ変換する。
+サーバー側のobjectスキーマとモデル向けstringの違いだけでは不具合と判定しない。
+ChatGPTの別の接続ではそのクライアントの添付引数の扱いを確認し、CodexのWindowsパスを代用しない。
+
+`ATTACHMENT_REFERENCE_REJECTED` は従来のコード・文言接頭辞を維持し、
+`layer`、`reference_kind`、`reason`、既知の `field`、期待するfileParams形式を追加する。
+`file_id` の拒否では `file_id_kind` も示す。これらは固定ラベルであり、元の値や未知のキー名を
+表示しない。クライアントがサーバー到達前に拒否した呼び出しには、この診断は付かない。
+自動フォールバック、添付IDの外部照会、任意パス読み取り、任意URL取得は追加していない。
+条件・再現試験・性能と未確認範囲は [添付参照の調査](ATTACHMENT_REFERENCE_INVESTIGATION_2026_10_06.md) を参照。
 
 ## 処理と保存の保証
 
@@ -115,3 +142,6 @@ Python例外にはcode属性がある。MCP wire上では標準ToolErrorの本�
 独自JSON-RPCエラーコードの追加は行わない。
 
 ローカルテストの結果と実ChatGPTへの接続未検証範囲は `VERIFICATION.md` を参照。
+
+2026-10-06の実接続で発生した汎用 `INVALID_ARGUMENT`、運用依存の欠落、サービス復旧、
+許可ホスト未設定の切り分けは [調査・復旧記録](ATTACHMENT_IMPORT_RECOVERY_2026_10_06.md) を参照。

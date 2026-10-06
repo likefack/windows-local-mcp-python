@@ -637,3 +637,58 @@ $env:PYTHONIOENCODING='utf-8'
 - 制限環境の一時ディレクトリ作成は `WinError 5` となったため、ACLを変更せず承認された通常Windows環境で再実行した。
 - 検証は合成データと保存済みチェックポイントを使う自動テスト。実承認画面の操作、実ChatGPT／Tunnel経由の新ツール取得、運用runtimeへの配備・再起動は未実施。既存のローカル承認・競合検知・復旧経路は維持し、通常ユーザーの承認操作を自動テストで代替したとは扱わない。
 - 本文ページ取得は対象内容全体のハッシュ検証、差分の再生成を行う。大容量ファイルを小ページで反復取得する場合の処理量は残る。チェックポイント保存期限後の完全取得は保証しない。
+
+## 添付取り込みの実接続復旧とホスト診断（2026-10-06）
+
+- 添付取り込み3テストファイルと追加診断テスト: **83 passed in 10.02s**。通信は合成。DNSホスト名だけを返し、署名URL・ファイルIDを表示せず、監査にはホスト名も保存しないことを確認した。
+- 運用版の欠落依存5件を同じ版へ復元。`pip check` 成功、既存サービスRunning、実接続の通常ファイル操作復旧を確認した。診断2ファイル以外の既存2,587ファイルは復旧前のハッシュを維持。変更不能性と認証付きauthority接続の検査も成功した。
+- 実添付で観測した正確な配信ホスト1件を設定し、画像の直接取り込みに成功。元添付と保存先はともに198,917バイトで、PowerShellによる独立したSHA-256計算も一致。成功した呼び出しは10,331ms。別経路との最速比較ではない。
+- 依存を消失させた操作は未特定。再接続中に監査未到達のタイムアウトが1件あり、その後の再試行で成功した。別ホスト・別クライアント・Approved Hostの承認後実行と異常終了回復は今回再検証していない。
+- 原因、配備範囲、運用設定、成功operation_id、復旧時の制約は [調査・復旧記録](docs/ATTACHMENT_IMPORT_RECOVERY_2026_10_06.md) を参照。
+
+## 添付参照の拒否診断とクライアント実体化（2026-10-06）
+
+今回の変更は `ATTACHMENT_REFERENCE_REJECTED` の診断追加とツール説明の明確化である。
+受理条件、fileParams schema、既存upload、Broker／Sandbox／Approved Hostの境界は変更しない。
+検査層・入力分類・拒否理由・期待形式を固定ラベルで返し、入力のURL・ID・名前・未知キーを
+エラーや監査へ転記しない。仕様・発生条件・未確認範囲は [調査記録](docs/ATTACHMENT_REFERENCE_INVESTIGATION_2026_10_06.md)。
+
+主担当が通常Windows環境で実行した最終回帰:
+
+```powershell
+$env:PYTHONIOENCODING='utf-8'
+.venv/Scripts/python.exe -B -m pytest tests/test_attachment_import.py tests/test_attachment_import_server.py tests/test_attachment_import_additional.py tests/test_attachment_import_host_diagnostic.py tests/test_attachment_reference_diagnostics.py tests/test_attachment_transfer_benchmark.py tests/test_artifact_transfer_errors.py tests/test_artifact_fast_path.py tests/test_transfer_resume.py tests/test_transfer_receipts.py tests/test_binary_transfer_lifecycle.py --basetemp=.dev-tmp/pytest/ar-final -ra
+```
+
+- **217 passed、2 failed、1 skipped、61.57秒**。失敗2件は初期化時のファイル置換が `WinError 5` となり、検査本体に未到達だった。スキップはシンボリックリンク作成が利用できない既存試験1件。
+- 失敗2件と、日本語の元添付名も確認するよう強化したPNG保存試験を、検査・ACLを変えず別の専用パスで再実行し **3 passed、1.71秒**。219件の成功を分割実行で確認した。一括実行の全成功とは記録しない。
+- 新規診断41件は入力分類、全拒否理由、MCP応答・監査の秘匿、拒否時の通信／保存未到達、PNG保存、日本語と空白を含む名前を確認する。新規測定2件は実JPEG／PNG、複数チャンク、最後の短いチャンク、保存・前後チェックポイント・ハッシュ、本文非出力、画像生成の再現性を確認する。
+- 既存試験でJPEG保存、同名保存先のCAS、取得中の保存先変更、workspace外・path traversal、改ざん、hash mismatch、サイズ制限、通信中断時の非変更性、既存uploadの再送／再開／整合性／保存回帰を確認した。
+- 制限環境では一時ディレクトリとRuffキャッシュの作成が拒否された。ホスト環境で再実行し、ACL・ownerや検査を変更していない。Ruffと差分の空白検査は成功。
+- 測定用の深い一時パスでは子プロセスが失敗したため、測定スクリプトのディレクトリ名を短縮した。長い専用basetempで測定2件の成功も確認した。製品のBroker保存・チェックポイント処理は置き換えていない。
+
+限定再実行:
+
+```powershell
+$env:PYTHONIOENCODING='utf-8'
+.venv/Scripts/python.exe -B -m pytest tests/test_attachment_import_additional.py::test_size_limit_failure_audit_omits_url_file_id_and_body 'tests/test_transfer_resume.py::test_invalid_or_noncanonical_base64[\u3042-INVALID]' tests/test_attachment_reference_diagnostics.py::test_mcp_fileparams_schema_and_real_png_save_with_japanese_and_spaces --basetemp=.dev-tmp/pytest/ar-recheck-host -q
+```
+
+実Codex／MCP／HTTPS取得経路で、非機密の161バイトPNG、4,183,461バイトJPEG、4,193,968バイトPNGを
+各1回の取り込みで保存した。JPEGの保存先は日本語と空白を含む。取得元ハッシュを指定し、
+応答と保存先の独立した `Get-FileHash` が一致した。呼び出し全体は2,547ms／6,293ms／7,437ms。
+新規診断は運用版へ未配備なので、これは変更前の直接取り込み経路の成功証拠である。
+元ChatGPTセッションの添付JPEGや変換後参照は取得できておらず、その変換内容を断定しない。
+
+最終性能測定は `scripts/benchmark_attachment_transfer.py --samples 1` の12ケース。
+実画像・SDKクライアント・Broker保存を使い、DNS／HTTPSとhealth確認は合成。約4MiBのJPEGは
+直接取得555.14ms／1呼び出し／本文Base64 0文字、分割upload1,177.36ms／10呼び出し／5,577,960文字。
+両方式とも本文はクライアントプログラム内に保持し、モデルへ展開していない。
+Python追跡対象の最大割り当ては13.49MiB／15.37MiB、RSS増加の観測値は11.32MiB／16.65MiB。
+実通信・LLM・ChatGPTの速度比較ではなく、計測負荷・OSキャッシュを含む単一観測である。
+測定中に並行変更を検出した回は採用せず、開始・終了の全Pythonソースハッシュが一致した回だけを採用した。
+原データと条件は `.dev-tmp/attachment-reference-20261006/benchmark.json`。
+
+保護された運用runtime、許可ホスト設定、承認サービス、回復状態は変更していない。
+会話所属の独立証明、元ChatGPTクライアントでの3失敗の再現、運用版の新診断は未検証。
+検証用に今回作った3画像は設定済みworkspaceに残した。小PNGの削除呼び出しの成功は確認できなかった。

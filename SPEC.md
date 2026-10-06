@@ -75,9 +75,16 @@ Ordinary file reads do not take a mutation lock. `read_file` is a strict UTF-8 t
 
 2026-10-06にupload再送、読み取り専用の `artifact_transfer_status`、転送専用TTLを追加した。受信記録の永続化順序、旧manifestの互換性、状態照会の意味、ChatGPT直接出力を採用しない理由は [転送の復旧仕様](docs/BINARY_TRANSFER_RESUME.md) を参照。
 
+添付取り込みの許可ホスト未設定時は、形式検査済みの実参照からDNSホスト名だけを応答へ表示する。
+これは設定のための診断であり、自動許可や会話所属の証明には使わない。URLのパス・署名クエリ・
+ファイルIDは表示せず、監査にはホスト名も残さない。実接続の共通操作失敗と復旧は
+[2026-10-06の調査記録](docs/ATTACHMENT_IMPORT_RECOVERY_2026_10_06.md) を参照。
+
 `artifact_download` and `artifact_upload` are bounded one-shot fast paths for payloads at or below `max_one_shot_artifact_bytes`. They preserve byte-exact base64, whole-payload SHA-256 validation, destination CAS, verified reads, and the existing atomic mutation/checkpoint/recovery path. Oversized input is rejected before a large response or mutation and identifies the existing chunked begin/chunk/commit route; chunked primitives remain unchanged for larger files.
 
 ChatGPT添付ファイルには `artifact_import_file` を使用する。公式の `openai/fileParams` で渡された参照を、管理者が完全一致で許可した配信ホストからHTTPSで取得し、全体サイズ・SHA-256・既知形式のシグネチャを検査後、既存のCAS／checkpoint／transaction経路で保存する。`file_name`は保存先に使わない。許可ホストの初期値は空であり、会話への所属を独立証明するものではない。2026-10-06に承認された限定取得の保証・制約・導入手順は [ChatGPT添付取り込み](docs/CHATGPT_ATTACHMENT_IMPORT.md) を参照。従来のone-shot／チャンク転送と512 KiBのrawチャンク既定値は維持する。チャンクはdecode前のBase64文字数上限も検査し、想定内エラーを識別コード付きで返す。
+
+`file` の添付解決・実体化はクライアントが担当し、サーバーは添付ID・ファイル名・URL・`/mnt/data` パスの文字列を直接解決しない。参照拒否は従来の `ATTACHMENT_REFERENCE_REJECTED` と文言接頭辞を維持し、固定ラベルの検査層・入力分類・拒否理由・期待形式を返す。値や未知のキー名を表示・記録せず、別経路への自動フォールバックを行わない。クライアントごとの扱い、実接続と性能の確認範囲は [添付参照の調査](docs/ATTACHMENT_REFERENCE_INVESTIGATION_2026_10_06.md) を参照。
 
 Binary transfer の durable manifest は `preparing`、`open`、`completed`、`committed`、`cancelled`、`expired`、`failed` を区別する。upload と download は一つの admission pool を共有し、`max_open_transfers` が数えるのは `preparing` と `open` だけである。download は terminal chunk を正常に生成した時点で自動的に `completed` へ遷移し、0 byte download は begin 時に完了する。upload は全 byte 数、全体 SHA-256、expected target hash、source binding を検証して atomic commit が成功した後に `committed` へ遷移する。不完全 upload は `open` のまま再試行できる。
 
